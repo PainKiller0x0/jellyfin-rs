@@ -235,4 +235,4 @@ cargo build --release
 
 ## License
 
-MIT
+GPL-2.0-only, matching Jellyfin's open source license.

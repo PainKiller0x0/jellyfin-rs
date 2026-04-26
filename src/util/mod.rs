@@ -35,7 +35,9 @@ pub fn now_unix() -> i64 {
 }
 
 pub fn unix_to_jellyfin_date(timestamp: i64) -> String {
-    format!("/Date({}000)/", timestamp.max(0))
+    chrono::DateTime::from_timestamp(timestamp.max(0), 0)
+        .map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
 pub fn infer_library_id_from_path(path: &str) -> &'static str {

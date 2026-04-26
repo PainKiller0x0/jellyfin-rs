@@ -164,6 +164,35 @@ pub async fn item_by_id(
     }
 }
 
+pub async fn item_by_id_public(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    let user_id = state.user_id.to_string();
+    match find_media_item(&state.db, &user_id, &item_id).await {
+        Ok(Some(item)) => match item_json_with_provider_ids(&state.db, item).await {
+            Ok(item) => Json(item).into_response(),
+            Err(error) => internal_error(error),
+        },
+        Ok(None) => Json(json!({ "Name": item_id, "Id": item_id, "Type": "Folder", "UserData": { "Played": false, "IsFavorite": false } })).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn items_root(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let user_id = query
+        .get("UserId")
+        .cloned()
+        .unwrap_or_else(|| state.user_id.to_string());
+    match list_media_items(&state.db, &user_id, &query).await {
+        Ok(items) => media_list_response(items),
+        Err(error) => internal_error(error),
+    }
+}
+
 async fn item_json_with_provider_ids(db: &sqlx::AnyPool, item: MediaItem) -> anyhow::Result<Value> {
     let mut value = item.to_jellyfin_json();
     let rows = sqlx::query("SELECT provider, provider_item_id FROM provider_ids WHERE item_id = ?")

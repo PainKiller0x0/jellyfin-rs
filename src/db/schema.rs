@@ -114,6 +114,10 @@ pub fn migrations() -> Vec<Migration> {
             r#"CREATE TABLE IF NOT EXISTS task_results (task_id TEXT PRIMARY KEY, status TEXT NOT NULL, start_time BIGINT, end_time BIGINT, message TEXT)"#,
             "failed to migrate task_results",
         ),
+        (
+            r#"CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at BIGINT NOT NULL)"#,
+            "failed to migrate app_settings",
+        ),
     ]
 }
 
@@ -198,6 +202,10 @@ pub fn optional_migrations() -> Vec<Migration> {
         (
             "CREATE INDEX IF NOT EXISTS idx_linked_children_parent ON linked_children(parent_id, sort_order)",
             "create linked_children index",
+        ),
+        (
+            r#"CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at BIGINT NOT NULL)"#,
+            "create app_settings table",
         ),
     ]
 }

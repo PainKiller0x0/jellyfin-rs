@@ -15,6 +15,18 @@ pub async fn empty_list() -> impl IntoResponse {
     Json(json!({ "Items": [], "TotalRecordCount": 0 }))
 }
 
+pub async fn empty_array() -> impl IntoResponse {
+    Json(Vec::<serde_json::Value>::new())
+}
+
+pub async fn empty_object() -> impl IntoResponse {
+    Json(json!({}))
+}
+
+pub async fn no_content() -> impl IntoResponse {
+    StatusCode::NO_CONTENT
+}
+
 pub fn internal_error(error: anyhow::Error) -> Response {
     tracing::warn!("request failed: {error:#}");
     (

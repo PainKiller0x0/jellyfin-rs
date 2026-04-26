@@ -75,6 +75,13 @@ pub async fn list_users(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+pub async fn public_users(State(state): State<Arc<AppState>>) -> Response {
+    match list_users_inner(&state.db).await {
+        Ok(users) => Json(users).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
 pub async fn user_by_id(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<String>,
@@ -160,6 +167,13 @@ pub async fn update_user_password(
     }
 }
 
+pub async fn update_user_configuration(
+    Path(_user_id): Path<String>,
+    Json(_configuration): Json<Value>,
+) -> Response {
+    StatusCode::NO_CONTENT.into_response()
+}
+
 pub async fn delete_user(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<String>,
@@ -177,6 +191,50 @@ pub async fn delete_user(
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error.into()),
     }
+}
+
+pub async fn update_user(
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<String>,
+    Json(request): Json<Value>,
+) -> Response {
+    let Some(name) = request
+        .get("Name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+
+    match sqlx::query(
+        "UPDATE users SET username = ?, display_name = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(name)
+    .bind(name)
+    .bind(now_unix())
+    .bind(&user_id)
+    .execute(&state.db)
+    .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error.into()),
+    }
+}
+
+pub async fn update_user_policy(
+    Path(_user_id): Path<String>,
+    Json(_policy): Json<Value>,
+) -> Response {
+    StatusCode::NO_CONTENT.into_response()
+}
+
+pub async fn forgot_password() -> impl IntoResponse {
+    Json(json!({
+        "Action": "ContactAdmin",
+        "PinFile": "",
+        "PinExpirationDate": null
+    }))
 }
 
 async fn authenticate_by_name_inner(
@@ -460,11 +518,32 @@ fn user_json(user_id: &str, name: &str, is_admin: bool, is_disabled: bool) -> Va
     json!({
         "Name": name,
         "Id": user_id,
+        "ServerId": "jellyfin-rs",
         "HasPassword": true,
+        "Configuration": default_user_configuration(),
         "Policy": {
             "IsAdministrator": is_admin,
             "IsDisabled": is_disabled
         }
+    })
+}
+
+fn default_user_configuration() -> Value {
+    json!({
+        "AudioLanguagePreference": "",
+        "SubtitleLanguagePreference": "",
+        "SubtitleMode": "Default",
+        "PlayDefaultAudioTrack": true,
+        "RememberAudioSelections": true,
+        "RememberSubtitleSelections": true,
+        "EnableNextEpisodeAutoPlay": true,
+        "DisplayMissingEpisodes": false,
+        "GroupedFolders": [],
+        "LatestItemsExcludes": [],
+        "MyMediaExcludes": [],
+        "OrderedViews": [],
+        "HidePlayedInLatest": false,
+        "CastReceiverId": ""
     })
 }
 

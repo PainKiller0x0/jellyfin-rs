@@ -12,7 +12,7 @@ pub async fn seed_default_data(state: &AppState) -> anyhow::Result<()> {
     let password = std::env::var("JELLYFIN_RS_PASSWORD").unwrap_or_else(|_| username.clone());
     let password_hash = hash_password(&password)?;
 
-    sqlx::query(r#"INSERT INTO users (id, username, password_hash, display_name, is_admin, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?) ON CONFLICT(id) DO UPDATE SET username = excluded.username, password_hash = excluded.password_hash, display_name = excluded.display_name, is_admin = excluded.is_admin, updated_at = excluded.updated_at"#)
+    sqlx::query(r#"INSERT INTO users (id, username, password_hash, display_name, is_admin, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?) ON CONFLICT(id) DO NOTHING"#)
         .bind(state.user_id.to_string())
         .bind(&username)
         .bind(&password_hash)

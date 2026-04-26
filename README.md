@@ -193,6 +193,22 @@ cargo run --release
 | GET | `/Videos/{itemId}/AdditionalParts` | 视频附加部件 |
 | GET | `/LiveTv/Channels` | 直播电视频道 |
 
+### 合集与播放列表 / Collections & Playlists
+
+| Method | Endpoint | 说明 |
+|--------|----------|------|
+| POST | `/Collections` | 创建合集（name + ids） |
+| POST | `/Collections/{id}/Items` | 添加项目到合集 |
+| DELETE | `/Collections/{id}/Items` | 从合集移除项目 |
+| POST | `/Playlists` | 创建播放列表 |
+| GET | `/Playlists/{id}` | 获取播放列表信息 |
+| POST | `/Playlists/{id}` | 更新播放列表（名称/项目顺序） |
+| GET | `/Playlists/{id}/Items` | 获取播放列表项目（分页） |
+| POST | `/Playlists/{id}/Items` | 添加项目到播放列表 |
+| DELETE | `/Playlists/{id}/Items` | 从播放列表移除项目 |
+
+合集/播放列表通过 `linked_children` 表关联项目，支持 `ListItemIds` 反查包含指定项目的所有合集/播放列表。
+
 ### 媒体扫描 / Library Scanning
 
 - 目录遍历与媒体分类（Movie/Series/Season/Episode）
@@ -205,7 +221,6 @@ cargo run --release
 
 - 转码 / HLS 串流
 - 直播电视 / DVR
-- 合集 (Collections) / 播放列表 (Playlists)
 - 完整缺失集检测（需 TVDb/TMDb 集数据）
 - TVDb / IMDb / MusicBrainz 提供者
 - 插件系统 / SyncPlay / Quick Connect

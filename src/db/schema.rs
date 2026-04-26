@@ -191,5 +191,13 @@ pub fn optional_migrations() -> Vec<Migration> {
             "ALTER TABLE user_data ADD COLUMN rating REAL",
             "add user_data.rating",
         ),
+        (
+            r#"CREATE TABLE IF NOT EXISTS linked_children (parent_id TEXT NOT NULL, item_id TEXT NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(parent_id, item_id), FOREIGN KEY(parent_id) REFERENCES media_items(id) ON DELETE CASCADE, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE)"#,
+            "create linked_children table",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_linked_children_parent ON linked_children(parent_id, sort_order)",
+            "create linked_children index",
+        ),
     ]
 }

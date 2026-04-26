@@ -7,7 +7,9 @@ use axum::{
 
 use crate::{
     app::state::AppState,
-    jellyfin::{auth, common, filters, images, items, library, playback, sessions, system},
+    jellyfin::{
+        auth, collect, common, filters, images, items, library, playback, sessions, system,
+    },
     playback::streaming::{
         stream_audio, stream_audio_head, stream_subtitle, stream_subtitle_head, stream_video,
         stream_video_head,
@@ -186,4 +188,20 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(playback::set_rating).delete(playback::delete_rating),
         )
         .route("/Items/Counts", get(items::item_counts))
+        .route("/Collections", post(collect::create_collection))
+        .route(
+            "/Collections/{collection_id}/Items",
+            post(collect::add_to_collection).delete(collect::remove_from_collection),
+        )
+        .route("/Playlists", post(collect::create_playlist))
+        .route(
+            "/Playlists/{playlist_id}",
+            get(collect::get_playlist).post(collect::update_playlist),
+        )
+        .route(
+            "/Playlists/{playlist_id}/Items",
+            get(collect::get_playlist_items)
+                .post(collect::add_to_playlist)
+                .delete(collect::remove_from_playlist),
+        )
 }

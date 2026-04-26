@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod collect;
 pub mod common;
 pub mod filters;
 pub mod images;

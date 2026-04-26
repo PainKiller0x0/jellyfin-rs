@@ -23,6 +23,7 @@ pub async fn list_media_items(
     user_id: &str,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<MediaItem>> {
+    let has_list_item_ids = query.contains_key("ListItemIds");
     let parent_id = query
         .get("ParentId")
         .map(String::as_str)
@@ -30,11 +31,25 @@ pub async fn list_media_items(
     let limit = query_u32(query, "Limit", 50).min(200) as usize;
     let offset = query_u32(query, "StartIndex", 0) as usize;
     let recursive = query_bool(query, "Recursive", false);
-    let rows = if recursive {
+
+    let parent_is_collection = is_collection_or_playlist(db, parent_id).await?;
+
+    let rows = if parent_is_collection {
+        sqlx::query(&linked_children_select_sql())
+            .bind(user_id)
+            .bind(parent_id)
+            .fetch_all(db)
+            .await
+    } else if recursive {
         sqlx::query(&recursive_media_item_select_sql())
             .bind(parent_id)
             .bind(user_id)
             .bind(parent_id)
+            .fetch_all(db)
+            .await
+    } else if has_list_item_ids {
+        sqlx::query(&media_item_select_sql(""))
+            .bind(user_id)
             .fetch_all(db)
             .await
     } else {
@@ -50,6 +65,23 @@ pub async fn list_media_items(
     apply_relation_filters(db, &mut items, query).await?;
     sort_media_items(&mut items, query);
     Ok(items.into_iter().skip(offset).take(limit).collect())
+}
+
+async fn is_collection_or_playlist(db: &AnyPool, item_id: &str) -> anyhow::Result<bool> {
+    let row = sqlx::query(
+        "SELECT item_type FROM media_items WHERE id = ? AND item_type IN ('BoxSet', 'Playlist')",
+    )
+    .bind(item_id)
+    .fetch_optional(db)
+    .await
+    .context("failed to check item type")?;
+    Ok(row.is_some())
+}
+
+fn linked_children_select_sql() -> String {
+    format!(
+        r#"SELECT mi.id, mi.title, mi.path, mi.library_id, mi.parent_id, mi.item_type, mi.is_folder, mi.container, mi.overview, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, 0) AS is_favorite, COALESCE(ud.played, 0) AS played, COALESCE(ud.playback_position_ticks, 0) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, 0) AS play_count, ud.last_played_at AS last_played_at FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC"#
+    )
 }
 
 pub async fn latest_media_items(db: &AnyPool, user_id: &str) -> anyhow::Result<Vec<MediaItem>> {
@@ -214,6 +246,10 @@ async fn apply_relation_filters(
         let item_ids = relation_item_ids(db, "media_studios", "studio_id", &ids).await?;
         items.retain(|item| item_ids.iter().any(|id| id == &item.id));
     }
+    if let Some(ids) = query_ids(query, "ListItemIds") {
+        let item_ids = parent_item_ids(db, &ids).await?;
+        items.retain(|item| item_ids.iter().any(|id| id == &item.id));
+    }
     if let Some(codecs) = query_insensitive(query, "VideoCodecs") {
         let item_ids = codec_item_ids(db, &codecs).await?;
         items.retain(|item| item_ids.iter().any(|id| id == &item.id));
@@ -289,6 +325,23 @@ async fn max_width_item_ids(db: &AnyPool, max: i64) -> anyhow::Result<Vec<String
         .into_iter()
         .filter_map(|row| row.try_get("item_id").ok())
         .collect())
+}
+
+async fn parent_item_ids(db: &AnyPool, item_ids: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut parents = Vec::new();
+    for id in item_ids {
+        let rows = sqlx::query("SELECT DISTINCT parent_id FROM linked_children WHERE item_id = ?")
+            .bind(id)
+            .fetch_all(db)
+            .await
+            .context("failed to find linked parents")?;
+        for row in rows {
+            parents.push(row.try_get("parent_id")?);
+        }
+    }
+    parents.sort();
+    parents.dedup();
+    Ok(parents)
 }
 
 async fn relation_item_ids(

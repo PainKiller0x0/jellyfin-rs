@@ -15,6 +15,14 @@ pub fn migrations() -> Vec<Migration> {
             "failed to migrate access_tokens",
         ),
         (
+            r#"CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, access_token TEXT NOT NULL UNIQUE, name TEXT NOT NULL, user_id TEXT NOT NULL, created_at BIGINT NOT NULL, last_used_at BIGINT, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"#,
+            "failed to migrate api_keys",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id)",
+            "failed to create api key user index",
+        ),
+        (
             "CREATE INDEX IF NOT EXISTS idx_access_tokens_user_id ON access_tokens(user_id)",
             "failed to create access token user index",
         ),
@@ -206,6 +214,14 @@ pub fn optional_migrations() -> Vec<Migration> {
         (
             r#"CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at BIGINT NOT NULL)"#,
             "create app_settings table",
+        ),
+        (
+            r#"CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, access_token TEXT NOT NULL UNIQUE, name TEXT NOT NULL, user_id TEXT NOT NULL, created_at BIGINT NOT NULL, last_used_at BIGINT, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"#,
+            "create api_keys table",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id)",
+            "create api key user index",
         ),
     ]
 }

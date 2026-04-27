@@ -90,11 +90,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/Playback/BitrateTest", get(system::bitrate_test))
         .route("/ClientLog/Document", post(common::no_content))
-        .route(
-            "/Auth/Keys",
-            get(common::empty_list).post(common::no_content),
-        )
-        .route("/Auth/Keys/{key}", delete(common::no_content))
+        .route("/Auth/Keys", get(auth::api_keys).post(auth::create_api_key))
+        .route("/Auth/Keys/{key}", delete(auth::delete_api_key))
         .route("/Plugins", get(common::empty_array))
         .route("/Plugins/{plugin_id}", delete(common::no_content))
         .route(

@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     app::state::AppState,
     jellyfin::routes::internal_error,
-    util::{hash_password, now_unix, stable_text_id, verify_password},
+    util::{hash_password, now_unix, stable_text_id, unix_to_jellyfin_date, verify_password},
 };
 
 #[derive(Deserialize)]
@@ -45,6 +45,11 @@ pub struct UpdatePasswordRequest {
     new_pw: Option<String>,
     #[serde(rename = "ResetPassword", default)]
     reset_password: bool,
+}
+
+#[derive(Deserialize)]
+pub struct CreateApiKeyQuery {
+    app: Option<String>,
 }
 
 struct UserRow {
@@ -237,6 +242,42 @@ pub async fn forgot_password() -> impl IntoResponse {
     }))
 }
 
+pub async fn api_keys(State(state): State<Arc<AppState>>) -> Response {
+    match api_keys_inner(&state.db).await {
+        Ok(keys) => Json(json!({
+            "Items": keys,
+            "TotalRecordCount": keys.len()
+        }))
+        .into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn create_api_key(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<CreateApiKeyQuery>,
+) -> Response {
+    match create_api_key_inner(&state, query).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) if error.to_string().contains("required") => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": error.to_string() })),
+        )
+            .into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn delete_api_key(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> Response {
+    match delete_api_key_inner(&state.db, &key).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
 async fn authenticate_by_name_inner(
     state: &AppState,
     request: LoginRequest,
@@ -305,6 +346,95 @@ async fn authenticate_by_name_inner(
         "AccessToken": token,
         "ServerId": "jellyfin-rs"
     }))
+}
+
+async fn api_keys_inner(db: &AnyPool) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        r#"SELECT id, access_token, name, user_id, created_at, last_used_at FROM api_keys ORDER BY created_at ASC"#,
+    )
+    .fetch_all(db)
+    .await
+    .context("failed to list api keys")?;
+
+    rows.into_iter()
+        .map(|row| {
+            let id: String = row.try_get("id")?;
+            let access_token: String = row.try_get("access_token")?;
+            let name: String = row.try_get("name")?;
+            let user_id: String = row.try_get("user_id")?;
+            let created_at: i64 = row.try_get("created_at")?;
+            let last_used_at: Option<i64> = row.try_get("last_used_at")?;
+            Ok(json!({
+                "Id": stable_text_id(&id),
+                "AccessToken": access_token,
+                "DeviceId": "",
+                "AppName": name,
+                "AppVersion": "",
+                "DeviceName": "",
+                "UserId": user_id,
+                "IsActive": true,
+                "DateCreated": unix_to_jellyfin_date(created_at),
+                "DateRevoked": null,
+                "DateLastActivity": unix_to_jellyfin_date(last_used_at.unwrap_or(created_at)),
+                "UserName": null
+            }))
+        })
+        .collect()
+}
+
+async fn create_api_key_inner(state: &AppState, query: CreateApiKeyQuery) -> anyhow::Result<()> {
+    let app = query
+        .app
+        .as_deref()
+        .map(str::trim)
+        .filter(|app| !app.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("app is required"))?;
+    let now = now_unix();
+    let token = Uuid::new_v4().simple().to_string();
+    let key_id = Uuid::new_v4().to_string();
+
+    sqlx::query(
+        r#"INSERT INTO api_keys (id, access_token, name, user_id, created_at) VALUES (?, ?, ?, ?, ?)"#,
+    )
+    .bind(&key_id)
+    .bind(&token)
+    .bind(app)
+    .bind(state.user_id.to_string())
+    .bind(now)
+    .execute(&state.db)
+    .await
+    .context("failed to create api key")?;
+
+    sqlx::query(
+        r#"INSERT INTO access_tokens (id, user_id, token_hash, name, created_at) VALUES (?, ?, ?, ?, ?)"#,
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(state.user_id.to_string())
+    .bind(stable_text_id(&token))
+    .bind(app)
+    .bind(now)
+    .execute(&state.db)
+    .await
+    .context("failed to create api key access token")?;
+
+    Ok(())
+}
+
+async fn delete_api_key_inner(db: &AnyPool, key: &str) -> anyhow::Result<()> {
+    let token_hash = stable_text_id(key);
+    sqlx::query("DELETE FROM api_keys WHERE access_token = ?")
+        .bind(key)
+        .execute(db)
+        .await
+        .context("failed to delete api key")?;
+
+    sqlx::query("DELETE FROM access_tokens WHERE token_hash = ?")
+        .bind(token_hash)
+        .execute(db)
+        .await
+        .context("failed to delete api key access token")?;
+
+    Ok(())
 }
 
 async fn list_users_inner(db: &AnyPool) -> anyhow::Result<Vec<Value>> {
@@ -456,6 +586,12 @@ pub async fn authenticated_user_id(
         .execute(db)
         .await
         .context("failed to update access token usage")?;
+    sqlx::query("UPDATE api_keys SET last_used_at = ? WHERE access_token = ?")
+        .bind(now)
+        .bind(&token)
+        .execute(db)
+        .await
+        .context("failed to update api key usage")?;
 
     Ok(Some(user_id))
 }

@@ -1,10 +1,10 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use axum::{
     Json,
     body::{Body, Bytes},
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -15,6 +15,9 @@ use sqlx::{AnyPool, Row};
 use crate::{
     app::state::AppState,
     jellyfin::common::{image as placeholder_image, internal_error},
+    library::image_processing::{
+        EncodedImageFormat, ImageRequestOptions, create_collage, create_placeholder, process_image,
+    },
     util::{now_unix, stable_text_id},
 };
 
@@ -35,14 +38,16 @@ pub async fn item_images(
 pub async fn get_item_image(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     Path((item_id, image_type)): Path<(String, String)>,
 ) -> Response {
-    serve_item_image(&state.db, &headers, &item_id, &image_type, 0).await
+    serve_item_image(&state.db, &headers, &query, &item_id, &image_type, 0).await
 }
 
 pub async fn get_item_image_with_index(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     Path((item_id, first, second)): Path<(String, String, String)>,
 ) -> Response {
     let (image_type, image_index) = if let Ok(index) = second.parse::<i64>() {
@@ -50,7 +55,15 @@ pub async fn get_item_image_with_index(
     } else {
         (second, first.parse::<i64>().unwrap_or_default())
     };
-    serve_item_image(&state.db, &headers, &item_id, &image_type, image_index).await
+    serve_item_image(
+        &state.db,
+        &headers,
+        &query,
+        &item_id,
+        &image_type,
+        image_index,
+    )
+    .await
 }
 
 pub async fn upload_item_image(
@@ -139,10 +152,12 @@ pub async fn user_avatar(Path(user_id): Path<String>) -> Response {
 async fn serve_item_image(
     db: &AnyPool,
     headers: &HeaderMap,
+    query: &HashMap<String, String>,
     item_id: &str,
     image_type: &str,
     image_index: i64,
 ) -> Response {
+    let options = image_options_from_query(query, image_type);
     let row = match sqlx::query("SELECT path, etag, size_bytes FROM image_assets WHERE item_id = ? AND image_type = ? AND image_index = ?")
         .bind(item_id)
         .bind(image_type)
@@ -156,7 +171,7 @@ async fn serve_item_image(
     };
 
     let Some(row) = row else {
-        return placeholder_image().await.into_response();
+        return dynamic_image_response(db, item_id, image_type, &options).await;
     };
     let etag: String = match row.try_get("etag") {
         Ok(etag) => etag,
@@ -174,7 +189,7 @@ async fn serve_item_image(
         Ok(path) => path,
         Err(error) => return internal_error(error.into()),
     };
-    let bytes = match tokio::fs::read(&path).await {
+    let mut bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(error) => {
             return (
@@ -185,11 +200,20 @@ async fn serve_item_image(
         }
     };
 
+    let content_type = if should_process(query) {
+        match process_image(&bytes, &options) {
+            Ok(processed) => {
+                bytes = processed;
+                options.format.content_type()
+            }
+            Err(error) => return internal_error(error),
+        }
+    } else {
+        content_type_from_path(&path)
+    };
+
     let mut response_headers = HeaderMap::new();
-    response_headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(content_type_from_path(&path)),
-    );
+    response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     response_headers.insert(
         header::CONTENT_LENGTH,
         HeaderValue::from_str(&bytes.len().to_string())
@@ -199,6 +223,94 @@ async fn serve_item_image(
         response_headers.insert(header::ETAG, value);
     }
     (response_headers, Body::from(bytes)).into_response()
+}
+
+async fn dynamic_image_response(
+    db: &AnyPool,
+    item_id: &str,
+    image_type: &str,
+    options: &ImageRequestOptions,
+) -> Response {
+    let width = options
+        .width
+        .unwrap_or_else(|| default_image_size(image_type).0);
+    let height = options
+        .height
+        .unwrap_or_else(|| default_image_size(image_type).1);
+    let bytes = match collage_source_images(db, item_id, image_type).await {
+        Ok(images) if !images.is_empty() => create_collage(&images, width, height, options),
+        Ok(_) => create_placeholder(width, height, item_id, options),
+        Err(error) => return internal_error(error),
+    };
+    match bytes {
+        Ok(bytes) => image_response(
+            bytes,
+            options.format.content_type(),
+            dynamic_etag(item_id, image_type, width, height),
+        ),
+        Err(error) => internal_error(error),
+    }
+}
+
+async fn collage_source_images(
+    db: &AnyPool,
+    item_id: &str,
+    image_type: &str,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let preferred_type = if image_type.eq_ignore_ascii_case("Thumb") {
+        "Backdrop"
+    } else {
+        "Primary"
+    };
+    let rows = sqlx::query(
+        r#"SELECT image_assets.path FROM image_assets JOIN media_items ON media_items.id = image_assets.item_id WHERE media_items.parent_id = ? AND image_assets.image_type = ? ORDER BY media_items.title ASC, image_assets.image_index ASC LIMIT 4"#,
+    )
+    .bind(item_id)
+    .bind(preferred_type)
+    .fetch_all(db)
+    .await
+    .context("failed to find child images for collage")?;
+
+    let mut images = Vec::new();
+    for row in rows {
+        let path: String = row.try_get("path")?;
+        if let Ok(bytes) = tokio::fs::read(&path).await {
+            images.push(bytes);
+        }
+    }
+    Ok(images)
+}
+
+fn image_response(bytes: Vec<u8>, content_type: &'static str, etag: String) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        headers.insert(header::ETAG, value);
+    }
+    (headers, Body::from(bytes)).into_response()
+}
+
+fn dynamic_etag(item_id: &str, image_type: &str, width: u32, height: u32) -> String {
+    stable_text_id(&format!(
+        "dynamic-image:{item_id}:{image_type}:{width}:{height}"
+    ))
+}
+
+fn default_image_size(image_type: &str) -> (u32, u32) {
+    if image_type.eq_ignore_ascii_case("Primary") {
+        (600, 600)
+    } else if image_type.eq_ignore_ascii_case("Thumb")
+        || image_type.eq_ignore_ascii_case("Backdrop")
+    {
+        (960, 540)
+    } else {
+        (600, 600)
+    }
 }
 
 async fn save_item_image(
@@ -361,6 +473,67 @@ fn content_type_from_path(path: &str) -> &'static str {
         "webp" => "image/webp",
         "gif" => "image/gif",
         _ => "application/octet-stream",
+    }
+}
+
+fn image_options_from_query(
+    query: &HashMap<String, String>,
+    _image_type: &str,
+) -> ImageRequestOptions {
+    ImageRequestOptions {
+        width: query_u32(query, &["Width", "width", "MaxWidth", "maxWidth"]),
+        height: query_u32(query, &["Height", "height", "MaxHeight", "maxHeight"]),
+        quality: query_u8(query, &["Quality", "quality"])
+            .unwrap_or(90)
+            .clamp(1, 100),
+        format: image_format_from_query(query).unwrap_or(EncodedImageFormat::Png),
+    }
+}
+
+fn should_process(query: &HashMap<String, String>) -> bool {
+    [
+        "Width",
+        "width",
+        "Height",
+        "height",
+        "MaxWidth",
+        "maxWidth",
+        "MaxHeight",
+        "maxHeight",
+        "Format",
+        "format",
+        "Quality",
+        "quality",
+    ]
+    .iter()
+    .any(|key| query.contains_key(*key))
+}
+
+fn query_u32(query: &HashMap<String, String>, keys: &[&str]) -> Option<u32> {
+    keys.iter()
+        .find_map(|key| query.get(*key))
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(4096))
+}
+
+fn query_u8(query: &HashMap<String, String>, keys: &[&str]) -> Option<u8> {
+    keys.iter()
+        .find_map(|key| query.get(*key))
+        .and_then(|value| value.parse::<u8>().ok())
+}
+
+fn image_format_from_query(query: &HashMap<String, String>) -> Option<EncodedImageFormat> {
+    let format = query
+        .get("Format")
+        .or_else(|| query.get("format"))?
+        .trim()
+        .to_ascii_lowercase();
+    match format.as_str() {
+        "jpg" | "jpeg" => Some(EncodedImageFormat::Jpeg),
+        "png" => Some(EncodedImageFormat::Png),
+        "webp" => Some(EncodedImageFormat::Webp),
+        _ => None,
     }
 }
 

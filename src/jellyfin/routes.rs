@@ -61,6 +61,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/Startup/RemoteAccess", post(system::update_remote_access))
         .route("/Startup/Complete", post(system::complete_startup))
+        .route("/Options", get(system::localization_options))
+        .route("/Cultures", get(system::localization_cultures))
+        .route("/Countries", get(system::localization_countries))
+        .route("/ParentalRatings", get(system::parental_ratings))
         .route("/Localization/Options", get(system::localization_options))
         .route("/Localization/Cultures", get(system::localization_cultures))
         .route(

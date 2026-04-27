@@ -17,12 +17,16 @@ use crate::{
 };
 
 mod configuration;
+mod localization;
 
 pub use configuration::{
     complete_startup, configuration_pages, dashboard_configuration_page, default_metadata_options,
     named_configuration, server_configuration, startup_configuration, startup_user,
     update_named_configuration, update_remote_access, update_server_configuration,
     update_startup_configuration, update_startup_user,
+};
+pub use localization::{
+    localization_countries, localization_cultures, localization_options, parental_ratings,
 };
 
 pub async fn system_info(State(state): State<Arc<AppState>>) -> Response {
@@ -50,31 +54,6 @@ pub async fn public_system_info(State(state): State<Arc<AppState>>) -> Response 
         "StartupWizardCompleted": startup_completed,
     }))
     .into_response()
-}
-
-pub async fn localization_options() -> impl IntoResponse {
-    Json(vec![
-        json!({ "Name": "Chinese Simplified", "Value": "zh-CN" }),
-        json!({ "Name": "English", "Value": "en-US" }),
-    ])
-}
-
-pub async fn localization_cultures() -> impl IntoResponse {
-    Json(vec![
-        json!({ "DisplayName": "Chinese Simplified", "Name": "zh-CN", "TwoLetterISOLanguageName": "zh-CN" }),
-        json!({ "DisplayName": "English", "Name": "en-US", "TwoLetterISOLanguageName": "en" }),
-    ])
-}
-
-pub async fn localization_countries() -> impl IntoResponse {
-    Json(vec![
-        json!({ "DisplayName": "China", "Name": "China", "TwoLetterISORegionName": "CN" }),
-        json!({ "DisplayName": "United States", "Name": "United States", "TwoLetterISORegionName": "US" }),
-    ])
-}
-
-pub async fn parental_ratings() -> impl IntoResponse {
-    Json(Vec::<Value>::new())
 }
 
 pub async fn quick_connect_enabled() -> impl IntoResponse {

@@ -548,7 +548,7 @@ pub async fn scheduled_tasks(State(state): State<Arc<AppState>>) -> impl IntoRes
     Json(vec![task])
 }
 
-async fn last_task_result(db: &sqlx::AnyPool, task_id: &str) -> Option<Value> {
+pub async fn last_task_result(db: &sqlx::AnyPool, task_id: &str) -> Option<Value> {
     let row = sqlx::query(
         "SELECT status, start_time, end_time, message FROM task_results WHERE task_id = ?",
     )
@@ -568,7 +568,7 @@ async fn last_task_result(db: &sqlx::AnyPool, task_id: &str) -> Option<Value> {
 }
 
 pub async fn log_activity(
-    db: &sqlx::AnyPool,
+    state: &AppState,
     name: &str,
     log_type: &str,
     user_id: Option<&str>,
@@ -585,12 +585,13 @@ pub async fn log_activity(
     .bind(user_id)
     .bind(item_id)
     .bind(now)
-    .execute(db)
+    .execute(&state.db)
     .await;
+    let _ = state.ws_event_tx.send(crate::ws::WsEvent::ActivityCreated);
 }
 
 pub async fn upsert_task_result(
-    db: &sqlx::AnyPool,
+    state: &AppState,
     task_id: &str,
     status: &str,
     start_time: i64,
@@ -605,8 +606,9 @@ pub async fn upsert_task_result(
     .bind(start_time)
     .bind(end_time)
     .bind(message)
-    .execute(db)
+    .execute(&state.db)
     .await;
+    let _ = state.ws_event_tx.send(crate::ws::WsEvent::TaskUpdated);
 }
 
 pub async fn shutdown_handler() -> Response {

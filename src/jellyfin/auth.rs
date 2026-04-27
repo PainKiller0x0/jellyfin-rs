@@ -59,7 +59,7 @@ pub async fn authenticate_by_name(
     State(state): State<Arc<AppState>>,
     Json(request): Json<LoginRequest>,
 ) -> Response {
-    match authenticate_by_name_inner(&state.db, request).await {
+    match authenticate_by_name_inner(&state, request).await {
         Ok(response) => Json(response).into_response(),
         Err(AuthError::Unauthorized(message)) => {
             (StatusCode::UNAUTHORIZED, Json(json!({ "Error": message }))).into_response()
@@ -238,9 +238,10 @@ pub async fn forgot_password() -> impl IntoResponse {
 }
 
 async fn authenticate_by_name_inner(
-    db: &AnyPool,
+    state: &AppState,
     request: LoginRequest,
 ) -> Result<Value, AuthError> {
+    let db = &state.db;
     let username = request.username.trim();
     if username.is_empty() {
         return Err(AuthError::Unauthorized("Username is required".to_string()));
@@ -291,7 +292,7 @@ async fn authenticate_by_name_inner(
         .map_err(AuthError::Internal)?;
 
     crate::jellyfin::system::log_activity(
-        db,
+        state,
         &format!("User {} logged in", user.username),
         "Authentication",
         Some(&user.id),

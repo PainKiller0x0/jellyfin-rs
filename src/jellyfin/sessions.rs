@@ -69,6 +69,7 @@ pub async fn capabilities(
         session_key(&headers, &query, &device.device_id),
         session_capabilities,
     );
+    let _ = state.ws_event_tx.send(crate::ws::WsEvent::SessionsChanged);
     StatusCode::NO_CONTENT.into_response()
 }
 

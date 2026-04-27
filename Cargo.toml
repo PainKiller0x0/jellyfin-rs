@@ -8,7 +8,7 @@ license = "GPL-2.0-only"
 [dependencies]
 anyhow = "1.0"
 argon2 = "0.5"
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 fastrand = "2.3"
@@ -24,3 +24,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
 walkdir = "2.5"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }

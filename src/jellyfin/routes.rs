@@ -14,6 +14,7 @@ use crate::{
         stream_audio, stream_audio_head, stream_subtitle, stream_subtitle_head, stream_video,
         stream_video_head,
     },
+    ws,
 };
 
 pub use common::{internal_error, not_found};
@@ -532,4 +533,6 @@ pub fn api_routes() -> Router<Arc<AppState>> {
                 .post(collect::add_to_playlist)
                 .delete(collect::remove_from_playlist),
         )
+        .route("/websocket", get(ws::ws_handler))
+        .route("/WebSocket", get(ws::ws_handler))
 }

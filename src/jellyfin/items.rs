@@ -341,7 +341,7 @@ pub async fn metadata_reset(
         }
 
         crate::jellyfin::system::log_activity(
-            &state.db,
+            &state,
             "Metadata reset",
             "MetadataReset",
             None,
@@ -661,7 +661,7 @@ pub async fn scan_handler(State(state): State<Arc<AppState>>) -> Response {
         Err(error) => ("Failed", Some(format!("{error:#}"))),
     };
     crate::jellyfin::system::upsert_task_result(
-        &state.db,
+        &state,
         "scan-library",
         status,
         start,
@@ -669,7 +669,7 @@ pub async fn scan_handler(State(state): State<Arc<AppState>>) -> Response {
         message.as_deref(),
     )
     .await;
-    crate::jellyfin::system::log_activity(&state.db, "Library scan", "LibraryScan", None, None)
+    crate::jellyfin::system::log_activity(&state, "Library scan", "LibraryScan", None, None)
         .await;
     match result {
         Ok(scanned) => Json(json!({ "Scanned": scanned })).into_response(),
@@ -892,7 +892,7 @@ pub async fn delete_items(
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    match delete_items_inner(&state.db, &ids).await {
+    match delete_items_inner(&state, &ids).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error),
     }
@@ -926,17 +926,17 @@ async fn item_delete_paths(
     ))
 }
 
-async fn delete_items_inner(db: &sqlx::AnyPool, ids: &[&str]) -> anyhow::Result<()> {
+async fn delete_items_inner(state: &AppState, ids: &[&str]) -> anyhow::Result<()> {
     let mut deleted = 0u64;
     for id in ids {
-        let rows = descendant_item_rows(db, id).await?;
+        let rows = descendant_item_rows(&state.db, id).await?;
         for (item_id, _) in rows.into_iter().rev() {
-            delete_item_records(db, &item_id).await?;
+            delete_item_records(&state.db, &item_id).await?;
             deleted += 1;
         }
     }
     crate::jellyfin::system::log_activity(
-        db,
+        state,
         &format!("Deleted {deleted} media items"),
         "MediaDeletion",
         None,

@@ -108,7 +108,7 @@ pub async fn refresh_library(State(state): State<Arc<AppState>>) -> Response {
         Err(error) => ("Failed", Some(format!("{error:#}"))),
     };
     system::upsert_task_result(
-        &state.db,
+        &state,
         "scan-library",
         status,
         start,
@@ -116,7 +116,7 @@ pub async fn refresh_library(State(state): State<Arc<AppState>>) -> Response {
         message.as_deref(),
     )
     .await;
-    system::log_activity(&state.db, "Library scan", "LibraryScan", None, None).await;
+    system::log_activity(&state, "Library scan", "LibraryScan", None, None).await;
     match result {
         Ok(scanned) => Json(json!({ "Scanned": scanned })).into_response(),
         Err(error) => internal_error(error),

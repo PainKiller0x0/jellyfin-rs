@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::AnyPool;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
 
 pub const SERVER_NAME: &str = "jellyfin-rs";
@@ -19,6 +19,7 @@ pub struct AppState {
     pub tmdb_api_key: Option<String>,
     pub playback_sessions: RwLock<HashMap<String, PlaybackSession>>,
     pub session_capabilities: RwLock<HashMap<String, SessionCapabilities>>,
+    pub ws_event_tx: broadcast::Sender<crate::ws::WsEvent>,
 }
 
 #[derive(Clone, Serialize)]

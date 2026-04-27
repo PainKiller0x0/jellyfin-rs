@@ -303,6 +303,7 @@ async fn update_playback_session(
             .write()
             .await
             .remove(&play_session_id);
+        let _ = state.ws_event_tx.send(crate::ws::WsEvent::SessionsChanged);
         return Ok(());
     }
 
@@ -356,6 +357,7 @@ async fn update_playback_session(
         .write()
         .await
         .insert(play_session_id, session);
+    let _ = state.ws_event_tx.send(crate::ws::WsEvent::SessionsChanged);
     Ok(())
 }
 

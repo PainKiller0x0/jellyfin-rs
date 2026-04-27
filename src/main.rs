@@ -15,6 +15,7 @@ mod jellyfin;
 mod library;
 mod playback;
 mod util;
+mod ws;
 
 use app::state::{AppState, DEFAULT_USER_NAME};
 
@@ -47,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
 
     let default_username =
         std::env::var("JELLYFIN_RS_USER").unwrap_or_else(|_| DEFAULT_USER_NAME.to_string());
+    let (ws_event_tx, _) = tokio::sync::broadcast::channel::<ws::WsEvent>(64);
     let state = AppState {
         user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, default_username.as_bytes()),
         access_token: Uuid::new_v4().simple().to_string(),
@@ -56,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         tmdb_api_key: std::env::var("JELLYFIN_RS_TMDB_API_KEY").ok(),
         playback_sessions: RwLock::new(HashMap::new()),
         session_capabilities: RwLock::new(HashMap::new()),
+        ws_event_tx,
     };
 
     db::seed_default_data(&state).await?;

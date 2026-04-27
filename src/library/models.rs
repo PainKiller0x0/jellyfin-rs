@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use crate::util::unix_to_jellyfin_date;
+use crate::{library::naming::parse_media_name, util::unix_to_jellyfin_date};
 
 #[derive(Clone, Debug)]
 pub struct MediaItem {
@@ -54,6 +54,7 @@ impl MediaItem {
     }
 
     pub fn to_jellyfin_json(&self) -> Value {
+        let parsed_name = parse_media_name(std::path::Path::new(&self.path), &self.library_id);
         let media_sources = if self.is_folder {
             json!([])
         } else {
@@ -72,8 +73,10 @@ impl MediaItem {
             "Overview": self.overview,
             "ProductionYear": self.production_year,
             "PremiereDate": self.production_year.map(|year| format!("{year}-01-01T00:00:00.0000000Z")),
-            "IndexNumber": episode_numbers(&self.title).map(|(_, episode)| episode),
-            "ParentIndexNumber": episode_numbers(&self.title).map(|(season, _)| season).or_else(|| season_number(&self.title)),
+            "IndexNumber": parsed_name.episode_number,
+            "ParentIndexNumber": parsed_name.season_number.or_else(|| season_number(&self.title)),
+            "IndexNumberEnd": parsed_name.ending_episode_number,
+            "OriginalTitle": parsed_name.version,
             "SortName": self.title,
             "ProviderIds": {},
             "LockData": false,
@@ -92,25 +95,6 @@ impl MediaItem {
             "MediaSources": media_sources,
         })
     }
-}
-
-fn episode_numbers(value: &str) -> Option<(i64, i64)> {
-    let lower = value.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
-    for index in 0..bytes.len().saturating_sub(5) {
-        if bytes[index] == b's'
-            && bytes[index + 1].is_ascii_digit()
-            && bytes[index + 2].is_ascii_digit()
-            && bytes[index + 3] == b'e'
-            && bytes[index + 4].is_ascii_digit()
-            && bytes[index + 5].is_ascii_digit()
-        {
-            let season = lower[index + 1..index + 3].parse().ok()?;
-            let episode = lower[index + 4..index + 6].parse().ok()?;
-            return Some((season, episode));
-        }
-    }
-    None
 }
 
 fn season_number(value: &str) -> Option<i64> {

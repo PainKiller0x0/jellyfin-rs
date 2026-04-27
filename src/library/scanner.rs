@@ -10,6 +10,7 @@ use crate::{
         classify::{classify_media_path, parent_id_for_path, tv_folder_type},
         images::upsert_sidecar_images,
         metadata::parse_sidecar_metadata,
+        naming::parse_media_name,
         probe::probe_media,
         storage::{
             ScannedMediaItem, remove_missing_media_items, upsert_default_media_stream,
@@ -86,13 +87,21 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
 
             seen_paths.push(path_string.clone());
             let parsed_metadata = parse_sidecar_metadata(path).await;
+            let parsed_name = parse_media_name(path, &library_id);
+            let title = if has_sidecar_nfo(path) {
+                parsed_metadata
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| media_title(path))
+            } else if parsed_name.title.is_empty() {
+                media_title(path)
+            } else {
+                parsed_name.title.clone()
+            };
             let probe = probe_media(path);
             let item = ScannedMediaItem {
                 id: stable_item_id(path),
-                title: parsed_metadata
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| media_title(path)),
+                title,
                 path: path_string,
                 library_id: library_id.clone(),
                 parent_id,
@@ -129,6 +138,14 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
     remove_missing_media_items(&state.db, &seen_paths).await?;
     tracing::info!("media scan indexed {scanned} item(s)");
     Ok(scanned)
+}
+
+fn has_sidecar_nfo(path: &std::path::Path) -> bool {
+    path.with_extension("nfo").exists()
+        || path
+            .parent()
+            .map(|parent| parent.join("movie.nfo").exists())
+            .unwrap_or_default()
 }
 
 async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String)>> {

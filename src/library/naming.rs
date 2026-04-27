@@ -11,6 +11,7 @@ pub struct ParsedName {
     pub stack_key: Option<String>,
     pub stack_part: Option<i64>,
     pub version: Option<String>,
+    pub extended_video_types: Vec<String>,
 }
 
 pub fn parse_media_name(path: &Path, library_id: &str) -> ParsedName {
@@ -62,6 +63,7 @@ fn parse_episode_name(stem: &str, folder: &str) -> ParsedName {
                 parsed.title = clean_title(stem);
             }
             parsed.version = parse_version(stem);
+            parsed.extended_video_types = parse_extended_video_types(stem);
             return parsed;
         }
     }
@@ -71,11 +73,13 @@ fn parse_episode_name(stem: &str, folder: &str) -> ParsedName {
         parsed.episode_number = Some(episode);
         parsed.title = clean_title(stem);
         parsed.version = parse_version(stem);
+        parsed.extended_video_types = parse_extended_video_types(stem);
         return parsed;
     }
 
     parsed.title = clean_title(stem);
     parsed.version = parse_version(stem);
+    parsed.extended_video_types = parse_extended_video_types(stem);
     parsed
 }
 
@@ -84,6 +88,7 @@ fn parse_video_name(stem: &str) -> ParsedName {
     let mut parsed = ParsedName {
         title: clean_title(stem),
         version: parse_version(stem),
+        extended_video_types: parse_extended_video_types(stem),
         ..ParsedName::default()
     };
 
@@ -196,6 +201,36 @@ fn parse_version(stem: &str) -> Option<String> {
         }
     }
     (!tags.is_empty()).then(|| tags.join(" "))
+}
+
+fn parse_extended_video_types(stem: &str) -> Vec<String> {
+    let normalized = normalize_separators(stem).to_ascii_lowercase();
+    let mut values = Vec::new();
+    for (needle, label) in [
+        ("3d", "3D"),
+        ("hsbs", "HalfSideBySide"),
+        ("sbs", "SideBySide"),
+        ("htab", "HalfTopAndBottom"),
+        ("tab", "TopAndBottom"),
+        ("hdr10+", "HDR10Plus"),
+        ("hdr10", "HDR10"),
+        ("dolby vision", "DolbyVision"),
+        (" dv ", "DolbyVision"),
+        ("hdr", "HDR"),
+        ("2160p", "UHD"),
+        ("4k", "UHD"),
+        ("remux", "Remux"),
+        ("bluray", "BluRay"),
+        ("blu ray", "BluRay"),
+        ("dvd", "Dvd"),
+        ("web dl", "WebDl"),
+        ("webrip", "WebRip"),
+    ] {
+        if normalized.contains(needle) && !values.iter().any(|value| value == label) {
+            values.push(label.to_string());
+        }
+    }
+    values
 }
 
 fn clean_title(value: &str) -> String {

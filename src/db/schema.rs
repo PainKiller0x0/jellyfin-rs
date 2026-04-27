@@ -43,7 +43,7 @@ pub fn migrations() -> Vec<Migration> {
             "failed to create library paths library index",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS media_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, path TEXT NOT NULL UNIQUE, library_id TEXT NOT NULL, parent_id TEXT NOT NULL, item_type TEXT NOT NULL, is_folder INTEGER NOT NULL DEFAULT 0, container TEXT, overview TEXT, production_year INTEGER, runtime_ticks BIGINT, size_bytes BIGINT, modified_at BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL DEFAULT 0)"#,
+            r#"CREATE TABLE IF NOT EXISTS media_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, path TEXT NOT NULL UNIQUE, library_id TEXT NOT NULL, parent_id TEXT NOT NULL, item_type TEXT NOT NULL, is_folder INTEGER NOT NULL DEFAULT 0, container TEXT, overview TEXT, official_rating TEXT, extended_video_type TEXT, production_year INTEGER, runtime_ticks BIGINT, size_bytes BIGINT, modified_at BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL DEFAULT 0)"#,
             "failed to migrate media_items",
         ),
         (
@@ -146,6 +146,14 @@ pub fn optional_migrations() -> Vec<Migration> {
         (
             "ALTER TABLE media_items ADD COLUMN production_year INTEGER",
             "add media_items.production_year",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN official_rating TEXT",
+            "add media_items.official_rating",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN extended_video_type TEXT",
+            "add media_items.extended_video_type",
         ),
         (
             "ALTER TABLE media_items ADD COLUMN runtime_ticks BIGINT",

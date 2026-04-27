@@ -112,6 +112,9 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
                     .and_then(|extension| extension.to_str())
                     .map(|extension| extension.to_ascii_lowercase()),
                 overview: parsed_metadata.overview.clone(),
+                official_rating: parsed_metadata.official_rating.clone(),
+                extended_video_type: (!parsed_name.extended_video_types.is_empty())
+                    .then(|| parsed_name.extended_video_types.join(",")),
                 production_year: parsed_metadata.production_year,
                 runtime_ticks: probe.as_ref().and_then(|probe| probe.runtime_ticks),
                 size_bytes: i64::try_from(metadata.len()).ok(),

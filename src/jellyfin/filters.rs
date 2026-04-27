@@ -46,8 +46,11 @@ pub async fn years(
     list_years(&state.db, &query).await
 }
 
-pub async fn official_ratings() -> Response {
-    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+pub async fn official_ratings(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    list_distinct_values(&state.db, "media_items", "official_rating", &query).await
 }
 
 pub async fn containers(
@@ -64,8 +67,53 @@ pub async fn video_codecs(
     list_distinct_values(&state.db, "media_streams", "codec", &query).await
 }
 
-pub async fn extended_video_types() -> Response {
-    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+pub async fn extended_video_types(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    match list_extended_video_types_inner(&state.db, &query).await {
+        Ok(items) => {
+            let total = items.len();
+            Json(json!({ "Items": items, "TotalRecordCount": total })).into_response()
+        }
+        Err(error) => internal_error(error),
+    }
+}
+
+async fn list_extended_video_types_inner(
+    db: &AnyPool,
+    query: &HashMap<String, String>,
+) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        "SELECT extended_video_type FROM media_items WHERE extended_video_type IS NOT NULL AND extended_video_type <> ''",
+    )
+    .fetch_all(db)
+    .await
+    .context("failed to list extended video types")?;
+
+    let mut names = Vec::<String>::new();
+    for row in rows {
+        let value: String = row.try_get("extended_video_type")?;
+        for name in value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if !names
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(name))
+            {
+                names.push(name.to_string());
+            }
+        }
+    }
+
+    let mut items = names
+        .into_iter()
+        .map(|name| json!({ "Name": name, "Id": name, "Type": "ExtendedVideoType" }))
+        .collect();
+    filter_by_search_and_paginate(&mut items, query);
+    Ok(items)
 }
 
 async fn list_years(db: &AnyPool, query: &HashMap<String, String>) -> Response {

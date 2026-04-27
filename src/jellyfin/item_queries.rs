@@ -80,7 +80,7 @@ async fn is_collection_or_playlist(db: &AnyPool, item_id: &str) -> anyhow::Resul
 
 fn linked_children_select_sql() -> String {
     format!(
-        r#"SELECT mi.id, mi.title, mi.path, mi.library_id, mi.parent_id, mi.item_type, mi.is_folder, mi.container, mi.overview, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, 0) AS is_favorite, COALESCE(ud.played, 0) AS played, COALESCE(ud.playback_position_ticks, 0) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, 0) AS play_count, ud.last_played_at AS last_played_at FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC"#
+        r#"SELECT mi.id, mi.title, mi.path, mi.library_id, mi.parent_id, mi.item_type, mi.is_folder, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, 0) AS is_favorite, COALESCE(ud.played, 0) AS played, COALESCE(ud.playback_position_ticks, 0) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, 0) AS play_count, ud.last_played_at AS last_played_at FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC"#
     )
 }
 
@@ -126,7 +126,7 @@ pub async fn find_media_item(
 
 pub fn media_item_select_sql(where_clause: &str) -> String {
     format!(
-        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.container, media_items.overview, media_items.production_year, media_items.runtime_ticks, media_items.size_bytes, media_items.created_at, media_items.modified_at, COALESCE(user_data.is_favorite, 0) AS is_favorite, COALESCE(user_data.played, 0) AS played, COALESCE(user_data.playback_position_ticks, 0) AS playback_position_ticks, user_data.played_percentage AS played_percentage, COALESCE(user_data.play_count, 0) AS play_count, user_data.last_played_at AS last_played_at FROM media_items LEFT JOIN user_data ON user_data.item_id = media_items.id AND user_data.user_id = ? {where_clause}"#
+        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.runtime_ticks, media_items.size_bytes, media_items.created_at, media_items.modified_at, COALESCE(user_data.is_favorite, 0) AS is_favorite, COALESCE(user_data.played, 0) AS played, COALESCE(user_data.playback_position_ticks, 0) AS playback_position_ticks, user_data.played_percentage AS played_percentage, COALESCE(user_data.play_count, 0) AS play_count, user_data.last_played_at AS last_played_at FROM media_items LEFT JOIN user_data ON user_data.item_id = media_items.id AND user_data.user_id = ? {where_clause}"#
     )
 }
 

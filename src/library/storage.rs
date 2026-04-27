@@ -16,6 +16,8 @@ pub struct ScannedMediaItem {
     pub is_folder: bool,
     pub container: Option<String>,
     pub overview: Option<String>,
+    pub official_rating: Option<String>,
+    pub extended_video_type: Option<String>,
     pub production_year: Option<i64>,
     pub runtime_ticks: Option<i64>,
     pub size_bytes: Option<i64>,
@@ -43,6 +45,8 @@ impl ScannedMediaItem {
             is_folder: true,
             container: None,
             overview: None,
+            official_rating: None,
+            extended_video_type: None,
             production_year: None,
             runtime_ticks: None,
             size_bytes: None,
@@ -53,8 +57,8 @@ impl ScannedMediaItem {
 }
 
 pub async fn upsert_media_item(db: &AnyPool, item: &ScannedMediaItem) -> anyhow::Result<()> {
-    sqlx::query(r#"INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, container, overview, production_year, runtime_ticks, size_bytes, modified_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET title = excluded.title, library_id = excluded.library_id, parent_id = excluded.parent_id, item_type = excluded.item_type, is_folder = excluded.is_folder, container = excluded.container, overview = excluded.overview, production_year = excluded.production_year, runtime_ticks = excluded.runtime_ticks, size_bytes = excluded.size_bytes, modified_at = excluded.modified_at, updated_at = excluded.updated_at"#)
-        .bind(&item.id).bind(&item.title).bind(&item.path).bind(&item.library_id).bind(&item.parent_id).bind(&item.item_type).bind(if item.is_folder { 1 } else { 0 }).bind(&item.container).bind(&item.overview).bind(item.production_year).bind(item.runtime_ticks).bind(item.size_bytes).bind(item.modified_at).bind(item.created_at).bind(now_unix())
+    sqlx::query(r#"INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, container, overview, official_rating, extended_video_type, production_year, runtime_ticks, size_bytes, modified_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET title = excluded.title, library_id = excluded.library_id, parent_id = excluded.parent_id, item_type = excluded.item_type, is_folder = excluded.is_folder, container = excluded.container, overview = excluded.overview, official_rating = excluded.official_rating, extended_video_type = excluded.extended_video_type, production_year = excluded.production_year, runtime_ticks = excluded.runtime_ticks, size_bytes = excluded.size_bytes, modified_at = excluded.modified_at, updated_at = excluded.updated_at"#)
+        .bind(&item.id).bind(&item.title).bind(&item.path).bind(&item.library_id).bind(&item.parent_id).bind(&item.item_type).bind(if item.is_folder { 1 } else { 0 }).bind(&item.container).bind(&item.overview).bind(&item.official_rating).bind(&item.extended_video_type).bind(item.production_year).bind(item.runtime_ticks).bind(item.size_bytes).bind(item.modified_at).bind(item.created_at).bind(now_unix())
         .execute(db).await.with_context(|| format!("failed to upsert media item: {}", item.path))?;
     Ok(())
 }

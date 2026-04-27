@@ -4,6 +4,7 @@ use std::path::Path;
 pub struct ParsedMetadata {
     pub title: Option<String>,
     pub overview: Option<String>,
+    pub official_rating: Option<String>,
     pub production_year: Option<i64>,
     pub provider_ids: Vec<(String, String)>,
     pub genres: Vec<String>,
@@ -65,6 +66,16 @@ async fn read_sidecar_nfo(path: &Path) -> Option<String> {
 fn merge_nfo_metadata(metadata: &mut ParsedMetadata, nfo: &str) {
     metadata.title = first_tag(nfo, &["title", "originaltitle"]).or(metadata.title.take());
     metadata.overview = first_tag(nfo, &["plot", "outline", "overview"]);
+    metadata.official_rating = first_tag(
+        nfo,
+        &[
+            "mpaa",
+            "contentrating",
+            "content_rating",
+            "rating",
+            "certification",
+        ],
+    );
     metadata.production_year = first_tag(nfo, &["year", "premiered", "releasedate"])
         .and_then(|value| find_year(&value))
         .or(metadata.production_year);

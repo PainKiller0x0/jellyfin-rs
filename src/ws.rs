@@ -98,22 +98,19 @@ async fn handle_socket(
             match event {
                 WsEvent::SessionsChanged => {
                     if conn.subscriptions.contains_key("Sessions") {
-                        let data =
-                            build_sessions_data(&state_for_receiver).await;
+                        let data = build_sessions_data(&state_for_receiver).await;
                         send_message(&conn.sender, "Sessions", data).await;
                     }
                 }
                 WsEvent::ActivityCreated => {
                     if conn.subscriptions.contains_key("ActivityLogEntry") {
-                        let data =
-                            build_activity_data(&state_for_receiver).await;
+                        let data = build_activity_data(&state_for_receiver).await;
                         send_message(&conn.sender, "ActivityLogEntry", data).await;
                     }
                 }
                 WsEvent::TaskUpdated => {
                     if conn.subscriptions.contains_key("ScheduledTasksInfo") {
-                        let data =
-                            build_tasks_data(&state_for_receiver).await;
+                        let data = build_tasks_data(&state_for_receiver).await;
                         send_message(&conn.sender, "ScheduledTasksInfo", data).await;
                     }
                 }
@@ -121,8 +118,7 @@ async fn handle_socket(
         }
     });
 
-    let mut periodic_timer =
-        tokio::time::interval(tokio::time::Duration::from_millis(1000));
+    let mut periodic_timer = tokio::time::interval(tokio::time::Duration::from_millis(1000));
     let state_for_periodic = state.clone();
     let connection_for_periodic = connection_state.clone();
 
@@ -143,12 +139,8 @@ async fn handle_socket(
             for msg_type in &to_send {
                 let data = match msg_type.as_str() {
                     "Sessions" => build_sessions_data(&state_for_periodic).await,
-                    "ActivityLogEntry" => {
-                        build_activity_data(&state_for_periodic).await
-                    }
-                    "ScheduledTasksInfo" => {
-                        build_tasks_data(&state_for_periodic).await
-                    }
+                    "ActivityLogEntry" => build_activity_data(&state_for_periodic).await,
+                    "ScheduledTasksInfo" => build_tasks_data(&state_for_periodic).await,
                     _ => continue,
                 };
                 {
@@ -168,11 +160,7 @@ async fn handle_socket(
 
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if sender_for_ws
-                .send(Message::Text(msg.into()))
-                .await
-                .is_err()
-            {
+            if sender_for_ws.send(Message::Text(msg.into())).await.is_err() {
                 break;
             }
         }
@@ -260,13 +248,16 @@ async fn handle_client_message(
                 "Sessions".to_string(),
                 Subscription {
                     interval_ms: timing.1,
-                    last_send: Instant::now()
-                        - tokio::time::Duration::from_millis(timing.0),
+                    last_send: Instant::now() - tokio::time::Duration::from_millis(timing.0),
                 },
             );
         }
         "SessionsStop" => {
-            connection_state.write().await.subscriptions.remove("Sessions");
+            connection_state
+                .write()
+                .await
+                .subscriptions
+                .remove("Sessions");
         }
         "ActivityLogEntryStart" => {
             let timing = parse_timing(msg.data.as_deref().unwrap_or("0,5000"));
@@ -275,8 +266,7 @@ async fn handle_client_message(
                 "ActivityLogEntry".to_string(),
                 Subscription {
                     interval_ms: timing.1,
-                    last_send: Instant::now()
-                        - tokio::time::Duration::from_millis(timing.0),
+                    last_send: Instant::now() - tokio::time::Duration::from_millis(timing.0),
                 },
             );
         }
@@ -294,8 +284,7 @@ async fn handle_client_message(
                 "ScheduledTasksInfo".to_string(),
                 Subscription {
                     interval_ms: timing.1,
-                    last_send: Instant::now()
-                        - tokio::time::Duration::from_millis(timing.0),
+                    last_send: Instant::now() - tokio::time::Duration::from_millis(timing.0),
                 },
             );
         }
@@ -315,7 +304,10 @@ async fn handle_client_message(
 
 fn parse_timing(data: &str) -> (u64, u64) {
     let parts: Vec<&str> = data.split(',').collect();
-    let delay = parts.first().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let delay = parts
+        .first()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
     let interval = parts
         .get(1)
         .and_then(|v| v.parse::<u64>().ok())
@@ -347,9 +339,7 @@ async fn build_sessions_data(state: &AppState) -> Value {
     Value::Array(
         sessions
             .into_iter()
-            .map(|s| {
-                serde_json::to_value(s).unwrap_or(Value::Null)
-            })
+            .map(|s| serde_json::to_value(s).unwrap_or(Value::Null))
             .collect(),
     )
 }

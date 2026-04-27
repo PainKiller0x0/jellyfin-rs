@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Context;
 use serde_json::{Value, json};
@@ -97,7 +97,15 @@ pub async fn latest_media_items(db: &AnyPool, user_id: &str) -> anyhow::Result<V
 }
 
 pub async fn resume_media_items(db: &AnyPool, user_id: &str) -> anyhow::Result<Vec<MediaItem>> {
-    decode_media_items(sqlx::query(&media_item_select_sql("WHERE media_items.is_folder = 0 AND COALESCE(user_data.playback_position_ticks, 0) > 0 ORDER BY user_data.updated_at DESC LIMIT 50")).bind(user_id).fetch_all(db).await.context("failed to list resume media items")?)
+    decode_media_items(
+        sqlx::query(&media_item_select_sql(
+            "WHERE media_items.is_folder = 0 AND COALESCE(user_data.playback_position_ticks, 0) > 0 ORDER BY user_data.updated_at DESC LIMIT 50",
+        ))
+        .bind(user_id)
+        .fetch_all(db)
+        .await
+        .context("failed to list resume media items")?,
+    )
 }
 
 pub async fn find_media_item(
@@ -216,7 +224,7 @@ fn apply_item_filters(items: &mut Vec<MediaItem>, query: &HashMap<String, String
                 .is_some_and(|year| years.iter().any(|y| y == &year.to_string()))
         });
     }
-    if let Some(containers) = query_insensitive(query, "Containers") {
+    if let Some(containers) = query_ids(query, "Containers") {
         items.retain(|item| {
             item.container.as_ref().is_some_and(|container| {
                 containers.iter().any(|c| c.eq_ignore_ascii_case(container))
@@ -230,44 +238,37 @@ async fn apply_relation_filters(
     items: &mut Vec<MediaItem>,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
-    if let Some(ids) = query_ids(query, "GenreIds") {
-        let item_ids = relation_item_ids(db, "media_genres", "genre_id", &ids).await?;
-        items.retain(|item| item_ids.iter().any(|id| id == &item.id));
-    }
-    if let Some(ids) = query_ids(query, "TagIds") {
-        let item_ids = relation_item_ids(db, "media_tags", "tag_id", &ids).await?;
-        items.retain(|item| item_ids.iter().any(|id| id == &item.id));
-    }
-    if let Some(ids) = query_ids(query, "PersonIds") {
-        let item_ids = relation_item_ids(db, "media_people", "person_id", &ids).await?;
-        items.retain(|item| item_ids.iter().any(|id| id == &item.id));
-    }
-    if let Some(ids) = query_ids(query, "StudioIds") {
-        let item_ids = relation_item_ids(db, "media_studios", "studio_id", &ids).await?;
-        items.retain(|item| item_ids.iter().any(|id| id == &item.id));
+    for (query_key, table, id_column) in [
+        ("GenreIds", "media_genres", "genre_id"),
+        ("TagIds", "media_tags", "tag_id"),
+        ("PersonIds", "media_people", "person_id"),
+        ("StudioIds", "media_studios", "studio_id"),
+    ] {
+        if let Some(ids) = query_ids(query, query_key) {
+            let item_ids = relation_item_ids(db, table, id_column, &ids).await?;
+            retain_item_ids(items, &item_ids);
+        }
     }
     if let Some(ids) = query_ids(query, "ListItemIds") {
         let item_ids = parent_item_ids(db, &ids).await?;
-        items.retain(|item| item_ids.iter().any(|id| id == &item.id));
+        retain_item_ids(items, &item_ids);
     }
-    if let Some(codecs) = query_insensitive(query, "VideoCodecs") {
+    if let Some(codecs) = query_ids(query, "VideoCodecs") {
         let item_ids = codec_item_ids(db, &codecs).await?;
-        items.retain(|item| item_ids.iter().any(|id| id == &item.id));
+        retain_item_ids(items, &item_ids);
     }
-    if let (Some(min), Some(max)) = (
-        query.get("MinWidth").and_then(|v| v.parse::<i64>().ok()),
-        query.get("MaxWidth").and_then(|v| v.parse::<i64>().ok()),
-    ) {
-        let item_ids = width_range_item_ids(db, min, max).await?;
-        items.retain(|item| item_ids.iter().any(|id| id == &item.id));
-    } else if let Some(min) = query.get("MinWidth").and_then(|v| v.parse::<i64>().ok()) {
-        let item_ids = min_width_item_ids(db, min).await?;
-        items.retain(|item| item_ids.iter().any(|id| id == &item.id));
-    } else if let Some(max) = query.get("MaxWidth").and_then(|v| v.parse::<i64>().ok()) {
-        let item_ids = max_width_item_ids(db, max).await?;
-        items.retain(|item| item_ids.iter().any(|id| id == &item.id));
+    let min_width = query.get("MinWidth").and_then(|v| v.parse::<i64>().ok());
+    let max_width = query.get("MaxWidth").and_then(|v| v.parse::<i64>().ok());
+    if min_width.is_some() || max_width.is_some() {
+        let item_ids = width_item_ids(db, min_width, max_width).await?;
+        retain_item_ids(items, &item_ids);
     }
     Ok(())
+}
+
+fn retain_item_ids(items: &mut Vec<MediaItem>, item_ids: &[String]) {
+    let item_ids = item_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    items.retain(|item| item_ids.contains(item.id.as_str()));
 }
 
 async fn codec_item_ids(db: &AnyPool, codecs: &[String]) -> anyhow::Result<Vec<String>> {
@@ -289,38 +290,35 @@ async fn codec_item_ids(db: &AnyPool, codecs: &[String]) -> anyhow::Result<Vec<S
     Ok(ids)
 }
 
-async fn width_range_item_ids(db: &AnyPool, min: i64, max: i64) -> anyhow::Result<Vec<String>> {
-    let rows = sqlx::query("SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND width >= ? AND width <= ?")
-        .bind(min).bind(max).fetch_all(db).await
-        .context("failed to filter by width range")?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| row.try_get("item_id").ok())
-        .collect())
-}
+async fn width_item_ids(
+    db: &AnyPool,
+    min_width: Option<i64>,
+    max_width: Option<i64>,
+) -> anyhow::Result<Vec<String>> {
+    let mut query = match (min_width, max_width) {
+        (Some(_), Some(_)) => sqlx::query(
+            "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND width >= ? AND width <= ?",
+        ),
+        (Some(_), None) => sqlx::query(
+            "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND width >= ?",
+        ),
+        (None, Some(_)) => sqlx::query(
+            "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND width <= ?",
+        ),
+        (None, None) => unreachable!("width_item_ids requires at least one bound"),
+    };
 
-async fn min_width_item_ids(db: &AnyPool, min: i64) -> anyhow::Result<Vec<String>> {
-    let rows = sqlx::query(
-        "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND width >= ?",
-    )
-    .bind(min)
-    .fetch_all(db)
-    .await
-    .context("failed to filter by min width")?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| row.try_get("item_id").ok())
-        .collect())
-}
+    if let Some(min_width) = min_width {
+        query = query.bind(min_width);
+    }
+    if let Some(max_width) = max_width {
+        query = query.bind(max_width);
+    }
 
-async fn max_width_item_ids(db: &AnyPool, max: i64) -> anyhow::Result<Vec<String>> {
-    let rows = sqlx::query(
-        "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND width <= ?",
-    )
-    .bind(max)
-    .fetch_all(db)
-    .await
-    .context("failed to filter by max width")?;
+    let rows = query
+        .fetch_all(db)
+        .await
+        .context("failed to filter by width")?;
     Ok(rows
         .into_iter()
         .filter_map(|row| row.try_get("item_id").ok())
@@ -379,10 +377,6 @@ fn query_ids(query: &HashMap<String, String>, key: &str) -> Option<Vec<String>> 
                 .collect::<Vec<_>>()
         })
         .filter(|ids| !ids.is_empty())
-}
-
-fn query_insensitive(query: &HashMap<String, String>, key: &str) -> Option<Vec<String>> {
-    query_ids(query, key)
 }
 
 fn sort_media_items(items: &mut [MediaItem], query: &HashMap<String, String>) {

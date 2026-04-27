@@ -138,7 +138,10 @@ pub async fn tmdb_tv_details(
 ) -> anyhow::Result<Value> {
     let response = client
         .get(format!("https://api.themoviedb.org/3/tv/{tmdb_id}"))
-        .query(&[("api_key", api_key), ("append_to_response", "credits,external_ids")])
+        .query(&[
+            ("api_key", api_key),
+            ("append_to_response", "credits,external_ids"),
+        ])
         .send()
         .await?
         .error_for_status()?
@@ -159,8 +162,14 @@ pub async fn tmdb_tv_details(
         .map(|person| json!({ "Name": person.name, "Role": person.roles.first().map(|r| r.character.clone()).unwrap_or_default(), "Type": "Actor" }))
         .collect::<Vec<_>>();
 
-    let external_imdb = response.external_ids.as_ref().and_then(|ids| ids.imdb_id.clone());
-    let external_tvdb = response.external_ids.as_ref().and_then(|ids| ids.tvdb_id.map(|id| id.to_string()));
+    let external_imdb = response
+        .external_ids
+        .as_ref()
+        .and_then(|ids| ids.imdb_id.clone());
+    let external_tvdb = response
+        .external_ids
+        .as_ref()
+        .and_then(|ids| ids.tvdb_id.map(|id| id.to_string()));
 
     Ok(json!({
         "Name": response.name,
@@ -218,7 +227,10 @@ pub async fn tmdb_person_details(
 ) -> anyhow::Result<Value> {
     let response = client
         .get(format!("https://api.themoviedb.org/3/person/{tmdb_id}"))
-        .query(&[("api_key", api_key), ("append_to_response", "external_ids,combined_credits")])
+        .query(&[
+            ("api_key", api_key),
+            ("append_to_response", "external_ids,combined_credits"),
+        ])
         .send()
         .await?
         .error_for_status()?
@@ -294,7 +306,9 @@ pub async fn tmdb_person_images(
     }
 
     let response = client
-        .get(format!("https://api.themoviedb.org/3/person/{tmdb_id}/images"))
+        .get(format!(
+            "https://api.themoviedb.org/3/person/{tmdb_id}/images"
+        ))
         .query(&[("api_key", api_key)])
         .send()
         .await?

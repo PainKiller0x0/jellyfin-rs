@@ -9,10 +9,7 @@ use axum::{
 use serde_json::{Value, json};
 use sqlx::{AnyPool, Row};
 
-use crate::{
-    app::state::AppState,
-    jellyfin::common::internal_error,
-};
+use crate::{app::state::AppState, jellyfin::common::internal_error};
 
 pub async fn person_by_name(
     State(state): State<Arc<AppState>>,
@@ -21,9 +18,11 @@ pub async fn person_by_name(
 ) -> Response {
     match person_detail(&state, &name, &query).await {
         Ok(Some(person)) => Json(person).into_response(),
-        Ok(None) => {
-            (StatusCode::NOT_FOUND, Json(json!({"Error": "Person not found"}))).into_response()
-        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"Error": "Person not found"})),
+        )
+            .into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -103,8 +102,13 @@ async fn person_detail(
     )
     .await?;
 
-    let total = count_tagged_items(&state.db, &person.id, &include_item_types, &person_item_types)
-        .await?;
+    let total = count_tagged_items(
+        &state.db,
+        &person.id,
+        &include_item_types,
+        &person_item_types,
+    )
+    .await?;
 
     let image_tags = person_images(&state.db, &person.id).await?;
 
@@ -178,8 +182,13 @@ async fn person_items_inner(
         start_index,
     )
     .await?;
-    let total =
-        count_tagged_items(&state.db, &person.id, &include_item_types, &person_item_types).await?;
+    let total = count_tagged_items(
+        &state.db,
+        &person.id,
+        &include_item_types,
+        &person_item_types,
+    )
+    .await?;
 
     Ok(json!({"Items": items, "TotalRecordCount": total, "StartIndex": start_index}))
 }
@@ -221,12 +230,20 @@ async fn fetch_tagged_items(
     );
 
     if !include_item_types.is_empty() {
-        let placeholders = include_item_types.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders = include_item_types
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
         sql.push_str(&format!(" AND mi.item_type IN ({placeholders})"));
     }
 
     if !person_types.is_empty() {
-        let placeholders = person_types.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders = person_types
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
         sql.push_str(&format!(" AND mp.person_type IN ({placeholders})"));
     }
 
@@ -308,15 +325,24 @@ async fn count_tagged_items(
     include_item_types: &[&str],
     person_types: &[&str],
 ) -> anyhow::Result<i64> {
-    let mut sql =
-        String::from("SELECT COUNT(*) as cnt FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id WHERE mp.person_id = ?");
+    let mut sql = String::from(
+        "SELECT COUNT(*) as cnt FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id WHERE mp.person_id = ?",
+    );
 
     if !include_item_types.is_empty() {
-        let placeholders = include_item_types.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders = include_item_types
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
         sql.push_str(&format!(" AND mi.item_type IN ({placeholders})"));
     }
     if !person_types.is_empty() {
-        let placeholders = person_types.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders = person_types
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
         sql.push_str(&format!(" AND mp.person_type IN ({placeholders})"));
     }
 

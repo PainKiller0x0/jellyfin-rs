@@ -7,6 +7,7 @@ mod item_queries;
 pub mod items;
 pub mod library;
 pub mod playback;
+pub mod persons;
 pub mod providers;
 pub mod routes;
 pub mod sessions;

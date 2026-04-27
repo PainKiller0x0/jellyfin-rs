@@ -8,7 +8,7 @@ use axum::{
 use crate::{
     app::state::AppState,
     jellyfin::{
-        auth, collect, common, filters, images, items, library, playback, sessions, system,
+        auth, collect, common, filters, images, items, library, persons, playback, sessions, system,
     },
     playback::streaming::{
         stream_audio, stream_audio_head, stream_subtitle, stream_subtitle_head, stream_video,
@@ -396,6 +396,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/MusicGenres/{genre_name}", get(common::empty_object))
         .route("/MusicGenres/{name}/InstantMix", get(common::empty_list))
         .route("/Persons", get(filters::persons))
+        .route("/Persons/{name}", get(persons::person_by_name))
+        .route("/Persons/{name}/Items", get(persons::person_items))
         .route("/Studios", get(filters::studios))
         .route("/Tags", get(filters::tags))
         .route("/Years", get(filters::years))

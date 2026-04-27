@@ -759,20 +759,27 @@ pub async fn remote_search(
         .cloned()
         .unwrap_or_else(|| "jellyfin-rs".to_string());
 
-    if item_type.eq_ignore_ascii_case("Movie") {
-        if let Some(api_key) = state.tmdb_api_key.as_deref().filter(|key| !key.is_empty()) {
-            match crate::jellyfin::providers::tmdb_movie_search(
-                &state.http_client,
-                api_key,
-                name,
-                production_year,
-            )
-            .await
-            {
-                Ok(results) if !results.is_empty() => return Json(results).into_response(),
-                Ok(_) => {}
-                Err(error) => tracing::warn!("TMDb movie search failed: {error:#}"),
-            }
+    if let Some(api_key) = state.tmdb_api_key.as_deref().filter(|key| !key.is_empty()) {
+        let search_result = if item_type.eq_ignore_ascii_case("Movie") {
+            crate::jellyfin::providers::tmdb_movie_search(
+                &state.http_client, api_key, name, production_year,
+            ).await
+        } else if item_type.eq_ignore_ascii_case("Series") {
+            crate::jellyfin::providers::tmdb_tv_search(
+                &state.http_client, api_key, name, production_year,
+            ).await
+        } else if item_type.eq_ignore_ascii_case("Person") {
+            crate::jellyfin::providers::tmdb_person_search(
+                &state.http_client, api_key, name,
+            ).await
+        } else {
+            Err(anyhow::anyhow!("unsupported item type"))
+        };
+
+        match search_result {
+            Ok(results) if !results.is_empty() => return Json(results).into_response(),
+            Ok(_) => {}
+            Err(error) => tracing::warn!("TMDb search failed for {item_type}: {error:#}"),
         }
     }
 
@@ -837,11 +844,23 @@ async fn enrich_remote_search_result(state: &AppState, body: Value) -> Value {
         return body;
     };
 
-    match crate::jellyfin::providers::tmdb_movie_details(&state.http_client, api_key, tmdb_id).await
-    {
+    let item_type = body
+        .get("Type")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    let details = if item_type.eq_ignore_ascii_case("Series") {
+        crate::jellyfin::providers::tmdb_tv_details(&state.http_client, api_key, tmdb_id).await
+    } else if item_type.eq_ignore_ascii_case("Person") {
+        crate::jellyfin::providers::tmdb_person_details(&state.http_client, api_key, tmdb_id).await
+    } else {
+        crate::jellyfin::providers::tmdb_movie_details(&state.http_client, api_key, tmdb_id).await
+    };
+
+    match details {
         Ok(details) => merge_remote_search_values(body, details),
         Err(error) => {
-            tracing::warn!("TMDb movie details failed: {error:#}");
+            tracing::warn!("TMDb details failed: {error:#}");
             body
         }
     }

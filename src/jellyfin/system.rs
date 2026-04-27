@@ -384,9 +384,10 @@ pub async fn utc_time() -> impl IntoResponse {
     }))
 }
 
-pub async fn tmdb_client_configuration() -> impl IntoResponse {
+pub async fn tmdb_client_configuration(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let enabled = state.tmdb_api_key.as_deref().is_some_and(|key| !key.is_empty());
     Json(json!({
-        "IsTmdbEnabled": false
+        "IsTmdbEnabled": enabled
     }))
 }
 

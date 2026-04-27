@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{AnyPool, Row};
 
@@ -151,7 +152,9 @@ pub async fn remote_images(
         let tmdb_id = lookup_tmdb_id(&state.db, &item_id).await.ok().flatten();
         match tmdb_id {
             Some(ref tmdb_id) => {
-                match providers::tmdb_movie_images(&state.http_client, api_key, tmdb_id).await {
+                let images_result =
+                    fetch_remote_images_by_type(&state, api_key, &item_id, tmdb_id).await;
+                match images_result {
                     Ok(images) => all_images.extend(images),
                     Err(error) => {
                         tracing::warn!("TMDb images fetch failed for {item_id}: {error:#}")
@@ -234,7 +237,7 @@ async fn search_tmdb_id_by_item(state: &AppState, item_id: &str) -> anyhow::Resu
         .as_deref()
         .filter(|key| !key.is_empty())
         .context("no TMDb API key configured")?;
-    let row = sqlx::query("SELECT title, production_year FROM media_items WHERE id = ?")
+    let row = sqlx::query("SELECT title, production_year, item_type FROM media_items WHERE id = ?")
         .bind(item_id)
         .fetch_optional(&state.db)
         .await
@@ -244,13 +247,93 @@ async fn search_tmdb_id_by_item(state: &AppState, item_id: &str) -> anyhow::Resu
     };
     let name: String = row.try_get("title")?;
     let year: Option<i64> = row.try_get("production_year")?;
-    let results = providers::tmdb_movie_search(&state.http_client, api_key, &name, year).await?;
+    let item_type: String = row.try_get("item_type")?;
+
+    let results = if item_type.eq_ignore_ascii_case("Series") {
+        providers::tmdb_tv_search(&state.http_client, api_key, &name, year).await?
+    } else {
+        providers::tmdb_movie_search(&state.http_client, api_key, &name, year).await?
+    };
+
     Ok(results
         .first()
         .and_then(|result| result.get("ProviderIds"))
         .and_then(|providers| providers.get("Tmdb"))
         .and_then(Value::as_str)
         .map(ToString::to_string))
+}
+
+async fn fetch_remote_images_by_type(
+    state: &AppState,
+    api_key: &str,
+    item_id: &str,
+    tmdb_id: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let row = sqlx::query("SELECT item_type FROM media_items WHERE id = ?")
+        .bind(item_id)
+        .fetch_optional(&state.db)
+        .await
+        .context("failed to fetch item type for images")?;
+
+    let is_series = row
+        .and_then(|row| row.try_get::<String, _>("item_type").ok())
+        .is_some_and(|t| t.eq_ignore_ascii_case("Series"));
+
+    if is_series {
+        let response: TmdbTvImageResponse = state
+            .http_client
+            .get(format!("https://api.themoviedb.org/3/tv/{tmdb_id}/images"))
+            .query(&[("api_key", api_key)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let mut images = Vec::new();
+        for poster in &response.posters {
+            images.push(build_remote_image("Primary", &poster.file_path, poster.width, poster.height, poster.vote_average, poster.vote_count, poster.iso_639_1.as_deref()));
+        }
+        for backdrop in &response.backdrops {
+            images.push(build_remote_image("Backdrop", &backdrop.file_path, backdrop.width, backdrop.height, backdrop.vote_average, backdrop.vote_count, backdrop.iso_639_1.as_deref()));
+        }
+        Ok(images)
+    } else {
+        providers::tmdb_movie_images(&state.http_client, api_key, tmdb_id).await
+    }
+}
+
+fn build_remote_image(
+    image_type: &str,
+    file_path: &str,
+    width: Option<i64>,
+    height: Option<i64>,
+    vote_average: Option<f64>,
+    vote_count: Option<i64>,
+    iso_639_1: Option<&str>,
+) -> Value {
+    let thumbnail_url = if image_type == "Primary" {
+        format!("https://image.tmdb.org/t/p/w342{file_path}")
+    } else {
+        format!("https://image.tmdb.org/t/p/w780{file_path}")
+    };
+    let full_url = format!("https://image.tmdb.org/t/p/original{file_path}");
+    let mut image = json!({
+        "ProviderName": "TheMovieDb",
+        "Url": full_url,
+        "ThumbnailUrl": thumbnail_url,
+        "Height": height,
+        "Width": width,
+        "CommunityRating": vote_average,
+        "VoteCount": vote_count,
+        "Type": image_type,
+    });
+    if let Some(lang) = iso_639_1 {
+        if !lang.is_empty() {
+            image["Language"] = json!(lang);
+        }
+    }
+    image
 }
 
 pub async fn user_avatar(Path(user_id): Path<String>) -> Response {
@@ -615,4 +698,22 @@ pub async fn item_image_tags(db: &AnyPool, item_id: &str) -> anyhow::Result<Valu
         tags.entry(image_type).or_insert_with(|| json!(etag));
     }
     Ok(Value::Object(tags))
+}
+
+#[derive(Deserialize)]
+struct TmdbTvImageResponse {
+    #[serde(default)]
+    posters: Vec<TmdbTvImage>,
+    #[serde(default)]
+    backdrops: Vec<TmdbTvImage>,
+}
+
+#[derive(Deserialize)]
+struct TmdbTvImage {
+    file_path: String,
+    width: Option<i64>,
+    height: Option<i64>,
+    vote_average: Option<f64>,
+    vote_count: Option<i64>,
+    iso_639_1: Option<String>,
 }

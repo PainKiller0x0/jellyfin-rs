@@ -204,6 +204,7 @@ async fn find_person_by_name(db: &AnyPool, name: &str) -> anyhow::Result<Option<
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_tagged_items(
     db: &AnyPool,
     person_id: &str,

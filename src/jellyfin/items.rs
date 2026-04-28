@@ -445,14 +445,14 @@ async fn item_counts_inner(
         let library_id: String = row.try_get("library_id")?;
         let item_type: String = row.try_get("item_type")?;
         let count: i64 = row.try_get("count")?;
-        counts
+        if let Some(obj) = counts
             .entry(library_id)
             .or_insert_with(|| json!({}))
             .as_object_mut()
-            .map(|obj| {
-                let existing = obj.get(&item_type).and_then(Value::as_i64).unwrap_or(0);
-                obj.insert(item_type, json!(existing + count));
-            });
+        {
+            let existing = obj.get(&item_type).and_then(Value::as_i64).unwrap_or(0);
+            obj.insert(item_type, json!(existing + count));
+        }
     }
 
     Ok(Value::Object(counts))

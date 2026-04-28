@@ -238,18 +238,9 @@ pub async fn update_named_configuration() -> impl IntoResponse {
 }
 
 pub async fn configuration_pages(
-    Query(query): Query<HashMap<String, String>>,
+    Query(_query): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let enable_in_main_menu = query
-        .get("enableInMainMenu")
-        .or_else(|| query.get("EnableInMainMenu"))
-        .is_none_or(|value| value.eq_ignore_ascii_case("true"));
-    let pages: Vec<Value> = if enable_in_main_menu {
-        Vec::new()
-    } else {
-        Vec::new()
-    };
-    Json(pages)
+    Json(Vec::<Value>::new())
 }
 
 pub async fn dashboard_configuration_page() -> Response {

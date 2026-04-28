@@ -73,8 +73,6 @@ pub fn create_collage(
 
     let (columns, rows) = if valid_images.len() == 1 {
         (1, 1)
-    } else if width >= height {
-        (2, 2)
     } else {
         (2, 2)
     };

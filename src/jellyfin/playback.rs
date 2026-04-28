@@ -291,6 +291,7 @@ async fn playback_progress_inner(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn update_playback_session(
     state: &AppState,
     headers: &HeaderMap,

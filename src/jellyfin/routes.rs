@@ -8,7 +8,8 @@ use axum::{
 use crate::{
     app::state::AppState,
     jellyfin::{
-        auth, collect, common, filters, images, items, library, persons, playback, sessions, system,
+        auth, collect, common, dlna, filters, images, items, library, persons, playback, sessions,
+        system,
     },
     playback::streaming::{
         stream_audio, stream_audio_head, stream_subtitle, stream_subtitle_head, stream_video,
@@ -93,6 +94,14 @@ pub fn api_routes() -> Router<Arc<AppState>> {
                 .delete(common::no_content),
         )
         .route("/Playback/BitrateTest", get(system::bitrate_test))
+        .route("/Dlna/ProfileInfos", get(dlna::profile_infos))
+        .route("/Dlna/Profiles/Default", get(dlna::default_profile))
+        .route("/Dlna/Profiles/{profile_id}", get(dlna::profile_by_id))
+        .route(
+            "/Dlna/{server_id}/description.xml",
+            get(dlna::device_description),
+        )
+        .route("/description.xml", get(dlna::device_description))
         .route("/ClientLog/Document", post(common::no_content))
         .route("/Auth/Keys", get(auth::api_keys).post(auth::create_api_key))
         .route("/Auth/Keys/{key}", delete(auth::delete_api_key))

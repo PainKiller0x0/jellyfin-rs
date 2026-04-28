@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod collect;
 pub mod common;
+pub mod dlna;
 pub mod filters;
 pub mod images;
 mod item_queries;

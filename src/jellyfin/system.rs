@@ -294,7 +294,7 @@ pub async fn activity_log(
 
 type Response = axum::response::Response;
 
-pub(super) async fn app_setting(db: &AnyPool, key: &str, default: &str) -> String {
+pub(crate) async fn app_setting(db: &AnyPool, key: &str, default: &str) -> String {
     sqlx::query("SELECT value FROM app_settings WHERE key = ?")
         .bind(key)
         .fetch_optional(db)

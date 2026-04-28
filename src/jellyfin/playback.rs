@@ -13,7 +13,9 @@ use uuid::Uuid;
 
 use crate::{
     app::state::{AppState, PlaybackSession, PlaybackState},
-    jellyfin::{auth::request_user_id_or_default, common::internal_error, items::find_media_item},
+    jellyfin::{
+        auth::request_user_id_or_default, common::internal_error, dlna, items::find_media_item,
+    },
     library::models::{MediaStreamRow, media_source_json_with_streams},
     util::{now_unix, unix_to_jellyfin_date},
 };
@@ -23,14 +25,23 @@ pub async fn playback_info(
     headers: HeaderMap,
     Path(item_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
+    body: Option<Json<Value>>,
 ) -> Response {
     let user_id = request_user_id_or_default(&state, &headers, &query).await;
     match find_media_item(&state.db, &user_id, &item_id).await {
         Ok(Some(item)) => match media_streams_for_item(&state.db, &item.id).await {
-            Ok(streams) => Json(json!({ "MediaSources": [media_source_json_with_streams(&item, streams)], "PlaySessionId": Uuid::new_v4().simple().to_string(), "ErrorCode": null })).into_response(),
+            Ok(streams) => {
+                let profile = dlna::request_device_profile(body.as_ref().map(|Json(value)| value));
+                let mut media_source = media_source_json_with_streams(&item, streams.clone());
+                dlna::apply_playback_profile(&mut media_source, &profile, &streams, &query);
+                Json(json!({ "MediaSources": [media_source], "PlaySessionId": Uuid::new_v4().simple().to_string(), "ErrorCode": null })).into_response()
+            }
             Err(error) => internal_error(error),
         },
-        Ok(None) => Json(json!({ "MediaSources": [], "PlaySessionId": Uuid::new_v4().simple().to_string() })).into_response(),
+        Ok(None) => Json(
+            json!({ "MediaSources": [], "PlaySessionId": Uuid::new_v4().simple().to_string() }),
+        )
+        .into_response(),
         Err(error) => internal_error(error),
     }
 }

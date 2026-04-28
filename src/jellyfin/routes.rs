@@ -218,7 +218,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/System/Restart", post(system::shutdown_handler))
         .route("/Library/MediaFolders", get(library::media_folders))
         .route("/Libraries/AvailableOptions", get(common::empty_object))
-        .route("/Library/PhysicalPaths", get(common::empty_array))
+        .route("/Library/PhysicalPaths", get(library::physical_paths))
         .route("/Library/Movies/Added", post(common::no_content))
         .route("/Library/Series/Added", post(common::no_content))
         .route("/Library/Media/Updated", post(common::no_content))

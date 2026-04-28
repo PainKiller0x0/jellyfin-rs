@@ -7,12 +7,14 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{AnyPool, Row};
 
 use crate::{
     app::state::{AppState, SERVER_NAME, VERSION},
     jellyfin::common::internal_error,
+    library::path_utils,
     util::now_unix,
 };
 
@@ -89,29 +91,82 @@ pub async fn device_options() -> impl IntoResponse {
     Json(json!({}))
 }
 
-pub async fn default_directory_browser() -> impl IntoResponse {
-    Json(json!(
-        std::env::current_dir()
-            .ok()
-            .and_then(|path| path.to_str().map(str::to_string))
-            .unwrap_or_else(|| ".".to_string())
-    ))
+#[derive(Deserialize)]
+pub struct DirectoryContentsQuery {
+    #[serde(rename = "path")]
+    path: String,
+    #[serde(rename = "includeFiles", default)]
+    include_files: bool,
+    #[serde(rename = "includeDirectories", default)]
+    include_directories: bool,
 }
 
-pub async fn directory_contents() -> impl IntoResponse {
-    Json(Vec::<Value>::new())
+#[derive(Deserialize)]
+pub struct ParentPathQuery {
+    #[serde(rename = "path")]
+    path: String,
+}
+
+#[derive(Deserialize)]
+pub struct ValidatePathRequest {
+    #[serde(rename = "Path")]
+    path: Option<String>,
+    #[serde(rename = "IsFile")]
+    is_file: Option<bool>,
+    #[serde(rename = "ValidateWritable", default)]
+    validate_writable: bool,
+}
+
+pub async fn default_directory_browser() -> impl IntoResponse {
+    Json(json!({
+        "Path": std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().to_string())
+    }))
+}
+
+pub async fn directory_contents(Query(query): Query<DirectoryContentsQuery>) -> Response {
+    match path_utils::directory_entries(&query.path, query.include_files, query.include_directories)
+    {
+        Ok(entries) => Json(entries).into_response(),
+        Err(error)
+            if error.to_string().contains("not exist")
+                || error.to_string().contains("failed to read") =>
+        {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "Error": error.to_string() })),
+            )
+                .into_response()
+        }
+        Err(error) => internal_error(error),
+    }
 }
 
 pub async fn drives() -> impl IntoResponse {
-    Json(Vec::<Value>::new())
+    Json(path_utils::drive_entries())
 }
 
-pub async fn parent_path() -> impl IntoResponse {
-    Json(json!(""))
+pub async fn parent_path(Query(query): Query<ParentPathQuery>) -> impl IntoResponse {
+    Json(path_utils::parent_path(&query.path))
 }
 
-pub async fn validate_path() -> impl IntoResponse {
-    StatusCode::NO_CONTENT
+pub async fn validate_path(Json(request): Json<ValidatePathRequest>) -> Response {
+    let path = request.path.unwrap_or_default();
+    match path_utils::validate_path(&path, request.is_file, request.validate_writable) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error)
+            if error.to_string().contains("not found")
+                || error.to_string().contains("required") =>
+        {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "Error": error.to_string() })),
+            )
+                .into_response()
+        }
+        Err(error) => internal_error(error),
+    }
 }
 
 pub async fn system_endpoint() -> impl IntoResponse {

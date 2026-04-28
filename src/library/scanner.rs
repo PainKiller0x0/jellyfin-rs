@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::UNIX_EPOCH};
+use std::path::PathBuf;
 
 use anyhow::Context;
 use sqlx::Row;
@@ -11,6 +11,7 @@ use crate::{
         images::upsert_sidecar_images,
         metadata::parse_sidecar_metadata,
         naming::parse_media_name,
+        path_utils,
         probe::probe_media,
         storage::{
             ScannedMediaItem, remove_missing_media_items, upsert_default_media_stream,
@@ -18,9 +19,7 @@ use crate::{
         },
         subtitles::upsert_sidecar_subtitles,
     },
-    util::{
-        infer_library_id_from_path, media_title, now_unix, stable_item_id, system_time_to_unix,
-    },
+    util::{infer_library_id_from_path, now_unix},
 };
 
 pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
@@ -51,34 +50,34 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
                 continue;
             }
 
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
+            let resolved = match path_utils::resolve_path_info(path) {
+                Ok(resolved) => resolved,
                 Err(error) => {
-                    tracing::warn!("failed to read metadata for {}: {error}", path.display());
+                    tracing::warn!("failed to resolve media path {}: {error:#}", path.display());
                     continue;
                 }
             };
 
-            let path_string = path.to_string_lossy().to_string();
+            let path_string = resolved.path.clone();
             let parent_id = parent_id_for_path(path, &root, &library_id);
 
-            if entry.file_type().is_dir() {
+            if resolved.is_directory {
                 seen_paths.push(path_string.clone());
                 let item = ScannedMediaItem::folder_with_type(
-                    stable_item_id(path),
+                    resolved.id,
                     library_id.clone(),
                     parent_id,
                     path_string,
-                    media_title(path),
+                    resolved.name,
                     tv_folder_type(path, &root, &library_id),
-                    system_time_to_unix(metadata.modified().unwrap_or(UNIX_EPOCH)),
+                    resolved.modified_at,
                 );
                 upsert_media_item(&state.db, &item).await?;
                 upsert_sidecar_images(&state.db, path, &item.id).await?;
                 continue;
             }
 
-            if !entry.file_type().is_file() {
+            if resolved.is_directory {
                 continue;
             }
             let Some(item_type) = classify_media_path(path, &library_id) else {
@@ -92,15 +91,15 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
                 parsed_metadata
                     .title
                     .clone()
-                    .unwrap_or_else(|| media_title(path))
+                    .unwrap_or_else(|| resolved.name.clone())
             } else if parsed_name.title.is_empty() {
-                media_title(path)
+                resolved.name.clone()
             } else {
                 parsed_name.title.clone()
             };
             let probe = probe_media(path);
             let item = ScannedMediaItem {
-                id: stable_item_id(path),
+                id: resolved.id,
                 title,
                 path: path_string,
                 library_id: library_id.clone(),
@@ -117,8 +116,8 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
                     .then(|| parsed_name.extended_video_types.join(",")),
                 production_year: parsed_metadata.production_year,
                 runtime_ticks: probe.as_ref().and_then(|probe| probe.runtime_ticks),
-                size_bytes: i64::try_from(metadata.len()).ok(),
-                modified_at: system_time_to_unix(metadata.modified().unwrap_or(UNIX_EPOCH)),
+                size_bytes: resolved.size_bytes,
+                modified_at: resolved.modified_at,
                 created_at: now_unix(),
             };
 
@@ -162,7 +161,7 @@ async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String)>>
             .iter()
             .map(|path| {
                 (
-                    path.clone(),
+                    PathBuf::from(path_utils::normalize_path(&path.to_string_lossy())),
                     infer_library_id_from_path(&path.to_string_lossy()).to_string(),
                 )
             })
@@ -172,7 +171,9 @@ async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String)>>
     rows.into_iter()
         .map(|row| -> anyhow::Result<(PathBuf, String)> {
             Ok((
-                PathBuf::from(row.try_get::<String, _>("path")?),
+                PathBuf::from(path_utils::normalize_path(
+                    &row.try_get::<String, _>("path")?,
+                )),
                 row.try_get("library_id")?,
             ))
         })

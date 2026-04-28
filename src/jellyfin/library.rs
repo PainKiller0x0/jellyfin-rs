@@ -15,7 +15,7 @@ use crate::{
     app::state::AppState,
     jellyfin::common::internal_error,
     jellyfin::system,
-    library::scanner::scan_media_library,
+    library::{path_utils, scanner::scan_media_library},
     util::{now_unix, stable_text_id},
 };
 
@@ -73,7 +73,7 @@ pub async fn add_virtual_folder_path(
     State(state): State<Arc<AppState>>,
     Query(query): Query<LibraryPathQuery>,
 ) -> Response {
-    match upsert_library_path(&state.db, &query.name, &query.path).await {
+    match upsert_library_path(&state.db, &query.name, &query.path, None).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) if error.to_string().contains("required") => (
             StatusCode::BAD_REQUEST,
@@ -90,7 +90,7 @@ pub async fn delete_virtual_folder_path(
 ) -> Response {
     match sqlx::query("DELETE FROM library_paths WHERE library_id = ? AND path = ?")
         .bind(library_id_for_name(&query.name))
-        .bind(query.path.trim())
+        .bind(path_utils::normalize_path(&query.path))
         .execute(&state.db)
         .await
     {
@@ -193,7 +193,7 @@ async fn create_virtual_folder_inner(
         for path in paths.split('|').flat_map(|value| value.split(',')) {
             let path = path.trim();
             if !path.is_empty() {
-                upsert_library_path(db, name, path).await?;
+                upsert_library_path(db, name, path, Some(collection_type)).await?;
             }
         }
     }
@@ -201,9 +201,14 @@ async fn create_virtual_folder_inner(
     Ok(())
 }
 
-async fn upsert_library_path(db: &AnyPool, name: &str, path: &str) -> anyhow::Result<()> {
+async fn upsert_library_path(
+    db: &AnyPool,
+    name: &str,
+    path: &str,
+    collection_type: Option<&str>,
+) -> anyhow::Result<()> {
     let name = name.trim();
-    let path = path.trim();
+    let path = path_utils::validate_library_path(path)?;
     if name.is_empty() {
         bail!("name is required");
     }
@@ -212,11 +217,12 @@ async fn upsert_library_path(db: &AnyPool, name: &str, path: &str) -> anyhow::Re
     }
 
     let library_id = library_id_for_name(name);
+    let collection_type = collection_type.unwrap_or_else(|| collection_type_for_name(name));
     let now = now_unix();
     sqlx::query(r#"INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at"#)
         .bind(&library_id)
         .bind(name)
-        .bind("movies")
+        .bind(collection_type)
         .bind(now)
         .bind(now)
         .execute(db)
@@ -226,7 +232,7 @@ async fn upsert_library_path(db: &AnyPool, name: &str, path: &str) -> anyhow::Re
     sqlx::query(r#"INSERT INTO library_paths (id, library_id, path, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET library_id = excluded.library_id"#)
         .bind(stable_text_id(&format!("library-path:{path}")))
         .bind(library_id)
-        .bind(path)
+        .bind(&path)
         .bind(now)
         .execute(db)
         .await
@@ -241,6 +247,29 @@ fn library_id_for_name(name: &str) -> String {
         "tv shows" | "tvshows" => "tvshows".to_string(),
         "music" => "music".to_string(),
         _ => stable_text_id(&format!("library:{}", name.trim().to_ascii_lowercase())),
+    }
+}
+
+pub async fn physical_paths(State(state): State<Arc<AppState>>) -> Response {
+    match sqlx::query("SELECT path FROM library_paths ORDER BY path ASC")
+        .fetch_all(&state.db)
+        .await
+    {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .filter_map(|row| row.try_get::<String, _>("path").ok())
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(error) => internal_error(error.into()),
+    }
+}
+
+fn collection_type_for_name(name: &str) -> &'static str {
+    match name.to_ascii_lowercase().as_str() {
+        "tv shows" | "tvshows" => "tvshows",
+        "music" => "music",
+        _ => "movies",
     }
 }
 

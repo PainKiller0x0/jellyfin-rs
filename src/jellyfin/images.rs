@@ -148,10 +148,8 @@ pub async fn user_avatar(Path(user_id): Path<String>) -> Response {
                     .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|duration| duration.as_secs())
                     .unwrap_or_default();
-                let etag = stable_text_id(&format!(
-                    "avatar:{user_id}:{}:{modified}",
-                    metadata.len()
-                ));
+                let etag =
+                    stable_text_id(&format!("avatar:{user_id}:{}:{modified}", metadata.len()));
                 if let Ok(value) = HeaderValue::from_str(&etag) {
                     headers.insert(header::ETAG, value);
                 }
@@ -395,11 +393,7 @@ async fn save_item_image(
     Ok(())
 }
 
-async fn save_user_avatar(
-    headers: &HeaderMap,
-    user_id: &str,
-    body: Bytes,
-) -> anyhow::Result<()> {
+async fn save_user_avatar(headers: &HeaderMap, user_id: &str, body: Bytes) -> anyhow::Result<()> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())

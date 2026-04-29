@@ -287,7 +287,16 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Users/{user_id}/Items/Latest", get(items::latest_items))
         .route("/Users/{user_id}/Items/Resume", get(items::resume_items))
         .route("/Users/{user_id}/Items/{item_id}", get(items::item_by_id))
-        .route("/Users/{user_id}/Images/Primary", get(images::user_avatar))
+        .route(
+            "/Users/{user_id}/Images/Primary",
+            get(images::user_avatar)
+                .post(images::upload_user_avatar)
+                .delete(images::delete_user_avatar),
+        )
+        .route(
+            "/Users/{user_id}/Images/Primary/Delete",
+            post(images::delete_user_avatar),
+        )
         .route("/UserViews", get(items::views))
         .route("/UserViews/GroupingOptions", get(common::empty_array))
         .route(

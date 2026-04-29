@@ -131,22 +131,53 @@ pub async fn delete_item_image_with_index(
 }
 
 pub async fn user_avatar(Path(user_id): Path<String>) -> Response {
-    let path = PathBuf::from("data")
-        .join("avatars")
-        .join(format!("{}_primary.png", sanitize_file_part(&user_id)));
+    let Some(path) = find_user_avatar_path(&user_id).await else {
+        return placeholder_image().await.into_response();
+    };
     match tokio::fs::read(&path).await {
         Ok(bytes) => {
             let mut headers = HeaderMap::new();
-            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
             headers.insert(
-                header::ETAG,
-                HeaderValue::from_str(&stable_text_id(&format!("avatar:{user_id}")))
-                    .unwrap_or_else(|_| HeaderValue::from_static("")),
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(content_type_from_path(&path.to_string_lossy())),
             );
+            if let Ok(metadata) = tokio::fs::metadata(&path).await {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or_default();
+                let etag = stable_text_id(&format!(
+                    "avatar:{user_id}:{}:{modified}",
+                    metadata.len()
+                ));
+                if let Ok(value) = HeaderValue::from_str(&etag) {
+                    headers.insert(header::ETAG, value);
+                }
+            }
             (headers, Body::from(bytes)).into_response()
         }
         Err(_) => placeholder_image().await.into_response(),
     }
+}
+
+pub async fn upload_user_avatar(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    body: Bytes,
+) -> Response {
+    match save_user_avatar(&headers, &user_id, body).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn delete_user_avatar(Path(user_id): Path<String>) -> Response {
+    for path in user_avatar_paths(&user_id) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn serve_item_image(
@@ -364,6 +395,37 @@ async fn save_item_image(
     Ok(())
 }
 
+async fn save_user_avatar(
+    headers: &HeaderMap,
+    user_id: &str,
+    body: Bytes,
+) -> anyhow::Result<()> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let bytes = decode_image_body(content_type, &body)?;
+    let extension = extension_from_content_type(content_type).unwrap_or("png");
+    let directory = PathBuf::from("data").join("avatars");
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .context("failed to create avatar directory")?;
+
+    for path in user_avatar_paths(user_id) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    let path = directory.join(format!(
+        "{}_primary.{}",
+        sanitize_file_part(user_id),
+        extension
+    ));
+    tokio::fs::write(&path, &bytes)
+        .await
+        .with_context(|| format!("failed to write avatar file: {}", path.display()))?;
+    Ok(())
+}
+
 async fn item_images_inner(db: &AnyPool, item_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
     let rows = sqlx::query("SELECT image_type, image_index, path, size_bytes FROM image_assets WHERE item_id = ? ORDER BY image_type ASC, image_index ASC")
         .bind(item_id)
@@ -474,6 +536,27 @@ fn content_type_from_path(path: &str) -> &'static str {
         "gif" => "image/gif",
         _ => "application/octet-stream",
     }
+}
+
+async fn find_user_avatar_path(user_id: &str) -> Option<PathBuf> {
+    for path in user_avatar_paths(user_id) {
+        if tokio::fs::metadata(&path).await.is_ok() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn user_avatar_paths(user_id: &str) -> Vec<PathBuf> {
+    let file_stem = format!("{}_primary", sanitize_file_part(user_id));
+    ["png", "jpg", "jpeg", "webp", "gif"]
+        .into_iter()
+        .map(|extension| {
+            PathBuf::from("data")
+                .join("avatars")
+                .join(format!("{file_stem}.{extension}"))
+        })
+        .collect()
 }
 
 fn image_options_from_query(

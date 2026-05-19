@@ -1,5 +1,5 @@
 use anyhow::Context;
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection};
 
 use crate::{
     db::row_ext::QueryResultExt,
@@ -57,7 +57,10 @@ impl ScannedMediaItem {
     }
 }
 
-pub async fn upsert_media_item(db: &DatabaseConnection, item: &ScannedMediaItem) -> anyhow::Result<()> {
+pub async fn upsert_media_item(
+    db: &DatabaseConnection,
+    item: &ScannedMediaItem,
+) -> anyhow::Result<()> {
     let backend = db.get_database_backend();
     db.execute(crate::db::helpers::portable_statement(
         backend,
@@ -284,7 +287,10 @@ pub async fn upsert_probed_media_streams(
     Ok(true)
 }
 
-pub async fn remove_missing_media_items(db: &DatabaseConnection, seen_paths: &[String]) -> anyhow::Result<()> {
+pub async fn remove_missing_media_items(
+    db: &DatabaseConnection,
+    seen_paths: &[String],
+) -> anyhow::Result<()> {
     let backend = db.get_database_backend();
     let rows = db
         .query_all(crate::db::helpers::portable_statement(

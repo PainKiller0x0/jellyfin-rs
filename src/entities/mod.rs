@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub mod access_tokens;
 pub mod activity_log;
 pub mod api_keys;

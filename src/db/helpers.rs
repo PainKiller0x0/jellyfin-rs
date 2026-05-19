@@ -1,6 +1,8 @@
+#![allow(dead_code)]
+
 use sea_orm::{
-    sea_query::{Alias, Expr, Query},
     ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, Value,
+    sea_query::{Alias, Expr, Query},
 };
 
 pub fn insert_into(table: &str) -> sea_orm::sea_query::InsertStatement {
@@ -15,8 +17,14 @@ pub fn alias_col(column: &str) -> Expr {
     Expr::col(Alias::new(column))
 }
 
-pub async fn exec_stmt(db: &DatabaseConnection, backend: DbBackend, sql: String) -> Result<(), DbErr> {
-    db.execute(Statement::from_string(backend, sql)).await.map(|_| ())
+pub async fn exec_stmt(
+    db: &DatabaseConnection,
+    backend: DbBackend,
+    sql: String,
+) -> Result<(), DbErr> {
+    db.execute(Statement::from_string(backend, sql))
+        .await
+        .map(|_| ())
 }
 
 pub fn db_backend(url: &str) -> DbBackend {

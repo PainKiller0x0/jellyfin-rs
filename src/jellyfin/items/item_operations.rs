@@ -7,8 +7,8 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use sea_orm::{ConnectionTrait, DatabaseConnection};
 use serde_json::{Value, json};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 use crate::{
     app::state::AppState,

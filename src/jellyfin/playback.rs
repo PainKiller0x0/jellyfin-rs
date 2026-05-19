@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
@@ -46,7 +46,10 @@ pub async fn playback_info(
     }
 }
 
-async fn media_streams_for_item(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Vec<JsonValue>> {
+async fn media_streams_for_item(
+    db: &DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<Vec<JsonValue>> {
     let backend = db.get_database_backend();
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
@@ -82,7 +85,10 @@ pub async fn subtitle_stream_path(
         ))
         .await
         .with_context(|| format!("failed to find subtitle stream: {item_id}:{stream_index}"))?;
-    row.as_ref().map(|row| row.get_str("path")).transpose().context("failed to decode subtitle path")
+    row.as_ref()
+        .map(|row| row.get_str("path"))
+        .transpose()
+        .context("failed to decode subtitle path")
 }
 
 pub async fn favorite_item(
@@ -382,7 +388,10 @@ async fn update_playback_session(
                 .get("IsPaused")
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(false),
-            can_seek: body.get("CanSeek").and_then(JsonValue::as_bool).unwrap_or(true),
+            can_seek: body
+                .get("CanSeek")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true),
         },
         playable_media_types: session_info.playable_media_types,
         supports_media_control_commands: session_info.supported_commands.clone(),

@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Value};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
@@ -324,7 +324,11 @@ pub(super) async fn app_setting_bool(db: &DatabaseConnection, key: &str, default
     }
 }
 
-pub(super) async fn set_app_setting(db: &DatabaseConnection, key: &str, value: &str) -> anyhow::Result<()> {
+pub(super) async fn set_app_setting(
+    db: &DatabaseConnection,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
     let backend = db.get_database_backend();
     db.execute(crate::db::helpers::portable_statement(
         backend,
@@ -335,7 +339,9 @@ pub(super) async fn set_app_setting(db: &DatabaseConnection, key: &str, value: &
     Ok(())
 }
 
-pub(super) async fn first_admin_user(db: &DatabaseConnection) -> anyhow::Result<Option<(String, String)>> {
+pub(super) async fn first_admin_user(
+    db: &DatabaseConnection,
+) -> anyhow::Result<Option<(String, String)>> {
     let backend = db.get_database_backend();
     let Some(row) = db
         .query_one(crate::db::helpers::portable_statement(

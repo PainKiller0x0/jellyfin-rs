@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Context;
+use sea_orm::{ConnectionTrait, DatabaseConnection};
 use serde_json::{Value, json};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 use crate::{db::row_ext::QueryResultExt, library::models::MediaItem};
 
@@ -94,7 +94,10 @@ fn linked_children_select_sql() -> String {
     r#"SELECT mi.id, mi.title, mi.path, mi.library_id, mi.parent_id, mi.item_type, mi.is_folder, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, 0) AS is_favorite, COALESCE(ud.played, 0) AS played, COALESCE(ud.playback_position_ticks, 0) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, 0) AS play_count, ud.last_played_at AS last_played_at FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC"#.to_string()
 }
 
-pub async fn latest_media_items(db: &DatabaseConnection, user_id: &str) -> anyhow::Result<Vec<MediaItem>> {
+pub async fn latest_media_items(
+    db: &DatabaseConnection,
+    user_id: &str,
+) -> anyhow::Result<Vec<MediaItem>> {
     let backend = db.get_database_backend();
     decode_media_items(
         &db.query_all(crate::db::helpers::portable_statement(
@@ -109,7 +112,10 @@ pub async fn latest_media_items(db: &DatabaseConnection, user_id: &str) -> anyho
     )
 }
 
-pub async fn resume_media_items(db: &DatabaseConnection, user_id: &str) -> anyhow::Result<Vec<MediaItem>> {
+pub async fn resume_media_items(
+    db: &DatabaseConnection,
+    user_id: &str,
+) -> anyhow::Result<Vec<MediaItem>> {
     let backend = db.get_database_backend();
     decode_media_items(
         &db.query_all(crate::db::helpers::portable_statement(
@@ -343,7 +349,10 @@ async fn width_item_ids(
         .collect())
 }
 
-async fn parent_item_ids(db: &DatabaseConnection, item_ids: &[String]) -> anyhow::Result<Vec<String>> {
+async fn parent_item_ids(
+    db: &DatabaseConnection,
+    item_ids: &[String],
+) -> anyhow::Result<Vec<String>> {
     let backend = db.get_database_backend();
     let mut parents = Vec::new();
     for id in item_ids {

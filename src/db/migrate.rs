@@ -1,6 +1,6 @@
 use anyhow::Context;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 use sea_orm::sqlx::{Sqlite, migrate::MigrateDatabase};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 
 use crate::db::schema::{migrations, optional_migrations};
 
@@ -57,7 +57,10 @@ async fn execute_optional_migration(
     sql: &str,
     context: &'static str,
 ) {
-    if let Err(error) = db.execute(Statement::from_string(backend, sql.to_string())).await {
+    if let Err(error) = db
+        .execute(Statement::from_string(backend, sql.to_string()))
+        .await
+    {
         let message = error.to_string().to_ascii_lowercase();
         if !message.contains("duplicate") && !message.contains("exists") {
             tracing::warn!("optional migration failed ({context}): {error}");

@@ -7,7 +7,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
@@ -341,7 +341,10 @@ pub async fn update_playlist(
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn get_playlist_inner(db: &DatabaseConnection, playlist_id: &str) -> anyhow::Result<Option<JsonValue>> {
+async fn get_playlist_inner(
+    db: &DatabaseConnection,
+    playlist_id: &str,
+) -> anyhow::Result<Option<JsonValue>> {
     let backend = db.get_database_backend();
     let row = db
         .query_one(crate::db::helpers::portable_statement(

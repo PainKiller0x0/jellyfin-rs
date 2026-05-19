@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::ConnectionTrait;
 use walkdir::WalkDir;
 
 use crate::{

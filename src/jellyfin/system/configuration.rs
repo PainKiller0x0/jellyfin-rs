@@ -9,7 +9,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::ConnectionTrait;
 
 use crate::{
     app::state::{AppState, DEFAULT_USER_NAME, SERVER_NAME},

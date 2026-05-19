@@ -1,9 +1,7 @@
 use serde_json::{Value, json};
 
 use crate::{
-    db::row_ext::QueryResultExt,
-    library::naming::parse_media_name,
-    util::unix_to_jellyfin_date,
+    db::row_ext::QueryResultExt, library::naming::parse_media_name, util::unix_to_jellyfin_date,
 };
 
 #[derive(Clone, Debug)]

@@ -7,8 +7,8 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use sea_orm::{ConnectionTrait, DatabaseConnection};
 use serde_json::{Value, json};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 use crate::{
     app::state::AppState,
@@ -205,7 +205,10 @@ pub async fn items_root(
     }
 }
 
-async fn item_json_with_provider_ids(db: &DatabaseConnection, item: MediaItem) -> anyhow::Result<Value> {
+async fn item_json_with_provider_ids(
+    db: &DatabaseConnection,
+    item: MediaItem,
+) -> anyhow::Result<Value> {
     let mut value = item.to_jellyfin_json();
     let backend = db.get_database_backend();
     let rows = db

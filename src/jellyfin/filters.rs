@@ -6,7 +6,7 @@ use axum::{
     extract::{Query, State},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection};
 use serde_json::{Value, json};
 
 use crate::{app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error};
@@ -186,7 +186,11 @@ async fn list_distinct_values_inner(
     );
     let backend = db.get_database_backend();
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(backend, &sql, vec![]))
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &sql,
+            vec![],
+        ))
         .await
         .with_context(|| format!("failed to list distinct {column} from {table}"))?;
 

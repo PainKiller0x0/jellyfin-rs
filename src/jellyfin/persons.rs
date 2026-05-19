@@ -6,7 +6,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Value};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error};
@@ -193,7 +193,10 @@ async fn person_items_inner(
     Ok(json!({"Items": items, "TotalRecordCount": total, "StartIndex": start_index}))
 }
 
-async fn find_person_by_name(db: &DatabaseConnection, name: &str) -> anyhow::Result<Option<PersonRow>> {
+async fn find_person_by_name(
+    db: &DatabaseConnection,
+    name: &str,
+) -> anyhow::Result<Option<PersonRow>> {
     let backend = db.get_database_backend();
     let row = db
         .query_one(crate::db::helpers::portable_statement(
@@ -283,7 +286,9 @@ async fn fetch_tagged_items(
 
     let backend = db.get_database_backend();
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(backend, &sql, values))
+        .query_all(crate::db::helpers::portable_statement(
+            backend, &sql, values,
+        ))
         .await?;
     let items = rows
         .iter()
@@ -362,7 +367,9 @@ async fn count_tagged_items(
 
     let backend = db.get_database_backend();
     let row = db
-        .query_one(crate::db::helpers::portable_statement(backend, &sql, values))
+        .query_one(crate::db::helpers::portable_statement(
+            backend, &sql, values,
+        ))
         .await?;
     Ok(row.map(|row| row.get_i64("cnt").unwrap_or(0)).unwrap_or(0))
 }

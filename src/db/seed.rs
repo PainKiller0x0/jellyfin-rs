@@ -1,5 +1,5 @@
 use anyhow::Context;
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::ConnectionTrait;
 
 use crate::{
     app::state::{AppState, DEFAULT_USER_NAME},

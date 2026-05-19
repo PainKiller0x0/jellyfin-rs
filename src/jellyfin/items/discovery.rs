@@ -6,8 +6,8 @@ use axum::{
     extract::{Path, Query, State},
     response::{IntoResponse, Response},
 };
+use sea_orm::{ConnectionTrait, DatabaseConnection, Value as SeaValue};
 use serde_json::{Value, json};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value as SeaValue};
 
 use crate::{
     app::state::AppState,
@@ -71,7 +71,9 @@ async fn similar_items_inner(
         values.push(id.as_str().into());
     }
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(backend, &sql, values))
+        .query_all(crate::db::helpers::portable_statement(
+            backend, &sql, values,
+        ))
         .await
         .context("failed to fetch similar items")?;
     item_queries::decode_media_items(&rows)
@@ -199,7 +201,11 @@ async fn next_up_inner(
                 r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND (COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) = 0) AND media_items.parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season') ORDER BY media_items.modified_at DESC LIMIT ?"#,
                 item_queries::media_item_select_sql("")
             ),
-            vec![user_id.into(), series_id.into(), i64::try_from(limit).unwrap_or(25).into()],
+            vec![
+                user_id.into(),
+                series_id.into(),
+                i64::try_from(limit).unwrap_or(25).into(),
+            ],
         )
     } else {
         (
@@ -207,12 +213,17 @@ async fn next_up_inner(
                 r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND (COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) = 0) ORDER BY media_items.modified_at DESC LIMIT ?"#,
                 item_queries::media_item_select_sql("")
             ),
-            vec![user_id.into(), i64::try_from(limit).unwrap_or(i64::MAX).into()],
+            vec![
+                user_id.into(),
+                i64::try_from(limit).unwrap_or(i64::MAX).into(),
+            ],
         )
     };
 
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(backend, &sql, values))
+        .query_all(crate::db::helpers::portable_statement(
+            backend, &sql, values,
+        ))
         .await
         .context("failed to list next up episodes")?;
 

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection};
 
 use crate::util::{now_unix, stable_text_id};
 

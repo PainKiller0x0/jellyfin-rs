@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Value};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use uuid::Uuid;
@@ -223,7 +223,12 @@ pub async fn update_user(
         .execute(crate::db::helpers::portable_statement(
             backend,
             "UPDATE users SET username = ?, display_name = ?, updated_at = ? WHERE id = ?",
-            vec![name.into(), name.into(), now_unix().into(), user_id.clone().into()],
+            vec![
+                name.into(),
+                name.into(),
+                now_unix().into(),
+                user_id.clone().into(),
+            ],
         ))
         .await
     {
@@ -483,7 +488,10 @@ async fn list_users_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<JsonVal
         .collect()
 }
 
-async fn user_by_id_inner(db: &DatabaseConnection, user_id: &str) -> anyhow::Result<Option<UserRow>> {
+async fn user_by_id_inner(
+    db: &DatabaseConnection,
+    user_id: &str,
+) -> anyhow::Result<Option<UserRow>> {
     let backend = db.get_database_backend();
     db.query_one(crate::db::helpers::portable_statement(
         backend,
@@ -497,7 +505,10 @@ async fn user_by_id_inner(db: &DatabaseConnection, user_id: &str) -> anyhow::Res
     .transpose()
 }
 
-async fn create_user_inner(db: &DatabaseConnection, request: CreateUserRequest) -> anyhow::Result<JsonValue> {
+async fn create_user_inner(
+    db: &DatabaseConnection,
+    request: CreateUserRequest,
+) -> anyhow::Result<JsonValue> {
     let username = request.name.trim();
     if username.is_empty() {
         bail!("Name is required");
@@ -585,7 +596,10 @@ async fn update_user_password_inner(
     Ok(())
 }
 
-async fn find_user_by_name(db: &DatabaseConnection, username: &str) -> anyhow::Result<Option<UserRow>> {
+async fn find_user_by_name(
+    db: &DatabaseConnection,
+    username: &str,
+) -> anyhow::Result<Option<UserRow>> {
     let backend = db.get_database_backend();
     db.query_one(crate::db::helpers::portable_statement(
         backend,

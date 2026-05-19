@@ -7,9 +7,9 @@ use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
+use sea_orm::ConnectionTrait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sea_orm::{ConnectionTrait, Statement};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 

@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
@@ -429,7 +429,10 @@ async fn save_user_avatar(headers: &HeaderMap, user_id: &str, body: Bytes) -> an
     Ok(())
 }
 
-async fn item_images_inner(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+async fn item_images_inner(
+    db: &DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
     let backend = db.get_database_backend();
     let rows = db
         .query_all(crate::db::helpers::portable_statement(

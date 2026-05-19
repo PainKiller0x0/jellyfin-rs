@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf};
 
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::AnyPool;
+use sea_orm::DatabaseConnection;
 use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
 
@@ -13,7 +13,7 @@ pub const DEFAULT_USER_NAME: &str = "tsukimi";
 pub struct AppState {
     pub user_id: Uuid,
     pub access_token: String,
-    pub db: AnyPool,
+    pub db: DatabaseConnection,
     pub media_dirs: Vec<PathBuf>,
     pub http_client: reqwest::Client,
     pub tmdb_api_key: Option<String>,

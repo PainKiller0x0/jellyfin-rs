@@ -9,11 +9,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose};
-use serde_json::{Value, json};
-use sqlx::{AnyPool, Row};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use serde_json::{Value as JsonValue, json};
 
 use crate::{
     app::state::AppState,
+    db::row_ext::QueryResultExt,
     jellyfin::common::{image as placeholder_image, internal_error},
     library::image_processing::{
         EncodedImageFormat, ImageRequestOptions, create_collage, create_placeholder, process_image,
@@ -179,7 +180,7 @@ pub async fn delete_user_avatar(Path(user_id): Path<String>) -> Response {
 }
 
 async fn serve_item_image(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     headers: &HeaderMap,
     query: &HashMap<String, String>,
     item_id: &str,
@@ -187,11 +188,13 @@ async fn serve_item_image(
     image_index: i64,
 ) -> Response {
     let options = image_options_from_query(query, image_type);
-    let row = match sqlx::query("SELECT path, etag, size_bytes FROM image_assets WHERE item_id = ? AND image_type = ? AND image_index = ?")
-        .bind(item_id)
-        .bind(image_type)
-        .bind(image_index)
-        .fetch_optional(db)
+    let backend = db.get_database_backend();
+    let row = match db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT path, etag, size_bytes FROM image_assets WHERE item_id = ? AND image_type = ? AND image_index = ?",
+            vec![item_id.into(), image_type.into(), image_index.into()],
+        ))
         .await
         .with_context(|| format!("failed to find image asset: {item_id}:{image_type}:{image_index}"))
     {
@@ -202,7 +205,7 @@ async fn serve_item_image(
     let Some(row) = row else {
         return dynamic_image_response(db, item_id, image_type, &options).await;
     };
-    let etag: String = match row.try_get("etag") {
+    let etag: String = match row.get_str("etag") {
         Ok(etag) => etag,
         Err(error) => return internal_error(error.into()),
     };
@@ -214,7 +217,7 @@ async fn serve_item_image(
         return StatusCode::NOT_MODIFIED.into_response();
     }
 
-    let path: String = match row.try_get("path") {
+    let path: String = match row.get_str("path") {
         Ok(path) => path,
         Err(error) => return internal_error(error.into()),
     };
@@ -255,7 +258,7 @@ async fn serve_item_image(
 }
 
 async fn dynamic_image_response(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     item_id: &str,
     image_type: &str,
     options: &ImageRequestOptions,
@@ -282,7 +285,7 @@ async fn dynamic_image_response(
 }
 
 async fn collage_source_images(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     item_id: &str,
     image_type: &str,
 ) -> anyhow::Result<Vec<Vec<u8>>> {
@@ -291,18 +294,19 @@ async fn collage_source_images(
     } else {
         "Primary"
     };
-    let rows = sqlx::query(
-        r#"SELECT image_assets.path FROM image_assets JOIN media_items ON media_items.id = image_assets.item_id WHERE media_items.parent_id = ? AND image_assets.image_type = ? ORDER BY media_items.title ASC, image_assets.image_index ASC LIMIT 4"#,
-    )
-    .bind(item_id)
-    .bind(preferred_type)
-    .fetch_all(db)
-    .await
-    .context("failed to find child images for collage")?;
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            r#"SELECT image_assets.path FROM image_assets JOIN media_items ON media_items.id = image_assets.item_id WHERE media_items.parent_id = ? AND image_assets.image_type = ? ORDER BY media_items.title ASC, image_assets.image_index ASC LIMIT 4"#,
+            vec![item_id.into(), preferred_type.into()],
+        ))
+        .await
+        .context("failed to find child images for collage")?;
 
     let mut images = Vec::new();
-    for row in rows {
-        let path: String = row.try_get("path")?;
+    for row in &rows {
+        let path: String = row.get_str("path")?;
         if let Ok(bytes) = tokio::fs::read(&path).await {
             images.push(bytes);
         }
@@ -343,7 +347,7 @@ fn default_image_size(image_type: &str) -> (u32, u32) {
 }
 
 async fn save_item_image(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     headers: &HeaderMap,
     item_id: &str,
     image_type: &str,
@@ -376,19 +380,24 @@ async fn save_item_image(
         .with_context(|| format!("failed to write image file: {}", path.display()))?;
 
     let now = now_unix();
-    sqlx::query(r#"INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, size_bytes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET path = excluded.path, etag = excluded.etag, size_bytes = excluded.size_bytes, updated_at = excluded.updated_at"#)
-        .bind(stable_text_id(&format!("image-asset:{item_id}:{image_type}:{image_index}")))
-        .bind(item_id)
-        .bind(image_type)
-        .bind(image_index)
-        .bind(path.to_string_lossy().to_string())
-        .bind(etag)
-        .bind(i64::try_from(bytes.len()).unwrap_or(i64::MAX))
-        .bind(now)
-        .bind(now)
-        .execute(db)
-        .await
-        .context("failed to upsert image asset")?;
+    let backend = db.get_database_backend();
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        r#"INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, size_bytes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET path = excluded.path, etag = excluded.etag, size_bytes = excluded.size_bytes, updated_at = excluded.updated_at"#,
+        vec![
+            stable_text_id(&format!("image-asset:{item_id}:{image_type}:{image_index}")).into(),
+            item_id.into(),
+            image_type.into(),
+            image_index.into(),
+            path.to_string_lossy().to_string().into(),
+            etag.into(),
+            i64::try_from(bytes.len()).unwrap_or(i64::MAX).into(),
+            now.into(),
+            now.into(),
+        ],
+    ))
+    .await
+    .context("failed to upsert image asset")?;
 
     Ok(())
 }
@@ -420,52 +429,55 @@ async fn save_user_avatar(headers: &HeaderMap, user_id: &str, body: Bytes) -> an
     Ok(())
 }
 
-async fn item_images_inner(db: &AnyPool, item_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
-    let rows = sqlx::query("SELECT image_type, image_index, path, size_bytes FROM image_assets WHERE item_id = ? ORDER BY image_type ASC, image_index ASC")
-        .bind(item_id)
-        .fetch_all(db)
+async fn item_images_inner(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT image_type, image_index, path, size_bytes FROM image_assets WHERE item_id = ? ORDER BY image_type ASC, image_index ASC",
+            vec![item_id.into()],
+        ))
         .await
         .context("failed to list item images")?;
-    rows.into_iter()
+    rows.iter()
         .map(|row| -> anyhow::Result<serde_json::Value> {
-            let path: Option<String> = row.try_get("path")?;
+            let path: Option<String> = row.get_opt_str("path")?;
             Ok(json!({
                 "Filename": path.as_deref().and_then(|path| std::path::Path::new(path).file_name()).and_then(|name| name.to_str()),
-                "ImageType": row.try_get::<String, _>("image_type")?,
-                "ImageIndex": row.try_get::<i64, _>("image_index")?,
-                "Size": row.try_get::<Option<i64>, _>("size_bytes")?,
+                "ImageType": row.get_str("image_type")?,
+                "ImageIndex": row.get_i64("image_index")?,
+                "Size": row.get_opt_i64("size_bytes")?,
             }))
         })
         .collect()
 }
 
 async fn delete_item_image_inner(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     item_id: &str,
     image_type: &str,
     image_index: i64,
 ) -> Response {
-    let path: Option<String> = match sqlx::query(
-        "SELECT path FROM image_assets WHERE item_id = ? AND image_type = ? AND image_index = ?",
-    )
-    .bind(item_id)
-    .bind(image_type)
-    .bind(image_index)
-    .fetch_optional(db)
-    .await
+    let backend = db.get_database_backend();
+    let path: Option<String> = match db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT path FROM image_assets WHERE item_id = ? AND image_type = ? AND image_index = ?",
+            vec![item_id.into(), image_type.into(), image_index.into()],
+        ))
+        .await
     {
-        Ok(Some(row)) => row.try_get("path").ok(),
+        Ok(Some(row)) => row.get_str("path").ok(),
         _ => None,
     };
 
-    match sqlx::query(
-        "DELETE FROM image_assets WHERE item_id = ? AND image_type = ? AND image_index = ?",
-    )
-    .bind(item_id)
-    .bind(image_type)
-    .bind(image_index)
-    .execute(db)
-    .await
+    match db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "DELETE FROM image_assets WHERE item_id = ? AND image_type = ? AND image_index = ?",
+            vec![item_id.into(), image_type.into(), image_index.into()],
+        ))
+        .await
     {
         Ok(_) => {
             if let Some(path) = path {
@@ -629,28 +641,30 @@ fn sanitize_file_part(value: &str) -> String {
 
 fn parse_image_url_body(body: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(body).ok()?;
-    let parsed: Value = serde_json::from_str(text).ok()?;
+    let parsed: JsonValue = serde_json::from_str(text).ok()?;
     parsed
         .get("Url")
-        .and_then(Value::as_str)
+        .and_then(JsonValue::as_str)
         .filter(|url| !url.trim().is_empty())
         .map(ToString::to_string)
 }
 
-pub async fn item_image_tags(db: &AnyPool, item_id: &str) -> anyhow::Result<Value> {
-    let rows = sqlx::query(
-        "SELECT image_type, etag FROM image_assets WHERE item_id = ? ORDER BY image_type ASC, image_index ASC",
-    )
-    .bind(item_id)
-    .fetch_all(db)
-    .await
-    .context("failed to load image tags")?;
+pub async fn item_image_tags(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<JsonValue> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT image_type, etag FROM image_assets WHERE item_id = ? ORDER BY image_type ASC, image_index ASC",
+            vec![item_id.into()],
+        ))
+        .await
+        .context("failed to load image tags")?;
 
     let mut tags = serde_json::Map::new();
-    for row in rows {
-        let image_type: String = row.try_get("image_type")?;
-        let etag: String = row.try_get("etag")?;
+    for row in &rows {
+        let image_type: String = row.get_str("image_type")?;
+        let etag: String = row.get_str("etag")?;
         tags.entry(image_type).or_insert_with(|| json!(etag));
     }
-    Ok(Value::Object(tags))
+    Ok(JsonValue::Object(tags))
 }

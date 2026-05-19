@@ -1,0 +1,30 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: jellyfin
+      POSTGRES_USER: jellyfin
+      POSTGRES_PASSWORD: jellyfin
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jellyfin"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8096:8096"
+    environment:
+      JELLYFIN_RS_DATABASE_URL: postgresql://jellyfin:jellyfin@db/jellyfin
+      RUST_LOG: info
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

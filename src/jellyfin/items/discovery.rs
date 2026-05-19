@@ -7,10 +7,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::{Value, json};
-use sqlx::Row;
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value as SeaValue};
 
 use crate::{
     app::state::AppState,
+    db::row_ext::QueryResultExt,
     jellyfin::{common::internal_error, item_queries},
     library::models::MediaItem,
 };
@@ -33,23 +34,23 @@ pub async fn similar_items(
 }
 
 async fn similar_items_inner(
-    db: &sqlx::AnyPool,
+    db: &DatabaseConnection,
     item_id: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<MediaItem>> {
-    let similar_ids = sqlx::query(
-        r#"SELECT mg_rel.item_id FROM media_genres mg_src JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id AND mg_src.item_id <> mg_rel.item_id WHERE (mg_src.item_id = ? OR mg_src.item_id = (SELECT parent_id FROM media_items WHERE id = ?)) GROUP BY mg_rel.item_id ORDER BY COUNT(*) DESC LIMIT ?"#,
-    )
-    .bind(item_id)
-    .bind(item_id)
-    .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-    .fetch_all(db)
-    .await
-    .context("failed to find similar items")?;
+    let backend = db.get_database_backend();
+    let similar_ids = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            r#"SELECT mg_rel.item_id FROM media_genres mg_src JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id AND mg_src.item_id <> mg_rel.item_id WHERE (mg_src.item_id = ? OR mg_src.item_id = (SELECT parent_id FROM media_items WHERE id = ?)) GROUP BY mg_rel.item_id ORDER BY COUNT(*) DESC LIMIT ?"#,
+            vec![item_id.into(), item_id.into(), i64::try_from(limit).unwrap_or(i64::MAX).into()],
+        ))
+        .await
+        .context("failed to find similar items")?;
 
     let similar_ids: Vec<String> = similar_ids
-        .into_iter()
-        .filter_map(|r| r.try_get("item_id").ok())
+        .iter()
+        .filter_map(|r| r.get_opt_str("item_id").ok().flatten())
         .collect();
 
     if similar_ids.is_empty() {
@@ -65,15 +66,15 @@ async fn similar_items_inner(
         r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.runtime_ticks, media_items.size_bytes, media_items.created_at, media_items.modified_at, 0 AS is_favorite, 0 AS played, 0 AS playback_position_ticks, NULL AS played_percentage, 0 AS play_count, NULL AS last_played_at FROM media_items WHERE media_items.id IN ({placeholders})"#
     );
 
-    let mut query = sqlx::query(&sql);
+    let mut values: Vec<SeaValue> = Vec::new();
     for id in &similar_ids {
-        query = query.bind(id);
+        values.push(id.as_str().into());
     }
-    let rows = query
-        .fetch_all(db)
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(backend, &sql, values))
         .await
         .context("failed to fetch similar items")?;
-    item_queries::decode_media_items(rows)
+    item_queries::decode_media_items(&rows)
 }
 
 pub async fn search_hints(
@@ -107,22 +108,26 @@ pub async fn search_hints(
 }
 
 async fn search_hints_inner(
-    db: &sqlx::AnyPool,
+    db: &DatabaseConnection,
     user_id: &str,
     search_term: &str,
     include_types: Option<Vec<&str>>,
     limit: usize,
 ) -> anyhow::Result<Vec<Value>> {
+    let backend = db.get_database_backend();
     let sql = item_queries::media_item_select_sql(
         "WHERE media_items.is_folder = 0 ORDER BY media_items.title ASC",
     );
-    let rows = sqlx::query(&sql)
-        .bind(user_id)
-        .fetch_all(db)
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &sql,
+            vec![user_id.into()],
+        ))
         .await
         .context("failed to fetch search hints")?;
 
-    let items = item_queries::decode_media_items(rows)?;
+    let items = item_queries::decode_media_items(&rows)?;
     let mut hints: Vec<Value> = items
         .into_iter()
         .filter(|item| {
@@ -182,36 +187,36 @@ pub async fn shows_next_up(
 }
 
 async fn next_up_inner(
-    db: &sqlx::AnyPool,
+    db: &DatabaseConnection,
     user_id: &str,
     series_id: Option<&str>,
     limit: usize,
 ) -> anyhow::Result<Vec<MediaItem>> {
-    let mut sql = format!(
-        r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND (COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) = 0) ORDER BY media_items.modified_at DESC LIMIT ?"#,
-        item_queries::media_item_select_sql("")
-    );
-    let rows = if let Some(series_id) = series_id {
-        sql = format!(
-            r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND (COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) = 0) AND media_items.parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season') ORDER BY media_items.modified_at DESC LIMIT ?"#,
-            item_queries::media_item_select_sql("")
-        );
-        sqlx::query(&sql)
-            .bind(user_id)
-            .bind(series_id)
-            .bind(i64::try_from(limit).unwrap_or(25))
-            .fetch_all(db)
-            .await
+    let backend = db.get_database_backend();
+    let (sql, values) = if let Some(series_id) = series_id {
+        (
+            format!(
+                r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND (COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) = 0) AND media_items.parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season') ORDER BY media_items.modified_at DESC LIMIT ?"#,
+                item_queries::media_item_select_sql("")
+            ),
+            vec![user_id.into(), series_id.into(), i64::try_from(limit).unwrap_or(25).into()],
+        )
     } else {
-        sqlx::query(&sql)
-            .bind(user_id)
-            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .fetch_all(db)
-            .await
-    }
-    .context("failed to list next up episodes")?;
+        (
+            format!(
+                r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND (COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) = 0) ORDER BY media_items.modified_at DESC LIMIT ?"#,
+                item_queries::media_item_select_sql("")
+            ),
+            vec![user_id.into(), i64::try_from(limit).unwrap_or(i64::MAX).into()],
+        )
+    };
 
-    item_queries::decode_media_items(rows)
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(backend, &sql, values))
+        .await
+        .context("failed to list next up episodes")?;
+
+    item_queries::decode_media_items(&rows)
 }
 
 pub async fn shows_missing() -> Response {

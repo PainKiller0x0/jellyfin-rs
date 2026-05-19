@@ -7,12 +7,13 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
 use serde::Deserialize;
-use serde_json::{Value, json};
-use sqlx::{AnyPool, Row};
+use serde_json::{Value as JsonValue, json};
 
 use crate::{
     app::state::{AppState, SERVER_NAME, VERSION},
+    db::row_ext::QueryResultExt,
     jellyfin::common::internal_error,
     library::path_utils,
     util::now_unix,
@@ -198,7 +199,7 @@ pub async fn tmdb_client_configuration(State(state): State<Arc<AppState>>) -> im
 }
 
 pub async fn system_logs() -> impl IntoResponse {
-    Json(Vec::<Value>::new())
+    Json(Vec::<JsonValue>::new())
 }
 
 pub async fn system_log_file() -> impl IntoResponse {
@@ -258,30 +259,32 @@ pub async fn activity_log(
         .or_else(|| query.get("HasUserId"))
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
 
+    let backend = state.db.get_database_backend();
     let sql = if has_user_id {
         "SELECT name, log_type, created_at, user_id FROM activity_log WHERE user_id IS NOT NULL ORDER BY created_at DESC LIMIT ? OFFSET ?"
-            .to_string()
     } else {
         "SELECT name, log_type, created_at, user_id FROM activity_log ORDER BY created_at DESC LIMIT ? OFFSET ?"
-            .to_string()
     };
 
-    match sqlx::query(&sql)
-        .bind(limit)
-        .bind(start_index)
-        .fetch_all(&state.db)
+    match state
+        .db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            sql,
+            vec![limit.into(), start_index.into()],
+        ))
         .await
     {
         Ok(rows) => {
-            let items: Vec<Value> = rows
-                .into_iter()
+            let items: Vec<JsonValue> = rows
+                .iter()
                 .map(|row| {
-                    let created_at: i64 = row.try_get("created_at").unwrap_or_default();
+                    let created_at: i64 = row.get_i64("created_at").unwrap_or_default();
                     json!({
-                        "Name": row.try_get::<String, _>("name").unwrap_or_default(),
-                        "Type": row.try_get::<String, _>("log_type").unwrap_or_default(),
+                        "Name": row.get_str("name").unwrap_or_default(),
+                        "Type": row.get_str("log_type").unwrap_or_default(),
                         "Date": crate::util::unix_to_jellyfin_date(created_at),
-                        "UserId": row.try_get::<Option<String>, _>("user_id").unwrap_or_default(),
+                        "UserId": row.get_opt_str("user_id").unwrap_or_default(),
                         "Severity": "Info",
                     })
                 })
@@ -294,19 +297,22 @@ pub async fn activity_log(
 
 type Response = axum::response::Response;
 
-pub(crate) async fn app_setting(db: &AnyPool, key: &str, default: &str) -> String {
-    sqlx::query("SELECT value FROM app_settings WHERE key = ?")
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|row| row.try_get::<String, _>("value").ok())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
+pub(crate) async fn app_setting(db: &DatabaseConnection, key: &str, default: &str) -> String {
+    let backend = db.get_database_backend();
+    db.query_one(crate::db::helpers::portable_statement(
+        backend,
+        "SELECT value FROM app_settings WHERE key = ?",
+        vec![key.into()],
+    ))
+    .await
+    .ok()
+    .flatten()
+    .and_then(|row| row.get_str("value").ok())
+    .filter(|value| !value.trim().is_empty())
+    .unwrap_or_else(|| default.to_string())
 }
 
-pub(super) async fn app_setting_bool(db: &AnyPool, key: &str, default: bool) -> bool {
+pub(super) async fn app_setting_bool(db: &DatabaseConnection, key: &str, default: bool) -> bool {
     match app_setting(db, key, if default { "true" } else { "false" })
         .await
         .to_ascii_lowercase()
@@ -318,27 +324,30 @@ pub(super) async fn app_setting_bool(db: &AnyPool, key: &str, default: bool) -> 
     }
 }
 
-pub(super) async fn set_app_setting(db: &AnyPool, key: &str, value: &str) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
-        .bind(key)
-        .bind(value)
-        .bind(now_unix())
-        .execute(db)
-        .await?;
+pub(super) async fn set_app_setting(db: &DatabaseConnection, key: &str, value: &str) -> anyhow::Result<()> {
+    let backend = db.get_database_backend();
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        vec![key.into(), value.into(), now_unix().into()],
+    ))
+    .await?;
     Ok(())
 }
 
-pub(super) async fn first_admin_user(db: &AnyPool) -> anyhow::Result<Option<(String, String)>> {
-    let Some(row) = sqlx::query(
-        "SELECT id, username FROM users WHERE is_admin = 1 ORDER BY created_at ASC LIMIT 1",
-    )
-    .fetch_optional(db)
-    .await?
+pub(super) async fn first_admin_user(db: &DatabaseConnection) -> anyhow::Result<Option<(String, String)>> {
+    let backend = db.get_database_backend();
+    let Some(row) = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT id, username FROM users WHERE is_admin = 1 ORDER BY created_at ASC LIMIT 1",
+            vec![],
+        ))
+        .await?
     else {
         return Ok(None);
     };
-
-    Ok(Some((row.try_get("id")?, row.try_get("username")?)))
+    Ok(Some((row.get_str("id")?, row.get_str("username")?)))
 }
 
 pub async fn scheduled_tasks(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -355,22 +364,24 @@ pub async fn scheduled_tasks(State(state): State<Arc<AppState>>) -> impl IntoRes
     Json(vec![task])
 }
 
-pub async fn last_task_result(db: &sqlx::AnyPool, task_id: &str) -> Option<Value> {
-    let row = sqlx::query(
-        "SELECT status, start_time, end_time, message FROM task_results WHERE task_id = ?",
-    )
-    .bind(task_id)
-    .fetch_optional(db)
-    .await
-    .ok()??;
-    let status: String = row.try_get("status").ok()?;
-    let start_time: Option<i64> = row.try_get("start_time").ok().flatten();
-    let end_time: Option<i64> = row.try_get("end_time").ok().flatten();
+pub async fn last_task_result(db: &DatabaseConnection, task_id: &str) -> Option<JsonValue> {
+    let backend = db.get_database_backend();
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT status, start_time, end_time, message FROM task_results WHERE task_id = ?",
+            vec![task_id.into()],
+        ))
+        .await
+        .ok()??;
+    let status: String = row.get_str("status").ok()?;
+    let start_time: Option<i64> = row.get_opt_i64("start_time").ok().flatten();
+    let end_time: Option<i64> = row.get_opt_i64("end_time").ok().flatten();
     Some(json!({
         "Status": status,
         "StartTimeUtc": start_time.map(crate::util::unix_to_jellyfin_date),
         "EndTimeUtc": end_time.map(crate::util::unix_to_jellyfin_date),
-        "Message": row.try_get::<Option<String>, _>("message").ok().flatten(),
+        "Message": row.get_opt_str("message").ok().flatten(),
     }))
 }
 
@@ -383,17 +394,22 @@ pub async fn log_activity(
 ) {
     let now = now_unix();
     let id = crate::util::stable_text_id(&format!("activity:{now}:{name}:{log_type}"));
-    let _ = sqlx::query(
-        "INSERT INTO activity_log (id, name, log_type, user_id, item_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(id)
-    .bind(name)
-    .bind(log_type)
-    .bind(user_id)
-    .bind(item_id)
-    .bind(now)
-    .execute(&state.db)
-    .await;
+    let backend = state.db.get_database_backend();
+    let _ = state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO activity_log (id, name, log_type, user_id, item_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            vec![
+                id.into(),
+                name.into(),
+                log_type.into(),
+                Value::from(user_id.map(ToString::to_string)),
+                Value::from(item_id.map(ToString::to_string)),
+                now.into(),
+            ],
+        ))
+        .await;
     let _ = state.ws_event_tx.send(crate::ws::WsEvent::ActivityCreated);
 }
 
@@ -405,16 +421,21 @@ pub async fn upsert_task_result(
     end_time: i64,
     message: Option<&str>,
 ) {
-    let _ = sqlx::query(
-        "INSERT INTO task_results (task_id, status, start_time, end_time, message) VALUES (?, ?, ?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET status = excluded.status, start_time = excluded.start_time, end_time = excluded.end_time, message = excluded.message",
-    )
-    .bind(task_id)
-    .bind(status)
-    .bind(start_time)
-    .bind(end_time)
-    .bind(message)
-    .execute(&state.db)
-    .await;
+    let backend = state.db.get_database_backend();
+    let _ = state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO task_results (task_id, status, start_time, end_time, message) VALUES (?, ?, ?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET status = excluded.status, start_time = excluded.start_time, end_time = excluded.end_time, message = excluded.message",
+            vec![
+                task_id.into(),
+                status.into(),
+                start_time.into(),
+                end_time.into(),
+                message.into(),
+            ],
+        ))
+        .await;
     let _ = state.ws_event_tx.send(crate::ws::WsEvent::TaskUpdated);
 }
 

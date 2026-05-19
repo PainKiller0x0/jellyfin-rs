@@ -1,0 +1,8 @@
+target/
+.git/
+.claude/
+data/
+*.db
+Dockerfile
+docker-compose.yml
+.dockerignore

@@ -1,4 +1,5 @@
 use anyhow::Context;
+use sea_orm::{ConnectionTrait, Statement};
 
 use crate::{
     app::state::{AppState, DEFAULT_USER_NAME},
@@ -11,24 +12,37 @@ pub async fn seed_default_data(state: &AppState) -> anyhow::Result<()> {
         std::env::var("JELLYFIN_RS_USER").unwrap_or_else(|_| DEFAULT_USER_NAME.to_string());
     let password = std::env::var("JELLYFIN_RS_PASSWORD").unwrap_or_else(|_| username.clone());
     let password_hash = hash_password(&password)?;
+    let backend = state.db.get_database_backend();
 
-    sqlx::query(r#"INSERT INTO users (id, username, password_hash, display_name, is_admin, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?) ON CONFLICT(id) DO NOTHING"#)
-        .bind(state.user_id.to_string())
-        .bind(&username)
-        .bind(&password_hash)
-        .bind(&username)
-        .bind(now)
-        .bind(now)
-        .execute(&state.db)
+    state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            r#"INSERT INTO users (id, username, password_hash, display_name, is_admin, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?) ON CONFLICT(id) DO NOTHING"#,
+            vec![
+                state.user_id.to_string().into(),
+                username.clone().into(),
+                password_hash.into(),
+                username.into(),
+                now.into(),
+                now.into(),
+            ],
+        ))
         .await
         .context("failed to seed default user")?;
 
-    sqlx::query(r#"INSERT INTO access_tokens (id, user_id, token_hash, name, created_at) VALUES (?, ?, ?, 'startup-token', ?) ON CONFLICT(token_hash) DO UPDATE SET user_id = excluded.user_id, name = excluded.name"#)
-        .bind(stable_text_id(&format!("token:{}", state.access_token)))
-        .bind(state.user_id.to_string())
-        .bind(stable_text_id(&state.access_token))
-        .bind(now)
-        .execute(&state.db)
+    state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            r#"INSERT INTO access_tokens (id, user_id, token_hash, name, created_at) VALUES (?, ?, ?, 'startup-token', ?) ON CONFLICT(token_hash) DO UPDATE SET user_id = excluded.user_id, name = excluded.name"#,
+            vec![
+                stable_text_id(&format!("token:{}", state.access_token)).into(),
+                state.user_id.to_string().into(),
+                stable_text_id(&state.access_token).into(),
+                now.into(),
+            ],
+        ))
         .await
         .context("failed to seed startup access token")?;
 
@@ -37,13 +51,19 @@ pub async fn seed_default_data(state: &AppState) -> anyhow::Result<()> {
         ("tvshows", "TV Shows", "tvshows"),
         ("music", "Music", "music"),
     ] {
-        sqlx::query(r#"INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, collection_type = excluded.collection_type, updated_at = excluded.updated_at"#)
-            .bind(id)
-            .bind(name)
-            .bind(collection_type)
-            .bind(now)
-            .bind(now)
-            .execute(&state.db)
+        state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                r#"INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, collection_type = excluded.collection_type, updated_at = excluded.updated_at"#,
+                vec![
+                    id.into(),
+                    name.into(),
+                    collection_type.into(),
+                    now.into(),
+                    now.into(),
+                ],
+            ))
             .await
             .with_context(|| format!("failed to seed library: {id}"))?;
     }
@@ -51,12 +71,18 @@ pub async fn seed_default_data(state: &AppState) -> anyhow::Result<()> {
     for path in &state.media_dirs {
         let path = path.to_string_lossy().to_string();
         let library_id = infer_library_id_from_path(&path);
-        sqlx::query(r#"INSERT INTO library_paths (id, library_id, path, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET library_id = excluded.library_id"#)
-            .bind(stable_text_id(&format!("library-path:{path}")))
-            .bind(library_id)
-            .bind(&path)
-            .bind(now)
-            .execute(&state.db)
+        state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                r#"INSERT INTO library_paths (id, library_id, path, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET library_id = excluded.library_id"#,
+                vec![
+                    stable_text_id(&format!("library-path:{path}")).into(),
+                    library_id.into(),
+                    path.as_str().into(),
+                    now.into(),
+                ],
+            ))
             .await
             .with_context(|| format!("failed to seed library path: {path}"))?;
     }

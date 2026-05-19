@@ -8,10 +8,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::{Value, json};
-use sqlx::Row;
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 use crate::{
     app::state::AppState,
+    db::row_ext::QueryResultExt,
     jellyfin::common::internal_error,
     util::{now_unix, stable_text_id},
 };
@@ -62,7 +63,7 @@ pub async fn update_item(
 }
 
 async fn item_delete_paths(
-    db: &sqlx::AnyPool,
+    db: &DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Option<Vec<String>>> {
     let rows = descendant_item_rows(db, item_id).await?;
@@ -98,20 +99,25 @@ async fn delete_items_inner(state: &AppState, ids: &[&str]) -> anyhow::Result<()
 }
 
 async fn descendant_item_rows(
-    db: &sqlx::AnyPool,
+    db: &DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let rows = sqlx::query(r#"WITH RECURSIVE tree(id, path) AS (SELECT id, path FROM media_items WHERE id = ? UNION ALL SELECT media_items.id, media_items.path FROM media_items JOIN tree ON media_items.parent_id = tree.id) SELECT id, path FROM tree"#)
-        .bind(item_id)
-        .fetch_all(db)
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            r#"WITH RECURSIVE tree(id, path) AS (SELECT id, path FROM media_items WHERE id = ? UNION ALL SELECT media_items.id, media_items.path FROM media_items JOIN tree ON media_items.parent_id = tree.id) SELECT id, path FROM tree"#,
+            vec![item_id.into()],
+        ))
         .await
         .with_context(|| format!("failed to list delete paths for item: {item_id}"))?;
-    rows.into_iter()
-        .map(|row| Ok((row.try_get("id")?, row.try_get("path")?)))
+    rows.iter()
+        .map(|row| Ok((row.get_str("id")?, row.get_str("path")?)))
         .collect()
 }
 
-async fn delete_item_records(db: &sqlx::AnyPool, item_id: &str) -> anyhow::Result<()> {
+async fn delete_item_records(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<()> {
+    let backend = db.get_database_backend();
     for table in [
         "media_streams",
         "user_data",
@@ -122,32 +128,39 @@ async fn delete_item_records(db: &sqlx::AnyPool, item_id: &str) -> anyhow::Resul
         "provider_ids",
         "image_assets",
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE item_id = ?"))
-            .bind(item_id)
-            .execute(db)
-            .await
-            .with_context(|| format!("failed to delete {table} for item: {item_id}"))?;
-    }
-    sqlx::query("DELETE FROM media_items WHERE id = ?")
-        .bind(item_id)
-        .execute(db)
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            &format!("DELETE FROM {table} WHERE item_id = ?"),
+            vec![item_id.into()],
+        ))
         .await
-        .with_context(|| format!("failed to delete media item: {item_id}"))?;
+        .with_context(|| format!("failed to delete {table} for item: {item_id}"))?;
+    }
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "DELETE FROM media_items WHERE id = ?",
+        vec![item_id.into()],
+    ))
+    .await
+    .with_context(|| format!("failed to delete media item: {item_id}"))?;
     Ok(())
 }
 
 pub(super) async fn update_item_inner(
-    db: &sqlx::AnyPool,
+    db: &DatabaseConnection,
     item_id: &str,
     body: Value,
 ) -> anyhow::Result<bool> {
     let now = now_unix();
-    let existing =
-        sqlx::query("SELECT title, overview, production_year FROM media_items WHERE id = ?")
-            .bind(item_id)
-            .fetch_optional(db)
-            .await
-            .with_context(|| format!("failed to fetch item for update: {item_id}"))?;
+    let backend = db.get_database_backend();
+    let existing = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT title, overview, production_year FROM media_items WHERE id = ?",
+            vec![item_id.into()],
+        ))
+        .await
+        .with_context(|| format!("failed to fetch item for update: {item_id}"))?;
     let Some(existing) = existing else {
         return Ok(false);
     };
@@ -158,26 +171,22 @@ pub(super) async fn update_item_inner(
         .filter(|value| !value.trim().is_empty())
         .map(str::trim)
         .map(ToString::to_string)
-        .unwrap_or(existing.try_get("title")?);
+        .unwrap_or(existing.get_str("title")?);
     let overview = body
         .get("Overview")
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .or(existing.try_get("overview")?);
+        .or(existing.get_opt_str("overview")?);
     let production_year = body
         .get("ProductionYear")
         .and_then(Value::as_i64)
-        .or(existing.try_get("production_year")?);
+        .or(existing.get_opt_i64("production_year")?);
 
-    sqlx::query(
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
         "UPDATE media_items SET title = ?, overview = ?, production_year = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(title)
-    .bind(overview)
-    .bind(production_year)
-    .bind(now)
-    .bind(item_id)
-    .execute(db)
+        vec![title.into(), overview.into(), production_year.into(), now.into(), item_id.into()],
+    ))
     .await
     .with_context(|| format!("failed to update item metadata: {item_id}"))?;
 
@@ -188,13 +197,13 @@ pub(super) async fn update_item_inner(
             else {
                 continue;
             };
-            sqlx::query(r#"INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, ?, ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id"#)
-                .bind(item_id)
-                .bind(provider)
-                .bind(provider_item_id)
-                .execute(db)
-                .await
-                .with_context(|| format!("failed to update provider id for item: {item_id}"))?;
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                r#"INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, ?, ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id"#,
+                vec![item_id.into(), provider.as_str().into(), provider_item_id.into()],
+            ))
+            .await
+            .with_context(|| format!("failed to update provider id for item: {item_id}"))?;
         }
     }
 
@@ -225,7 +234,7 @@ pub(super) async fn update_item_inner(
 }
 
 async fn update_named_relations(
-    db: &sqlx::AnyPool,
+    db: &DatabaseConnection,
     item_id: &str,
     table: &str,
     relation_table: &str,
@@ -236,42 +245,49 @@ async fn update_named_relations(
     let Some(values) = body.get(body_key).and_then(Value::as_array) else {
         return Ok(());
     };
-    sqlx::query(&format!("DELETE FROM {relation_table} WHERE item_id = ?"))
-        .bind(item_id)
-        .execute(db)
-        .await
-        .with_context(|| format!("failed to clear {relation_table} for item: {item_id}"))?;
+    let backend = db.get_database_backend();
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        &format!("DELETE FROM {relation_table} WHERE item_id = ?"),
+        vec![item_id.into()],
+    ))
+    .await
+    .with_context(|| format!("failed to clear {relation_table} for item: {item_id}"))?;
     for value in values {
         let Some(name) = value.as_str().filter(|value| !value.trim().is_empty()) else {
             continue;
         };
         let id = stable_text_id(&format!("{table}:{}", name.trim().to_ascii_lowercase()));
-        sqlx::query(&format!("INSERT INTO {table} (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING"))
-            .bind(&id)
-            .bind(name.trim())
-            .bind(now_unix())
-            .execute(db)
-            .await
-            .with_context(|| format!("failed to upsert {table}: {name}"))?;
-        sqlx::query(&format!("INSERT INTO {relation_table} (item_id, {relation_column}) VALUES (?, ?) ON CONFLICT(item_id, {relation_column}) DO NOTHING"))
-            .bind(item_id)
-            .bind(id)
-            .execute(db)
-            .await
-            .with_context(|| format!("failed to link {table} to item: {item_id}"))?;
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            &format!("INSERT INTO {table} (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING"),
+            vec![id.clone().into(), name.trim().into(), now_unix().into()],
+        ))
+        .await
+        .with_context(|| format!("failed to upsert {table}: {name}"))?;
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            &format!("INSERT INTO {relation_table} (item_id, {relation_column}) VALUES (?, ?) ON CONFLICT(item_id, {relation_column}) DO NOTHING"),
+            vec![item_id.into(), id.into()],
+        ))
+        .await
+        .with_context(|| format!("failed to link {table} to item: {item_id}"))?;
     }
     Ok(())
 }
 
-async fn update_people(db: &sqlx::AnyPool, item_id: &str, body: &Value) -> anyhow::Result<()> {
+async fn update_people(db: &DatabaseConnection, item_id: &str, body: &Value) -> anyhow::Result<()> {
     let Some(values) = body.get("People").and_then(Value::as_array) else {
         return Ok(());
     };
-    sqlx::query("DELETE FROM media_people WHERE item_id = ?")
-        .bind(item_id)
-        .execute(db)
-        .await
-        .with_context(|| format!("failed to clear people for item: {item_id}"))?;
+    let backend = db.get_database_backend();
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "DELETE FROM media_people WHERE item_id = ?",
+        vec![item_id.into()],
+    ))
+    .await
+    .with_context(|| format!("failed to clear people for item: {item_id}"))?;
     for (sort_order, value) in values.iter().enumerate() {
         let Some(name) = value
             .get("Name")
@@ -283,22 +299,20 @@ async fn update_people(db: &sqlx::AnyPool, item_id: &str, body: &Value) -> anyho
         let id = stable_text_id(&format!("people:{}", name.trim().to_ascii_lowercase()));
         let role = value.get("Role").and_then(Value::as_str);
         let person_type = value.get("Type").and_then(Value::as_str).unwrap_or("Actor");
-        sqlx::query("INSERT INTO people (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING")
-            .bind(&id)
-            .bind(name.trim())
-            .bind(now_unix())
-            .execute(db)
-            .await
-            .with_context(|| format!("failed to upsert person: {name}"))?;
-        sqlx::query("INSERT INTO media_people (item_id, person_id, role, person_type, sort_order) VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id, person_id, person_type) DO UPDATE SET role = excluded.role, sort_order = excluded.sort_order")
-            .bind(item_id)
-            .bind(id)
-            .bind(role)
-            .bind(person_type)
-            .bind(i64::try_from(sort_order).unwrap_or(i64::MAX))
-            .execute(db)
-            .await
-            .with_context(|| format!("failed to link person to item: {item_id}"))?;
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO people (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING",
+            vec![id.clone().into(), name.trim().into(), now_unix().into()],
+        ))
+        .await
+        .with_context(|| format!("failed to upsert person: {name}"))?;
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_people (item_id, person_id, role, person_type, sort_order) VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id, person_id, person_type) DO UPDATE SET role = excluded.role, sort_order = excluded.sort_order",
+            vec![item_id.into(), id.into(), role.into(), person_type.into(), i64::try_from(sort_order).unwrap_or(i64::MAX).into()],
+        ))
+        .await
+        .with_context(|| format!("failed to link person to item: {item_id}"))?;
     }
     Ok(())
 }

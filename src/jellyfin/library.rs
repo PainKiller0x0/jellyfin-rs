@@ -7,12 +7,13 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::{AnyPool, Row};
 
 use crate::{
     app::state::AppState,
+    db::row_ext::QueryResultExt,
     jellyfin::common::internal_error,
     jellyfin::system,
     library::{path_utils, scanner::scan_media_library},
@@ -88,10 +89,17 @@ pub async fn delete_virtual_folder_path(
     State(state): State<Arc<AppState>>,
     Query(query): Query<LibraryPathQuery>,
 ) -> Response {
-    match sqlx::query("DELETE FROM library_paths WHERE library_id = ? AND path = ?")
-        .bind(library_id_for_name(&query.name))
-        .bind(path_utils::normalize_path(&query.path))
-        .execute(&state.db)
+    let backend = state.db.get_database_backend();
+    match state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "DELETE FROM library_paths WHERE library_id = ? AND path = ?",
+            vec![
+                library_id_for_name(&query.name).into(),
+                path_utils::normalize_path(&query.path).into(),
+            ],
+        ))
         .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -123,20 +131,23 @@ pub async fn refresh_library(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-async fn virtual_folders_inner(db: &AnyPool) -> anyhow::Result<Vec<Value>> {
-    let rows = sqlx::query(
-        r#"SELECT libraries.id, libraries.name, libraries.collection_type, library_paths.path FROM libraries LEFT JOIN library_paths ON library_paths.library_id = libraries.id ORDER BY libraries.name ASC, library_paths.path ASC"#,
-    )
-    .fetch_all(db)
-    .await
-    .context("failed to list virtual folders")?;
+async fn virtual_folders_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            r#"SELECT libraries.id, libraries.name, libraries.collection_type, library_paths.path FROM libraries LEFT JOIN library_paths ON library_paths.library_id = libraries.id ORDER BY libraries.name ASC, library_paths.path ASC"#,
+            vec![],
+        ))
+        .await
+        .context("failed to list virtual folders")?;
 
     let mut folders = Vec::<VirtualFolder>::new();
-    for row in rows {
-        let id: String = row.try_get("id")?;
-        let name: String = row.try_get("name")?;
-        let collection_type: String = row.try_get("collection_type")?;
-        let path: Option<String> = row.try_get("path")?;
+    for row in &rows {
+        let id: String = row.get_str("id")?;
+        let name: String = row.get_str("name")?;
+        let collection_type: String = row.get_str("collection_type")?;
+        let path: Option<String> = row.get_opt_str("path")?;
 
         if let Some(folder) = folders.iter_mut().find(|folder| folder.id == id) {
             if let Some(path) = path {
@@ -168,7 +179,7 @@ async fn virtual_folders_inner(db: &AnyPool) -> anyhow::Result<Vec<Value>> {
 }
 
 async fn create_virtual_folder_inner(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     query: VirtualFolderQuery,
 ) -> anyhow::Result<()> {
     let name = query.name.as_deref().unwrap_or_default().trim();
@@ -179,15 +190,21 @@ async fn create_virtual_folder_inner(
     let collection_type = query.collection_type.as_deref().unwrap_or("movies").trim();
     let library_id = library_id_for_name(name);
     let now = now_unix();
-    sqlx::query(r#"INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, collection_type = excluded.collection_type, updated_at = excluded.updated_at"#)
-        .bind(&library_id)
-        .bind(name)
-        .bind(collection_type)
-        .bind(now)
-        .bind(now)
-        .execute(db)
-        .await
-        .context("failed to create virtual folder")?;
+    let backend = db.get_database_backend();
+
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        r#"INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, collection_type = excluded.collection_type, updated_at = excluded.updated_at"#,
+        vec![
+            library_id.into(),
+            name.into(),
+            collection_type.into(),
+            now.into(),
+            now.into(),
+        ],
+    ))
+    .await
+    .context("failed to create virtual folder")?;
 
     if let Some(paths) = query.paths {
         for path in paths.split('|').flat_map(|value| value.split(',')) {
@@ -202,7 +219,7 @@ async fn create_virtual_folder_inner(
 }
 
 async fn upsert_library_path(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     name: &str,
     path: &str,
     collection_type: Option<&str>,
@@ -219,24 +236,34 @@ async fn upsert_library_path(
     let library_id = library_id_for_name(name);
     let collection_type = collection_type.unwrap_or_else(|| collection_type_for_name(name));
     let now = now_unix();
-    sqlx::query(r#"INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at"#)
-        .bind(&library_id)
-        .bind(name)
-        .bind(collection_type)
-        .bind(now)
-        .bind(now)
-        .execute(db)
-        .await
-        .context("failed to ensure library")?;
+    let backend = db.get_database_backend();
 
-    sqlx::query(r#"INSERT INTO library_paths (id, library_id, path, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET library_id = excluded.library_id"#)
-        .bind(stable_text_id(&format!("library-path:{path}")))
-        .bind(library_id)
-        .bind(&path)
-        .bind(now)
-        .execute(db)
-        .await
-        .context("failed to upsert library path")?;
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        r#"INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at"#,
+        vec![
+            library_id.clone().into(),
+            name.into(),
+            collection_type.into(),
+            now.into(),
+            now.into(),
+        ],
+    ))
+    .await
+    .context("failed to ensure library")?;
+
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        r#"INSERT INTO library_paths (id, library_id, path, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET library_id = excluded.library_id"#,
+        vec![
+            stable_text_id(&format!("library-path:{path}")).into(),
+            library_id.into(),
+            path.into(),
+            now.into(),
+        ],
+    ))
+    .await
+    .context("failed to upsert library path")?;
 
     Ok(())
 }
@@ -251,13 +278,19 @@ fn library_id_for_name(name: &str) -> String {
 }
 
 pub async fn physical_paths(State(state): State<Arc<AppState>>) -> Response {
-    match sqlx::query("SELECT path FROM library_paths ORDER BY path ASC")
-        .fetch_all(&state.db)
+    let backend = state.db.get_database_backend();
+    match state
+        .db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT path FROM library_paths ORDER BY path ASC",
+            vec![],
+        ))
         .await
     {
         Ok(rows) => Json(
-            rows.into_iter()
-                .filter_map(|row| row.try_get::<String, _>("path").ok())
+            rows.iter()
+                .filter_map(|row| row.get_str("path").ok())
                 .collect::<Vec<_>>(),
         )
         .into_response(),

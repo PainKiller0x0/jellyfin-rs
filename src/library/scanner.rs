@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use sqlx::Row;
+use sea_orm::{ConnectionTrait, Statement};
 use walkdir::WalkDir;
 
 use crate::{
     app::state::AppState,
+    db::row_ext::QueryResultExt,
     library::{
         classify::{classify_media_path, parent_id_for_path, tv_folder_type},
         images::upsert_sidecar_images,
@@ -151,8 +152,14 @@ fn has_sidecar_nfo(path: &std::path::Path) -> bool {
 }
 
 async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String)>> {
-    let rows = sqlx::query("SELECT path, library_id FROM library_paths ORDER BY path ASC")
-        .fetch_all(&state.db)
+    let backend = state.db.get_database_backend();
+    let rows = state
+        .db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT path, library_id FROM library_paths ORDER BY path ASC",
+            vec![],
+        ))
         .await
         .context("failed to list library paths for scan")?;
     if rows.is_empty() {
@@ -168,13 +175,11 @@ async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String)>>
             .collect());
     }
 
-    rows.into_iter()
+    rows.iter()
         .map(|row| -> anyhow::Result<(PathBuf, String)> {
             Ok((
-                PathBuf::from(path_utils::normalize_path(
-                    &row.try_get::<String, _>("path")?,
-                )),
-                row.try_get("library_id")?,
+                PathBuf::from(path_utils::normalize_path(&row.get_str("path")?)),
+                row.get_str("library_id")?,
             ))
         })
         .collect()

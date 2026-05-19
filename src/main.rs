@@ -2,7 +2,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use axum::Router;
-use sqlx::any::AnyPoolOptions;
+use sea_orm::{ConnectOptions, Database};
 use tokio::sync::RwLock;
 use tokio::{net::TcpListener, signal};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 mod app;
 mod db;
+mod entities;
 mod jellyfin;
 mod library;
 mod playback;
@@ -34,17 +35,16 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("invalid listen address")?;
 
-    sqlx::any::install_default_drivers();
-
     let database_url = std::env::var("JELLYFIN_RS_DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://jellyfin-rs.db".to_string());
     db::ensure_database_exists(&database_url).await?;
-    let db = AnyPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
+
+    let mut opt = ConnectOptions::new(database_url.clone());
+    opt.max_connections(5).sqlx_logging(false);
+    let db = Database::connect(opt)
         .await
         .with_context(|| format!("failed to connect database: {database_url}"))?;
-    db::migrate(&db).await?;
+    db::migrate(&db, &database_url).await?;
 
     let default_username =
         std::env::var("JELLYFIN_RS_USER").unwrap_or_else(|_| DEFAULT_USER_NAME.to_string());

@@ -3,7 +3,7 @@ pub type Migration = (&'static str, &'static str);
 pub fn migrations() -> Vec<Migration> {
     vec![
         (
-            r#"CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT, display_name TEXT NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0, is_disabled INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, last_login_at BIGINT)"#,
+            r#"CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT, display_name TEXT NOT NULL, is_admin BIGINT NOT NULL DEFAULT 0, is_disabled BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, last_login_at BIGINT)"#,
             "failed to migrate users",
         ),
         (
@@ -43,7 +43,7 @@ pub fn migrations() -> Vec<Migration> {
             "failed to create library paths library index",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS media_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, path TEXT NOT NULL UNIQUE, library_id TEXT NOT NULL, parent_id TEXT NOT NULL, item_type TEXT NOT NULL, is_folder INTEGER NOT NULL DEFAULT 0, container TEXT, overview TEXT, official_rating TEXT, extended_video_type TEXT, production_year INTEGER, runtime_ticks BIGINT, size_bytes BIGINT, modified_at BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL DEFAULT 0)"#,
+            r#"CREATE TABLE IF NOT EXISTS media_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, path TEXT NOT NULL UNIQUE, library_id TEXT NOT NULL, parent_id TEXT NOT NULL, item_type TEXT NOT NULL, is_folder BIGINT NOT NULL DEFAULT 0, container TEXT, overview TEXT, official_rating TEXT, extended_video_type TEXT, production_year BIGINT, runtime_ticks BIGINT, size_bytes BIGINT, modified_at BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL DEFAULT 0)"#,
             "failed to migrate media_items",
         ),
         (
@@ -55,7 +55,7 @@ pub fn migrations() -> Vec<Migration> {
             "failed to create media item type index",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS media_streams (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, stream_index INTEGER NOT NULL, stream_type TEXT NOT NULL, codec TEXT, language TEXT, title TEXT, bit_rate BIGINT, width INTEGER, height INTEGER, channels INTEGER, sample_rate INTEGER, path TEXT, is_external INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, UNIQUE(item_id, stream_index))"#,
+            r#"CREATE TABLE IF NOT EXISTS media_streams (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, stream_index BIGINT NOT NULL, stream_type TEXT NOT NULL, codec TEXT, language TEXT, title TEXT, bit_rate BIGINT, width BIGINT, height BIGINT, channels BIGINT, sample_rate BIGINT, path TEXT, is_external BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, UNIQUE(item_id, stream_index))"#,
             "failed to migrate media_streams",
         ),
         (
@@ -63,7 +63,7 @@ pub fn migrations() -> Vec<Migration> {
             "failed to create media stream item index",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS user_data (user_id TEXT NOT NULL, item_id TEXT NOT NULL, is_favorite INTEGER NOT NULL DEFAULT 0, played INTEGER NOT NULL DEFAULT 0, playback_position_ticks BIGINT NOT NULL DEFAULT 0, played_percentage REAL, play_count INTEGER NOT NULL DEFAULT 0, last_played_at BIGINT, updated_at BIGINT NOT NULL, PRIMARY KEY(user_id, item_id), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE)"#,
+            r#"CREATE TABLE IF NOT EXISTS user_data (user_id TEXT NOT NULL, item_id TEXT NOT NULL, is_favorite BIGINT NOT NULL DEFAULT 0, played BIGINT NOT NULL DEFAULT 0, playback_position_ticks BIGINT NOT NULL DEFAULT 0, played_percentage REAL, play_count BIGINT NOT NULL DEFAULT 0, last_played_at BIGINT, updated_at BIGINT NOT NULL, PRIMARY KEY(user_id, item_id), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE)"#,
             "failed to migrate user_data",
         ),
         (
@@ -75,7 +75,7 @@ pub fn migrations() -> Vec<Migration> {
             "failed to migrate people",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS media_people (item_id TEXT NOT NULL, person_id TEXT NOT NULL, role TEXT, person_type TEXT, sort_order INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(item_id, person_id, person_type), FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE)"#,
+            r#"CREATE TABLE IF NOT EXISTS media_people (item_id TEXT NOT NULL, person_id TEXT NOT NULL, role TEXT, person_type TEXT, sort_order BIGINT NOT NULL DEFAULT 0, PRIMARY KEY(item_id, person_id, person_type), FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE)"#,
             "failed to migrate media_people",
         ),
         (
@@ -107,7 +107,7 @@ pub fn migrations() -> Vec<Migration> {
             "failed to migrate provider_ids",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS image_assets (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, image_type TEXT NOT NULL, image_index INTEGER NOT NULL DEFAULT 0, path TEXT, etag TEXT, width INTEGER, height INTEGER, size_bytes BIGINT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, UNIQUE(item_id, image_type, image_index))"#,
+            r#"CREATE TABLE IF NOT EXISTS image_assets (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, image_type TEXT NOT NULL, image_index BIGINT NOT NULL DEFAULT 0, path TEXT, etag TEXT, width BIGINT, height BIGINT, size_bytes BIGINT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, UNIQUE(item_id, image_type, image_index))"#,
             "failed to migrate image_assets",
         ),
         (
@@ -136,7 +136,7 @@ pub fn optional_migrations() -> Vec<Migration> {
             "add media_items.library_id",
         ),
         (
-            "ALTER TABLE media_items ADD COLUMN is_folder INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE media_items ADD COLUMN is_folder BIGINT NOT NULL DEFAULT 0",
             "add media_items.is_folder",
         ),
         (
@@ -144,7 +144,7 @@ pub fn optional_migrations() -> Vec<Migration> {
             "add media_items.overview",
         ),
         (
-            "ALTER TABLE media_items ADD COLUMN production_year INTEGER",
+            "ALTER TABLE media_items ADD COLUMN production_year BIGINT",
             "add media_items.production_year",
         ),
         (
@@ -164,19 +164,19 @@ pub fn optional_migrations() -> Vec<Migration> {
             "add media_streams.bit_rate",
         ),
         (
-            "ALTER TABLE media_streams ADD COLUMN width INTEGER",
+            "ALTER TABLE media_streams ADD COLUMN width BIGINT",
             "add media_streams.width",
         ),
         (
-            "ALTER TABLE media_streams ADD COLUMN height INTEGER",
+            "ALTER TABLE media_streams ADD COLUMN height BIGINT",
             "add media_streams.height",
         ),
         (
-            "ALTER TABLE media_streams ADD COLUMN channels INTEGER",
+            "ALTER TABLE media_streams ADD COLUMN channels BIGINT",
             "add media_streams.channels",
         ),
         (
-            "ALTER TABLE media_streams ADD COLUMN sample_rate INTEGER",
+            "ALTER TABLE media_streams ADD COLUMN sample_rate BIGINT",
             "add media_streams.sample_rate",
         ),
         (
@@ -188,7 +188,7 @@ pub fn optional_migrations() -> Vec<Migration> {
             "add media_streams.path",
         ),
         (
-            "ALTER TABLE media_streams ADD COLUMN is_external INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE media_streams ADD COLUMN is_external BIGINT NOT NULL DEFAULT 0",
             "add media_streams.is_external",
         ),
         (
@@ -212,7 +212,7 @@ pub fn optional_migrations() -> Vec<Migration> {
             "add user_data.rating",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS linked_children (parent_id TEXT NOT NULL, item_id TEXT NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(parent_id, item_id), FOREIGN KEY(parent_id) REFERENCES media_items(id) ON DELETE CASCADE, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE)"#,
+            r#"CREATE TABLE IF NOT EXISTS linked_children (parent_id TEXT NOT NULL, item_id TEXT NOT NULL, sort_order BIGINT NOT NULL DEFAULT 0, PRIMARY KEY(parent_id, item_id), FOREIGN KEY(parent_id) REFERENCES media_items(id) ON DELETE CASCADE, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE)"#,
             "create linked_children table",
         ),
         (

@@ -1,7 +1,8 @@
 use anyhow::Context;
-use sqlx::{AnyPool, Row};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 use crate::{
+    db::row_ext::QueryResultExt,
     library::{metadata::ParsedMetadata, probe::MediaProbe},
     util::{now_unix, stable_text_id},
 };
@@ -56,26 +57,50 @@ impl ScannedMediaItem {
     }
 }
 
-pub async fn upsert_media_item(db: &AnyPool, item: &ScannedMediaItem) -> anyhow::Result<()> {
-    sqlx::query(r#"INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, container, overview, official_rating, extended_video_type, production_year, runtime_ticks, size_bytes, modified_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET title = excluded.title, library_id = excluded.library_id, parent_id = excluded.parent_id, item_type = excluded.item_type, is_folder = excluded.is_folder, container = excluded.container, overview = excluded.overview, official_rating = excluded.official_rating, extended_video_type = excluded.extended_video_type, production_year = excluded.production_year, runtime_ticks = excluded.runtime_ticks, size_bytes = excluded.size_bytes, modified_at = excluded.modified_at, updated_at = excluded.updated_at"#)
-        .bind(&item.id).bind(&item.title).bind(&item.path).bind(&item.library_id).bind(&item.parent_id).bind(&item.item_type).bind(if item.is_folder { 1 } else { 0 }).bind(&item.container).bind(&item.overview).bind(&item.official_rating).bind(&item.extended_video_type).bind(item.production_year).bind(item.runtime_ticks).bind(item.size_bytes).bind(item.modified_at).bind(item.created_at).bind(now_unix())
-        .execute(db).await.with_context(|| format!("failed to upsert media item: {}", item.path))?;
+pub async fn upsert_media_item(db: &DatabaseConnection, item: &ScannedMediaItem) -> anyhow::Result<()> {
+    let backend = db.get_database_backend();
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        r#"INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, container, overview, official_rating, extended_video_type, production_year, runtime_ticks, size_bytes, modified_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET title = excluded.title, library_id = excluded.library_id, parent_id = excluded.parent_id, item_type = excluded.item_type, is_folder = excluded.is_folder, container = excluded.container, overview = excluded.overview, official_rating = excluded.official_rating, extended_video_type = excluded.extended_video_type, production_year = excluded.production_year, runtime_ticks = excluded.runtime_ticks, size_bytes = excluded.size_bytes, modified_at = excluded.modified_at, updated_at = excluded.updated_at"#,
+        vec![
+            item.id.as_str().into(),
+            item.title.as_str().into(),
+            item.path.as_str().into(),
+            item.library_id.as_str().into(),
+            item.parent_id.as_str().into(),
+            item.item_type.as_str().into(),
+            (if item.is_folder { 1i64 } else { 0i64 }).into(),
+            item.container.as_deref().into(),
+            item.overview.as_deref().into(),
+            item.official_rating.as_deref().into(),
+            item.extended_video_type.as_deref().into(),
+            item.production_year.into(),
+            item.runtime_ticks.into(),
+            item.size_bytes.into(),
+            item.modified_at.into(),
+            item.created_at.into(),
+            now_unix().into(),
+        ],
+    ))
+    .await
+    .with_context(|| format!("failed to upsert media item: {}", item.path))?;
     Ok(())
 }
 
 pub async fn upsert_media_metadata(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     item_id: &str,
     metadata: &ParsedMetadata,
 ) -> anyhow::Result<()> {
+    let backend = db.get_database_backend();
     for (provider, provider_item_id) in &metadata.provider_ids {
-        sqlx::query(r#"INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, ?, ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id"#)
-            .bind(item_id)
-            .bind(provider)
-            .bind(provider_item_id)
-            .execute(db)
-            .await
-            .with_context(|| format!("failed to upsert provider id for item: {item_id}"))?;
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            r#"INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, ?, ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id"#,
+            vec![item_id.into(), provider.as_str().into(), provider_item_id.as_str().into()],
+        ))
+        .await
+        .with_context(|| format!("failed to upsert provider id for item: {item_id}"))?;
     }
 
     upsert_named_relations(
@@ -102,7 +127,7 @@ pub async fn upsert_media_metadata(
 }
 
 async fn upsert_named_relations(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     item_id: &str,
     table: &str,
     relation_table: &str,
@@ -113,11 +138,14 @@ async fn upsert_named_relations(
         return Ok(());
     }
 
-    sqlx::query(&format!("DELETE FROM {relation_table} WHERE item_id = ?"))
-        .bind(item_id)
-        .execute(db)
-        .await
-        .with_context(|| format!("failed to clear {relation_table} for item: {item_id}"))?;
+    let backend = db.get_database_backend();
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        &format!("DELETE FROM {relation_table} WHERE item_id = ?"),
+        vec![item_id.into()],
+    ))
+    .await
+    .with_context(|| format!("failed to clear {relation_table} for item: {item_id}"))?;
 
     for value in values
         .iter()
@@ -125,25 +153,26 @@ async fn upsert_named_relations(
         .filter(|value| !value.is_empty())
     {
         let id = stable_text_id(&format!("{table}:{}", value.to_ascii_lowercase()));
-        sqlx::query(&format!("INSERT INTO {table} (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING"))
-            .bind(&id)
-            .bind(value)
-            .bind(now_unix())
-            .execute(db)
-            .await
-            .with_context(|| format!("failed to upsert {table}: {value}"))?;
-        sqlx::query(&format!("INSERT INTO {relation_table} (item_id, {relation_column}) VALUES (?, ?) ON CONFLICT(item_id, {relation_column}) DO NOTHING"))
-            .bind(item_id)
-            .bind(id)
-            .execute(db)
-            .await
-            .with_context(|| format!("failed to link {table} to item: {item_id}"))?;
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            &format!("INSERT INTO {table} (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING"),
+            vec![id.clone().into(), value.into(), now_unix().into()],
+        ))
+        .await
+        .with_context(|| format!("failed to upsert {table}: {value}"))?;
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            &format!("INSERT INTO {relation_table} (item_id, {relation_column}) VALUES (?, ?) ON CONFLICT(item_id, {relation_column}) DO NOTHING"),
+            vec![item_id.into(), id.into()],
+        ))
+        .await
+        .with_context(|| format!("failed to link {table} to item: {item_id}"))?;
     }
     Ok(())
 }
 
 async fn upsert_people(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     item_id: &str,
     metadata: &ParsedMetadata,
 ) -> anyhow::Result<()> {
@@ -151,38 +180,39 @@ async fn upsert_people(
         return Ok(());
     }
 
-    sqlx::query("DELETE FROM media_people WHERE item_id = ?")
-        .bind(item_id)
-        .execute(db)
-        .await
-        .with_context(|| format!("failed to clear people for item: {item_id}"))?;
+    let backend = db.get_database_backend();
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "DELETE FROM media_people WHERE item_id = ?",
+        vec![item_id.into()],
+    ))
+    .await
+    .with_context(|| format!("failed to clear people for item: {item_id}"))?;
     for (sort_order, person) in metadata.people.iter().enumerate() {
         let id = stable_text_id(&format!(
             "people:{}",
             person.name.trim().to_ascii_lowercase()
         ));
-        sqlx::query("INSERT INTO people (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING")
-            .bind(&id)
-            .bind(person.name.trim())
-            .bind(now_unix())
-            .execute(db)
-            .await
-            .with_context(|| format!("failed to upsert person: {}", person.name))?;
-        sqlx::query("INSERT INTO media_people (item_id, person_id, role, person_type, sort_order) VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id, person_id, person_type) DO UPDATE SET role = excluded.role, sort_order = excluded.sort_order")
-            .bind(item_id)
-            .bind(id)
-            .bind(&person.role)
-            .bind(&person.person_type)
-            .bind(i64::try_from(sort_order).unwrap_or(i64::MAX))
-            .execute(db)
-            .await
-            .with_context(|| format!("failed to link person to item: {item_id}"))?;
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO people (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING",
+            vec![id.clone().into(), person.name.trim().into(), now_unix().into()],
+        ))
+        .await
+        .with_context(|| format!("failed to upsert person: {}", person.name))?;
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_people (item_id, person_id, role, person_type, sort_order) VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id, person_id, person_type) DO UPDATE SET role = excluded.role, sort_order = excluded.sort_order",
+            vec![item_id.into(), id.into(), person.role.as_deref().into(), person.person_type.as_str().into(), i64::try_from(sort_order).unwrap_or(i64::MAX).into()],
+        ))
+        .await
+        .with_context(|| format!("failed to link person to item: {item_id}"))?;
     }
     Ok(())
 }
 
 pub async fn upsert_default_media_stream(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     item: &ScannedMediaItem,
 ) -> anyhow::Result<()> {
     if item.is_folder {
@@ -193,14 +223,24 @@ pub async fn upsert_default_media_stream(
     } else {
         "Video"
     };
-    sqlx::query(r#"INSERT INTO media_streams (id, item_id, stream_index, stream_type, created_at) VALUES (?, ?, 0, ?, ?) ON CONFLICT(item_id, stream_index) DO UPDATE SET stream_type = excluded.stream_type"#)
-        .bind(stable_text_id(&format!("stream:{}:0", item.id))).bind(&item.id).bind(stream_type).bind(now_unix()).execute(db).await
-        .with_context(|| format!("failed to upsert default media stream: {}", item.path))?;
+    let backend = db.get_database_backend();
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        r#"INSERT INTO media_streams (id, item_id, stream_index, stream_type, created_at) VALUES (?, ?, 0, ?, ?) ON CONFLICT(item_id, stream_index) DO UPDATE SET stream_type = excluded.stream_type"#,
+        vec![
+            stable_text_id(&format!("stream:{}:0", item.id)).into(),
+            item.id.as_str().into(),
+            stream_type.into(),
+            now_unix().into(),
+        ],
+    ))
+    .await
+    .with_context(|| format!("failed to upsert default media stream: {}", item.path))?;
     Ok(())
 }
 
 pub async fn upsert_probed_media_streams(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     item: &ScannedMediaItem,
     probe: &MediaProbe,
 ) -> anyhow::Result<bool> {
@@ -208,49 +248,63 @@ pub async fn upsert_probed_media_streams(
         return Ok(false);
     }
 
-    sqlx::query("DELETE FROM media_streams WHERE item_id = ? AND is_external = 0")
-        .bind(&item.id)
-        .execute(db)
-        .await
-        .with_context(|| format!("failed to clear probed media streams: {}", item.id))?;
+    let backend = db.get_database_backend();
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "DELETE FROM media_streams WHERE item_id = ? AND is_external = 0",
+        vec![item.id.as_str().into()],
+    ))
+    .await
+    .with_context(|| format!("failed to clear probed media streams: {}", item.id))?;
 
     for stream in &probe.streams {
-        sqlx::query(r#"INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, title, bit_rate, width, height, channels, sample_rate, is_external, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?) ON CONFLICT(item_id, stream_index) DO UPDATE SET stream_type = excluded.stream_type, codec = excluded.codec, language = excluded.language, title = excluded.title, bit_rate = excluded.bit_rate, width = excluded.width, height = excluded.height, channels = excluded.channels, sample_rate = excluded.sample_rate, is_external = 0"#)
-            .bind(stable_text_id(&format!("stream:{}:{}", item.id, stream.stream_index)))
-            .bind(&item.id)
-            .bind(stream.stream_index)
-            .bind(&stream.stream_type)
-            .bind(&stream.codec)
-            .bind(&stream.language)
-            .bind(&stream.title)
-            .bind(stream.bit_rate)
-            .bind(stream.width)
-            .bind(stream.height)
-            .bind(stream.channels)
-            .bind(stream.sample_rate)
-            .bind(now_unix())
-            .execute(db)
-            .await
-            .with_context(|| format!("failed to upsert probed stream for item: {}", item.id))?;
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            r#"INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, title, bit_rate, width, height, channels, sample_rate, is_external, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?) ON CONFLICT(item_id, stream_index) DO UPDATE SET stream_type = excluded.stream_type, codec = excluded.codec, language = excluded.language, title = excluded.title, bit_rate = excluded.bit_rate, width = excluded.width, height = excluded.height, channels = excluded.channels, sample_rate = excluded.sample_rate, is_external = 0"#,
+            vec![
+                stable_text_id(&format!("stream:{}:{}", item.id, stream.stream_index)).into(),
+                item.id.as_str().into(),
+                stream.stream_index.into(),
+                stream.stream_type.as_str().into(),
+                stream.codec.as_deref().into(),
+                stream.language.as_deref().into(),
+                stream.title.as_deref().into(),
+                stream.bit_rate.into(),
+                stream.width.into(),
+                stream.height.into(),
+                stream.channels.into(),
+                stream.sample_rate.into(),
+                now_unix().into(),
+            ],
+        ))
+        .await
+        .with_context(|| format!("failed to upsert probed stream for item: {}", item.id))?;
     }
 
     Ok(true)
 }
 
-pub async fn remove_missing_media_items(db: &AnyPool, seen_paths: &[String]) -> anyhow::Result<()> {
-    let rows = sqlx::query("SELECT id, path FROM media_items")
-        .fetch_all(db)
+pub async fn remove_missing_media_items(db: &DatabaseConnection, seen_paths: &[String]) -> anyhow::Result<()> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT id, path FROM media_items",
+            vec![],
+        ))
         .await
         .context("failed to list media items for cleanup")?;
-    for row in rows {
-        let id: String = row.try_get("id")?;
-        let path: String = row.try_get("path")?;
+    for row in &rows {
+        let id: String = row.get_str("id")?;
+        let path: String = row.get_str("path")?;
         if !seen_paths.iter().any(|seen| seen == &path) && !std::path::Path::new(&path).exists() {
-            sqlx::query("DELETE FROM media_items WHERE id = ?")
-                .bind(id)
-                .execute(db)
-                .await
-                .with_context(|| format!("failed to delete missing media item: {path}"))?;
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "DELETE FROM media_items WHERE id = ?",
+                vec![id.into()],
+            ))
+            .await
+            .with_context(|| format!("failed to delete missing media item: {path}"))?;
         }
     }
     Ok(())

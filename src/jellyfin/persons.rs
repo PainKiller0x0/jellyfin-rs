@@ -6,10 +6,10 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use serde_json::{Value, json};
-use sqlx::{AnyPool, Row};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
+use serde_json::{Value as JsonValue, json};
 
-use crate::{app::state::AppState, jellyfin::common::internal_error};
+use crate::{app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error};
 
 pub async fn person_by_name(
     State(state): State<Arc<AppState>>,
@@ -42,7 +42,7 @@ async fn person_detail(
     state: &AppState,
     name: &str,
     query: &HashMap<String, String>,
-) -> anyhow::Result<Option<Value>> {
+) -> anyhow::Result<Option<JsonValue>> {
     let name = name.trim();
     let Some(person) = find_person_by_name(&state.db, name).await? else {
         return Ok(None);
@@ -129,7 +129,7 @@ async fn person_items_inner(
     state: &AppState,
     name: &str,
     query: &HashMap<String, String>,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<JsonValue> {
     let name = name.trim();
     let Some(person) = find_person_by_name(&state.db, name).await? else {
         return Ok(json!({"Items": [], "TotalRecordCount": 0}));
@@ -193,20 +193,24 @@ async fn person_items_inner(
     Ok(json!({"Items": items, "TotalRecordCount": total, "StartIndex": start_index}))
 }
 
-async fn find_person_by_name(db: &AnyPool, name: &str) -> anyhow::Result<Option<PersonRow>> {
-    let row = sqlx::query("SELECT id, name FROM people WHERE name = ?")
-        .bind(name)
-        .fetch_optional(db)
+async fn find_person_by_name(db: &DatabaseConnection, name: &str) -> anyhow::Result<Option<PersonRow>> {
+    let backend = db.get_database_backend();
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT id, name FROM people WHERE name = ?",
+            vec![name.into()],
+        ))
         .await?;
     Ok(row.map(|row| PersonRow {
-        id: row.try_get("id").unwrap_or_default(),
-        name: row.try_get("name").unwrap_or_default(),
+        id: row.get_str("id").unwrap_or_default(),
+        name: row.get_str("name").unwrap_or_default(),
     }))
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn fetch_tagged_items(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     person_id: &str,
     user_id: Option<&str>,
     include_item_types: &[&str],
@@ -215,20 +219,18 @@ async fn fetch_tagged_items(
     sort_order: &str,
     limit: i64,
     start_index: i64,
-) -> anyhow::Result<Vec<Value>> {
+) -> anyhow::Result<Vec<JsonValue>> {
     let mut sql = String::from(
         r#"SELECT mi.id, mi.title, mi.path, mi.library_id, mi.parent_id, mi.item_type, mi.is_folder, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.created_at, mi.modified_at"#,
     );
 
-    if let Some(_uid) = user_id {
+    let mut values: Vec<Value> = vec![person_id.into()];
+
+    if user_id.is_some() {
         sql.push_str(
             r#", COALESCE(ud.is_favorite, 0) AS is_favorite, COALESCE(ud.played, 0) AS played, COALESCE(ud.playback_position_ticks, 0) AS playback_position_ticks, ud.played_percentage, COALESCE(ud.play_count, 0) AS play_count, ud.last_played_at"#,
         );
     }
-
-    sql.push_str(
-        r#" FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id WHERE mp.person_id = ?"#,
-    );
 
     if !include_item_types.is_empty() {
         let placeholders = include_item_types
@@ -237,6 +239,9 @@ async fn fetch_tagged_items(
             .collect::<Vec<_>>()
             .join(",");
         sql.push_str(&format!(" AND mi.item_type IN ({placeholders})"));
+        for item_type in include_item_types {
+            values.push((*item_type).into());
+        }
     }
 
     if !person_types.is_empty() {
@@ -246,10 +251,18 @@ async fn fetch_tagged_items(
             .collect::<Vec<_>>()
             .join(",");
         sql.push_str(&format!(" AND mp.person_type IN ({placeholders})"));
+        for person_type in person_types {
+            values.push((*person_type).into());
+        }
     }
 
-    if let Some(_uid) = user_id {
+    sql.push_str(
+        r#" FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id WHERE mp.person_id = ?"#,
+    );
+
+    if let Some(uid) = user_id {
         sql.push_str(" LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ?");
+        values.push(uid.into());
     }
 
     let order = match sort_order {
@@ -265,51 +278,44 @@ async fn fetch_tagged_items(
     }
 
     sql.push_str(" LIMIT ? OFFSET ?");
+    values.push(limit.into());
+    values.push(start_index.into());
 
-    let mut query = sqlx::query(&sql).bind(person_id);
-    for item_type in include_item_types {
-        query = query.bind(*item_type);
-    }
-    for person_type in person_types {
-        query = query.bind(*person_type);
-    }
-    if let Some(uid) = user_id {
-        query = query.bind(uid);
-    }
-    query = query.bind(limit).bind(start_index);
-
-    let rows = query.fetch_all(db).await?;
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(backend, &sql, values))
+        .await?;
     let items = rows
-        .into_iter()
+        .iter()
         .map(|row| {
-            let item_type: String = row.try_get("item_type").unwrap_or_default();
-            let is_folder: i64 = row.try_get("is_folder").unwrap_or_default();
+            let item_type: String = row.get_str("item_type").unwrap_or_default();
+            let is_folder: i64 = row.get_i64("is_folder").unwrap_or_default();
             let user_data = if user_id.is_some() {
-                let last_played: Option<i64> = row.try_get("last_played_at").unwrap_or(None);
+                let last_played: Option<i64> = row.get_opt_i64("last_played_at").unwrap_or_default();
                 json!({
-                    "IsFavorite": row.try_get::<i64, _>("is_favorite").unwrap_or_default() != 0,
-                    "Played": row.try_get::<i64, _>("played").unwrap_or_default() != 0,
-                    "PlaybackPositionTicks": row.try_get::<i64, _>("playback_position_ticks").unwrap_or_default(),
-                    "PlayCount": row.try_get::<i64, _>("play_count").unwrap_or_default(),
-                    "PlayedPercentage": row.try_get::<Option<f64>, _>("played_percentage").unwrap_or_default(),
+                    "IsFavorite": row.get_bool_from_i64("is_favorite").unwrap_or_default(),
+                    "Played": row.get_bool_from_i64("played").unwrap_or_default(),
+                    "PlaybackPositionTicks": row.get_i64("playback_position_ticks").unwrap_or_default(),
+                    "PlayCount": row.get_i64("play_count").unwrap_or_default(),
+                    "PlayedPercentage": row.get_f64("played_percentage").unwrap_or_default(),
                     "LastPlayedDate": last_played.map(crate::util::unix_to_jellyfin_date),
                 })
             } else {
                 json!(null)
             };
             json!({
-                "Name": row.try_get::<String, _>("title").unwrap_or_default(),
-                "Id": row.try_get::<String, _>("id").unwrap_or_default(),
+                "Name": row.get_str("title").unwrap_or_default(),
+                "Id": row.get_str("id").unwrap_or_default(),
                 "Type": item_type,
                 "IsFolder": is_folder != 0,
-                "ProductionYear": row.try_get::<Option<i64>, _>("production_year").unwrap_or_default(),
-                "RunTimeTicks": row.try_get::<Option<i64>, _>("runtime_ticks").unwrap_or_default(),
-                "Overview": row.try_get::<Option<String>, _>("overview").unwrap_or_default(),
-                "Path": row.try_get::<String, _>("path").unwrap_or_default(),
-                "LibraryId": row.try_get::<String, _>("library_id").unwrap_or_default(),
-                "ParentId": row.try_get::<String, _>("parent_id").unwrap_or_default(),
-                "Container": row.try_get::<Option<String>, _>("container").unwrap_or_default(),
-                "Size": row.try_get::<Option<i64>, _>("size_bytes").unwrap_or_default(),
+                "ProductionYear": row.get_opt_i64("production_year").unwrap_or_default(),
+                "RunTimeTicks": row.get_opt_i64("runtime_ticks").unwrap_or_default(),
+                "Overview": row.get_opt_str("overview").unwrap_or_default(),
+                "Path": row.get_str("path").unwrap_or_default(),
+                "LibraryId": row.get_str("library_id").unwrap_or_default(),
+                "ParentId": row.get_str("parent_id").unwrap_or_default(),
+                "Container": row.get_opt_str("container").unwrap_or_default(),
+                "Size": row.get_opt_i64("size_bytes").unwrap_or_default(),
                 "IndexNumber": null,
                 "ParentIndexNumber": null,
                 "ImageTags": {},
@@ -321,7 +327,7 @@ async fn fetch_tagged_items(
 }
 
 async fn count_tagged_items(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     person_id: &str,
     include_item_types: &[&str],
     person_types: &[&str],
@@ -329,6 +335,7 @@ async fn count_tagged_items(
     let mut sql = String::from(
         "SELECT COUNT(*) as cnt FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id WHERE mp.person_id = ?",
     );
+    let mut values: Vec<Value> = vec![person_id.into()];
 
     if !include_item_types.is_empty() {
         let placeholders = include_item_types
@@ -337,6 +344,9 @@ async fn count_tagged_items(
             .collect::<Vec<_>>()
             .join(",");
         sql.push_str(&format!(" AND mi.item_type IN ({placeholders})"));
+        for item_type in include_item_types {
+            values.push((*item_type).into());
+        }
     }
     if !person_types.is_empty() {
         let placeholders = person_types
@@ -345,33 +355,33 @@ async fn count_tagged_items(
             .collect::<Vec<_>>()
             .join(",");
         sql.push_str(&format!(" AND mp.person_type IN ({placeholders})"));
+        for person_type in person_types {
+            values.push((*person_type).into());
+        }
     }
 
-    let mut query = sqlx::query(&sql).bind(person_id);
-    for item_type in include_item_types {
-        query = query.bind(*item_type);
-    }
-    for person_type in person_types {
-        query = query.bind(*person_type);
-    }
-
-    let row = query.fetch_one(db).await?;
-    Ok(row.try_get::<i64, _>("cnt").unwrap_or(0))
+    let backend = db.get_database_backend();
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(backend, &sql, values))
+        .await?;
+    Ok(row.map(|row| row.get_i64("cnt").unwrap_or(0)).unwrap_or(0))
 }
 
-async fn person_images(db: &AnyPool, person_id: &str) -> anyhow::Result<Value> {
-    let rows = sqlx::query(
-        "SELECT image_type, etag, width, height FROM image_assets WHERE item_id = ? ORDER BY image_index ASC",
-    )
-    .bind(person_id)
-    .fetch_all(db)
-    .await?;
+async fn person_images(db: &DatabaseConnection, person_id: &str) -> anyhow::Result<JsonValue> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT image_type, etag, width, height FROM image_assets WHERE item_id = ? ORDER BY image_index ASC",
+            vec![person_id.into()],
+        ))
+        .await?;
 
     let mut tags = json!({});
     if let Some(obj) = tags.as_object_mut() {
         for row in &rows {
-            let image_type: String = row.try_get("image_type").unwrap_or_default();
-            let etag: String = row.try_get("etag").unwrap_or_default();
+            let image_type: String = row.get_str("image_type").unwrap_or_default();
+            let etag: String = row.get_str("etag").unwrap_or_default();
             obj.insert(image_type, json!(etag));
         }
     }

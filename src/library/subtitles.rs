@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use anyhow::Context;
-use sqlx::AnyPool;
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 use crate::util::{now_unix, stable_text_id};
 
 pub async fn upsert_sidecar_subtitles(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     media_path: &Path,
     item_id: &str,
 ) -> anyhow::Result<()> {
@@ -17,11 +17,14 @@ pub async fn upsert_sidecar_subtitles(
         return Ok(());
     };
 
-    sqlx::query("DELETE FROM media_streams WHERE item_id = ? AND stream_type = 'Subtitle'")
-        .bind(item_id)
-        .execute(db)
-        .await
-        .context("failed to clear existing subtitle streams")?;
+    let backend = db.get_database_backend();
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "DELETE FROM media_streams WHERE item_id = ? AND stream_type = 'Subtitle'",
+        vec![item_id.into()],
+    ))
+    .await
+    .context("failed to clear existing subtitle streams")?;
     let mut subtitle_index = 1i64;
     for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
         let path = entry.path();
@@ -35,7 +38,7 @@ pub async fn upsert_sidecar_subtitles(
 }
 
 async fn upsert_subtitle_stream(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     item_id: &str,
     stream_index: i64,
     path: &Path,
@@ -51,9 +54,23 @@ async fn upsert_subtitle_stream(
         .and_then(|name| name.to_str())
         .unwrap_or("Subtitle")
         .to_string();
-    sqlx::query(r#"INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, title, path, is_external, created_at) VALUES (?, ?, ?, 'Subtitle', ?, ?, ?, ?, 1, ?) ON CONFLICT(item_id, stream_index) DO UPDATE SET codec = excluded.codec, language = excluded.language, title = excluded.title, path = excluded.path, is_external = excluded.is_external"#)
-        .bind(stable_text_id(&format!("subtitle:{item_id}:{path_string}"))).bind(item_id).bind(stream_index).bind(codec).bind(infer_subtitle_language(path)).bind(title).bind(path_string).bind(now_unix()).execute(db).await
-        .with_context(|| format!("failed to upsert subtitle stream: {}", path.display()))?;
+    let backend = db.get_database_backend();
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        r#"INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, title, path, is_external, created_at) VALUES (?, ?, ?, 'Subtitle', ?, ?, ?, ?, 1, ?) ON CONFLICT(item_id, stream_index) DO UPDATE SET codec = excluded.codec, language = excluded.language, title = excluded.title, path = excluded.path, is_external = excluded.is_external"#,
+        vec![
+            stable_text_id(&format!("subtitle:{item_id}:{path_string}")).into(),
+            item_id.into(),
+            stream_index.into(),
+            codec.into(),
+            infer_subtitle_language(path).into(),
+            title.into(),
+            path_string.into(),
+            now_unix().into(),
+        ],
+    ))
+    .await
+    .with_context(|| format!("failed to upsert subtitle stream: {}", path.display()))?;
     Ok(())
 }
 

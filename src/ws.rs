@@ -9,11 +9,12 @@ use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::Row;
+use sea_orm::{ConnectionTrait, Statement};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::app::state::{AppState, PlaybackSession, session_timeout_seconds};
+use crate::db::row_ext::QueryResultExt;
 use crate::jellyfin::auth::request_token;
 use crate::util::now_unix;
 
@@ -345,23 +346,27 @@ async fn build_sessions_data(state: &AppState) -> Value {
 }
 
 async fn build_activity_data(state: &AppState) -> Value {
-    let rows = sqlx::query(
-        "SELECT name, log_type, created_at, user_id FROM activity_log ORDER BY created_at DESC LIMIT 15",
-    )
-    .fetch_all(&state.db)
-    .await;
+    let backend = state.db.get_database_backend();
+    let rows = state
+        .db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT name, log_type, created_at, user_id FROM activity_log ORDER BY created_at DESC LIMIT 15",
+            vec![],
+        ))
+        .await;
 
     match rows {
         Ok(rows) => {
             let items: Vec<Value> = rows
-                .into_iter()
+                .iter()
                 .map(|row| {
-                    let created_at: i64 = row.try_get("created_at").unwrap_or_default();
+                    let created_at: i64 = row.get_i64("created_at").unwrap_or_default();
                     serde_json::json!({
-                        "Name": row.try_get::<String, _>("name").unwrap_or_default(),
-                        "Type": row.try_get::<String, _>("log_type").unwrap_or_default(),
+                        "Name": row.get_str("name").unwrap_or_default(),
+                        "Type": row.get_str("log_type").unwrap_or_default(),
                         "Date": crate::util::unix_to_jellyfin_date(created_at),
-                        "UserId": row.try_get::<Option<String>, _>("user_id").unwrap_or_default(),
+                        "UserId": row.get_opt_str("user_id").ok().flatten(),
                         "Severity": "Info",
                     })
                 })

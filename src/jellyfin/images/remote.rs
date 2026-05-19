@@ -9,10 +9,11 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::{AnyPool, Row};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 use crate::{
     app::state::AppState,
+    db::row_ext::QueryResultExt,
     jellyfin::{common::internal_error, providers},
     library::images::upsert_image_asset,
 };
@@ -197,15 +198,17 @@ pub(super) async fn download_and_cache_image(
     .await
 }
 
-async fn lookup_tmdb_id(db: &AnyPool, item_id: &str) -> anyhow::Result<Option<String>> {
-    let row = sqlx::query(
-        "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
-    )
-    .bind(item_id)
-    .fetch_optional(db)
-    .await
-    .context("failed to look up TMDb id")?;
-    Ok(row.and_then(|row| row.try_get("provider_item_id").ok()))
+async fn lookup_tmdb_id(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Option<String>> {
+    let backend = db.get_database_backend();
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
+            vec![item_id.into()],
+        ))
+        .await
+        .context("failed to look up TMDb id")?;
+    Ok(row.and_then(|row| row.get_opt_str("provider_item_id").ok().flatten()))
 }
 
 async fn search_tmdb_id_by_item(state: &AppState, item_id: &str) -> anyhow::Result<Option<String>> {
@@ -214,17 +217,22 @@ async fn search_tmdb_id_by_item(state: &AppState, item_id: &str) -> anyhow::Resu
         .as_deref()
         .filter(|key| !key.is_empty())
         .context("no TMDb API key configured")?;
-    let row = sqlx::query("SELECT title, production_year, item_type FROM media_items WHERE id = ?")
-        .bind(item_id)
-        .fetch_optional(&state.db)
+    let backend = state.db.get_database_backend();
+    let row = state
+        .db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT title, production_year, item_type FROM media_items WHERE id = ?",
+            vec![item_id.into()],
+        ))
         .await
         .context("failed to fetch item for TMDb search")?;
     let Some(row) = row else {
         return Ok(None);
     };
-    let name: String = row.try_get("title")?;
-    let year: Option<i64> = row.try_get("production_year")?;
-    let item_type: String = row.try_get("item_type")?;
+    let name: String = row.get_str("title")?;
+    let year: Option<i64> = row.get_opt_i64("production_year")?;
+    let item_type: String = row.get_str("item_type")?;
 
     let results = if item_type.eq_ignore_ascii_case("Series") {
         providers::tmdb_tv_search(&state.http_client, api_key, &name, year).await?
@@ -246,14 +254,19 @@ async fn fetch_remote_images_by_type(
     item_id: &str,
     tmdb_id: &str,
 ) -> anyhow::Result<Vec<Value>> {
-    let row = sqlx::query("SELECT item_type FROM media_items WHERE id = ?")
-        .bind(item_id)
-        .fetch_optional(&state.db)
+    let backend = state.db.get_database_backend();
+    let row = state
+        .db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT item_type FROM media_items WHERE id = ?",
+            vec![item_id.into()],
+        ))
         .await
         .context("failed to fetch item type for images")?;
 
     let is_series = row
-        .and_then(|row| row.try_get::<String, _>("item_type").ok())
+        .and_then(|row| row.get_str("item_type").ok())
         .is_some_and(|t| t.eq_ignore_ascii_case("Series"));
 
     if is_series {

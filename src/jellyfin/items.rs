@@ -8,10 +8,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::{Value, json};
-use sqlx::Row;
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 use crate::{
     app::state::AppState,
+    db::row_ext::QueryResultExt,
     jellyfin::{
         common::internal_error,
         item_queries::{latest_media_items, library_views, list_media_items, resume_media_items},
@@ -116,43 +117,47 @@ pub(super) fn media_list_response(items: Vec<MediaItem>) -> Response {
 }
 
 async fn child_items_by_type(
-    db: &sqlx::AnyPool,
+    db: &DatabaseConnection,
     user_id: &str,
     parent_id: &str,
     item_type: &str,
 ) -> anyhow::Result<Vec<MediaItem>> {
-    let rows = sqlx::query(&crate::jellyfin::item_queries::media_item_select_sql(
-        "WHERE media_items.parent_id = ? AND media_items.item_type = ? ORDER BY media_items.title ASC",
-    ))
-    .bind(user_id)
-    .bind(parent_id)
-    .bind(item_type)
-    .fetch_all(db)
-    .await
-    .with_context(|| format!("failed to list {item_type} children for: {parent_id}"))?;
-    rows.into_iter()
-        .map(MediaItem::from_row)
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &crate::jellyfin::item_queries::media_item_select_sql(
+                "WHERE media_items.parent_id = ? AND media_items.item_type = ? ORDER BY media_items.title ASC",
+            ),
+            vec![user_id.into(), parent_id.into(), item_type.into()],
+        ))
+        .await
+        .with_context(|| format!("failed to list {item_type} children for: {parent_id}"))?;
+    rows.iter()
+        .map(MediaItem::from_query_result)
         .collect::<Result<Vec<_>, _>>()
         .context("failed to decode show child items")
 }
 
 async fn descendant_episodes(
-    db: &sqlx::AnyPool,
+    db: &DatabaseConnection,
     user_id: &str,
     show_id: &str,
 ) -> anyhow::Result<Vec<MediaItem>> {
-    let rows = sqlx::query(&format!(
-        r#"WITH RECURSIVE tree(id) AS (SELECT ? UNION ALL SELECT media_items.id FROM media_items JOIN tree ON media_items.parent_id = tree.id) {} WHERE media_items.id IN (SELECT id FROM tree WHERE id <> ?) AND media_items.item_type = 'Episode' ORDER BY media_items.title ASC"#,
-        crate::jellyfin::item_queries::media_item_select_sql("").trim()
-    ))
-    .bind(show_id)
-    .bind(user_id)
-    .bind(show_id)
-    .fetch_all(db)
-    .await
-    .with_context(|| format!("failed to list episodes for show: {show_id}"))?;
-    rows.into_iter()
-        .map(MediaItem::from_row)
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &format!(
+                r#"WITH RECURSIVE tree(id) AS (SELECT ? UNION ALL SELECT media_items.id FROM media_items JOIN tree ON media_items.parent_id = tree.id) {} WHERE media_items.id IN (SELECT id FROM tree WHERE id <> ?) AND media_items.item_type = 'Episode' ORDER BY media_items.title ASC"#,
+                crate::jellyfin::item_queries::media_item_select_sql("").trim()
+            ),
+            vec![show_id.into(), user_id.into(), show_id.into()],
+        ))
+        .await
+        .with_context(|| format!("failed to list episodes for show: {show_id}"))?;
+    rows.iter()
+        .map(MediaItem::from_query_result)
         .collect::<Result<Vec<_>, _>>()
         .context("failed to decode show episodes")
 }
@@ -200,19 +205,23 @@ pub async fn items_root(
     }
 }
 
-async fn item_json_with_provider_ids(db: &sqlx::AnyPool, item: MediaItem) -> anyhow::Result<Value> {
+async fn item_json_with_provider_ids(db: &DatabaseConnection, item: MediaItem) -> anyhow::Result<Value> {
     let mut value = item.to_jellyfin_json();
-    let rows = sqlx::query("SELECT provider, provider_item_id FROM provider_ids WHERE item_id = ?")
-        .bind(&item.id)
-        .fetch_all(db)
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT provider, provider_item_id FROM provider_ids WHERE item_id = ?",
+            vec![item.id.clone().into()],
+        ))
         .await
         .with_context(|| format!("failed to list provider ids for item: {}", item.id))?;
     let provider_ids = rows
-        .into_iter()
+        .iter()
         .map(|row| -> anyhow::Result<(String, Value)> {
             Ok((
-                row.try_get("provider")?,
-                Value::String(row.try_get("provider_item_id")?),
+                row.get_str("provider")?,
+                Value::String(row.get_str("provider_item_id")?),
             ))
         })
         .collect::<anyhow::Result<serde_json::Map<String, Value>>>()?;
@@ -231,7 +240,7 @@ async fn item_json_with_provider_ids(db: &sqlx::AnyPool, item: MediaItem) -> any
 }
 
 async fn relation_values(
-    db: &sqlx::AnyPool,
+    db: &DatabaseConnection,
     table: &str,
     relation_table: &str,
     relation_column: &str,
@@ -240,34 +249,42 @@ async fn relation_values(
     let sql = format!(
         "SELECT {table}.id, {table}.name FROM {table} JOIN {relation_table} ON {relation_table}.{relation_column} = {table}.id WHERE {relation_table}.item_id = ? ORDER BY {table}.name ASC"
     );
-    let rows = sqlx::query(&sql)
-        .bind(item_id)
-        .fetch_all(db)
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &sql,
+            vec![item_id.into()],
+        ))
         .await
         .with_context(|| format!("failed to list {table} for item: {item_id}"))?;
-    rows.into_iter()
+    rows.iter()
         .map(|row| -> anyhow::Result<Value> {
             Ok(json!({
-                "Id": row.try_get::<String, _>("id")?,
-                "Name": row.try_get::<String, _>("name")?,
+                "Id": row.get_str("id")?,
+                "Name": row.get_str("name")?,
             }))
         })
         .collect()
 }
 
-async fn people_values(db: &sqlx::AnyPool, item_id: &str) -> anyhow::Result<Vec<Value>> {
-    let rows = sqlx::query("SELECT people.id, people.name, media_people.role, media_people.person_type FROM people JOIN media_people ON media_people.person_id = people.id WHERE media_people.item_id = ? ORDER BY media_people.sort_order ASC, people.name ASC")
-        .bind(item_id)
-        .fetch_all(db)
+async fn people_values(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Vec<Value>> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT people.id, people.name, media_people.role, media_people.person_type FROM people JOIN media_people ON media_people.person_id = people.id WHERE media_people.item_id = ? ORDER BY media_people.sort_order ASC, people.name ASC",
+            vec![item_id.into()],
+        ))
         .await
         .with_context(|| format!("failed to list people for item: {item_id}"))?;
-    rows.into_iter()
+    rows.iter()
         .map(|row| -> anyhow::Result<Value> {
             Ok(json!({
-                "Id": row.try_get::<String, _>("id")?,
-                "Name": row.try_get::<String, _>("name")?,
-                "Role": row.try_get::<Option<String>, _>("role")?,
-                "Type": row.try_get::<Option<String>, _>("person_type")?,
+                "Id": row.get_str("id")?,
+                "Name": row.get_str("name")?,
+                "Role": row.get_opt_str("role")?,
+                "Type": row.get_opt_str("person_type")?,
             }))
         })
         .collect()
@@ -285,23 +302,25 @@ pub async fn item_subtitles(
     }
 }
 
-async fn subtitle_list_inner(db: &sqlx::AnyPool, item_id: &str) -> anyhow::Result<Vec<Value>> {
-    let rows = sqlx::query(
-        "SELECT stream_index, codec, language, title, is_external FROM media_streams WHERE item_id = ? AND stream_type = 'Subtitle' ORDER BY stream_index ASC",
-    )
-    .bind(item_id)
-    .fetch_all(db)
-    .await
-    .context("failed to list subtitles")?;
+async fn subtitle_list_inner(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Vec<Value>> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT stream_index, codec, language, title, is_external FROM media_streams WHERE item_id = ? AND stream_type = 'Subtitle' ORDER BY stream_index ASC",
+            vec![item_id.into()],
+        ))
+        .await
+        .context("failed to list subtitles")?;
 
-    rows.into_iter()
+    rows.iter()
         .map(|row| -> anyhow::Result<Value> {
             Ok(json!({
-                "Index": row.try_get::<i64, _>("stream_index")?,
-                "Codec": row.try_get::<Option<String>, _>("codec")?,
-                "Language": row.try_get::<Option<String>, _>("language")?,
-                "DisplayTitle": row.try_get::<Option<String>, _>("title")?,
-                "IsExternal": row.try_get::<i64, _>("is_external").unwrap_or_default() != 0,
+                "Index": row.get_i64("stream_index")?,
+                "Codec": row.get_opt_str("codec")?,
+                "Language": row.get_opt_str("language")?,
+                "DisplayTitle": row.get_opt_str("title")?,
+                "IsExternal": row.get_i64("is_external").unwrap_or_default() != 0,
             }))
         })
         .collect()
@@ -327,11 +346,15 @@ pub async fn metadata_reset(
     }
 
     let now = now_unix();
+    let backend = state.db.get_database_backend();
     for item_id in &item_ids {
-        let _ = sqlx::query("UPDATE media_items SET overview = NULL, production_year = NULL, updated_at = ? WHERE id = ?")
-            .bind(now)
-            .bind(item_id)
-            .execute(&state.db)
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "UPDATE media_items SET overview = NULL, production_year = NULL, updated_at = ? WHERE id = ?",
+                vec![now.into(), (*item_id).into()],
+            ))
             .await;
 
         for table in [
@@ -341,9 +364,13 @@ pub async fn metadata_reset(
             "media_studios",
             "provider_ids",
         ] {
-            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE item_id = ?"))
-                .bind(item_id)
-                .execute(&state.db)
+            let _ = state
+                .db
+                .execute(crate::db::helpers::portable_statement(
+                    backend,
+                    &format!("DELETE FROM {table} WHERE item_id = ?"),
+                    vec![(*item_id).into()],
+                ))
                 .await;
         }
 
@@ -384,16 +411,15 @@ pub async fn update_display_preferences(
         .get("UserId")
         .and_then(Value::as_str)
         .unwrap_or(&default_user_id);
-    match sqlx::query(
-        r#"INSERT INTO display_preferences (id, user_id, preferences_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET preferences_json = excluded.preferences_json, user_id = excluded.user_id, updated_at = excluded.updated_at"#,
-    )
-    .bind(&id)
-    .bind(user_id)
-    .bind(&prefs_json)
-    .bind(now)
-    .bind(now)
-    .execute(&state.db)
-    .await
+    let backend = state.db.get_database_backend();
+    match state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            r#"INSERT INTO display_preferences (id, user_id, preferences_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET preferences_json = excluded.preferences_json, user_id = excluded.user_id, updated_at = excluded.updated_at"#,
+            vec![id.into(), user_id.into(), prefs_json.into(), now.into(), now.into()],
+        ))
+        .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error.into()),
@@ -401,18 +427,22 @@ pub async fn update_display_preferences(
 }
 
 async fn display_preferences_inner(
-    db: &sqlx::AnyPool,
+    db: &DatabaseConnection,
     prefs_id: &str,
 ) -> anyhow::Result<Option<Value>> {
     let id = crate::util::stable_text_id(&format!("display-prefs:{prefs_id}"));
-    let row = sqlx::query("SELECT preferences_json FROM display_preferences WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(db)
+    let backend = db.get_database_backend();
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT preferences_json FROM display_preferences WHERE id = ?",
+            vec![id.into()],
+        ))
         .await
         .context("failed to load display preferences")?;
     match row {
         Some(row) => {
-            let json_str: String = row.try_get("preferences_json")?;
+            let json_str: String = row.get_str("preferences_json")?;
             Ok(Some(serde_json::from_str(&json_str)?))
         }
         None => Ok(None),
@@ -430,21 +460,24 @@ pub async fn item_counts(
 }
 
 async fn item_counts_inner(
-    db: &sqlx::AnyPool,
+    db: &DatabaseConnection,
     _query: &HashMap<String, String>,
 ) -> anyhow::Result<Value> {
-    let rows = sqlx::query(
-        r#"SELECT library_id, item_type, COUNT(*) AS count FROM media_items WHERE is_folder = 0 GROUP BY library_id, item_type"#,
-    )
-    .fetch_all(db)
-    .await
-    .context("failed to count items")?;
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            r#"SELECT library_id, item_type, COUNT(*) AS count FROM media_items WHERE is_folder = 0 GROUP BY library_id, item_type"#,
+            vec![],
+        ))
+        .await
+        .context("failed to count items")?;
 
     let mut counts = serde_json::Map::new();
-    for row in rows {
-        let library_id: String = row.try_get("library_id")?;
-        let item_type: String = row.try_get("item_type")?;
-        let count: i64 = row.try_get("count")?;
+    for row in &rows {
+        let library_id: String = row.get_str("library_id")?;
+        let item_type: String = row.get_str("item_type")?;
+        let count: i64 = row.get_i64("count")?;
         if let Some(obj) = counts
             .entry(library_id)
             .or_insert_with(|| json!({}))

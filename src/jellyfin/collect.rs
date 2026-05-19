@@ -7,11 +7,12 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use serde_json::{Value, json};
-use sqlx::{AnyPool, Row};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use serde_json::{Value as JsonValue, json};
 
 use crate::{
     app::state::AppState,
+    db::row_ext::QueryResultExt,
     jellyfin::common::internal_error,
     util::{now_unix, stable_text_id},
 };
@@ -51,33 +52,39 @@ pub async fn create_collection(
 }
 
 async fn create_collection_inner(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     name: &str,
     ids: &[String],
 ) -> anyhow::Result<String> {
     let now = now_unix();
     let id = stable_text_id(&format!("boxset:{}:{}", name.to_ascii_lowercase(), now));
-    sqlx::query(
+    let backend = db.get_database_backend();
+
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
         "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, created_at, modified_at, updated_at) VALUES (?, ?, ?, '', '', 'BoxSet', 1, ?, ?, ?)",
-    )
-    .bind(&id)
-    .bind(name)
-    .bind(&id)
-    .bind(now)
-    .bind(now)
-    .bind(now)
-    .execute(db)
+        vec![
+            id.clone().into(),
+            name.into(),
+            id.clone().into(),
+            now.into(),
+            now.into(),
+            now.into(),
+        ],
+    ))
     .await
     .context("failed to create collection")?;
 
     for (index, item_id) in ids.iter().enumerate() {
-        sqlx::query(
-            "INSERT OR IGNORE INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(item_id)
-        .bind(i64::try_from(index).unwrap_or(0))
-        .execute(db)
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?) ON CONFLICT(parent_id, item_id) DO NOTHING",
+            vec![
+                id.clone().into(),
+                item_id.clone().into(),
+                i64::try_from(index).unwrap_or(0).into(),
+            ],
+        ))
         .await
         .context("failed to link item to collection")?;
     }
@@ -106,34 +113,43 @@ pub async fn add_to_collection(
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    let max_order: i64 = sqlx::query(
-        "SELECT COALESCE(MAX(sort_order), -1) FROM linked_children WHERE parent_id = ?",
-    )
-    .bind(&collection_id)
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten()
-    .and_then(|row| row.try_get(0).ok())
-    .unwrap_or(-1);
+    let backend = state.db.get_database_backend();
+    let max_order: i64 = state
+        .db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT COALESCE(MAX(sort_order), -1) FROM linked_children WHERE parent_id = ?",
+            vec![collection_id.clone().into()],
+        ))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.get_i64("COALESCE(MAX(sort_order), -1)").ok())
+        .unwrap_or(-1);
 
     for (index, item_id) in ids.iter().enumerate() {
-        let _ = sqlx::query(
-            "INSERT OR IGNORE INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?)",
-        )
-        .bind(&collection_id)
-        .bind(item_id)
-        .bind(max_order + 1 + i64::try_from(index).unwrap_or(0))
-        .execute(&state.db)
-        .await;
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?) ON CONFLICT(parent_id, item_id) DO NOTHING",
+                vec![
+                    collection_id.clone().into(),
+                    item_id.clone().into(),
+                    (max_order + 1 + i64::try_from(index).unwrap_or(0)).into(),
+                ],
+            ))
+            .await;
     }
 
     let now = now_unix();
-    let _ = sqlx::query("UPDATE media_items SET modified_at = ?, updated_at = ? WHERE id = ?")
-        .bind(now)
-        .bind(now)
-        .bind(&collection_id)
-        .execute(&state.db)
+    let _ = state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE media_items SET modified_at = ?, updated_at = ? WHERE id = ?",
+            vec![now.into(), now.into(), collection_id.into()],
+        ))
         .await;
 
     StatusCode::NO_CONTENT.into_response()
@@ -156,11 +172,15 @@ pub async fn remove_from_collection(
         })
         .unwrap_or_default();
 
+    let backend = state.db.get_database_backend();
     for item_id in &ids {
-        let _ = sqlx::query("DELETE FROM linked_children WHERE parent_id = ? AND item_id = ?")
-            .bind(&collection_id)
-            .bind(item_id)
-            .execute(&state.db)
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "DELETE FROM linked_children WHERE parent_id = ? AND item_id = ?",
+                vec![collection_id.clone().into(), item_id.clone().into()],
+            ))
             .await;
     }
 
@@ -169,11 +189,11 @@ pub async fn remove_from_collection(
 
 pub async fn create_playlist(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
+    Json(body): Json<JsonValue>,
 ) -> Response {
     let Some(name) = body
         .get("Name")
-        .and_then(Value::as_str)
+        .and_then(JsonValue::as_str)
         .filter(|v| !v.trim().is_empty())
     else {
         return (
@@ -185,7 +205,7 @@ pub async fn create_playlist(
 
     let ids: Vec<String> = body
         .get("Ids")
-        .and_then(Value::as_array)
+        .and_then(JsonValue::as_array)
         .map(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(ToString::to_string))
@@ -195,7 +215,7 @@ pub async fn create_playlist(
 
     let media_type = body
         .get("MediaType")
-        .and_then(Value::as_str)
+        .and_then(JsonValue::as_str)
         .unwrap_or("Video");
 
     match create_playlist_inner(&state.db, name, &ids, media_type).await {
@@ -205,34 +225,40 @@ pub async fn create_playlist(
 }
 
 async fn create_playlist_inner(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     name: &str,
     ids: &[String],
     _media_type: &str,
 ) -> anyhow::Result<String> {
     let now = now_unix();
     let id = stable_text_id(&format!("playlist:{}:{}", name.to_ascii_lowercase(), now));
-    sqlx::query(
+    let backend = db.get_database_backend();
+
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
         "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, created_at, modified_at, updated_at) VALUES (?, ?, ?, '', '', 'Playlist', 1, ?, ?, ?)",
-    )
-    .bind(&id)
-    .bind(name)
-    .bind(format!("playlist:{id}"))
-    .bind(now)
-    .bind(now)
-    .bind(now)
-    .execute(db)
+        vec![
+            id.clone().into(),
+            name.into(),
+            format!("playlist:{id}").into(),
+            now.into(),
+            now.into(),
+            now.into(),
+        ],
+    ))
     .await
     .context("failed to create playlist")?;
 
     for (index, item_id) in ids.iter().enumerate() {
-        sqlx::query(
-            "INSERT OR IGNORE INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(item_id)
-        .bind(i64::try_from(index).unwrap_or(0))
-        .execute(db)
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?) ON CONFLICT(parent_id, item_id) DO NOTHING",
+            vec![
+                id.clone().into(),
+                item_id.clone().into(),
+                i64::try_from(index).unwrap_or(0).into(),
+            ],
+        ))
         .await
         .context("failed to link item to playlist")?;
     }
@@ -258,74 +284,91 @@ pub async fn get_playlist(
 pub async fn update_playlist(
     State(state): State<Arc<AppState>>,
     Path(playlist_id): Path<String>,
-    Json(body): Json<Value>,
+    Json(body): Json<JsonValue>,
 ) -> Response {
     let now = now_unix();
+    let backend = state.db.get_database_backend();
     if let Some(name) = body
         .get("Name")
-        .and_then(Value::as_str)
+        .and_then(JsonValue::as_str)
         .filter(|v| !v.trim().is_empty())
     {
-        let _ = sqlx::query("UPDATE media_items SET title = ?, updated_at = ? WHERE id = ? AND item_type = 'Playlist'")
-            .bind(name.trim())
-            .bind(now)
-            .bind(&playlist_id)
-            .execute(&state.db)
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "UPDATE media_items SET title = ?, updated_at = ? WHERE id = ? AND item_type = 'Playlist'",
+                vec![name.trim().into(), now.into(), playlist_id.clone().into()],
+            ))
             .await;
     }
 
-    if let Some(ids) = body.get("Ids").and_then(Value::as_array) {
-        let _ = sqlx::query("DELETE FROM linked_children WHERE parent_id = ?")
-            .bind(&playlist_id)
-            .execute(&state.db)
+    if let Some(ids) = body.get("Ids").and_then(JsonValue::as_array) {
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "DELETE FROM linked_children WHERE parent_id = ?",
+                vec![playlist_id.clone().into()],
+            ))
             .await;
         for (index, id_val) in ids.iter().enumerate() {
             if let Some(item_id) = id_val.as_str() {
-                let _ = sqlx::query(
-                    "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?)",
-                )
-                .bind(&playlist_id)
-                .bind(item_id)
-                .bind(i64::try_from(index).unwrap_or(0))
-                .execute(&state.db)
-                .await;
+                let _ = state
+                    .db
+                    .execute(crate::db::helpers::portable_statement(
+                        backend,
+                        "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?)",
+                        vec![
+                            playlist_id.clone().into(),
+                            item_id.into(),
+                            i64::try_from(index).unwrap_or(0).into(),
+                        ],
+                    ))
+                    .await;
             }
         }
-        let _ = sqlx::query("UPDATE media_items SET modified_at = ?, updated_at = ? WHERE id = ?")
-            .bind(now)
-            .bind(now)
-            .bind(&playlist_id)
-            .execute(&state.db)
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "UPDATE media_items SET modified_at = ?, updated_at = ? WHERE id = ?",
+                vec![now.into(), now.into(), playlist_id.into()],
+            ))
             .await;
     }
 
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn get_playlist_inner(db: &AnyPool, playlist_id: &str) -> anyhow::Result<Option<Value>> {
-    let row =
-        sqlx::query("SELECT id, title FROM media_items WHERE id = ? AND item_type = 'Playlist'")
-            .bind(playlist_id)
-            .fetch_optional(db)
-            .await
-            .context("failed to find playlist")?;
+async fn get_playlist_inner(db: &DatabaseConnection, playlist_id: &str) -> anyhow::Result<Option<JsonValue>> {
+    let backend = db.get_database_backend();
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT id, title FROM media_items WHERE id = ? AND item_type = 'Playlist'",
+            vec![playlist_id.into()],
+        ))
+        .await
+        .context("failed to find playlist")?;
 
     let Some(row) = row else {
         return Ok(None);
     };
-    let title: String = row.try_get("title")?;
+    let title: String = row.get_str("title")?;
 
-    let child_rows = sqlx::query(
-        "SELECT item_id FROM linked_children WHERE parent_id = ? ORDER BY sort_order ASC",
-    )
-    .bind(playlist_id)
-    .fetch_all(db)
-    .await
-    .context("failed to list playlist items")?;
+    let child_rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT item_id FROM linked_children WHERE parent_id = ? ORDER BY sort_order ASC",
+            vec![playlist_id.into()],
+        ))
+        .await
+        .context("failed to list playlist items")?;
 
     let item_ids: Vec<String> = child_rows
-        .into_iter()
-        .filter_map(|row| row.try_get("item_id").ok())
+        .iter()
+        .filter_map(|row| row.get_str("item_id").ok())
         .collect();
 
     Ok(Some(json!({
@@ -381,26 +424,33 @@ pub async fn add_to_playlist(
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    let max_order: i64 = sqlx::query(
-        "SELECT COALESCE(MAX(sort_order), -1) FROM linked_children WHERE parent_id = ?",
-    )
-    .bind(&playlist_id)
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten()
-    .and_then(|row| row.try_get(0).ok())
-    .unwrap_or(-1);
+    let backend = state.db.get_database_backend();
+    let max_order: i64 = state
+        .db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT COALESCE(MAX(sort_order), -1) FROM linked_children WHERE parent_id = ?",
+            vec![playlist_id.clone().into()],
+        ))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.get_i64("COALESCE(MAX(sort_order), -1)").ok())
+        .unwrap_or(-1);
 
     for (index, item_id) in ids.iter().enumerate() {
-        let _ = sqlx::query(
-            "INSERT OR IGNORE INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?)",
-        )
-        .bind(&playlist_id)
-        .bind(item_id)
-        .bind(max_order + 1 + i64::try_from(index).unwrap_or(0))
-        .execute(&state.db)
-        .await;
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?) ON CONFLICT(parent_id, item_id) DO NOTHING",
+                vec![
+                    playlist_id.clone().into(),
+                    item_id.clone().into(),
+                    (max_order + 1 + i64::try_from(index).unwrap_or(0)).into(),
+                ],
+            ))
+            .await;
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -424,11 +474,15 @@ pub async fn remove_from_playlist(
         })
         .unwrap_or_default();
 
+    let backend = state.db.get_database_backend();
     for item_id in &ids {
-        let _ = sqlx::query("DELETE FROM linked_children WHERE parent_id = ? AND item_id = ?")
-            .bind(&playlist_id)
-            .bind(item_id)
-            .execute(&state.db)
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "DELETE FROM linked_children WHERE parent_id = ? AND item_id = ?",
+                vec![playlist_id.clone().into(), item_id.clone().into()],
+            ))
             .await;
     }
 
@@ -436,34 +490,38 @@ pub async fn remove_from_playlist(
 }
 
 async fn playlist_items_inner(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     playlist_id: &str,
     offset: usize,
     limit: usize,
-) -> anyhow::Result<Vec<Value>> {
-    let rows = sqlx::query(
-        r#"SELECT mi.id, mi.title, mi.item_type, mi.production_year, mi.runtime_ticks, lc.sort_order FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC LIMIT ? OFFSET ?"#,
-    )
-    .bind(playlist_id)
-    .bind(i64::try_from(limit).unwrap_or(50))
-    .bind(i64::try_from(offset).unwrap_or(0))
-    .fetch_all(db)
-    .await
-    .context("failed to list playlist items")?;
+) -> anyhow::Result<Vec<JsonValue>> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            r#"SELECT mi.id, mi.title, mi.item_type, mi.production_year, mi.runtime_ticks, lc.sort_order FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC LIMIT ? OFFSET ?"#,
+            vec![
+                playlist_id.into(),
+                i64::try_from(limit).unwrap_or(50).into(),
+                i64::try_from(offset).unwrap_or(0).into(),
+            ],
+        ))
+        .await
+        .context("failed to list playlist items")?;
 
     Ok(rows
-        .into_iter()
+        .iter()
         .map(|row| {
-            let id: String = row.try_get("id").unwrap_or_default();
-            let title: String = row.try_get("title").unwrap_or_default();
-            let sort_order: i64 = row.try_get("sort_order").unwrap_or_default();
+            let id: String = row.get_str("id").unwrap_or_default();
+            let title: String = row.get_str("title").unwrap_or_default();
+            let sort_order: i64 = row.get_i64("sort_order").unwrap_or_default();
             json!({
                 "Id": id,
                 "Name": title,
                 "PlaylistItemId": id,
-                "Type": row.try_get::<String, _>("item_type").unwrap_or_default(),
-                "ProductionYear": row.try_get::<Option<i64>, _>("production_year").ok().flatten(),
-                "RunTimeTicks": row.try_get::<Option<i64>, _>("runtime_ticks").ok().flatten(),
+                "Type": row.get_str("item_type").unwrap_or_default(),
+                "ProductionYear": row.get_opt_i64("production_year").ok().flatten(),
+                "RunTimeTicks": row.get_opt_i64("runtime_ticks").ok().flatten(),
                 "IndexNumber": sort_order,
             })
         })

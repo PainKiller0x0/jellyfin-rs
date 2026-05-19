@@ -1,4 +1,6 @@
+pub mod helpers;
 mod migrate;
+pub mod row_ext;
 mod schema;
 mod seed;
 

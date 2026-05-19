@@ -1,7 +1,10 @@
 use serde_json::{Value, json};
-use sqlx::Row;
 
-use crate::{library::naming::parse_media_name, util::unix_to_jellyfin_date};
+use crate::{
+    db::row_ext::QueryResultExt,
+    library::naming::parse_media_name,
+    util::unix_to_jellyfin_date,
+};
 
 #[derive(Clone, Debug)]
 pub struct MediaItem {
@@ -30,30 +33,30 @@ pub struct MediaItem {
 }
 
 impl MediaItem {
-    pub fn from_row(row: sqlx::any::AnyRow) -> sqlx::Result<Self> {
+    pub fn from_query_result(row: &sea_orm::QueryResult) -> Result<Self, sea_orm::DbErr> {
         Ok(Self {
-            id: row.try_get("id")?,
-            title: row.try_get("title")?,
-            path: row.try_get("path")?,
-            library_id: row.try_get("library_id")?,
-            parent_id: row.try_get("parent_id")?,
-            item_type: row.try_get("item_type")?,
-            is_folder: row.try_get::<i64, _>("is_folder").unwrap_or_default() != 0,
-            container: row.try_get("container")?,
-            overview: row.try_get("overview")?,
-            official_rating: row.try_get("official_rating")?,
-            extended_video_type: row.try_get("extended_video_type")?,
-            production_year: row.try_get("production_year")?,
-            runtime_ticks: row.try_get("runtime_ticks")?,
-            size_bytes: row.try_get("size_bytes")?,
-            created_at: row.try_get("created_at")?,
-            modified_at: row.try_get("modified_at")?,
-            is_favorite: row.try_get::<i64, _>("is_favorite").unwrap_or_default() != 0,
-            played: row.try_get::<i64, _>("played").unwrap_or_default() != 0,
-            playback_position_ticks: row.try_get("playback_position_ticks").unwrap_or_default(),
-            played_percentage: row.try_get("played_percentage").ok(),
-            play_count: row.try_get("play_count").unwrap_or_default(),
-            last_played_at: row.try_get("last_played_at").ok().flatten(),
+            id: row.get_str("id")?,
+            title: row.get_str("title")?,
+            path: row.get_str("path")?,
+            library_id: row.get_str("library_id")?,
+            parent_id: row.get_str("parent_id")?,
+            item_type: row.get_str("item_type")?,
+            is_folder: row.get_bool_from_i64("is_folder")?,
+            container: row.get_opt_str("container")?,
+            overview: row.get_opt_str("overview")?,
+            official_rating: row.get_opt_str("official_rating")?,
+            extended_video_type: row.get_opt_str("extended_video_type")?,
+            production_year: row.get_opt_i64("production_year")?,
+            runtime_ticks: row.get_opt_i64("runtime_ticks")?,
+            size_bytes: row.get_opt_i64("size_bytes")?,
+            created_at: row.get_i64("created_at")?,
+            modified_at: row.get_i64("modified_at")?,
+            is_favorite: row.get_bool_from_i64("is_favorite")?,
+            played: row.get_bool_from_i64("played")?,
+            playback_position_ticks: row.get_i64("playback_position_ticks").unwrap_or(0),
+            played_percentage: row.get_f64("played_percentage").ok().flatten(),
+            play_count: row.get_i64("play_count").unwrap_or(0),
+            last_played_at: row.get_opt_i64("last_played_at").ok().flatten(),
         })
     }
 
@@ -155,19 +158,19 @@ pub struct MediaStreamRow {
 }
 
 impl MediaStreamRow {
-    pub fn from_row(row: sqlx::any::AnyRow) -> sqlx::Result<Self> {
+    pub fn from_query_result(row: &sea_orm::QueryResult) -> Result<Self, sea_orm::DbErr> {
         Ok(Self {
-            stream_index: row.try_get("stream_index")?,
-            stream_type: row.try_get("stream_type")?,
-            codec: row.try_get("codec")?,
-            language: row.try_get("language")?,
-            title: row.try_get("title")?,
-            bit_rate: row.try_get("bit_rate")?,
-            width: row.try_get("width")?,
-            height: row.try_get("height")?,
-            channels: row.try_get("channels")?,
-            sample_rate: row.try_get("sample_rate")?,
-            is_external: row.try_get::<i64, _>("is_external").unwrap_or_default() != 0,
+            stream_index: row.get_i64("stream_index")?,
+            stream_type: row.get_str("stream_type")?,
+            codec: row.get_opt_str("codec")?,
+            language: row.get_opt_str("language")?,
+            title: row.get_opt_str("title")?,
+            bit_rate: row.get_opt_i64("bit_rate")?,
+            width: row.get_opt_i64("width")?,
+            height: row.get_opt_i64("height")?,
+            channels: row.get_opt_i64("channels")?,
+            sample_rate: row.get_opt_i64("sample_rate")?,
+            is_external: row.get_bool_from_i64("is_external")?,
         })
     }
 

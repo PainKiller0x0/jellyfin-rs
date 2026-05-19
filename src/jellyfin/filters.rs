@@ -6,10 +6,10 @@ use axum::{
     extract::{Query, State},
     response::{IntoResponse, Response},
 };
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde_json::{Value, json};
-use sqlx::{AnyPool, Row};
 
-use crate::{app::state::AppState, jellyfin::common::internal_error};
+use crate::{app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error};
 
 pub async fn genres(
     State(state): State<Arc<AppState>>,
@@ -81,19 +81,22 @@ pub async fn extended_video_types(
 }
 
 async fn list_extended_video_types_inner(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
-    let rows = sqlx::query(
-        "SELECT extended_video_type FROM media_items WHERE extended_video_type IS NOT NULL AND extended_video_type <> ''",
-    )
-    .fetch_all(db)
-    .await
-    .context("failed to list extended video types")?;
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT extended_video_type FROM media_items WHERE extended_video_type IS NOT NULL AND extended_video_type <> ''",
+            vec![],
+        ))
+        .await
+        .context("failed to list extended video types")?;
 
     let mut names = Vec::<String>::new();
-    for row in rows {
-        let value: String = row.try_get("extended_video_type")?;
+    for row in &rows {
+        let value: String = row.get_str("extended_video_type")?;
         for name in value
             .split(',')
             .map(str::trim)
@@ -108,7 +111,7 @@ async fn list_extended_video_types_inner(
         }
     }
 
-    let mut items = names
+    let mut items: Vec<Value> = names
         .into_iter()
         .map(|name| json!({ "Name": name, "Id": name, "Type": "ExtendedVideoType" }))
         .collect();
@@ -116,7 +119,7 @@ async fn list_extended_video_types_inner(
     Ok(items)
 }
 
-async fn list_years(db: &AnyPool, query: &HashMap<String, String>) -> Response {
+async fn list_years(db: &DatabaseConnection, query: &HashMap<String, String>) -> Response {
     match list_years_inner(db, query).await {
         Ok(items) => {
             let total = items.len();
@@ -127,20 +130,23 @@ async fn list_years(db: &AnyPool, query: &HashMap<String, String>) -> Response {
 }
 
 async fn list_years_inner(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
-    let rows = sqlx::query(
-        "SELECT DISTINCT production_year FROM media_items WHERE production_year IS NOT NULL AND production_year > 0 ORDER BY production_year DESC",
-    )
-    .fetch_all(db)
-    .await
-    .context("failed to list years")?;
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT DISTINCT production_year FROM media_items WHERE production_year IS NOT NULL AND production_year > 0 ORDER BY production_year DESC",
+            vec![],
+        ))
+        .await
+        .context("failed to list years")?;
 
     let mut items: Vec<Value> = rows
-        .into_iter()
+        .iter()
         .filter_map(|row| {
-            let year: i64 = row.try_get("production_year").ok()?;
+            let year: i64 = row.get_i64("production_year").ok()?;
             let year_str = year.to_string();
             Some(json!({
                 "Name": year_str,
@@ -155,7 +161,7 @@ async fn list_years_inner(
 }
 
 async fn list_distinct_values(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     table: &str,
     column: &str,
     query: &HashMap<String, String>,
@@ -170,7 +176,7 @@ async fn list_distinct_values(
 }
 
 async fn list_distinct_values_inner(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     table: &str,
     column: &str,
     query: &HashMap<String, String>,
@@ -178,15 +184,16 @@ async fn list_distinct_values_inner(
     let sql = format!(
         "SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL AND {column} <> '' ORDER BY {column} ASC"
     );
-    let rows = sqlx::query(&sql)
-        .fetch_all(db)
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(backend, &sql, vec![]))
         .await
         .with_context(|| format!("failed to list distinct {column} from {table}"))?;
 
     let mut items: Vec<Value> = rows
-        .into_iter()
+        .iter()
         .filter_map(|row| {
-            let name: String = row.try_get(column).ok()?;
+            let name: String = row.get_str(column).ok()?;
             Some(json!({
                 "Name": name,
                 "Id": name,
@@ -240,7 +247,7 @@ fn filter_by_search_and_paginate(items: &mut Vec<Value>, query: &HashMap<String,
 }
 
 async fn list_filter_items(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     kind: FilterKind,
     query: &HashMap<String, String>,
 ) -> Response {
@@ -254,19 +261,24 @@ async fn list_filter_items(
 }
 
 async fn list_filter_items_inner(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     kind: FilterKind,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
-    let rows = sqlx::query(kind.select_sql())
-        .fetch_all(db)
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            kind.select_sql(),
+            vec![],
+        ))
         .await
         .with_context(|| format!("failed to list {}", kind.name()))?;
     let mut items = rows
-        .into_iter()
+        .iter()
         .map(|row| -> anyhow::Result<Value> {
-            let id: String = row.try_get("id")?;
-            let name: String = row.try_get("name")?;
+            let id: String = row.get_str("id")?;
+            let name: String = row.get_str("name")?;
             Ok(json!({
                 "Name": name,
                 "Id": id,

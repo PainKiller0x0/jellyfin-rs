@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use sqlx::AnyPool;
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 use crate::util::{now_unix, stable_text_id};
 
 pub async fn upsert_sidecar_images(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     item_path: &Path,
     item_id: &str,
 ) -> anyhow::Result<()> {
@@ -32,7 +32,7 @@ pub async fn upsert_sidecar_images(
 }
 
 pub async fn upsert_image_asset(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     item_id: &str,
     image_type: &str,
     image_index: i64,
@@ -43,19 +43,24 @@ pub async fn upsert_image_asset(
     let etag = stable_text_id(&format!(
         "image:{item_id}:{image_type}:{image_index}:{path}"
     ));
-    sqlx::query(r#"INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, size_bytes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET path = excluded.path, etag = excluded.etag, size_bytes = excluded.size_bytes, updated_at = excluded.updated_at"#)
-        .bind(stable_text_id(&format!("image-asset:{item_id}:{image_type}:{image_index}")))
-        .bind(item_id)
-        .bind(image_type)
-        .bind(image_index)
-        .bind(path)
-        .bind(etag)
-        .bind(size_bytes)
-        .bind(now)
-        .bind(now)
-        .execute(db)
-        .await
-        .with_context(|| format!("failed to upsert image asset for item: {item_id}"))?;
+    let backend = db.get_database_backend();
+    db.execute(crate::db::helpers::portable_statement(
+        backend,
+        r#"INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, size_bytes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET path = excluded.path, etag = excluded.etag, size_bytes = excluded.size_bytes, updated_at = excluded.updated_at"#,
+        vec![
+            stable_text_id(&format!("image-asset:{item_id}:{image_type}:{image_index}")).into(),
+            item_id.into(),
+            image_type.into(),
+            image_index.into(),
+            path.into(),
+            etag.into(),
+            size_bytes.into(),
+            now.into(),
+            now.into(),
+        ],
+    ))
+    .await
+    .with_context(|| format!("failed to upsert image asset for item: {item_id}"))?;
     Ok(())
 }
 

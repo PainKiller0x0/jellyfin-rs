@@ -1,5 +1,6 @@
 use anyhow::Context;
-use sqlx::{AnyPool, Sqlite, migrate::MigrateDatabase};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
+use sea_orm::sqlx::{Sqlite, migrate::MigrateDatabase};
 
 use crate::db::schema::{migrations, optional_migrations};
 
@@ -20,25 +21,43 @@ pub async fn ensure_database_exists(database_url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn migrate(db: &AnyPool) -> anyhow::Result<()> {
+pub async fn migrate(db: &DatabaseConnection, url: &str) -> anyhow::Result<()> {
+    let backend = if url.starts_with("sqlite:") {
+        DbBackend::Sqlite
+    } else {
+        DbBackend::Postgres
+    };
+
     for (sql, context) in migrations() {
-        execute_migration(db, sql, context).await?;
+        execute_migration(db, backend, sql, context).await?;
     }
 
     for (sql, context) in optional_migrations() {
-        execute_optional_migration(db, sql, context).await;
+        execute_optional_migration(db, backend, sql, context).await;
     }
 
     Ok(())
 }
 
-async fn execute_migration(db: &AnyPool, sql: &str, context: &'static str) -> anyhow::Result<()> {
-    sqlx::query(sql).execute(db).await.context(context)?;
+async fn execute_migration(
+    db: &DatabaseConnection,
+    backend: DbBackend,
+    sql: &str,
+    context: &'static str,
+) -> anyhow::Result<()> {
+    db.execute(Statement::from_string(backend, sql.to_string()))
+        .await
+        .context(context)?;
     Ok(())
 }
 
-async fn execute_optional_migration(db: &AnyPool, sql: &str, context: &'static str) {
-    if let Err(error) = sqlx::query(sql).execute(db).await {
+async fn execute_optional_migration(
+    db: &DatabaseConnection,
+    backend: DbBackend,
+    sql: &str,
+    context: &'static str,
+) {
+    if let Err(error) = db.execute(Statement::from_string(backend, sql.to_string())).await {
         let message = error.to_string().to_ascii_lowercase();
         if !message.contains("duplicate") && !message.contains("exists") {
             tracing::warn!("optional migration failed ({context}): {error}");

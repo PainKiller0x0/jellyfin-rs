@@ -9,6 +9,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use sea_orm::{ConnectionTrait, Statement};
+
 use crate::{
     app::state::{AppState, DEFAULT_USER_NAME, SERVER_NAME},
     jellyfin::common::internal_error,
@@ -107,15 +109,20 @@ pub async fn update_startup_user(
     };
     let user_id = state.user_id.to_string();
 
-    match sqlx::query(r#"INSERT INTO users (id, username, password_hash, display_name, is_admin, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?) ON CONFLICT(id) DO UPDATE SET username = excluded.username, password_hash = excluded.password_hash, display_name = excluded.display_name, is_admin = 1, is_disabled = 0, updated_at = excluded.updated_at"#)
-        .bind(&user_id)
-        .bind(username)
-        .bind(&password_hash)
-        .bind(username)
-        .bind(now)
-        .bind(now)
-        .execute(&state.db)
-        .await
+    let backend = state.db.get_database_backend();
+    match state.db.execute(crate::db::helpers::portable_statement(
+        backend,
+        r#"INSERT INTO users (id, username, password_hash, display_name, is_admin, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?) ON CONFLICT(id) DO UPDATE SET username = excluded.username, password_hash = excluded.password_hash, display_name = excluded.display_name, is_admin = 1, is_disabled = 0, updated_at = excluded.updated_at"#,
+        vec![
+            user_id.clone().into(),
+            username.into(),
+            password_hash.into(),
+            username.into(),
+            now.into(),
+            now.into(),
+        ],
+    ))
+    .await
     {
         Ok(_) => Json(json!({ "Id": user_id, "Name": username })).into_response(),
         Err(error) => internal_error(error.into()),

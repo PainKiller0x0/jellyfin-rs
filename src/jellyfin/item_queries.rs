@@ -2,24 +2,29 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Context;
 use serde_json::{Value, json};
-use sqlx::{AnyPool, Row};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
-use crate::library::models::MediaItem;
+use crate::{db::row_ext::QueryResultExt, library::models::MediaItem};
 
-pub async fn library_views(db: &AnyPool) -> anyhow::Result<Vec<Value>> {
-    let rows = sqlx::query("SELECT id, name, collection_type FROM libraries ORDER BY name ASC")
-        .fetch_all(db)
+pub async fn library_views(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT id, name, collection_type FROM libraries ORDER BY name ASC",
+            vec![],
+        ))
         .await
         .context("failed to list libraries")?;
-    rows.into_iter()
+    rows.iter()
         .map(|row| -> anyhow::Result<Value> {
-            Ok(json!({ "Name": row.try_get::<String, _>("name")?, "Id": row.try_get::<String, _>("id")?, "CollectionType": row.try_get::<String, _>("collection_type")?, "Type": "CollectionFolder" }))
+            Ok(json!({ "Name": row.get_str("name")?, "Id": row.get_str("id")?, "CollectionType": row.get_str("collection_type")?, "Type": "CollectionFolder" }))
         })
         .collect()
 }
 
 pub async fn list_media_items(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     user_id: &str,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<MediaItem>> {
@@ -33,48 +38,55 @@ pub async fn list_media_items(
     let recursive = query_bool(query, "Recursive", false);
 
     let parent_is_collection = is_collection_or_playlist(db, parent_id).await?;
+    let backend = db.get_database_backend();
 
     let rows = if parent_is_collection {
-        sqlx::query(&linked_children_select_sql())
-            .bind(user_id)
-            .bind(parent_id)
-            .fetch_all(db)
-            .await
+        db.query_all(crate::db::helpers::portable_statement(
+            backend,
+            &linked_children_select_sql(),
+            vec![user_id.into(), parent_id.into()],
+        ))
+        .await
     } else if recursive {
-        sqlx::query(&recursive_media_item_select_sql())
-            .bind(parent_id)
-            .bind(user_id)
-            .bind(parent_id)
-            .fetch_all(db)
-            .await
+        db.query_all(crate::db::helpers::portable_statement(
+            backend,
+            &recursive_media_item_select_sql(),
+            vec![parent_id.into(), user_id.into(), parent_id.into()],
+        ))
+        .await
     } else if has_list_item_ids {
-        sqlx::query(&media_item_select_sql(""))
-            .bind(user_id)
-            .fetch_all(db)
-            .await
+        db.query_all(crate::db::helpers::portable_statement(
+            backend,
+            &media_item_select_sql(""),
+            vec![user_id.into()],
+        ))
+        .await
     } else {
-        sqlx::query(&media_item_select_sql("WHERE media_items.parent_id = ?"))
-            .bind(user_id)
-            .bind(parent_id)
-            .fetch_all(db)
-            .await
+        db.query_all(crate::db::helpers::portable_statement(
+            backend,
+            &media_item_select_sql("WHERE media_items.parent_id = ?"),
+            vec![user_id.into(), parent_id.into()],
+        ))
+        .await
     }
     .context("failed to list media items")?;
-    let mut items = decode_media_items(rows)?;
+    let mut items = decode_media_items(&rows)?;
     apply_item_filters(&mut items, query);
     apply_relation_filters(db, &mut items, query).await?;
     sort_media_items(&mut items, query);
     Ok(items.into_iter().skip(offset).take(limit).collect())
 }
 
-async fn is_collection_or_playlist(db: &AnyPool, item_id: &str) -> anyhow::Result<bool> {
-    let row = sqlx::query(
-        "SELECT item_type FROM media_items WHERE id = ? AND item_type IN ('BoxSet', 'Playlist')",
-    )
-    .bind(item_id)
-    .fetch_optional(db)
-    .await
-    .context("failed to check item type")?;
+async fn is_collection_or_playlist(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<bool> {
+    let backend = db.get_database_backend();
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT item_type FROM media_items WHERE id = ? AND item_type IN ('BoxSet', 'Playlist')",
+            vec![item_id.into()],
+        ))
+        .await
+        .context("failed to check item type")?;
     Ok(row.is_some())
 }
 
@@ -82,42 +94,51 @@ fn linked_children_select_sql() -> String {
     r#"SELECT mi.id, mi.title, mi.path, mi.library_id, mi.parent_id, mi.item_type, mi.is_folder, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, 0) AS is_favorite, COALESCE(ud.played, 0) AS played, COALESCE(ud.playback_position_ticks, 0) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, 0) AS play_count, ud.last_played_at AS last_played_at FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC"#.to_string()
 }
 
-pub async fn latest_media_items(db: &AnyPool, user_id: &str) -> anyhow::Result<Vec<MediaItem>> {
+pub async fn latest_media_items(db: &DatabaseConnection, user_id: &str) -> anyhow::Result<Vec<MediaItem>> {
+    let backend = db.get_database_backend();
     decode_media_items(
-        sqlx::query(&media_item_select_sql(
-            "WHERE media_items.is_folder = 0 ORDER BY media_items.modified_at DESC LIMIT 16",
+        &db.query_all(crate::db::helpers::portable_statement(
+            backend,
+            &media_item_select_sql(
+                "WHERE media_items.is_folder = 0 ORDER BY media_items.modified_at DESC LIMIT 16",
+            ),
+            vec![user_id.into()],
         ))
-        .bind(user_id)
-        .fetch_all(db)
         .await
         .context("failed to list latest media items")?,
     )
 }
 
-pub async fn resume_media_items(db: &AnyPool, user_id: &str) -> anyhow::Result<Vec<MediaItem>> {
+pub async fn resume_media_items(db: &DatabaseConnection, user_id: &str) -> anyhow::Result<Vec<MediaItem>> {
+    let backend = db.get_database_backend();
     decode_media_items(
-        sqlx::query(&media_item_select_sql(
-            "WHERE media_items.is_folder = 0 AND COALESCE(user_data.playback_position_ticks, 0) > 0 ORDER BY user_data.updated_at DESC LIMIT 50",
+        &db.query_all(crate::db::helpers::portable_statement(
+            backend,
+            &media_item_select_sql(
+                "WHERE media_items.is_folder = 0 AND COALESCE(user_data.playback_position_ticks, 0) > 0 ORDER BY user_data.updated_at DESC LIMIT 50",
+            ),
+            vec![user_id.into()],
         ))
-        .bind(user_id)
-        .fetch_all(db)
         .await
         .context("failed to list resume media items")?,
     )
 }
 
 pub async fn find_media_item(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     user_id: &str,
     id: &str,
 ) -> anyhow::Result<Option<MediaItem>> {
-    let row = sqlx::query(&media_item_select_sql("WHERE media_items.id = ?"))
-        .bind(user_id)
-        .bind(id)
-        .fetch_optional(db)
+    let backend = db.get_database_backend();
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            &media_item_select_sql("WHERE media_items.id = ?"),
+            vec![user_id.into(), id.into()],
+        ))
         .await
         .with_context(|| format!("failed to find media item: {id}"))?;
-    row.map(MediaItem::from_row)
+    row.map(|r| MediaItem::from_query_result(&r))
         .transpose()
         .context("failed to decode media item")
 }
@@ -135,9 +156,9 @@ fn recursive_media_item_select_sql() -> String {
     )
 }
 
-pub fn decode_media_items(rows: Vec<sqlx::any::AnyRow>) -> anyhow::Result<Vec<MediaItem>> {
-    rows.into_iter()
-        .map(MediaItem::from_row)
+pub fn decode_media_items(rows: &[sea_orm::QueryResult]) -> anyhow::Result<Vec<MediaItem>> {
+    rows.iter()
+        .map(MediaItem::from_query_result)
         .collect::<Result<Vec<_>, _>>()
         .context("failed to decode media items")
 }
@@ -232,7 +253,7 @@ fn apply_item_filters(items: &mut Vec<MediaItem>, query: &HashMap<String, String
 }
 
 async fn apply_relation_filters(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     items: &mut Vec<MediaItem>,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
@@ -269,18 +290,20 @@ fn retain_item_ids(items: &mut Vec<MediaItem>, item_ids: &[String]) {
     items.retain(|item| item_ids.contains(item.id.as_str()));
 }
 
-async fn codec_item_ids(db: &AnyPool, codecs: &[String]) -> anyhow::Result<Vec<String>> {
+async fn codec_item_ids(db: &DatabaseConnection, codecs: &[String]) -> anyhow::Result<Vec<String>> {
+    let backend = db.get_database_backend();
     let mut ids = Vec::new();
     for codec in codecs {
-        let rows = sqlx::query(
-            "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND codec = ?",
-        )
-        .bind(codec)
-        .fetch_all(db)
-        .await
-        .context("failed to filter by video codec")?;
-        for row in rows {
-            ids.push(row.try_get("item_id")?);
+        let rows = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend,
+                "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND codec = ?",
+                vec![codec.as_str().into()],
+            ))
+            .await
+            .context("failed to filter by video codec")?;
+        for row in &rows {
+            ids.push(row.get_str("item_id")?);
         }
     }
     ids.sort();
@@ -289,50 +312,51 @@ async fn codec_item_ids(db: &AnyPool, codecs: &[String]) -> anyhow::Result<Vec<S
 }
 
 async fn width_item_ids(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     min_width: Option<i64>,
     max_width: Option<i64>,
 ) -> anyhow::Result<Vec<String>> {
-    let mut query = match (min_width, max_width) {
-        (Some(_), Some(_)) => sqlx::query(
+    let backend = db.get_database_backend();
+    let (sql, values) = match (min_width, max_width) {
+        (Some(_), Some(_)) => (
             "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND width >= ? AND width <= ?",
+            vec![min_width.into(), max_width.into()],
         ),
-        (Some(_), None) => sqlx::query(
+        (Some(_), None) => (
             "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND width >= ?",
+            vec![min_width.into()],
         ),
-        (None, Some(_)) => sqlx::query(
+        (None, Some(_)) => (
             "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND width <= ?",
+            vec![max_width.into()],
         ),
         (None, None) => unreachable!("width_item_ids requires at least one bound"),
     };
 
-    if let Some(min_width) = min_width {
-        query = query.bind(min_width);
-    }
-    if let Some(max_width) = max_width {
-        query = query.bind(max_width);
-    }
-
-    let rows = query
-        .fetch_all(db)
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(backend, sql, values))
         .await
         .context("failed to filter by width")?;
     Ok(rows
-        .into_iter()
-        .filter_map(|row| row.try_get("item_id").ok())
+        .iter()
+        .filter_map(|row| row.get_opt_str("item_id").ok().flatten())
         .collect())
 }
 
-async fn parent_item_ids(db: &AnyPool, item_ids: &[String]) -> anyhow::Result<Vec<String>> {
+async fn parent_item_ids(db: &DatabaseConnection, item_ids: &[String]) -> anyhow::Result<Vec<String>> {
+    let backend = db.get_database_backend();
     let mut parents = Vec::new();
     for id in item_ids {
-        let rows = sqlx::query("SELECT DISTINCT parent_id FROM linked_children WHERE item_id = ?")
-            .bind(id)
-            .fetch_all(db)
+        let rows = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend,
+                "SELECT DISTINCT parent_id FROM linked_children WHERE item_id = ?",
+                vec![id.as_str().into()],
+            ))
             .await
             .context("failed to find linked parents")?;
-        for row in rows {
-            parents.push(row.try_get("parent_id")?);
+        for row in &rows {
+            parents.push(row.get_str("parent_id")?);
         }
     }
     parents.sort();
@@ -341,21 +365,25 @@ async fn parent_item_ids(db: &AnyPool, item_ids: &[String]) -> anyhow::Result<Ve
 }
 
 async fn relation_item_ids(
-    db: &AnyPool,
+    db: &DatabaseConnection,
     table: &str,
     id_column: &str,
     ids: &[String],
 ) -> anyhow::Result<Vec<String>> {
+    let backend = db.get_database_backend();
     let mut item_ids = Vec::new();
     let sql = format!("SELECT DISTINCT item_id FROM {table} WHERE {id_column} = ?");
     for id in ids {
-        let rows = sqlx::query(&sql)
-            .bind(id)
-            .fetch_all(db)
+        let rows = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend,
+                &sql,
+                vec![id.as_str().into()],
+            ))
             .await
             .with_context(|| format!("failed to filter items by {table}"))?;
-        for row in rows {
-            item_ids.push(row.try_get("item_id")?);
+        for row in &rows {
+            item_ids.push(row.get_str("item_id")?);
         }
     }
     item_ids.sort();

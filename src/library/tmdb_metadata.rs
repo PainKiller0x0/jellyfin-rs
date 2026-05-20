@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Context;
 use sea_orm::{ConnectionTrait, Value};
 
-use crate::jellyfin::providers;
+use crate::{db::row_ext::QueryResultExt, jellyfin::providers};
 
 /// Extract TMDb ID from `{tmdb-XXXXX}` or `[tmdbid=XXXXX]` in the path
 pub fn extract_tmdb_id(path: &Path) -> Option<String> {
@@ -38,6 +38,161 @@ pub fn clean_provider_tags(title: &str) -> String {
     result.trim().to_string()
 }
 
+/// Fetch TMDb episode details using series TMDb ID + season/episode numbers
+pub async fn fetch_episode_tmdb_metadata(
+    db: &sea_orm::DatabaseConnection,
+    item_id: &str,
+    season_number: i64,
+    episode_number: i64,
+    series_tmdb_id: &str,
+    api_key: &str,
+) -> anyhow::Result<()> {
+    let client = build_client()?;
+    let url = format!(
+        "https://api.themoviedb.org/3/tv/{series_tmdb_id}/season/{season_number}/episode/{episode_number}"
+    );
+    #[derive(serde::Deserialize)]
+    struct TmdbEpisode {
+        name: Option<String>,
+        overview: Option<String>,
+        still_path: Option<String>,
+    }
+    let ep: TmdbEpisode = client
+        .get(&url)
+        .query(&[("api_key", api_key), ("language", "zh-CN")])
+        .send().await?
+        .error_for_status()?
+        .json().await?;
+
+    let backend = db.get_database_backend();
+    if let Some(name) = ep.name.as_ref().filter(|n| !n.is_empty()) {
+        let _ = db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE media_items SET title = ? WHERE id = ?",
+            vec![name.as_str().into(), item_id.into()],
+        )).await;
+    }
+    if let Some(overview) = ep.overview.as_ref().filter(|o| !o.is_empty()) {
+        let _ = db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE media_items SET overview = ? WHERE id = ?",
+            vec![overview.as_str().into(), item_id.into()],
+        )).await;
+    }
+    if let Some(still) = ep.still_path.as_ref() {
+        let img_url = format!("https://image.tmdb.org/t/p/w500{still}");
+        let _ = download_and_save_tmdb_image(db, &client, item_id, &img_url, "Primary").await;
+    }
+    Ok(())
+}
+
+fn build_client() -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+    let proxy_url = std::env::var("HTTPS_PROXY")
+        .or_else(|_| std::env::var("https_proxy"))
+        .or_else(|_| std::env::var("ALL_PROXY"))
+        .unwrap_or_default();
+    if !proxy_url.is_empty() {
+        builder = builder.proxy(reqwest::Proxy::all(&proxy_url)?);
+    }
+    Ok(builder.build()?)
+}
+
+/// Batch fetch TMDb episode metadata for all episodes after scan completes
+pub async fn batch_fetch_episode_tmdb(
+    db: &sea_orm::DatabaseConnection,
+    api_key: &str,
+) -> anyhow::Result<usize> {
+    let backend = db.get_database_backend();
+    // Find episodes with season/episode numbers whose parent series has a Tmdb ID
+    let rows = db.query_all(crate::db::helpers::portable_statement(
+        backend,
+        r#"SELECT e.id as episode_id, e.season_number, e.episode_number, p.provider_item_id as tmdb_id
+           FROM media_items e
+           JOIN media_items se ON se.id = e.parent_id
+           JOIN media_items s ON s.id = se.parent_id
+           JOIN provider_ids p ON p.item_id = s.id AND p.provider = 'Tmdb'
+           WHERE e.item_type = 'Episode' AND e.season_number IS NOT NULL AND e.episode_number IS NOT NULL"#,
+        vec![],
+    )).await?;
+
+    let client = build_client()?;
+    let mut count = 0usize;
+    for row in &rows {
+        let episode_id: String = row.get_str("episode_id")?;
+        let sn: i64 = row.get_i64("season_number")?;
+        let en: i64 = row.get_i64("episode_number")?;
+        let tmdb_id: String = row.get_str("tmdb_id")?;
+
+        let url = format!("https://api.themoviedb.org/3/tv/{tmdb_id}/season/{sn}/episode/{en}");
+        #[derive(serde::Deserialize)]
+        struct Ep { name: Option<String>, overview: Option<String>, still_path: Option<String> }
+        let resp = match client.get(&url).query(&[("api_key", api_key), ("language", "zh-CN")]).send().await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let Ok(resp) = resp.error_for_status() else { continue };
+        let Ok(ep) = resp.json::<Ep>().await else { continue };
+
+        if let Some(name) = ep.name.as_ref().filter(|n| !n.is_empty()) {
+            let _ = db.execute(crate::db::helpers::portable_statement(
+                backend, "UPDATE media_items SET title = ? WHERE id = ?",
+                vec![name.as_str().into(), episode_id.clone().into()],
+            )).await;
+        }
+        if let Some(overview) = ep.overview.as_ref().filter(|o| !o.is_empty()) {
+            let _ = db.execute(crate::db::helpers::portable_statement(
+                backend, "UPDATE media_items SET overview = ? WHERE id = ?",
+                vec![overview.as_str().into(), episode_id.clone().into()],
+            )).await;
+        }
+        if let Some(still) = ep.still_path.as_ref() {
+            let img = format!("https://image.tmdb.org/t/p/w500{still}");
+            let _ = download_and_save_tmdb_image(db, &client, &episode_id, &img, "Primary").await;
+        }
+        count += 1;
+    }
+    if count > 0 {
+        tracing::info!("TMDb episode metadata fetched for {count} episodes");
+    }
+    Ok(count)
+}
+
+/// Look up the TMDb series ID for an episode by walking up the parent chain
+pub async fn lookup_series_tmdb_id(
+    db: &sea_orm::DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<Option<(String, String)>> {
+    // Walk up: Episode → Season → Series, check provider_ids at each level
+    let backend = db.get_database_backend();
+    let mut current_id = item_id.to_string();
+    for _ in 0..3 {
+        let row = db.query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT parent_id, item_type FROM media_items WHERE id = ?",
+            vec![current_id.clone().into()],
+        )).await?;
+        let Some(row) = row else { break };
+        let parent_id: String = row.get_str("parent_id")?;
+        let item_type: String = row.get_str("item_type")?;
+        // Check parent for TMDb ID
+        if let Some(tmdb_id) = db.query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
+            vec![parent_id.clone().into()],
+        )).await?.and_then(|r| r.get_opt_str("provider_item_id").ok().flatten())
+        {
+            return Ok(Some((parent_id, tmdb_id)));
+        }
+        if item_type == "Season" {
+            current_id = parent_id;
+        } else {
+            break;
+        }
+    }
+    Ok(None)
+}
+
 /// Fetch TMDb metadata for a Series or Movie and store it in the database
 pub async fn fetch_and_apply_tmdb_metadata(
     db: &sea_orm::DatabaseConnection,
@@ -50,17 +205,7 @@ pub async fn fetch_and_apply_tmdb_metadata(
         return Ok(());
     };
 
-    let client = {
-        let mut builder = reqwest::Client::builder();
-        let proxy_url = std::env::var("HTTPS_PROXY")
-            .or_else(|_| std::env::var("https_proxy"))
-            .or_else(|_| std::env::var("ALL_PROXY"))
-            .unwrap_or_default();
-        if !proxy_url.is_empty() {
-            builder = builder.proxy(reqwest::Proxy::all(&proxy_url)?);
-        }
-        builder.build()?
-    };
+    let client = build_client()?;
     let metadata = if item_type == "Series" || item_type == "Season" || item_type == "Episode" {
         providers::tmdb_tv_details(&client, api_key, &tmdb_id).await
     } else {

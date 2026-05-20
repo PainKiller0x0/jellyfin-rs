@@ -57,6 +57,14 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
 
     remove_missing_media_items(&state.db, &all_seen).await?;
     tracing::info!("media scan indexed {total} item(s) across all libraries");
+
+    // Post-scan: fetch TMDb episode metadata (series provider_ids are ready now)
+    if let Some(api_key) = std::env::var("JELLYFIN_RS_TMDB_API_KEY").ok().filter(|k| !k.is_empty()) {
+        if let Err(e) = crate::library::tmdb_metadata::batch_fetch_episode_tmdb(&state.db, &api_key).await {
+            tracing::warn!("episode TMDb fetch failed: {e:#}");
+        }
+    }
+
     Ok(total)
 }
 

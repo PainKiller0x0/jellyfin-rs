@@ -46,26 +46,33 @@ pub async fn seed_default_data(state: &AppState) -> anyhow::Result<()> {
         .await
         .context("failed to seed startup access token")?;
 
-    for (id, name, collection_type) in [
-        ("movies", "Movies", "movies"),
-        ("tvshows", "TV Shows", "tvshows"),
-        ("music", "Music", "music"),
-    ] {
-        state
-            .db
-            .execute(crate::db::helpers::portable_statement(
-                backend,
-                r#"INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, collection_type = excluded.collection_type, updated_at = excluded.updated_at"#,
-                vec![
-                    id.into(),
-                    name.into(),
-                    collection_type.into(),
-                    now.into(),
-                    now.into(),
-                ],
-            ))
-            .await
-            .with_context(|| format!("failed to seed library: {id}"))?;
+    use sea_orm::{ConnectionTrait, EntityTrait};
+    let existing = crate::entities::libraries::Entity::find()
+        .all(&state.db)
+        .await
+        .context("failed to count libraries")?;
+    if existing.is_empty() {
+        for (id, name, collection_type) in [
+            ("movies", "Movies", "movies"),
+            ("tvshows", "TV Shows", "tvshows"),
+            ("music", "Music", "music"),
+        ] {
+            state
+                .db
+                .execute(crate::db::helpers::portable_statement(
+                    backend,
+                    r#"INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING"#,
+                    vec![
+                        id.into(),
+                        name.into(),
+                        collection_type.into(),
+                        now.into(),
+                        now.into(),
+                    ],
+                ))
+                .await
+                .with_context(|| format!("failed to seed library: {id}"))?;
+        }
     }
 
     for path in &state.media_dirs {

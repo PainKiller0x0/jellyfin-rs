@@ -30,117 +30,142 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
         return Ok(0);
     }
 
-    let mut scanned = 0usize;
-    let mut seen_paths = Vec::new();
+    let mut tasks = tokio::task::JoinSet::new();
     for (root, library_id, collection_type) in roots {
         if !root.exists() {
             tracing::warn!("media directory does not exist: {}", root.display());
             continue;
         }
+        let db = state.db.clone();
+        tasks.spawn(async move {
+            scan_root(db, root, library_id, collection_type).await
+        });
+    }
 
-        for entry in WalkDir::new(&root).follow_links(false).into_iter() {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    tracing::warn!("failed to read media path: {error}");
-                    continue;
-                }
-            };
-            let path = entry.path();
-            if path == root {
-                continue;
+    let mut total = 0usize;
+    let mut all_seen = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok((count, paths))) => {
+                total += count;
+                all_seen.extend(paths);
             }
-
-            let resolved = match path_utils::resolve_path_info(path) {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    tracing::warn!("failed to resolve media path {}: {error:#}", path.display());
-                    continue;
-                }
-            };
-
-            let path_string = resolved.path.clone();
-            let parent_id = parent_id_for_path(path, &root, &library_id);
-
-            if resolved.is_directory {
-                seen_paths.push(path_string.clone());
-                let item = ScannedMediaItem::folder_with_type(
-                    resolved.id,
-                    library_id.clone(),
-                    parent_id,
-                    path_string,
-                    resolved.name,
-                    tv_folder_type(path, &root, &collection_type),
-                    resolved.modified_at,
-                );
-                upsert_media_item(&state.db, &item).await?;
-                upsert_sidecar_images(&state.db, path, &item.id).await?;
-                continue;
-            }
-
-            if resolved.is_directory {
-                continue;
-            }
-            let Some(item_type) = classify_media_path(path, &collection_type) else {
-                continue;
-            };
-
-            seen_paths.push(path_string.clone());
-            let parsed_metadata = parse_sidecar_metadata(path).await;
-            let parsed_name = parse_media_name(path, &collection_type);
-            let title = if has_sidecar_nfo(path) {
-                parsed_metadata
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| resolved.name.clone())
-            } else if parsed_name.title.is_empty() {
-                resolved.name.clone()
-            } else {
-                parsed_name.title.clone()
-            };
-            let probe = probe_media(path);
-            let item = ScannedMediaItem {
-                id: resolved.id,
-                title,
-                path: path_string,
-                library_id: library_id.clone(),
-                parent_id,
-                item_type,
-                is_folder: false,
-                container: path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .map(|extension| extension.to_ascii_lowercase()),
-                overview: parsed_metadata.overview.clone(),
-                official_rating: parsed_metadata.official_rating.clone(),
-                extended_video_type: (!parsed_name.extended_video_types.is_empty())
-                    .then(|| parsed_name.extended_video_types.join(",")),
-                production_year: parsed_metadata.production_year,
-                runtime_ticks: probe.as_ref().and_then(|probe| probe.runtime_ticks),
-                size_bytes: resolved.size_bytes,
-                modified_at: resolved.modified_at,
-                created_at: now_unix(),
-            };
-
-            upsert_media_item(&state.db, &item).await?;
-            upsert_media_metadata(&state.db, &item.id, &parsed_metadata).await?;
-            upsert_sidecar_images(&state.db, path, &item.id).await?;
-            let probed = if let Some(probe) = &probe {
-                upsert_probed_media_streams(&state.db, &item, probe).await?
-            } else {
-                false
-            };
-            if !probed {
-                upsert_default_media_stream(&state.db, &item).await?;
-            }
-            upsert_sidecar_subtitles(&state.db, path, &item.id).await?;
-            scanned += 1;
+            Ok(Err(e)) => tracing::warn!("library scan failed: {e:#}"),
+            Err(e) => tracing::warn!("scan task panicked: {e}"),
         }
     }
 
-    remove_missing_media_items(&state.db, &seen_paths).await?;
-    tracing::info!("media scan indexed {scanned} item(s)");
-    Ok(scanned)
+    remove_missing_media_items(&state.db, &all_seen).await?;
+    tracing::info!("media scan indexed {total} item(s) across all libraries");
+    Ok(total)
+}
+
+async fn scan_root(
+    db: sea_orm::DatabaseConnection,
+    root: PathBuf,
+    library_id: String,
+    collection_type: String,
+) -> anyhow::Result<(usize, Vec<String>)> {
+    let mut scanned = 0usize;
+    let mut seen_paths = Vec::new();
+
+    for entry in WalkDir::new(&root).follow_links(false).into_iter() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!("failed to read media path: {error}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+
+        let resolved = match path_utils::resolve_path_info(path) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::warn!("failed to resolve media path {}: {error:#}", path.display());
+                continue;
+            }
+        };
+
+        let path_string = resolved.path.clone();
+        let parent_id = parent_id_for_path(path, &root, &library_id);
+
+        if resolved.is_directory {
+            seen_paths.push(path_string.clone());
+            let item = ScannedMediaItem::folder_with_type(
+                resolved.id,
+                library_id.clone(),
+                parent_id,
+                path_string,
+                resolved.name,
+                tv_folder_type(path, &root, &collection_type),
+                resolved.modified_at,
+            );
+            upsert_media_item(&db, &item).await?;
+            upsert_sidecar_images(&db, path, &item.id).await?;
+            continue;
+        }
+
+        let Some(item_type) = classify_media_path(path, &collection_type) else {
+            continue;
+        };
+
+        seen_paths.push(path_string.clone());
+        let parsed_metadata = parse_sidecar_metadata(path).await;
+        let parsed_name = parse_media_name(path, &collection_type);
+        let title = if has_sidecar_nfo(path) {
+            parsed_metadata
+                .title
+                .clone()
+                .unwrap_or_else(|| resolved.name.clone())
+        } else if parsed_name.title.is_empty() {
+            resolved.name.clone()
+        } else {
+            parsed_name.title.clone()
+        };
+        let probe = probe_media(path);
+        let item = ScannedMediaItem {
+            id: resolved.id,
+            title,
+            path: path_string,
+            library_id: library_id.clone(),
+            parent_id,
+            item_type,
+            is_folder: false,
+            container: path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.to_ascii_lowercase()),
+            overview: parsed_metadata.overview.clone(),
+            official_rating: parsed_metadata.official_rating.clone(),
+            extended_video_type: (!parsed_name.extended_video_types.is_empty())
+                .then(|| parsed_name.extended_video_types.join(",")),
+            production_year: parsed_metadata.production_year,
+            runtime_ticks: probe.as_ref().and_then(|probe| probe.runtime_ticks),
+            size_bytes: resolved.size_bytes,
+            modified_at: resolved.modified_at,
+            created_at: now_unix(),
+        };
+
+        upsert_media_item(&db, &item).await?;
+        upsert_media_metadata(&db, &item.id, &parsed_metadata).await?;
+        upsert_sidecar_images(&db, path, &item.id).await?;
+        let probed = if let Some(probe) = &probe {
+            upsert_probed_media_streams(&db, &item, probe).await?
+        } else {
+            false
+        };
+        if !probed {
+            upsert_default_media_stream(&db, &item).await?;
+        }
+        upsert_sidecar_subtitles(&db, path, &item.id).await?;
+        scanned += 1;
+    }
+
+    Ok((scanned, seen_paths))
 }
 
 fn has_sidecar_nfo(path: &std::path::Path) -> bool {

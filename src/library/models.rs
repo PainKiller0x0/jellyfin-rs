@@ -1,4 +1,4 @@
-use serde_json::{Value, json};
+use serde_json::{Value as JsonValue, json};
 
 use crate::{db::row_ext::QueryResultExt, util::unix_to_jellyfin_date};
 
@@ -29,6 +29,7 @@ pub struct MediaItem {
     pub played_percentage: Option<f64>,
     pub play_count: i64,
     pub last_played_at: Option<i64>,
+    pub image_tags: Option<JsonValue>,
 }
 
 impl MediaItem {
@@ -59,10 +60,11 @@ impl MediaItem {
             played_percentage: row.get_f64("played_percentage").ok().flatten(),
             play_count: row.get_i64("play_count").unwrap_or(0),
             last_played_at: row.get_opt_i64("last_played_at").ok().flatten(),
+            image_tags: None,
         })
     }
 
-    pub fn to_jellyfin_json(&self) -> Value {
+    pub fn to_jellyfin_json(&self) -> JsonValue {
         let media_sources = if self.is_folder {
             json!([])
         } else {
@@ -100,17 +102,17 @@ impl MediaItem {
             },
             "DateCreated": unix_to_jellyfin_date(self.created_at),
             "DateLastMediaAdded": unix_to_jellyfin_date(self.modified_at),
-            "ImageTags": {},
+            "ImageTags": self.image_tags.clone().unwrap_or_else(|| json!({})),
             "MediaSources": media_sources,
         })
     }
 }
 
-pub fn media_source_json(item: &MediaItem) -> Value {
+pub fn media_source_json(item: &MediaItem) -> JsonValue {
     media_source_json_with_streams(item, Vec::new())
 }
 
-pub fn media_source_json_with_streams(item: &MediaItem, media_streams: Vec<Value>) -> Value {
+pub fn media_source_json_with_streams(item: &MediaItem, media_streams: Vec<JsonValue>) -> JsonValue {
     let container = item.container.as_deref().unwrap_or("bin");
     let stream_path = match item.item_type.as_str() {
         "Audio" => format!("/Audio/{}/universal", item.id),
@@ -149,7 +151,7 @@ pub struct MediaStreamRow {
 }
 
 impl MediaStreamRow {
-    pub fn to_jellyfin_json(&self, item_id: &str) -> Value {
+    pub fn to_jellyfin_json(&self, item_id: &str) -> JsonValue {
         let codec = self.codec.as_deref().unwrap_or_default();
         let delivery_url = if self.stream_type == "Subtitle" && self.is_external {
             Some(format!(

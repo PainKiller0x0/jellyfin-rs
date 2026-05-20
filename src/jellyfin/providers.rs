@@ -52,7 +52,7 @@ pub async fn tmdb_movie_details(
 ) -> anyhow::Result<Value> {
     let response = client
         .get(format!("https://api.themoviedb.org/3/movie/{tmdb_id}"))
-        .query(&[("api_key", api_key), ("append_to_response", "credits")])
+        .query(&[("api_key", api_key), ("language", "zh-CN"), ("append_to_response", "credits")])
         .send()
         .await?
         .error_for_status()?
@@ -142,6 +142,7 @@ pub async fn tmdb_tv_details(
         .get(format!("https://api.themoviedb.org/3/tv/{tmdb_id}"))
         .query(&[
             ("api_key", api_key),
+            ("language", "zh-CN"),
             ("append_to_response", "credits,external_ids"),
         ])
         .send()

@@ -74,7 +74,19 @@ pub async fn list_media_items(
     apply_item_filters(&mut items, query);
     apply_relation_filters(db, &mut items, query).await?;
     sort_media_items(&mut items, query);
-    Ok(items.into_iter().skip(offset).take(limit).collect())
+    let mut items: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
+    // Batch load image tags
+    if !items.is_empty() {
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        if let Ok(tags_map) = batch_item_image_tags(db, &ids).await {
+            for item in &mut items {
+                if let Some(tags) = tags_map.get(&item.id) {
+                    item.image_tags = Some(tags.clone());
+                }
+            }
+        }
+    }
+    Ok(items)
 }
 
 async fn is_collection_or_playlist(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<bool> {
@@ -167,6 +179,30 @@ pub fn decode_media_items(rows: &[sea_orm::QueryResult]) -> anyhow::Result<Vec<M
         .map(MediaItem::from_query_result)
         .collect::<Result<Vec<_>, _>>()
         .context("failed to decode media items")
+}
+
+async fn batch_item_image_tags(
+    db: &DatabaseConnection,
+    item_ids: &[String],
+) -> anyhow::Result<HashMap<String, serde_json::Value>> {
+    use crate::entities::image_assets::{Entity as ImageAssets, Column};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+    let mut map = HashMap::new();
+    for chunk in item_ids.chunks(100) {
+        let models = ImageAssets::find()
+            .filter(Column::ItemId.is_in(chunk.iter().map(|s| s.as_str())))
+            .order_by_asc(Column::ImageType)
+            .order_by_asc(Column::ImageIndex)
+            .all(db).await?;
+        for m in &models {
+            let etag = m.etag.as_deref().unwrap_or_default();
+            let entry: &mut serde_json::Value = map.entry(m.item_id.clone()).or_insert_with(|| serde_json::Map::new().into());
+            if let Some(obj) = entry.as_object_mut() {
+                obj.entry(m.image_type.clone()).or_insert_with(|| json!(etag));
+            }
+        }
+    }
+    Ok(map)
 }
 
 fn query_u32(query: &HashMap<String, String>, key: &str, default: u32) -> u32 {

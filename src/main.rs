@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     let default_username =
         std::env::var("JELLYFIN_RS_USER").unwrap_or_else(|_| DEFAULT_USER_NAME.to_string());
     let (ws_event_tx, _) = tokio::sync::broadcast::channel::<ws::WsEvent>(64);
-    let state = AppState {
+    let state = Arc::new(AppState {
         user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, default_username.as_bytes()),
         access_token: Uuid::new_v4().simple().to_string(),
         db,
@@ -59,18 +59,21 @@ async fn main() -> anyhow::Result<()> {
         playback_sessions: RwLock::new(HashMap::new()),
         session_capabilities: RwLock::new(HashMap::new()),
         ws_event_tx,
-    };
+    });
 
     db::seed_default_data(&state).await?;
     if app::state::should_scan_on_startup() {
-        library::scanner::scan_media_library(&state).await?;
+        let scan_state = state.clone();
+        tokio::spawn(async move {
+            let _ = library::scanner::scan_media_library(&scan_state).await;
+        });
     }
 
     let app = Router::new()
         .nest("/emby", jellyfin::routes::api_routes())
         .merge(jellyfin::routes::api_routes())
         .fallback(jellyfin::routes::not_found)
-        .with_state(Arc::new(state))
+        .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 

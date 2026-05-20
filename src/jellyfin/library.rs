@@ -108,27 +108,26 @@ pub async fn delete_virtual_folder_path(
 }
 
 pub async fn refresh_library(State(state): State<Arc<AppState>>) -> Response {
-    let start = now_unix();
-    let result = scan_media_library(&state).await;
-    let end = now_unix();
-    let (status, message) = match &result {
-        Ok(count) => ("Completed", Some(format!("Scanned {count} items"))),
-        Err(error) => ("Failed", Some(format!("{error:#}"))),
-    };
-    system::upsert_task_result(
-        &state,
-        "scan-library",
-        status,
-        start,
-        end,
-        message.as_deref(),
-    )
-    .await;
-    system::log_activity(&state, "Library scan", "LibraryScan", None, None).await;
-    match result {
-        Ok(scanned) => Json(json!({ "Scanned": scanned })).into_response(),
-        Err(error) => internal_error(error),
-    }
+    tokio::spawn(async move {
+        let start = now_unix();
+        let result = scan_media_library(&state).await;
+        let end = now_unix();
+        let (status, message) = match &result {
+            Ok(count) => ("Completed", Some(format!("Scanned {count} items"))),
+            Err(error) => ("Failed", Some(format!("{error:#}"))),
+        };
+        system::upsert_task_result(
+            &state,
+            "scan-library",
+            status,
+            start,
+            end,
+            message.as_deref(),
+        )
+        .await;
+        system::log_activity(&state, "Library scan", "LibraryScan", None, None).await;
+    });
+    Json(json!({ "Scanning": true })).into_response()
 }
 
 async fn virtual_folders_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>> {

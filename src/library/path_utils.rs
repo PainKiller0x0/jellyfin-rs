@@ -38,11 +38,20 @@ pub fn canonicalize_path(path: &str) -> anyhow::Result<String> {
     if normalized.is_empty() {
         bail!("path is required");
     }
-    let canonical = fs::canonicalize(&normalized)
-        .with_context(|| format!("path does not exist: {normalized}"))?
-        .to_string_lossy()
-        .to_string();
-    Ok(strip_windows_extended_prefix(&canonical))
+    match fs::canonicalize(&normalized) {
+        Ok(canonical) => Ok(strip_windows_extended_prefix(
+            &canonical.to_string_lossy(),
+        )),
+        Err(_) => {
+            // canonicalize fails on virtual filesystems (e.g. CloudDrive).
+            // Fall back to the normalized path if the directory exists.
+            let p = Path::new(&normalized);
+            if !p.try_exists().unwrap_or(false) || !p.is_dir() {
+                bail!("path does not exist: {normalized}");
+            }
+            Ok(normalized)
+        }
+    }
 }
 
 pub fn validate_path(

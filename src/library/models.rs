@@ -10,6 +10,7 @@ pub struct MediaItem {
     pub title: String,
     pub path: String,
     pub library_id: String,
+    pub collection_type: String,
     pub parent_id: String,
     pub item_type: String,
     pub is_folder: bool,
@@ -37,6 +38,7 @@ impl MediaItem {
             title: row.get_str("title")?,
             path: row.get_str("path")?,
             library_id: row.get_str("library_id")?,
+            collection_type: row.get_str("collection_type").unwrap_or_default(),
             parent_id: row.get_str("parent_id")?,
             item_type: row.get_str("item_type")?,
             is_folder: row.get_bool_from_i64("is_folder")?,
@@ -59,7 +61,7 @@ impl MediaItem {
     }
 
     pub fn to_jellyfin_json(&self) -> Value {
-        let parsed_name = parse_media_name(std::path::Path::new(&self.path), &self.library_id);
+        let parsed_name = parse_media_name(std::path::Path::new(&self.path), &self.collection_type);
         let media_sources = if self.is_folder {
             json!([])
         } else {

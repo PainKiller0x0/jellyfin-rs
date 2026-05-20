@@ -46,7 +46,7 @@ pub async fn seed_default_data(state: &AppState) -> anyhow::Result<()> {
         .await
         .context("failed to seed startup access token")?;
 
-    use sea_orm::{ConnectionTrait, EntityTrait};
+    use sea_orm::EntityTrait;
     let existing = crate::entities::libraries::Entity::find()
         .all(&state.db)
         .await

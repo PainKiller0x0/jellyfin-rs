@@ -91,7 +91,7 @@ async fn is_collection_or_playlist(db: &DatabaseConnection, item_id: &str) -> an
 }
 
 fn linked_children_select_sql() -> String {
-    r#"SELECT mi.id, mi.title, mi.path, mi.library_id, mi.parent_id, mi.item_type, mi.is_folder, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC"#.to_string()
+    r#"SELECT mi.id, mi.title, mi.path, mi.library_id, libraries.collection_type, mi.parent_id, mi.item_type, mi.is_folder, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.season_number, mi.episode_number, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? LEFT JOIN libraries ON libraries.id = mi.library_id WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC"#.to_string()
 }
 
 pub async fn latest_media_items(
@@ -151,7 +151,7 @@ pub async fn find_media_item(
 
 pub fn media_item_select_sql(where_clause: &str) -> String {
     format!(
-        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.runtime_ticks, media_items.size_bytes, media_items.created_at, media_items.modified_at, COALESCE(user_data.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(user_data.played, CAST(0 AS bigint)) AS played, COALESCE(user_data.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, user_data.played_percentage AS played_percentage, COALESCE(user_data.play_count, CAST(0 AS bigint)) AS play_count, user_data.last_played_at AS last_played_at FROM media_items LEFT JOIN user_data ON user_data.item_id = media_items.id AND user_data.user_id = ? LEFT JOIN libraries ON libraries.id = media_items.library_id {where_clause}"#
+        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.runtime_ticks, media_items.size_bytes, media_items.season_number, media_items.episode_number, media_items.created_at, media_items.modified_at, COALESCE(user_data.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(user_data.played, CAST(0 AS bigint)) AS played, COALESCE(user_data.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, user_data.played_percentage AS played_percentage, COALESCE(user_data.play_count, CAST(0 AS bigint)) AS play_count, user_data.last_played_at AS last_played_at FROM media_items LEFT JOIN user_data ON user_data.item_id = media_items.id AND user_data.user_id = ? LEFT JOIN libraries ON libraries.id = media_items.library_id {where_clause}"#
     )
 }
 
@@ -415,16 +415,32 @@ fn query_ids(query: &HashMap<String, String>, key: &str) -> Option<Vec<String>> 
 }
 
 fn sort_media_items(items: &mut [MediaItem], query: &HashMap<String, String>) {
+    let default_sort = if items.first().is_some_and(|i| i.item_type == "Episode") {
+        "IndexNumber"
+    } else {
+        "SortName"
+    };
     let sort_by = query
         .get("SortBy")
         .map(String::as_str)
-        .unwrap_or("SortName");
-    let primary_sort = sort_by.split(',').next().unwrap_or("SortName");
+        .unwrap_or(default_sort);
+    let primary_sort = sort_by.split(',').next().unwrap_or(default_sort);
     match primary_sort {
         "SortName" => items.sort_by(|a, b| {
             a.title
                 .to_ascii_lowercase()
                 .cmp(&b.title.to_ascii_lowercase())
+        }),
+        "IndexNumber" | "AiredEpisodeOrder" => items.sort_by(|a, b| {
+            a.season_number
+                .unwrap_or(0)
+                .cmp(&b.season_number.unwrap_or(0))
+                .then_with(|| {
+                    a.episode_number
+                        .unwrap_or(0)
+                        .cmp(&b.episode_number.unwrap_or(0))
+                })
+                .then_with(|| a.title.cmp(&b.title))
         }),
         "DateCreated" => items.sort_by_key(|item| item.created_at),
         "DateLastMediaAdded" | "DateLastContentAdded" => items.sort_by_key(|item| item.modified_at),

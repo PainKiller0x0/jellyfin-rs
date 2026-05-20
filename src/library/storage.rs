@@ -22,6 +22,8 @@ pub struct ScannedMediaItem {
     pub production_year: Option<i64>,
     pub runtime_ticks: Option<i64>,
     pub size_bytes: Option<i64>,
+    pub season_number: Option<i64>,
+    pub episode_number: Option<i64>,
     pub modified_at: i64,
     pub created_at: i64,
 }
@@ -51,6 +53,8 @@ impl ScannedMediaItem {
             production_year: None,
             runtime_ticks: None,
             size_bytes: None,
+            season_number: None,
+            episode_number: None,
             modified_at,
             created_at: now_unix(),
         }
@@ -64,7 +68,7 @@ pub async fn upsert_media_item(
     let backend = db.get_database_backend();
     db.execute(crate::db::helpers::portable_statement(
         backend,
-        r#"INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, container, overview, official_rating, extended_video_type, production_year, runtime_ticks, size_bytes, modified_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET title = excluded.title, library_id = excluded.library_id, parent_id = excluded.parent_id, item_type = excluded.item_type, is_folder = excluded.is_folder, container = excluded.container, overview = excluded.overview, official_rating = excluded.official_rating, extended_video_type = excluded.extended_video_type, production_year = excluded.production_year, runtime_ticks = excluded.runtime_ticks, size_bytes = excluded.size_bytes, modified_at = excluded.modified_at, updated_at = excluded.updated_at"#,
+        r#"INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, container, overview, official_rating, extended_video_type, production_year, runtime_ticks, size_bytes, season_number, episode_number, modified_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET title = excluded.title, library_id = excluded.library_id, parent_id = excluded.parent_id, item_type = excluded.item_type, is_folder = excluded.is_folder, container = excluded.container, overview = excluded.overview, official_rating = excluded.official_rating, extended_video_type = excluded.extended_video_type, production_year = excluded.production_year, runtime_ticks = excluded.runtime_ticks, size_bytes = excluded.size_bytes, season_number = excluded.season_number, episode_number = excluded.episode_number, modified_at = excluded.modified_at, updated_at = excluded.updated_at"#,
         vec![
             item.id.as_str().into(),
             item.title.as_str().into(),
@@ -80,6 +84,8 @@ pub async fn upsert_media_item(
             item.production_year.into(),
             item.runtime_ticks.into(),
             item.size_bytes.into(),
+            item.season_number.into(),
+            item.episode_number.into(),
             item.modified_at.into(),
             item.created_at.into(),
             now_unix().into(),

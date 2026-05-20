@@ -146,6 +146,8 @@ async fn scan_root(
             production_year: parsed_metadata.production_year,
             runtime_ticks: probe.as_ref().and_then(|probe| probe.runtime_ticks),
             size_bytes: resolved.size_bytes,
+            season_number: parsed_name.season_number,
+            episode_number: parsed_name.episode_number,
             modified_at: resolved.modified_at,
             created_at: now_unix(),
         };

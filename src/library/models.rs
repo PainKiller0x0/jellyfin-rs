@@ -1,8 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::{
-    db::row_ext::QueryResultExt, library::naming::parse_media_name, util::unix_to_jellyfin_date,
-};
+use crate::{db::row_ext::QueryResultExt, util::unix_to_jellyfin_date};
 
 #[derive(Clone, Debug)]
 pub struct MediaItem {
@@ -21,6 +19,8 @@ pub struct MediaItem {
     pub production_year: Option<i64>,
     pub runtime_ticks: Option<i64>,
     pub size_bytes: Option<i64>,
+    pub season_number: Option<i64>,
+    pub episode_number: Option<i64>,
     pub created_at: i64,
     pub modified_at: i64,
     pub is_favorite: bool,
@@ -49,6 +49,8 @@ impl MediaItem {
             production_year: row.get_opt_i64("production_year")?,
             runtime_ticks: row.get_opt_i64("runtime_ticks")?,
             size_bytes: row.get_opt_i64("size_bytes")?,
+            season_number: row.get_opt_i64("season_number").ok().flatten(),
+            episode_number: row.get_opt_i64("episode_number").ok().flatten(),
             created_at: row.get_i64("created_at")?,
             modified_at: row.get_i64("modified_at")?,
             is_favorite: row.get_bool_from_i64("is_favorite")?,
@@ -61,7 +63,6 @@ impl MediaItem {
     }
 
     pub fn to_jellyfin_json(&self) -> Value {
-        let parsed_name = parse_media_name(std::path::Path::new(&self.path), &self.collection_type);
         let media_sources = if self.is_folder {
             json!([])
         } else {
@@ -82,10 +83,9 @@ impl MediaItem {
             "ExtendedVideoType": self.extended_video_type,
             "ProductionYear": self.production_year,
             "PremiereDate": self.production_year.map(|year| format!("{year}-01-01T00:00:00.0000000Z")),
-            "IndexNumber": parsed_name.episode_number,
-            "ParentIndexNumber": parsed_name.season_number.or_else(|| season_number(&self.title)),
-            "IndexNumberEnd": parsed_name.ending_episode_number,
-            "OriginalTitle": parsed_name.version,
+            "IndexNumber": self.episode_number,
+            "ParentIndexNumber": self.season_number,
+            "IndexNumberEnd": null,
             "SortName": self.title,
             "ProviderIds": {},
             "LockData": false,
@@ -104,15 +104,6 @@ impl MediaItem {
             "MediaSources": media_sources,
         })
     }
-}
-
-fn season_number(value: &str) -> Option<i64> {
-    let lower = value.to_ascii_lowercase();
-    let digits = lower
-        .strip_prefix("season")
-        .or_else(|| lower.strip_prefix('s'))?
-        .trim_matches(|c: char| !c.is_ascii_digit());
-    digits.parse().ok()
 }
 
 pub fn media_source_json(item: &MediaItem) -> Value {

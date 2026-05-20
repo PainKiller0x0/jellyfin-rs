@@ -123,11 +123,16 @@ async fn child_items_by_type(
     item_type: &str,
 ) -> anyhow::Result<Vec<MediaItem>> {
     let backend = db.get_database_backend();
+    let order = if item_type == "Episode" {
+        "ORDER BY media_items.season_number ASC, media_items.episode_number ASC"
+    } else {
+        "ORDER BY media_items.title ASC"
+    };
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
             &crate::jellyfin::item_queries::media_item_select_sql(
-                "WHERE media_items.parent_id = ? AND media_items.item_type = ? ORDER BY media_items.title ASC",
+                &format!("WHERE media_items.parent_id = ? AND media_items.item_type = ? {order}"),
             ),
             vec![user_id.into(), parent_id.into(), item_type.into()],
         ))

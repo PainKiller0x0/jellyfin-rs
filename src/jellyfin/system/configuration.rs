@@ -9,10 +9,11 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use sea_orm::ConnectionTrait;
+use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 
 use crate::{
     app::state::{AppState, DEFAULT_USER_NAME, SERVER_NAME},
+    entities::users::{self, Entity as Users},
     jellyfin::common::internal_error,
     util::{hash_password, now_unix},
 };
@@ -109,21 +110,35 @@ pub async fn update_startup_user(
     };
     let user_id = state.user_id.to_string();
 
-    let backend = state.db.get_database_backend();
-    match state.db.execute(crate::db::helpers::portable_statement(
-        backend,
-        r#"INSERT INTO users (id, username, password_hash, display_name, is_admin, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?) ON CONFLICT(id) DO UPDATE SET username = excluded.username, password_hash = excluded.password_hash, display_name = excluded.display_name, is_admin = 1, is_disabled = 0, updated_at = excluded.updated_at"#,
-        vec![
-            user_id.clone().into(),
-            username.into(),
-            password_hash.into(),
-            username.into(),
-            now.into(),
-            now.into(),
-        ],
-    ))
-    .await
-    {
+    let result = match Users::find_by_id(&user_id).one(&state.db).await {
+        Ok(Some(model)) => {
+            let mut active: users::ActiveModel = model.into();
+            active.username = Set(username.to_string());
+            active.password_hash = Set(Some(password_hash));
+            active.display_name = Set(username.to_string());
+            active.is_admin = Set(1);
+            active.is_disabled = Set(0);
+            active.updated_at = Set(now);
+            active.update(&state.db).await.map(|_| ())
+        }
+        Ok(None) => {
+            let active = users::ActiveModel {
+                id: Set(user_id.clone()),
+                username: Set(username.to_string()),
+                password_hash: Set(Some(password_hash)),
+                display_name: Set(username.to_string()),
+                is_admin: Set(1),
+                is_disabled: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            };
+            Users::insert(active).exec(&state.db).await.map(|_| ())
+        }
+        Err(e) => Err(e),
+    };
+
+    match result {
         Ok(_) => Json(json!({ "Id": user_id, "Name": username })).into_response(),
         Err(error) => internal_error(error.into()),
     }

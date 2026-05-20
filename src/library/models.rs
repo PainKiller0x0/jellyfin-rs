@@ -156,22 +156,6 @@ pub struct MediaStreamRow {
 }
 
 impl MediaStreamRow {
-    pub fn from_query_result(row: &sea_orm::QueryResult) -> Result<Self, sea_orm::DbErr> {
-        Ok(Self {
-            stream_index: row.get_i64("stream_index")?,
-            stream_type: row.get_str("stream_type")?,
-            codec: row.get_opt_str("codec")?,
-            language: row.get_opt_str("language")?,
-            title: row.get_opt_str("title")?,
-            bit_rate: row.get_opt_i64("bit_rate")?,
-            width: row.get_opt_i64("width")?,
-            height: row.get_opt_i64("height")?,
-            channels: row.get_opt_i64("channels")?,
-            sample_rate: row.get_opt_i64("sample_rate")?,
-            is_external: row.get_bool_from_i64("is_external")?,
-        })
-    }
-
     pub fn to_jellyfin_json(&self, item_id: &str) -> Value {
         let codec = self.codec.as_deref().unwrap_or_default();
         let delivery_url = if self.stream_type == "Subtitle" && self.is_external {

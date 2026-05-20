@@ -7,7 +7,10 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, Value};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, Set,
+};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use uuid::Uuid;
@@ -15,6 +18,10 @@ use uuid::Uuid;
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
+    entities::{
+        access_tokens, access_tokens::Entity as AccessTokens, api_keys,
+        api_keys::Entity as ApiKeys, users, users::Entity as Users,
+    },
     jellyfin::routes::internal_error,
     util::{hash_password, now_unix, stable_text_id, unix_to_jellyfin_date, verify_password},
 };
@@ -183,17 +190,8 @@ pub async fn delete_user(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<String>,
 ) -> Response {
-    let backend = state.db.get_database_backend();
-    match state
-        .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
-            "DELETE FROM users WHERE id = ?",
-            vec![user_id.clone().into()],
-        ))
-        .await
-    {
-        Ok(result) if result.rows_affected() == 0 => (
+    match Users::delete_by_id(user_id.clone()).exec(&state.db).await {
+        Ok(result) if result.rows_affected == 0 => (
             StatusCode::NOT_FOUND,
             Json(json!({ "Error": "User not found" })),
         )
@@ -217,21 +215,19 @@ pub async fn update_user(
         return StatusCode::NO_CONTENT.into_response();
     };
 
-    let backend = state.db.get_database_backend();
-    match state
-        .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
-            "UPDATE users SET username = ?, display_name = ?, updated_at = ? WHERE id = ?",
-            vec![
-                name.into(),
-                name.into(),
-                now_unix().into(),
-                user_id.clone().into(),
-            ],
-        ))
-        .await
-    {
+    let result = match Users::find_by_id(user_id.clone()).one(&state.db).await {
+        Ok(Some(model)) => {
+            let mut active: users::ActiveModel = model.into();
+            active.username = Set(name.to_string());
+            active.display_name = Set(name.to_string());
+            active.updated_at = Set(now_unix());
+            active.update(&state.db).await
+        }
+        Ok(None) => return StatusCode::NO_CONTENT.into_response(),
+        Err(e) => Err(e),
+    };
+
+    match result {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error.into()),
     }
@@ -319,32 +315,37 @@ async fn authenticate_by_name_inner(
 
     let now = now_unix();
     let token = Uuid::new_v4().simple().to_string();
-    let backend = db.get_database_backend();
 
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
-        r#"INSERT INTO access_tokens (id, user_id, token_hash, name, device_id, created_at, last_used_at) VALUES (?, ?, ?, 'login-token', ?, ?, ?)"#,
-        vec![
-            Uuid::new_v4().to_string().into(),
-            user.id.clone().into(),
-            stable_text_id(&token).into(),
-            request.device_id.into(),
-            now.into(),
-            now.into(),
-        ],
-    ))
-    .await
-    .context("failed to create access token")
-    .map_err(AuthError::Internal)?;
+    let token_active = access_tokens::ActiveModel {
+        id: Set(Uuid::new_v4().to_string()),
+        user_id: Set(user.id.clone()),
+        token_hash: Set(stable_text_id(&token)),
+        name: Set(Some("login-token".to_string())),
+        device_id: Set(request.device_id),
+        created_at: Set(now),
+        last_used_at: Set(Some(now)),
+        ..Default::default()
+    };
+    AccessTokens::insert(token_active)
+        .exec(db)
+        .await
+        .context("failed to create access token")
+        .map_err(AuthError::Internal)?;
 
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?",
-        vec![now.into(), now.into(), user.id.clone().into()],
-    ))
-    .await
-    .context("failed to update last login time")
-    .map_err(AuthError::Internal)?;
+    let user_model = Users::find_by_id(&user.id)
+        .one(db)
+        .await
+        .context("failed to find user")
+        .map_err(AuthError::Internal)?
+        .ok_or_else(|| AuthError::Internal(anyhow::anyhow!("user not found")))?;
+    let mut user_active: users::ActiveModel = user_model.into();
+    user_active.last_login_at = Set(Some(now));
+    user_active.updated_at = Set(now);
+    user_active
+        .update(db)
+        .await
+        .context("failed to update last login time")
+        .map_err(AuthError::Internal)?;
 
     crate::jellyfin::system::log_activity(
         state,
@@ -363,40 +364,31 @@ async fn authenticate_by_name_inner(
 }
 
 async fn api_keys_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<JsonValue>> {
-    let backend = db.get_database_backend();
-    let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            r#"SELECT id, access_token, name, user_id, created_at, last_used_at FROM api_keys ORDER BY created_at ASC"#,
-            vec![],
-        ))
+    let models = ApiKeys::find()
+        .order_by_asc(api_keys::Column::CreatedAt)
+        .all(db)
         .await
         .context("failed to list api keys")?;
 
-    rows.into_iter()
-        .map(|row| {
-            let id: String = row.get_str("id")?;
-            let access_token: String = row.get_str("access_token")?;
-            let name: String = row.get_str("name")?;
-            let user_id: String = row.get_str("user_id")?;
-            let created_at: i64 = row.get_i64("created_at")?;
-            let last_used_at: Option<i64> = row.get_opt_i64("last_used_at")?;
-            Ok(json!({
-                "Id": stable_text_id(&id),
-                "AccessToken": access_token,
+    Ok(models
+        .into_iter()
+        .map(|m| {
+            json!({
+                "Id": stable_text_id(&m.id),
+                "AccessToken": m.access_token,
                 "DeviceId": "",
-                "AppName": name,
+                "AppName": m.name,
                 "AppVersion": "",
                 "DeviceName": "",
-                "UserId": user_id,
+                "UserId": m.user_id,
                 "IsActive": true,
-                "DateCreated": unix_to_jellyfin_date(created_at),
+                "DateCreated": unix_to_jellyfin_date(m.created_at),
                 "DateRevoked": null,
-                "DateLastActivity": unix_to_jellyfin_date(last_used_at.unwrap_or(created_at)),
+                "DateLastActivity": unix_to_jellyfin_date(m.last_used_at.unwrap_or(m.created_at)),
                 "UserName": null
-            }))
+            })
         })
-        .collect()
+        .collect())
 }
 
 async fn create_api_key_inner(state: &AppState, query: CreateApiKeyQuery) -> anyhow::Result<()> {
@@ -409,37 +401,30 @@ async fn create_api_key_inner(state: &AppState, query: CreateApiKeyQuery) -> any
     let now = now_unix();
     let token = Uuid::new_v4().simple().to_string();
     let key_id = Uuid::new_v4().to_string();
-    let backend = state.db.get_database_backend();
 
-    state
-        .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
-            r#"INSERT INTO api_keys (id, access_token, name, user_id, created_at) VALUES (?, ?, ?, ?, ?)"#,
-            vec![
-                key_id.into(),
-                token.clone().into(),
-                app.into(),
-                state.user_id.to_string().into(),
-                now.into(),
-            ],
-        ))
+    let key_active = api_keys::ActiveModel {
+        id: Set(key_id),
+        access_token: Set(token.clone()),
+        name: Set(app.to_string()),
+        user_id: Set(state.user_id.to_string()),
+        created_at: Set(now),
+        ..Default::default()
+    };
+    ApiKeys::insert(key_active)
+        .exec(&state.db)
         .await
         .context("failed to create api key")?;
 
-    state
-        .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
-            r#"INSERT INTO access_tokens (id, user_id, token_hash, name, created_at) VALUES (?, ?, ?, ?, ?)"#,
-            vec![
-                Uuid::new_v4().to_string().into(),
-                state.user_id.to_string().into(),
-                stable_text_id(&token).into(),
-                app.into(),
-                now.into(),
-            ],
-        ))
+    let token_active = access_tokens::ActiveModel {
+        id: Set(Uuid::new_v4().to_string()),
+        user_id: Set(state.user_id.to_string()),
+        token_hash: Set(stable_text_id(&token)),
+        name: Set(Some(app.to_string())),
+        created_at: Set(now),
+        ..Default::default()
+    };
+    AccessTokens::insert(token_active)
+        .exec(&state.db)
         .await
         .context("failed to create api key access token")?;
 
@@ -448,61 +433,53 @@ async fn create_api_key_inner(state: &AppState, query: CreateApiKeyQuery) -> any
 
 async fn delete_api_key_inner(db: &DatabaseConnection, key: &str) -> anyhow::Result<()> {
     let token_hash = stable_text_id(key);
-    let backend = db.get_database_backend();
 
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "DELETE FROM api_keys WHERE access_token = ?",
-        vec![key.into()],
-    ))
-    .await
-    .context("failed to delete api key")?;
+    ApiKeys::delete_many()
+        .filter(api_keys::Column::AccessToken.eq(key))
+        .exec(db)
+        .await
+        .context("failed to delete api key")?;
 
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "DELETE FROM access_tokens WHERE token_hash = ?",
-        vec![token_hash.into()],
-    ))
-    .await
-    .context("failed to delete api key access token")?;
+    AccessTokens::delete_many()
+        .filter(access_tokens::Column::TokenHash.eq(token_hash))
+        .exec(db)
+        .await
+        .context("failed to delete api key access token")?;
 
     Ok(())
 }
 
 async fn list_users_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<JsonValue>> {
-    let backend = db.get_database_backend();
-    let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT id, username, password_hash, is_admin, is_disabled FROM users ORDER BY username ASC",
-            vec![],
-        ))
+    let models = Users::find()
+        .order_by_asc(users::Column::Username)
+        .all(db)
         .await
         .context("failed to list users")?;
 
-    rows.iter()
-        .map(|row| {
-            user_from_row(row)
-                .map(|user| user_json(&user.id, &user.username, user.is_admin, user.is_disabled))
-        })
-        .collect()
+    Ok(models
+        .iter()
+        .map(|m| user_json(&m.id, &m.username, m.is_admin != 0, m.is_disabled != 0))
+        .collect())
 }
 
 async fn user_by_id_inner(
     db: &DatabaseConnection,
     user_id: &str,
 ) -> anyhow::Result<Option<UserRow>> {
-    let backend = db.get_database_backend();
-    db.query_one(crate::db::helpers::portable_statement(
-        backend,
-        "SELECT id, username, password_hash, is_admin, is_disabled FROM users WHERE id = ?",
-        vec![user_id.into()],
-    ))
-    .await
-    .context("failed to fetch user")?
-    .as_ref()
-    .map(user_from_row)
-    .transpose()
+    let Some(model) = Users::find_by_id(user_id)
+        .one(db)
+        .await
+        .context("failed to fetch user")?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(UserRow {
+        id: model.id,
+        username: model.username,
+        password_hash: model.password_hash,
+        is_admin: model.is_admin != 0,
+        is_disabled: model.is_disabled != 0,
+    }))
 }
 
 async fn create_user_inner(
@@ -522,21 +499,21 @@ async fn create_user_inner(
         _ => None,
     };
 
-    let backend = db.get_database_backend();
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
-        r#"INSERT INTO users (id, username, password_hash, display_name, is_admin, created_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?)"#,
-        vec![
-            user_id.clone().into(),
-            username.into(),
-            Value::from(password_hash),
-            username.into(),
-            now.into(),
-            now.into(),
-        ],
-    ))
-    .await
-    .context("failed to create user")?;
+    let active = users::ActiveModel {
+        id: Set(user_id.clone()),
+        username: Set(username.to_string()),
+        password_hash: Set(password_hash),
+        display_name: Set(username.to_string()),
+        is_admin: Set(0),
+        is_disabled: Set(0),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+    Users::insert(active)
+        .exec(db)
+        .await
+        .context("failed to create user")?;
 
     Ok(user_json(&user_id, username, false, false))
 }
@@ -573,17 +550,23 @@ async fn update_user_password_inner(
                 .map_err(AuthError::Internal)?,
         )
     };
+
+    let model = Users::find_by_id(user_id)
+        .one(db)
+        .await
+        .context("failed to find user")
+        .map_err(AuthError::Internal)?
+        .ok_or_else(|| AuthError::Internal(anyhow::anyhow!("user not found")))?;
+    let mut active: users::ActiveModel = model.into();
+    active.password_hash = Set(password_hash);
+    active.updated_at = Set(now);
+    active
+        .update(db)
+        .await
+        .context("failed to update password")
+        .map_err(AuthError::Internal)?;
+
     let backend = db.get_database_backend();
-
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
-        vec![Value::from(password_hash), now.into(), user_id.into()],
-    ))
-    .await
-    .context("failed to update password")
-    .map_err(AuthError::Internal)?;
-
     db.execute(crate::db::helpers::portable_statement(
         backend,
         "UPDATE access_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
@@ -600,17 +583,21 @@ async fn find_user_by_name(
     db: &DatabaseConnection,
     username: &str,
 ) -> anyhow::Result<Option<UserRow>> {
-    let backend = db.get_database_backend();
-    db.query_one(crate::db::helpers::portable_statement(
-        backend,
-        "SELECT id, username, password_hash, is_admin, is_disabled FROM users WHERE username = ?",
-        vec![username.into()],
-    ))
-    .await
-    .context("failed to fetch user by username")?
-    .as_ref()
-    .map(user_from_row)
-    .transpose()
+    let Some(model) = Users::find()
+        .filter(users::Column::Username.eq(username))
+        .one(db)
+        .await
+        .context("failed to fetch user by username")?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(UserRow {
+        id: model.id,
+        username: model.username,
+        password_hash: model.password_hash,
+        is_admin: model.is_admin != 0,
+        is_disabled: model.is_disabled != 0,
+    }))
 }
 
 pub async fn authenticated_user_id(
@@ -698,16 +685,6 @@ pub fn header_token(headers: &HeaderMap, name: &str) -> Option<String> {
         part.strip_prefix("Token=")
             .map(|token| token.trim_matches('"').to_string())
             .filter(|token| !token.is_empty())
-    })
-}
-
-fn user_from_row(row: &sea_orm::QueryResult) -> anyhow::Result<UserRow> {
-    Ok(UserRow {
-        id: row.get_str("id")?,
-        username: row.get_str("username")?,
-        password_hash: row.get_opt_str("password_hash")?,
-        is_admin: row.get_bool_from_i64("is_admin")?,
-        is_disabled: row.get_bool_from_i64("is_disabled")?,
     })
 }
 

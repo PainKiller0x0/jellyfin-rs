@@ -7,13 +7,20 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, Value};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
+};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
     app::state::{AppState, SERVER_NAME, VERSION},
-    db::row_ext::QueryResultExt,
+    entities::{
+        activity_log, activity_log::Entity as ActivityLog, app_settings,
+        app_settings::Entity as AppSettings, task_results, task_results::Entity as TaskResults,
+        users, users::Entity as Users,
+    },
     jellyfin::common::internal_error,
     library::path_utils,
     util::now_unix,
@@ -246,45 +253,38 @@ pub async fn activity_log(
     let limit = query
         .get("Limit")
         .or_else(|| query.get("limit"))
-        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(15)
         .clamp(1, 100);
     let start_index = query
         .get("StartIndex")
         .or_else(|| query.get("startIndex"))
-        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let has_user_id = query
         .get("hasUserId")
         .or_else(|| query.get("HasUserId"))
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
 
-    let backend = state.db.get_database_backend();
-    let sql = if has_user_id {
-        "SELECT name, log_type, created_at, user_id FROM activity_log WHERE user_id IS NOT NULL ORDER BY created_at DESC LIMIT ? OFFSET ?"
-    } else {
-        "SELECT name, log_type, created_at, user_id FROM activity_log ORDER BY created_at DESC LIMIT ? OFFSET ?"
-    };
+    let mut select = ActivityLog::find()
+        .order_by_desc(activity_log::Column::CreatedAt)
+        .limit(limit)
+        .offset(start_index);
 
-    match state
-        .db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            sql,
-            vec![limit.into(), start_index.into()],
-        ))
-        .await
-    {
-        Ok(rows) => {
-            let items: Vec<JsonValue> = rows
+    if has_user_id {
+        select = select.filter(activity_log::Column::UserId.is_not_null());
+    }
+
+    match select.all(&state.db).await {
+        Ok(models) => {
+            let items: Vec<JsonValue> = models
                 .iter()
-                .map(|row| {
-                    let created_at: i64 = row.get_i64("created_at").unwrap_or_default();
+                .map(|m| {
                     json!({
-                        "Name": row.get_str("name").unwrap_or_default(),
-                        "Type": row.get_str("log_type").unwrap_or_default(),
-                        "Date": crate::util::unix_to_jellyfin_date(created_at),
-                        "UserId": row.get_opt_str("user_id").unwrap_or_default(),
+                        "Name": m.name,
+                        "Type": m.log_type,
+                        "Date": crate::util::unix_to_jellyfin_date(m.created_at),
+                        "UserId": m.user_id.as_deref().unwrap_or_default(),
                         "Severity": "Info",
                     })
                 })
@@ -298,18 +298,14 @@ pub async fn activity_log(
 type Response = axum::response::Response;
 
 pub(crate) async fn app_setting(db: &DatabaseConnection, key: &str, default: &str) -> String {
-    let backend = db.get_database_backend();
-    db.query_one(crate::db::helpers::portable_statement(
-        backend,
-        "SELECT value FROM app_settings WHERE key = ?",
-        vec![key.into()],
-    ))
-    .await
-    .ok()
-    .flatten()
-    .and_then(|row| row.get_str("value").ok())
-    .filter(|value| !value.trim().is_empty())
-    .unwrap_or_else(|| default.to_string())
+    AppSettings::find_by_id(key)
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .map(|model| model.value)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 pub(super) async fn app_setting_bool(db: &DatabaseConnection, key: &str, default: bool) -> bool {
@@ -329,31 +325,36 @@ pub(super) async fn set_app_setting(
     key: &str,
     value: &str,
 ) -> anyhow::Result<()> {
-    let backend = db.get_database_backend();
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        vec![key.into(), value.into(), now_unix().into()],
-    ))
-    .await?;
+    let now = now_unix();
+    let existing = AppSettings::find_by_id(key).one(db).await?;
+    if let Some(model) = existing {
+        let mut active: app_settings::ActiveModel = model.into();
+        active.value = Set(value.to_string());
+        active.updated_at = Set(now);
+        active.update(db).await?;
+    } else {
+        let active = app_settings::ActiveModel {
+            key: Set(key.to_string()),
+            value: Set(value.to_string()),
+            updated_at: Set(now),
+        };
+        AppSettings::insert(active).exec(db).await?;
+    }
     Ok(())
 }
 
 pub(super) async fn first_admin_user(
     db: &DatabaseConnection,
 ) -> anyhow::Result<Option<(String, String)>> {
-    let backend = db.get_database_backend();
-    let Some(row) = db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT id, username FROM users WHERE is_admin = 1 ORDER BY created_at ASC LIMIT 1",
-            vec![],
-        ))
+    let Some(model) = Users::find()
+        .filter(users::Column::IsAdmin.eq(1))
+        .order_by_asc(users::Column::CreatedAt)
+        .one(db)
         .await?
     else {
         return Ok(None);
     };
-    Ok(Some((row.get_str("id")?, row.get_str("username")?)))
+    Ok(Some((model.id, model.username)))
 }
 
 pub async fn scheduled_tasks(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -371,23 +372,12 @@ pub async fn scheduled_tasks(State(state): State<Arc<AppState>>) -> impl IntoRes
 }
 
 pub async fn last_task_result(db: &DatabaseConnection, task_id: &str) -> Option<JsonValue> {
-    let backend = db.get_database_backend();
-    let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT status, start_time, end_time, message FROM task_results WHERE task_id = ?",
-            vec![task_id.into()],
-        ))
-        .await
-        .ok()??;
-    let status: String = row.get_str("status").ok()?;
-    let start_time: Option<i64> = row.get_opt_i64("start_time").ok().flatten();
-    let end_time: Option<i64> = row.get_opt_i64("end_time").ok().flatten();
+    let model = TaskResults::find_by_id(task_id).one(db).await.ok()??;
     Some(json!({
-        "Status": status,
-        "StartTimeUtc": start_time.map(crate::util::unix_to_jellyfin_date),
-        "EndTimeUtc": end_time.map(crate::util::unix_to_jellyfin_date),
-        "Message": row.get_opt_str("message").ok().flatten(),
+        "Status": model.status,
+        "StartTimeUtc": model.start_time.map(crate::util::unix_to_jellyfin_date),
+        "EndTimeUtc": model.end_time.map(crate::util::unix_to_jellyfin_date),
+        "Message": model.message,
     }))
 }
 
@@ -400,22 +390,16 @@ pub async fn log_activity(
 ) {
     let now = now_unix();
     let id = crate::util::stable_text_id(&format!("activity:{now}:{name}:{log_type}"));
-    let backend = state.db.get_database_backend();
-    let _ = state
-        .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
-            "INSERT INTO activity_log (id, name, log_type, user_id, item_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            vec![
-                id.into(),
-                name.into(),
-                log_type.into(),
-                Value::from(user_id.map(ToString::to_string)),
-                Value::from(item_id.map(ToString::to_string)),
-                now.into(),
-            ],
-        ))
-        .await;
+    let active = activity_log::ActiveModel {
+        id: Set(id),
+        name: Set(name.to_string()),
+        log_type: Set(log_type.to_string()),
+        user_id: Set(user_id.map(ToString::to_string)),
+        item_id: Set(item_id.map(ToString::to_string)),
+        severity: Set("Info".to_string()),
+        created_at: Set(now),
+    };
+    let _ = ActivityLog::insert(active).exec(&state.db).await;
     let _ = state.ws_event_tx.send(crate::ws::WsEvent::ActivityCreated);
 }
 
@@ -427,21 +411,32 @@ pub async fn upsert_task_result(
     end_time: i64,
     message: Option<&str>,
 ) {
-    let backend = state.db.get_database_backend();
-    let _ = state
-        .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
-            "INSERT INTO task_results (task_id, status, start_time, end_time, message) VALUES (?, ?, ?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET status = excluded.status, start_time = excluded.start_time, end_time = excluded.end_time, message = excluded.message",
-            vec![
-                task_id.into(),
-                status.into(),
-                start_time.into(),
-                end_time.into(),
-                message.into(),
-            ],
-        ))
-        .await;
+    let existing = TaskResults::find_by_id(task_id)
+        .one(&state.db)
+        .await
+        .ok()
+        .flatten();
+    let result = if let Some(model) = existing {
+        let mut active: task_results::ActiveModel = model.into();
+        active.status = Set(status.to_string());
+        active.start_time = Set(Some(start_time));
+        active.end_time = Set(Some(end_time));
+        active.message = Set(message.map(ToString::to_string));
+        active.update(&state.db).await.map(|_| ())
+    } else {
+        let active = task_results::ActiveModel {
+            task_id: Set(task_id.to_string()),
+            status: Set(status.to_string()),
+            start_time: Set(Some(start_time)),
+            end_time: Set(Some(end_time)),
+            message: Set(message.map(ToString::to_string)),
+        };
+        TaskResults::insert(active)
+            .exec(&state.db)
+            .await
+            .map(|_| ())
+    };
+    let _ = result;
     let _ = state.ws_event_tx.send(crate::ws::WsEvent::TaskUpdated);
 }
 

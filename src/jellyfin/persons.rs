@@ -6,10 +6,17 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, Value};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Value,
+};
 use serde_json::{Value as JsonValue, json};
 
-use crate::{app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error};
+use crate::{
+    app::state::AppState,
+    db::row_ext::QueryResultExt,
+    entities::{image_assets::Entity as ImageAssets, people::Entity as People},
+    jellyfin::common::internal_error,
+};
 
 pub async fn person_by_name(
     State(state): State<Arc<AppState>>,
@@ -197,17 +204,16 @@ async fn find_person_by_name(
     db: &DatabaseConnection,
     name: &str,
 ) -> anyhow::Result<Option<PersonRow>> {
-    let backend = db.get_database_backend();
-    let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT id, name FROM people WHERE name = ?",
-            vec![name.into()],
-        ))
-        .await?;
-    Ok(row.map(|row| PersonRow {
-        id: row.get_str("id").unwrap_or_default(),
-        name: row.get_str("name").unwrap_or_default(),
+    let Some(model) = People::find()
+        .filter(crate::entities::people::Column::Name.eq(name))
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PersonRow {
+        id: model.id,
+        name: model.name,
     }))
 }
 
@@ -231,7 +237,7 @@ async fn fetch_tagged_items(
 
     if user_id.is_some() {
         sql.push_str(
-            r#", COALESCE(ud.is_favorite, 0) AS is_favorite, COALESCE(ud.played, 0) AS played, COALESCE(ud.playback_position_ticks, 0) AS playback_position_ticks, ud.played_percentage, COALESCE(ud.play_count, 0) AS play_count, ud.last_played_at"#,
+            r#", COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at"#,
         );
     }
 
@@ -375,24 +381,19 @@ async fn count_tagged_items(
 }
 
 async fn person_images(db: &DatabaseConnection, person_id: &str) -> anyhow::Result<JsonValue> {
-    let backend = db.get_database_backend();
-    let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT image_type, etag, width, height FROM image_assets WHERE item_id = ? ORDER BY image_index ASC",
-            vec![person_id.into()],
-        ))
+    let models = ImageAssets::find()
+        .filter(crate::entities::image_assets::Column::ItemId.eq(person_id))
+        .order_by_asc(crate::entities::image_assets::Column::ImageIndex)
+        .all(db)
         .await?;
 
-    let mut tags = json!({});
-    if let Some(obj) = tags.as_object_mut() {
-        for row in &rows {
-            let image_type: String = row.get_str("image_type").unwrap_or_default();
-            let etag: String = row.get_str("etag").unwrap_or_default();
-            obj.insert(image_type, json!(etag));
-        }
+    let mut tags = serde_json::Map::new();
+    for m in &models {
+        let etag = m.etag.as_deref().unwrap_or_default();
+        tags.entry(m.image_type.clone())
+            .or_insert_with(|| json!(etag));
     }
-    Ok(tags)
+    Ok(JsonValue::Object(tags))
 }
 
 struct PersonRow {

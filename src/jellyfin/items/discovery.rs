@@ -63,7 +63,7 @@ async fn similar_items_inner(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.runtime_ticks, media_items.size_bytes, media_items.created_at, media_items.modified_at, 0 AS is_favorite, 0 AS played, 0 AS playback_position_ticks, NULL AS played_percentage, 0 AS play_count, NULL AS last_played_at FROM media_items WHERE media_items.id IN ({placeholders})"#
+        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.runtime_ticks, media_items.size_bytes, media_items.created_at, media_items.modified_at, CAST(0 AS bigint) AS is_favorite, CAST(0 AS bigint) AS played, CAST(0 AS bigint) AS playback_position_ticks, NULL AS played_percentage, CAST(0 AS bigint) AS play_count, NULL AS last_played_at FROM media_items WHERE media_items.id IN ({placeholders})"#
     );
 
     let mut values: Vec<SeaValue> = Vec::new();

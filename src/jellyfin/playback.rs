@@ -7,12 +7,18 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, Set,
+};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
     app::state::{AppState, PlaybackSession, PlaybackState},
-    db::row_ext::QueryResultExt,
+    entities::{
+        media_streams::Entity as MediaStreams,
+        user_data::{self, Entity as UserData},
+    },
     jellyfin::{
         auth::request_user_id_or_default, common::internal_error, dlna, items::find_media_item,
     },
@@ -50,25 +56,32 @@ async fn media_streams_for_item(
     db: &DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Vec<JsonValue>> {
-    let backend = db.get_database_backend();
-    let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT stream_index, stream_type, codec, language, title, bit_rate, width, height, channels, sample_rate, path, is_external FROM media_streams WHERE item_id = ? ORDER BY stream_index ASC",
-            vec![item_id.into()],
-        ))
+    let models = MediaStreams::find()
+        .filter(crate::entities::media_streams::Column::ItemId.eq(item_id))
+        .order_by_asc(crate::entities::media_streams::Column::StreamIndex)
+        .all(db)
         .await
         .with_context(|| format!("failed to list media streams for item: {item_id}"))?;
-    rows.iter()
-        .map(MediaStreamRow::from_query_result)
-        .collect::<Result<Vec<_>, _>>()
-        .context("failed to decode media stream rows")
-        .map(|streams| {
-            streams
-                .into_iter()
-                .map(|stream| stream.to_jellyfin_json(item_id))
-                .collect()
+    let streams: Vec<_> = models
+        .iter()
+        .map(|m| MediaStreamRow {
+            stream_index: m.stream_index,
+            stream_type: m.stream_type.clone(),
+            codec: m.codec.clone(),
+            language: m.language.clone(),
+            title: m.title.clone(),
+            bit_rate: m.bit_rate,
+            width: m.width,
+            height: m.height,
+            channels: m.channels,
+            sample_rate: m.sample_rate,
+            is_external: m.is_external != 0,
         })
+        .collect();
+    Ok(streams
+        .into_iter()
+        .map(|s| s.to_jellyfin_json(item_id))
+        .collect())
 }
 
 pub async fn subtitle_stream_path(
@@ -76,19 +89,15 @@ pub async fn subtitle_stream_path(
     item_id: &str,
     stream_index: i64,
 ) -> anyhow::Result<Option<String>> {
-    let backend = db.get_database_backend();
-    let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT path FROM media_streams WHERE item_id = ? AND stream_index = ? AND stream_type = 'Subtitle' AND is_external = 1",
-            vec![item_id.into(), stream_index.into()],
-        ))
+    let model = MediaStreams::find()
+        .filter(crate::entities::media_streams::Column::ItemId.eq(item_id))
+        .filter(crate::entities::media_streams::Column::StreamIndex.eq(stream_index))
+        .filter(crate::entities::media_streams::Column::StreamType.eq("Subtitle"))
+        .filter(crate::entities::media_streams::Column::IsExternal.eq(1))
+        .one(db)
         .await
         .with_context(|| format!("failed to find subtitle stream: {item_id}:{stream_index}"))?;
-    row.as_ref()
-        .map(|row| row.get_str("path"))
-        .transpose()
-        .context("failed to decode subtitle path")
+    Ok(model.and_then(|m| m.path))
 }
 
 pub async fn favorite_item(
@@ -123,19 +132,13 @@ pub async fn hide_from_resume(
     State(state): State<Arc<AppState>>,
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Response {
-    let now = now_unix();
-    let backend = state.db.get_database_backend();
-    match state
-        .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
-            "INSERT INTO user_data (user_id, item_id, playback_position_ticks, updated_at) VALUES (?, ?, 0, ?) ON CONFLICT(user_id, item_id) DO UPDATE SET playback_position_ticks = 0, updated_at = ?",
-            vec![user_id.into(), item_id.into(), now.into(), now.into()],
-        ))
-        .await
+    match upsert_user_data_simple(&state.db, &user_id, &item_id, |active| {
+        active.playback_position_ticks = Set(0);
+    })
+    .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error.into()),
+        Err(error) => internal_error(error),
     }
 }
 
@@ -150,26 +153,13 @@ pub async fn set_rating(
         .map(|likes| if likes { 1.0 } else { -1.0 })
         .or_else(|| body.get("Rating").and_then(JsonValue::as_f64))
         .unwrap_or(0.0);
-    let now = now_unix();
-    let backend = state.db.get_database_backend();
-    match state
-        .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
-            "INSERT INTO user_data (user_id, item_id, rating, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, item_id) DO UPDATE SET rating = ?, updated_at = ?",
-            vec![
-                user_id.into(),
-                item_id.into(),
-                rating.into(),
-                now.into(),
-                rating.into(),
-                now.into(),
-            ],
-        ))
-        .await
+    match upsert_user_data_simple(&state.db, &user_id, &item_id, |active| {
+        active.rating = Set(Some(rating));
+    })
+    .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error.into()),
+        Err(error) => internal_error(error),
     }
 }
 
@@ -177,19 +167,13 @@ pub async fn delete_rating(
     State(state): State<Arc<AppState>>,
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Response {
-    let now = now_unix();
-    let backend = state.db.get_database_backend();
-    match state
-        .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
-            "UPDATE user_data SET rating = NULL, updated_at = ? WHERE user_id = ? AND item_id = ?",
-            vec![now.into(), user_id.into(), item_id.into()],
-        ))
-        .await
+    match upsert_user_data_simple(&state.db, &user_id, &item_id, |active| {
+        active.rating = Set(None);
+    })
+    .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error.into()),
+        Err(error) => internal_error(error),
     }
 }
 
@@ -213,23 +197,21 @@ async fn upsert_user_data_flag(
     field: &str,
     value: bool,
 ) -> anyhow::Result<()> {
-    let now = now_unix();
     let value_int = if value { 1 } else { 0 };
-    let backend = db.get_database_backend();
-    let sql = match field {
+
+    match field {
         "is_favorite" => {
-            r#"INSERT INTO user_data (user_id, item_id, is_favorite, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, item_id) DO UPDATE SET is_favorite = excluded.is_favorite, updated_at = excluded.updated_at"#
+            upsert_user_data_simple(db, user_id, item_id, |active| {
+                active.is_favorite = Set(value_int);
+            })
+            .await
         }
         "played" => {
-            r#"INSERT INTO user_data (user_id, item_id, played, playback_position_ticks, played_percentage, play_count, last_played_at, updated_at) VALUES (?, ?, ?, 0, NULL, COALESCE((SELECT play_count FROM user_data WHERE user_id = ? AND item_id = ?), 0) + 1, ?, ?) ON CONFLICT(user_id, item_id) DO UPDATE SET played = excluded.played, playback_position_ticks = excluded.playback_position_ticks, played_percentage = excluded.played_percentage, play_count = COALESCE(user_data.play_count, 0) + 1, last_played_at = excluded.last_played_at, updated_at = excluded.updated_at"#
-        }
-        _ => anyhow::bail!("unsupported user data flag: {field}"),
-    };
-    let result = match field {
-        "played" => {
+            let now = now_unix();
+            let backend = db.get_database_backend();
             db.execute(crate::db::helpers::portable_statement(
                 backend,
-                sql,
+                r#"INSERT INTO user_data (user_id, item_id, played, playback_position_ticks, played_percentage, play_count, last_played_at, updated_at) VALUES (?, ?, ?, 0, NULL, COALESCE((SELECT play_count FROM user_data WHERE user_id = ? AND item_id = ?), 0) + 1, ?, ?) ON CONFLICT(user_id, item_id) DO UPDATE SET played = excluded.played, playback_position_ticks = excluded.playback_position_ticks, played_percentage = excluded.played_percentage, play_count = COALESCE(user_data.play_count, 0) + 1, last_played_at = excluded.last_played_at, updated_at = excluded.updated_at"#,
                 vec![
                     user_id.into(),
                     item_id.into(),
@@ -241,17 +223,45 @@ async fn upsert_user_data_flag(
                 ],
             ))
             .await
+            .with_context(|| format!("failed to update user data flag for item: {item_id}"))?;
+            Ok(())
         }
-        _ => {
-            db.execute(crate::db::helpers::portable_statement(
-                backend,
-                sql,
-                vec![user_id.into(), item_id.into(), value_int.into(), now.into()],
-            ))
-            .await
+        _ => anyhow::bail!("unsupported user data flag: {field}"),
+    }
+}
+
+async fn upsert_user_data_simple(
+    db: &DatabaseConnection,
+    user_id: &str,
+    item_id: &str,
+    apply: impl FnOnce(&mut user_data::ActiveModel),
+) -> anyhow::Result<()> {
+    let now = now_unix();
+    match UserData::find_by_id((user_id.to_string(), item_id.to_string()))
+        .one(db)
+        .await?
+    {
+        Some(model) => {
+            let mut active: user_data::ActiveModel = model.into();
+            apply(&mut active);
+            active.updated_at = Set(now);
+            active.update(db).await?;
         }
-    };
-    result.with_context(|| format!("failed to update user data flag for item: {item_id}"))?;
+        None => {
+            let mut active = user_data::ActiveModel {
+                user_id: Set(user_id.to_string()),
+                item_id: Set(item_id.to_string()),
+                is_favorite: Set(0),
+                played: Set(0),
+                playback_position_ticks: Set(0),
+                play_count: Set(0),
+                updated_at: Set(now),
+                ..Default::default()
+            };
+            apply(&mut active);
+            UserData::insert(active).exec(db).await?;
+        }
+    }
     Ok(())
 }
 
@@ -422,13 +432,25 @@ async fn upsert_playback_position(
     position_ticks: i64,
 ) -> anyhow::Result<()> {
     let now = now_unix();
-    let backend = db.get_database_backend();
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
-        r#"INSERT INTO user_data (user_id, item_id, playback_position_ticks, updated_at, last_played_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, item_id) DO UPDATE SET playback_position_ticks = excluded.playback_position_ticks, updated_at = excluded.updated_at, last_played_at = excluded.last_played_at"#,
-        vec![user_id.into(), item_id.into(), position_ticks.max(0).into(), now.into(), now.into()],
-    ))
-    .await
-    .with_context(|| format!("failed to update playback position for item: {item_id}"))?;
+    let existing = UserData::find_by_id((user_id.to_string(), item_id.to_string()))
+        .one(db)
+        .await?;
+    if let Some(model) = existing {
+        let mut active: user_data::ActiveModel = model.into();
+        active.playback_position_ticks = Set(position_ticks.max(0));
+        active.updated_at = Set(now);
+        active.last_played_at = Set(Some(now));
+        active.update(db).await?;
+    } else {
+        let active = user_data::ActiveModel {
+            user_id: Set(user_id.to_string()),
+            item_id: Set(item_id.to_string()),
+            playback_position_ticks: Set(position_ticks.max(0)),
+            updated_at: Set(now),
+            last_played_at: Set(Some(now)),
+            ..Default::default()
+        };
+        UserData::insert(active).exec(db).await?;
+    }
     Ok(())
 }

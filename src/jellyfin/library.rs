@@ -7,13 +7,20 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, Set,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
+    entities::{
+        libraries::{self, Entity as Libraries},
+        library_paths::{self, Entity as LibraryPaths},
+    },
     jellyfin::common::internal_error,
     jellyfin::system,
     library::{path_utils, scanner::scan_media_library},
@@ -89,17 +96,10 @@ pub async fn delete_virtual_folder_path(
     State(state): State<Arc<AppState>>,
     Query(query): Query<LibraryPathQuery>,
 ) -> Response {
-    let backend = state.db.get_database_backend();
-    match state
-        .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
-            "DELETE FROM library_paths WHERE library_id = ? AND path = ?",
-            vec![
-                library_id_for_name(&query.name).into(),
-                path_utils::normalize_path(&query.path).into(),
-            ],
-        ))
+    match LibraryPaths::delete_many()
+        .filter(library_paths::Column::LibraryId.eq(library_id_for_name(&query.name)))
+        .filter(library_paths::Column::Path.eq(path_utils::normalize_path(&query.path)))
+        .exec(&state.db)
         .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -190,21 +190,8 @@ async fn create_virtual_folder_inner(
     let collection_type = query.collection_type.as_deref().unwrap_or("movies").trim();
     let library_id = library_id_for_name(name);
     let now = now_unix();
-    let backend = db.get_database_backend();
 
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
-        r#"INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, collection_type = excluded.collection_type, updated_at = excluded.updated_at"#,
-        vec![
-            library_id.into(),
-            name.into(),
-            collection_type.into(),
-            now.into(),
-            now.into(),
-        ],
-    ))
-    .await
-    .context("failed to create virtual folder")?;
+    upsert_library(db, &library_id, name, collection_type, now).await?;
 
     if let Some(paths) = query.paths {
         for path in paths.split('|').flat_map(|value| value.split(',')) {
@@ -215,6 +202,35 @@ async fn create_virtual_folder_inner(
         }
     }
 
+    Ok(())
+}
+
+async fn upsert_library(
+    db: &DatabaseConnection,
+    id: &str,
+    name: &str,
+    collection_type: &str,
+    now: i64,
+) -> anyhow::Result<()> {
+    match Libraries::find_by_id(id).one(db).await? {
+        Some(model) => {
+            let mut active: libraries::ActiveModel = model.into();
+            active.name = Set(name.to_string());
+            active.collection_type = Set(collection_type.to_string());
+            active.updated_at = Set(now);
+            active.update(db).await?;
+        }
+        None => {
+            let active = libraries::ActiveModel {
+                id: Set(id.to_string()),
+                name: Set(name.to_string()),
+                collection_type: Set(collection_type.to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            };
+            Libraries::insert(active).exec(db).await?;
+        }
+    }
     Ok(())
 }
 
@@ -236,34 +252,24 @@ async fn upsert_library_path(
     let library_id = library_id_for_name(name);
     let collection_type = collection_type.unwrap_or_else(|| collection_type_for_name(name));
     let now = now_unix();
-    let backend = db.get_database_backend();
 
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
-        r#"INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at"#,
-        vec![
-            library_id.clone().into(),
-            name.into(),
-            collection_type.into(),
-            now.into(),
-            now.into(),
-        ],
-    ))
-    .await
-    .context("failed to ensure library")?;
+    upsert_library(db, &library_id, name, collection_type, now).await?;
 
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
-        r#"INSERT INTO library_paths (id, library_id, path, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET library_id = excluded.library_id"#,
-        vec![
-            stable_text_id(&format!("library-path:{path}")).into(),
-            library_id.into(),
-            path.into(),
-            now.into(),
-        ],
-    ))
-    .await
-    .context("failed to upsert library path")?;
+    let path_id = stable_text_id(&format!("library-path:{path}"));
+    let existing = LibraryPaths::find_by_id(&path_id).one(db).await?;
+    if let Some(model) = existing {
+        let mut active: library_paths::ActiveModel = model.into();
+        active.library_id = Set(library_id);
+        active.update(db).await?;
+    } else {
+        let active = library_paths::ActiveModel {
+            id: Set(path_id),
+            library_id: Set(library_id),
+            path: Set(path),
+            created_at: Set(now),
+        };
+        LibraryPaths::insert(active).exec(db).await?;
+    }
 
     Ok(())
 }
@@ -278,22 +284,14 @@ fn library_id_for_name(name: &str) -> String {
 }
 
 pub async fn physical_paths(State(state): State<Arc<AppState>>) -> Response {
-    let backend = state.db.get_database_backend();
-    match state
-        .db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT path FROM library_paths ORDER BY path ASC",
-            vec![],
-        ))
+    match LibraryPaths::find()
+        .order_by_asc(library_paths::Column::Path)
+        .all(&state.db)
         .await
     {
-        Ok(rows) => Json(
-            rows.iter()
-                .filter_map(|row| row.get_str("path").ok())
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+        Ok(models) => {
+            Json(models.iter().map(|m| m.path.as_str()).collect::<Vec<_>>()).into_response()
+        }
         Err(error) => internal_error(error.into()),
     }
 }

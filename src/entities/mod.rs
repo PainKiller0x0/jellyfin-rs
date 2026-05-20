@@ -1,3 +1,5 @@
+// Entity definitions mirror the DB schema. Not all are used via SeaORM
+// queries — complex joins and dynamic-table queries still use raw SQL.
 #![allow(dead_code)]
 
 pub mod access_tokens;

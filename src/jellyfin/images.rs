@@ -9,12 +9,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose};
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
+};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
+    entities::image_assets::{self, Entity as ImageAssets},
     jellyfin::common::{image as placeholder_image, internal_error},
     library::image_processing::{
         EncodedImageFormat, ImageRequestOptions, create_collage, create_placeholder, process_image,
@@ -188,27 +191,23 @@ async fn serve_item_image(
     image_index: i64,
 ) -> Response {
     let options = image_options_from_query(query, image_type);
-    let backend = db.get_database_backend();
-    let row = match db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT path, etag, size_bytes FROM image_assets WHERE item_id = ? AND image_type = ? AND image_index = ?",
-            vec![item_id.into(), image_type.into(), image_index.into()],
-        ))
+    let model = match ImageAssets::find()
+        .filter(image_assets::Column::ItemId.eq(item_id))
+        .filter(image_assets::Column::ImageType.eq(image_type))
+        .filter(image_assets::Column::ImageIndex.eq(image_index))
+        .one(db)
         .await
-        .with_context(|| format!("failed to find image asset: {item_id}:{image_type}:{image_index}"))
-    {
+        .with_context(|| {
+            format!("failed to find image asset: {item_id}:{image_type}:{image_index}")
+        }) {
         Ok(row) => row,
         Err(error) => return internal_error(error),
     };
 
-    let Some(row) = row else {
+    let Some(model) = model else {
         return dynamic_image_response(db, item_id, image_type, &options).await;
     };
-    let etag: String = match row.get_str("etag") {
-        Ok(etag) => etag,
-        Err(error) => return internal_error(error.into()),
-    };
+    let etag = model.etag.unwrap_or_default();
     if headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
@@ -217,10 +216,7 @@ async fn serve_item_image(
         return StatusCode::NOT_MODIFIED.into_response();
     }
 
-    let path: String = match row.get_str("path") {
-        Ok(path) => path,
-        Err(error) => return internal_error(error.into()),
-    };
+    let path = model.path.unwrap_or_default();
     let mut bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -433,23 +429,21 @@ async fn item_images_inner(
     db: &DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    let backend = db.get_database_backend();
-    let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT image_type, image_index, path, size_bytes FROM image_assets WHERE item_id = ? ORDER BY image_type ASC, image_index ASC",
-            vec![item_id.into()],
-        ))
+    let models = ImageAssets::find()
+        .filter(image_assets::Column::ItemId.eq(item_id))
+        .order_by_asc(image_assets::Column::ImageType)
+        .order_by_asc(image_assets::Column::ImageIndex)
+        .all(db)
         .await
         .context("failed to list item images")?;
-    rows.iter()
-        .map(|row| -> anyhow::Result<serde_json::Value> {
-            let path: Option<String> = row.get_opt_str("path")?;
+    models
+        .iter()
+        .map(|m| {
             Ok(json!({
-                "Filename": path.as_deref().and_then(|path| std::path::Path::new(path).file_name()).and_then(|name| name.to_str()),
-                "ImageType": row.get_str("image_type")?,
-                "ImageIndex": row.get_i64("image_index")?,
-                "Size": row.get_opt_i64("size_bytes")?,
+                "Filename": m.path.as_deref().and_then(|path| std::path::Path::new(path).file_name()).and_then(|name| name.to_str()),
+                "ImageType": m.image_type,
+                "ImageIndex": m.image_index,
+                "Size": m.size_bytes,
             }))
         })
         .collect()
@@ -461,25 +455,21 @@ async fn delete_item_image_inner(
     image_type: &str,
     image_index: i64,
 ) -> Response {
-    let backend = db.get_database_backend();
-    let path: Option<String> = match db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT path FROM image_assets WHERE item_id = ? AND image_type = ? AND image_index = ?",
-            vec![item_id.into(), image_type.into(), image_index.into()],
-        ))
+    let path = ImageAssets::find()
+        .filter(image_assets::Column::ItemId.eq(item_id))
+        .filter(image_assets::Column::ImageType.eq(image_type))
+        .filter(image_assets::Column::ImageIndex.eq(image_index))
+        .one(db)
         .await
-    {
-        Ok(Some(row)) => row.get_str("path").ok(),
-        _ => None,
-    };
+        .ok()
+        .flatten()
+        .and_then(|m| m.path);
 
-    match db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
-            "DELETE FROM image_assets WHERE item_id = ? AND image_type = ? AND image_index = ?",
-            vec![item_id.into(), image_type.into(), image_index.into()],
-        ))
+    match ImageAssets::delete_many()
+        .filter(image_assets::Column::ItemId.eq(item_id))
+        .filter(image_assets::Column::ImageType.eq(image_type))
+        .filter(image_assets::Column::ImageIndex.eq(image_index))
+        .exec(db)
         .await
     {
         Ok(_) => {
@@ -653,21 +643,19 @@ fn parse_image_url_body(body: &[u8]) -> Option<String> {
 }
 
 pub async fn item_image_tags(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<JsonValue> {
-    let backend = db.get_database_backend();
-    let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT image_type, etag FROM image_assets WHERE item_id = ? ORDER BY image_type ASC, image_index ASC",
-            vec![item_id.into()],
-        ))
+    let models = ImageAssets::find()
+        .filter(image_assets::Column::ItemId.eq(item_id))
+        .order_by_asc(image_assets::Column::ImageType)
+        .order_by_asc(image_assets::Column::ImageIndex)
+        .all(db)
         .await
         .context("failed to load image tags")?;
 
     let mut tags = serde_json::Map::new();
-    for row in &rows {
-        let image_type: String = row.get_str("image_type")?;
-        let etag: String = row.get_str("etag")?;
-        tags.entry(image_type).or_insert_with(|| json!(etag));
+    for m in &models {
+        let etag = m.etag.as_deref().unwrap_or_default();
+        tags.entry(m.image_type.clone())
+            .or_insert_with(|| json!(etag));
     }
     Ok(JsonValue::Object(tags))
 }

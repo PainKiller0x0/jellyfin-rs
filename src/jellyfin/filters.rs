@@ -6,10 +6,18 @@ use axum::{
     extract::{Query, State},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, QueryOrder};
 use serde_json::{Value, json};
 
-use crate::{app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error};
+use crate::{
+    app::state::AppState,
+    db::row_ext::QueryResultExt,
+    entities::{
+        genres::Entity as Genres, people::Entity as People, studios::Entity as Studios,
+        tags::Entity as Tags,
+    },
+    jellyfin::common::internal_error,
+};
 
 pub async fn genres(
     State(state): State<Arc<AppState>>,
@@ -269,28 +277,52 @@ async fn list_filter_items_inner(
     kind: FilterKind,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
-    let backend = db.get_database_backend();
-    let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            kind.select_sql(),
-            vec![],
-        ))
-        .await
-        .with_context(|| format!("failed to list {}", kind.name()))?;
-    let mut items = rows
-        .iter()
-        .map(|row| -> anyhow::Result<Value> {
-            let id: String = row.get_str("id")?;
-            let name: String = row.get_str("name")?;
-            Ok(json!({
-                "Name": name,
-                "Id": id,
-                "Type": kind.item_type(),
-                "ImageTags": {},
-            }))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut items = match kind {
+        FilterKind::Genre => {
+            let models = Genres::find()
+                .order_by_asc(crate::entities::genres::Column::Name)
+                .all(db)
+                .await
+                .context("failed to list genres")?;
+            models
+                .into_iter()
+                .map(|m| json!({ "Name": m.name, "Id": m.id, "Type": kind.item_type(), "ImageTags": {} }))
+                .collect()
+        }
+        FilterKind::Tag => {
+            let models = Tags::find()
+                .order_by_asc(crate::entities::tags::Column::Name)
+                .all(db)
+                .await
+                .context("failed to list tags")?;
+            models
+                .into_iter()
+                .map(|m| json!({ "Name": m.name, "Id": m.id, "Type": kind.item_type(), "ImageTags": {} }))
+                .collect()
+        }
+        FilterKind::Person => {
+            let models = People::find()
+                .order_by_asc(crate::entities::people::Column::Name)
+                .all(db)
+                .await
+                .context("failed to list persons")?;
+            models
+                .into_iter()
+                .map(|m| json!({ "Name": m.name, "Id": m.id, "Type": kind.item_type(), "ImageTags": {} }))
+                .collect()
+        }
+        FilterKind::Studio => {
+            let models = Studios::find()
+                .order_by_asc(crate::entities::studios::Column::Name)
+                .all(db)
+                .await
+                .context("failed to list studios")?;
+            models
+                .into_iter()
+                .map(|m| json!({ "Name": m.name, "Id": m.id, "Type": kind.item_type(), "ImageTags": {} }))
+                .collect()
+        }
+    };
 
     filter_by_search_and_paginate(&mut items, query);
     Ok(items)
@@ -305,30 +337,12 @@ enum FilterKind {
 }
 
 impl FilterKind {
-    fn select_sql(self) -> &'static str {
-        match self {
-            Self::Genre => "SELECT id, name FROM genres",
-            Self::Tag => "SELECT id, name FROM tags",
-            Self::Person => "SELECT id, name FROM people",
-            Self::Studio => "SELECT id, name FROM studios",
-        }
-    }
-
     fn item_type(self) -> &'static str {
         match self {
             Self::Genre => "Genre",
             Self::Tag => "Tag",
             Self::Person => "Person",
             Self::Studio => "Studio",
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Genre => "genres",
-            Self::Tag => "tags",
-            Self::Person => "persons",
-            Self::Studio => "studios",
         }
     }
 }

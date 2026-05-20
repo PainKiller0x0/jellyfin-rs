@@ -39,9 +39,7 @@ pub fn canonicalize_path(path: &str) -> anyhow::Result<String> {
         bail!("path is required");
     }
     match fs::canonicalize(&normalized) {
-        Ok(canonical) => Ok(strip_windows_extended_prefix(
-            &canonical.to_string_lossy(),
-        )),
+        Ok(canonical) => Ok(strip_windows_extended_prefix(&canonical.to_string_lossy())),
         Err(_) => {
             // canonicalize fails on virtual filesystems (e.g. CloudDrive).
             // Fall back to the normalized path if the directory exists.
@@ -93,10 +91,11 @@ pub fn resolve_path_info(path: &Path) -> anyhow::Result<ResolvedPathInfo> {
     let metadata =
         fs::metadata(path).with_context(|| format!("failed to read path: {}", path.display()))?;
     let is_directory = metadata.is_dir();
+    let normalized_path = normalize_path(&path.to_string_lossy());
     Ok(ResolvedPathInfo {
-        id: stable_item_id(path),
+        id: stable_item_id(Path::new(&normalized_path)),
         name: media_title(path),
-        path: path.to_string_lossy().to_string(),
+        path: normalized_path,
         is_directory,
         size_bytes: (!is_directory).then(|| i64::try_from(metadata.len()).unwrap_or(i64::MAX)),
         modified_at: system_time_to_unix(metadata.modified().unwrap_or(UNIX_EPOCH)),

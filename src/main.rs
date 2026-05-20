@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     db::ensure_database_exists(&database_url).await?;
 
     let mut opt = ConnectOptions::new(database_url.clone());
-    opt.max_connections(5).sqlx_logging(false);
+    opt.max_connections(20).sqlx_logging(false);
     let db = Database::connect(opt)
         .await
         .with_context(|| format!("failed to connect database: {database_url}"))?;
@@ -49,12 +49,25 @@ async fn main() -> anyhow::Result<()> {
     let default_username =
         std::env::var("JELLYFIN_RS_USER").unwrap_or_else(|_| DEFAULT_USER_NAME.to_string());
     let (ws_event_tx, _) = tokio::sync::broadcast::channel::<ws::WsEvent>(64);
+    let http_client = {
+        let mut builder = reqwest::Client::builder();
+        let proxy_url = std::env::var("HTTPS_PROXY")
+            .or_else(|_| std::env::var("https_proxy"))
+            .or_else(|_| std::env::var("ALL_PROXY"))
+            .unwrap_or_default();
+        if !proxy_url.is_empty() {
+            if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                builder = builder.proxy(proxy);
+            }
+        }
+        builder.build().context("failed to build HTTP client")?
+    };
     let state = Arc::new(AppState {
         user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, default_username.as_bytes()),
         access_token: Uuid::new_v4().simple().to_string(),
         db,
         media_dirs: app::state::media_dirs_from_env(),
-        http_client: reqwest::Client::new(),
+        http_client,
         tmdb_api_key: std::env::var("JELLYFIN_RS_TMDB_API_KEY").ok(),
         playback_sessions: RwLock::new(HashMap::new()),
         session_capabilities: RwLock::new(HashMap::new()),

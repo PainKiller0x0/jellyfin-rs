@@ -184,9 +184,7 @@ async fn try_fetch_tmdb(db: &sea_orm::DatabaseConnection, item: &ScannedMediaIte
         .ok()
         .filter(|k| !k.is_empty()) else { return };
     let check_path = if item.is_folder { path.to_path_buf() } else { path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.to_path_buf()) };
-    if let Err(e) = crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(db, &item.id, &item.item_type, &check_path, &api_key).await {
-        tracing::debug!("TMDb fetch skipped for {}: {e:#}", item.path);
-    }
+    let _ = crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(db, &item.id, &item.item_type, &check_path, &api_key).await;
 }
 
 fn has_sidecar_nfo(path: &std::path::Path) -> bool {

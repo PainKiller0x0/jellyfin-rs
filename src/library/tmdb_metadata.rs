@@ -50,17 +50,31 @@ pub async fn fetch_and_apply_tmdb_metadata(
         return Ok(());
     };
 
-    let client = reqwest::Client::new();
-    let metadata = if item_type == "Series" {
+    let client = {
+        let mut builder = reqwest::Client::builder();
+        let proxy_url = std::env::var("HTTPS_PROXY")
+            .or_else(|_| std::env::var("https_proxy"))
+            .or_else(|_| std::env::var("ALL_PROXY"))
+            .unwrap_or_default();
+        if !proxy_url.is_empty() {
+            builder = builder.proxy(reqwest::Proxy::all(&proxy_url)?);
+        }
+        builder.build()?
+    };
+    let metadata = if item_type == "Series" || item_type == "Season" || item_type == "Episode" {
         providers::tmdb_tv_details(&client, api_key, &tmdb_id).await
     } else {
-        // Try movie details for non-Series items
         providers::tmdb_movie_details(&client, api_key, &tmdb_id).await
     };
 
-    let Ok(metadata) = metadata else {
-        return Ok(());
+    let metadata = match metadata {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("TMDb API call failed for {tmdb_id} (type: {item_type}): {e:#}");
+            return Ok(());
+        }
     };
+    tracing::info!("TMDb metadata fetched for {item_type} {tmdb_id}");
 
     let backend = db.get_database_backend();
     let overview = metadata

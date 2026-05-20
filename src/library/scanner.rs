@@ -95,17 +95,23 @@ async fn scan_root(
 
         if resolved.is_directory {
             seen_paths.push(path_string.clone());
+            let folder_type = tv_folder_type(path, &root, &collection_type);
+            let folder_title = crate::library::tmdb_metadata::clean_provider_tags(&resolved.name);
             let item = ScannedMediaItem::folder_with_type(
                 resolved.id,
                 library_id.clone(),
                 parent_id,
                 path_string,
-                resolved.name,
-                tv_folder_type(path, &root, &collection_type),
+                folder_title,
+                folder_type,
                 resolved.modified_at,
             );
-            upsert_media_item(&db, &item).await?;
+            if let Err(e) = upsert_media_item(&db, &item).await {
+                tracing::warn!("failed to upsert folder {}: {e:#}", item.path);
+                continue;
+            }
             upsert_sidecar_images(&db, path, &item.id).await?;
+            try_fetch_tmdb(&db, &item, path).await;
             continue;
         }
 
@@ -152,7 +158,10 @@ async fn scan_root(
             created_at: now_unix(),
         };
 
-        upsert_media_item(&db, &item).await?;
+        if let Err(e) = upsert_media_item(&db, &item).await {
+            tracing::warn!("failed to upsert media item {}: {e:#}", item.path);
+            continue;
+        }
         upsert_media_metadata(&db, &item.id, &parsed_metadata).await?;
         upsert_sidecar_images(&db, path, &item.id).await?;
         let probed = if let Some(probe) = &probe {
@@ -168,6 +177,16 @@ async fn scan_root(
     }
 
     Ok((scanned, seen_paths))
+}
+
+async fn try_fetch_tmdb(db: &sea_orm::DatabaseConnection, item: &ScannedMediaItem, path: &std::path::Path) {
+    let Some(api_key) = std::env::var("JELLYFIN_RS_TMDB_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty()) else { return };
+    let check_path = if item.is_folder { path.to_path_buf() } else { path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.to_path_buf()) };
+    if let Err(e) = crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(db, &item.id, &item.item_type, &check_path, &api_key).await {
+        tracing::debug!("TMDb fetch skipped for {}: {e:#}", item.path);
+    }
 }
 
 fn has_sidecar_nfo(path: &std::path::Path) -> bool {

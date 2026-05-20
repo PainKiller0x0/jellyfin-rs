@@ -9,4 +9,5 @@ pub mod probe;
 pub mod scanner;
 pub mod storage;
 pub mod subtitles;
+pub mod tmdb_metadata;
 pub mod watcher;

@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = library::scanner::scan_media_library(&scan_state).await;
         });
     }
+    library::watcher::start_watching(state.clone());
 
     let app = Router::new()
         .nest("/emby", jellyfin::routes::api_routes())

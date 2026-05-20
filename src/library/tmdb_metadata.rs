@@ -220,5 +220,57 @@ pub async fn fetch_and_apply_tmdb_metadata(
             .await;
     }
 
+    // Download poster and backdrop images
+    if let Some(image_url) = metadata
+        .get("ImageUrl")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        let _ = download_and_save_tmdb_image(db, &client, item_id, image_url, "Primary").await;
+    }
+    // Also try to get backdrop from the original TMDb API response
+    if let Some(backdrop) = metadata.get("BackdropUrl").and_then(|v| v.as_str()) {
+        let _ = download_and_save_tmdb_image(db, &client, item_id, backdrop, "Backdrop").await;
+    }
+
+    Ok(())
+}
+
+async fn download_and_save_tmdb_image(
+    db: &sea_orm::DatabaseConnection,
+    client: &reqwest::Client,
+    item_id: &str,
+    url: &str,
+    image_type: &str,
+) -> anyhow::Result<()> {
+    let response = client.get(url).send().await?.error_for_status()?;
+    let bytes = response.bytes().await?;
+    let ext = url
+        .rsplit('.')
+        .next()
+        .and_then(|e| if e.len() <= 5 { Some(e) } else { None })
+        .unwrap_or("jpg");
+    let dir = std::path::PathBuf::from("data").join("images");
+    tokio::fs::create_dir_all(&dir).await.ok();
+    let path = dir.join(format!("{}_{}_tmdb.{}", crate::util::stable_text_id(item_id), image_type.to_ascii_lowercase(), ext));
+    tokio::fs::write(&path, &bytes).await?;
+    let now = crate::util::now_unix();
+    let backend = db.get_database_backend();
+    let _ = db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            r#"INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, width, height, size_bytes, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, NULL, NULL, ?, ?, ?) ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET path = excluded.path, size_bytes = excluded.size_bytes, updated_at = excluded.updated_at"#,
+            vec![
+                crate::util::stable_text_id(&format!("image-asset:{item_id}:{image_type}:0")).into(),
+                item_id.into(),
+                image_type.into(),
+                path.to_string_lossy().to_string().into(),
+                crate::util::stable_text_id(&format!("tmdb:{item_id}:{image_type}")).into(),
+                i64::try_from(bytes.len()).unwrap_or(i64::MAX).into(),
+                now.into(),
+                now.into(),
+            ],
+        ))
+        .await;
     Ok(())
 }

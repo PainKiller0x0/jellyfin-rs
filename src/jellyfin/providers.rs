@@ -84,6 +84,8 @@ pub async fn tmdb_movie_details(
         "Genres": response.genres.into_iter().map(|genre| genre.name).collect::<Vec<_>>(),
         "Studios": response.production_companies.into_iter().map(|company| company.name).collect::<Vec<_>>(),
         "People": cast,
+        "ImageUrl": response.poster_path.map(|p| format!("https://image.tmdb.org/t/p/w500{p}")),
+        "BackdropUrl": response.backdrop_path.map(|p| format!("https://image.tmdb.org/t/p/w1280{p}")),
     }))
 }
 
@@ -183,6 +185,8 @@ pub async fn tmdb_tv_details(
         "Genres": response.genres.into_iter().map(|genre| genre.name).collect::<Vec<_>>(),
         "Studios": response.networks.into_iter().map(|network| network.name).collect::<Vec<_>>(),
         "People": cast,
+        "ImageUrl": response.poster_path.map(|p| format!("https://image.tmdb.org/t/p/w500{p}")),
+        "BackdropUrl": response.backdrop_path.map(|p| format!("https://image.tmdb.org/t/p/w1280{p}")),
         "Status": response.status,
         "AirDays": response.episode_run_time.first().copied(),
         "SeasonCount": response.number_of_seasons,
@@ -366,6 +370,8 @@ struct TmdbMovieDetails {
     title: String,
     overview: Option<String>,
     release_date: Option<String>,
+    poster_path: Option<String>,
+    backdrop_path: Option<String>,
     imdb_id: Option<String>,
     #[serde(default)]
     genres: Vec<TmdbNamedItem>,
@@ -380,6 +386,8 @@ struct TmdbTvDetails {
     name: String,
     overview: Option<String>,
     first_air_date: Option<String>,
+    poster_path: Option<String>,
+    backdrop_path: Option<String>,
     status: Option<String>,
     number_of_seasons: Option<i64>,
     number_of_episodes: Option<i64>,

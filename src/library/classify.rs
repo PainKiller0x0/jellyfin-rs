@@ -25,9 +25,13 @@ pub fn classify_media_path(path: &Path, collection_type: &str) -> Option<String>
 }
 
 pub fn parent_id_for_path(path: &Path, root: &Path, library_id: &str) -> String {
+    let norm_path = super::path_utils::normalize_path(&path.to_string_lossy());
+    let norm_root = super::path_utils::normalize_path(&root.to_string_lossy());
+    let path = std::path::Path::new(&norm_path);
+    let root = std::path::Path::new(&norm_root);
     path.parent()
         .filter(|parent| *parent != root)
-        .map(stable_item_id)
+        .map(|parent| stable_item_id(parent))
         .unwrap_or_else(|| library_id.to_string())
 }
 
@@ -35,8 +39,10 @@ pub fn tv_folder_type(path: &Path, root: &Path, collection_type: &str) -> &'stat
     if collection_type != "tvshows" && collection_type != "tv" {
         return "Folder";
     }
-    let depth = path
-        .strip_prefix(root)
+    let norm_path = super::path_utils::normalize_path(&path.to_string_lossy());
+    let norm_root = super::path_utils::normalize_path(&root.to_string_lossy());
+    let depth = std::path::Path::new(&norm_path)
+        .strip_prefix(std::path::Path::new(&norm_root))
         .ok()
         .map(|relative| relative.components().count())
         .unwrap_or_default();

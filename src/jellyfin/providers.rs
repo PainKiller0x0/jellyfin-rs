@@ -70,7 +70,13 @@ pub async fn tmdb_movie_details(
         .unwrap_or_default()
         .into_iter()
         .take(20)
-        .map(|person| json!({ "Name": person.name, "Role": person.character, "Type": "Actor" }))
+        .map(|person| {
+            let mut entry = json!({ "Name": person.name, "Role": person.character, "Type": "Actor" });
+            if let Some(ref profile) = person.profile_path {
+                entry["ImageUrl"] = json!(format!("https://image.tmdb.org/t/p/w185{profile}"));
+            }
+            entry
+        })
         .collect::<Vec<_>>();
 
     Ok(json!({
@@ -162,7 +168,13 @@ pub async fn tmdb_tv_details(
         .unwrap_or_default()
         .into_iter()
         .take(20)
-        .map(|person| json!({ "Name": person.name, "Role": person.roles.first().map(|r| r.character.clone()).unwrap_or_default(), "Type": "Actor" }))
+        .map(|person| {
+            let mut entry = json!({ "Name": person.name, "Role": person.roles.first().map(|r| r.character.clone()).unwrap_or_default(), "Type": "Actor" });
+            if let Some(ref profile) = person.profile_path {
+                entry["ImageUrl"] = json!(format!("https://image.tmdb.org/t/p/w185{profile}"));
+            }
+            entry
+        })
         .collect::<Vec<_>>();
 
     let external_imdb = response
@@ -411,6 +423,7 @@ struct TmdbTvCredits {
 #[derive(Deserialize)]
 struct TmdbTvCastMember {
     name: String,
+    profile_path: Option<String>,
     #[serde(default)]
     roles: Vec<TmdbTvRole>,
 }
@@ -489,6 +502,7 @@ struct TmdbCredits {
 struct TmdbCastMember {
     name: String,
     character: Option<String>,
+    profile_path: Option<String>,
 }
 
 pub async fn tmdb_movie_images(

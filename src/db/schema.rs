@@ -239,5 +239,10 @@ pub fn optional_migrations() -> Vec<Migration> {
             "ALTER TABLE media_items ADD COLUMN episode_number BIGINT",
             "add media_items.episode_number",
         ),
+        (
+            // Drop FK so image_assets can reference people IDs too
+            "ALTER TABLE image_assets DROP CONSTRAINT IF EXISTS image_assets_item_id_fkey",
+            "drop image_assets FK to allow person images",
+        ),
     ]
 }

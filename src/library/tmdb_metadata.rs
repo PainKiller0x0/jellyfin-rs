@@ -247,7 +247,7 @@ pub async fn fetch_and_apply_tmdb_metadata(
                 .collect()
         })
         .unwrap_or_default();
-    let people: Vec<(String, String, String)> = metadata
+    let people: Vec<(String, String, String, Option<String>)> = metadata
         .get("People")
         .and_then(|v| v.as_array())
         .map(|a| {
@@ -257,11 +257,16 @@ pub async fn fetch_and_apply_tmdb_metadata(
                         p.get("Name")?.as_str()?.to_string(),
                         p.get("Role")?.as_str()?.to_string(),
                         p.get("Type")?.as_str()?.to_string(),
+                        p.get("ImageUrl").and_then(|v| v.as_str().filter(|s| !s.is_empty()).map(ToString::to_string)),
                     ))
                 })
                 .collect()
         })
         .unwrap_or_default();
+    let people_with_images = people.iter().filter(|(_, _, _, img)| img.is_some()).count();
+    if people_with_images > 0 {
+        tracing::info!("Found {people_with_images} cast members with profile images for {item_type} {tmdb_id}");
+    }
 
     // Update media item
     if let Some(overview) = overview {
@@ -340,7 +345,7 @@ pub async fn fetch_and_apply_tmdb_metadata(
     }
 
     // Upsert people
-    for (name, role, person_type) in &people {
+    for (name, role, person_type, image_url) in &people {
         let person_id = crate::util::stable_text_id(&format!("person:{name}"));
         let _ = db
             .execute(crate::db::helpers::portable_statement(
@@ -349,20 +354,26 @@ pub async fn fetch_and_apply_tmdb_metadata(
                 vec![person_id.clone().into(), name.as_str().into(), now.into()],
             ))
             .await;
-        let sort_order = people.iter().position(|(n, _, _)| n == name).unwrap_or(0) as i64;
+        let sort_order = people.iter().position(|(n, _, _, _)| n == name).unwrap_or(0) as i64;
         let _ = db
             .execute(crate::db::helpers::portable_statement(
                 backend,
                 "INSERT INTO media_people (item_id, person_id, role, person_type, sort_order) VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id, person_id, person_type) DO NOTHING",
                 vec![
                     item_id.into(),
-                    person_id.into(),
+                    person_id.clone().into(),
                     role.as_str().into(),
                     Value::from(person_type.as_str()),
                     sort_order.into(),
                 ],
             ))
             .await;
+        // Download person profile image
+        if let Some(img_url) = image_url {
+            if let Err(e) = download_and_save_tmdb_image(db, &client, person_id.as_str(), img_url, "Primary").await {
+                tracing::warn!("Failed to download person image for {name}: {e:#}");
+            }
+        }
     }
 
     // Download poster and backdrop images

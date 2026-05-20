@@ -2,20 +2,18 @@ use std::path::Path;
 
 use crate::util::stable_item_id;
 
-pub fn classify_media_path(path: &Path, library_id: &str) -> Option<String> {
+pub fn classify_media_path(path: &Path, collection_type: &str) -> Option<String> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     if matches!(
         extension.as_str(),
         "mkv" | "mp4" | "m4v" | "mov" | "avi" | "wmv" | "webm" | "ts" | "m2ts" | "flv"
     ) {
-        return Some(
-            if library_id == "tvshows" {
-                "Episode"
-            } else {
-                "Movie"
-            }
-            .to_string(),
-        );
+        return Some(match collection_type {
+            "tvshows" | "tv" => "Episode",
+            "music" => "Audio",
+            _ => "Movie",
+        }
+        .to_string());
     }
     if matches!(
         extension.as_str(),
@@ -33,8 +31,8 @@ pub fn parent_id_for_path(path: &Path, root: &Path, library_id: &str) -> String 
         .unwrap_or_else(|| library_id.to_string())
 }
 
-pub fn tv_folder_type(path: &Path, root: &Path, library_id: &str) -> &'static str {
-    if library_id != "tvshows" {
+pub fn tv_folder_type(path: &Path, root: &Path, collection_type: &str) -> &'static str {
+    if collection_type != "tvshows" && collection_type != "tv" {
         return "Folder";
     }
     let depth = path

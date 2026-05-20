@@ -32,7 +32,7 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
 
     let mut scanned = 0usize;
     let mut seen_paths = Vec::new();
-    for (root, library_id) in roots {
+    for (root, library_id, collection_type) in roots {
         if !root.exists() {
             tracing::warn!("media directory does not exist: {}", root.display());
             continue;
@@ -70,7 +70,7 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
                     parent_id,
                     path_string,
                     resolved.name,
-                    tv_folder_type(path, &root, &library_id),
+                    tv_folder_type(path, &root, &collection_type),
                     resolved.modified_at,
                 );
                 upsert_media_item(&state.db, &item).await?;
@@ -81,13 +81,13 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
             if resolved.is_directory {
                 continue;
             }
-            let Some(item_type) = classify_media_path(path, &library_id) else {
+            let Some(item_type) = classify_media_path(path, &collection_type) else {
                 continue;
             };
 
             seen_paths.push(path_string.clone());
             let parsed_metadata = parse_sidecar_metadata(path).await;
-            let parsed_name = parse_media_name(path, &library_id);
+            let parsed_name = parse_media_name(path, &collection_type);
             let title = if has_sidecar_nfo(path) {
                 parsed_metadata
                     .title
@@ -151,13 +151,13 @@ fn has_sidecar_nfo(path: &std::path::Path) -> bool {
             .unwrap_or_default()
 }
 
-async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String)>> {
+async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String, String)>> {
     let backend = state.db.get_database_backend();
     let rows = state
         .db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            "SELECT path, library_id FROM library_paths ORDER BY path ASC",
+            "SELECT lp.path, lp.library_id, l.collection_type FROM library_paths lp JOIN libraries l ON l.id = lp.library_id ORDER BY lp.path ASC",
             vec![],
         ))
         .await
@@ -167,19 +167,20 @@ async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String)>>
             .media_dirs
             .iter()
             .map(|path| {
-                (
-                    PathBuf::from(path_utils::normalize_path(&path.to_string_lossy())),
-                    infer_library_id_from_path(&path.to_string_lossy()).to_string(),
-                )
+                let path_str = path.to_string_lossy();
+                let id = infer_library_id_from_path(&path_str).to_string();
+                let ct = "movies".to_string();
+                (PathBuf::from(path_utils::normalize_path(&path_str)), id, ct)
             })
             .collect());
     }
 
     rows.iter()
-        .map(|row| -> anyhow::Result<(PathBuf, String)> {
+        .map(|row| -> anyhow::Result<(PathBuf, String, String)> {
             Ok((
                 PathBuf::from(path_utils::normalize_path(&row.get_str("path")?)),
                 row.get_str("library_id")?,
+                row.get_str("collection_type")?,
             ))
         })
         .collect()

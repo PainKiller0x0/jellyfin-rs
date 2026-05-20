@@ -14,7 +14,7 @@ pub struct ParsedName {
     pub extended_video_types: Vec<String>,
 }
 
-pub fn parse_media_name(path: &Path, library_id: &str) -> ParsedName {
+pub fn parse_media_name(path: &Path, collection_type: &str) -> ParsedName {
     let stem = path
         .file_stem()
         .and_then(|name| name.to_str())
@@ -25,7 +25,7 @@ pub fn parse_media_name(path: &Path, library_id: &str) -> ParsedName {
         .and_then(|name| name.to_str())
         .unwrap_or_default();
 
-    if library_id == "tvshows" {
+    if collection_type == "tvshows" || collection_type == "tv" {
         parse_episode_name(stem, folder)
     } else {
         parse_video_name(stem)

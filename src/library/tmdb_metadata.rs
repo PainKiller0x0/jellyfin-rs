@@ -98,6 +98,87 @@ fn build_client() -> anyhow::Result<reqwest::Client> {
     Ok(builder.build()?)
 }
 
+/// Download poster images for all seasons that belong to a TMDb series
+async fn download_season_images(db: &sea_orm::DatabaseConnection, api_key: &str) {
+    let backend = db.get_database_backend();
+    let rows = db.query_all(crate::db::helpers::portable_statement(
+        backend,
+        r#"SELECT s.id as season_id, s.title, p.provider_item_id as series_tmdb_id
+           FROM media_items s
+           JOIN media_items series ON series.id = s.parent_id
+           JOIN provider_ids p ON p.item_id = series.id AND p.provider = 'Tmdb'
+           WHERE s.item_type = 'Season'
+           AND NOT EXISTS (SELECT 1 FROM image_assets ia WHERE ia.item_id = s.id)"#,
+        vec![],
+    )).await;
+    let Ok(rows) = rows else { return };
+    if rows.is_empty() { return };
+
+    let total = rows.len();
+    tracing::info!("Downloading {total} season poster images...");
+
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(e) => { tracing::warn!("Failed to build HTTP client: {e:#}"); return },
+    };
+    let mut downloaded = 0usize;
+
+    for chunk in rows.chunks(10) {
+        let futures: Vec<_> = chunk.iter().map(|row| {
+            let client = &client;
+            async move {
+                let Ok(season_id) = row.get_str("season_id") else { return None };
+                let title: String = row.get_str("title").ok()?;
+                let Ok(series_tmdb) = row.get_str("series_tmdb_id") else { return None };
+                // Parse season number from title like "Season 1" or "第1季"
+                let sn = parse_season_number(&title).unwrap_or(0);
+                let url = format!("https://api.themoviedb.org/3/tv/{series_tmdb}/season/{sn}?api_key={api_key}&language=zh-CN");
+                let resp = client.get(&url).send().await.ok()?;
+                let resp = resp.error_for_status().ok()?;
+                #[derive(serde::Deserialize)]
+                struct SeasonResp { poster_path: Option<String> }
+                let season: SeasonResp = resp.json().await.ok()?;
+                season.poster_path.map(|p| (season_id, p))
+            }
+        }).collect();
+
+        let results = futures_util::future::join_all(futures).await;
+        for (season_id, poster_path) in results.into_iter().flatten() {
+            let img_url = format!("https://image.tmdb.org/t/p/w500{poster_path}");
+            if download_and_save_tmdb_image(db, &client, &season_id, &img_url, "Primary").await.is_ok() {
+                downloaded += 1;
+            }
+        }
+    }
+    tracing::info!("Season images downloaded: {downloaded}/{total}");
+}
+
+fn parse_season_number(title: &str) -> Option<i64> {
+    // "Season 1", "第1季", "S01", "season_1"
+    let title_lower = title.to_ascii_lowercase();
+    // Try "season 1"
+    if let Some(pos) = title_lower.find("season") {
+        let rest = &title_lower[pos + 6..];
+        return rest.trim().split_whitespace().next()
+            .and_then(|s| s.parse::<i64>().ok());
+    }
+    // Try "第1季"
+    if let Some(pos) = title.find("第") {
+        if let Some(end) = title[pos..].find("季") {
+            let num = &title[pos + 3..pos + end];
+            return num.parse::<i64>().ok();
+        }
+    }
+    // Try "S01" at start
+    if title_lower.starts_with('s') {
+        let rest = &title_lower[1..];
+        if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
+            return rest[..end].parse::<i64>().ok();
+        }
+    }
+    None
+}
+
 /// Batch fetch TMDb episode metadata for all episodes after scan completes
 pub async fn batch_fetch_episode_tmdb(
     db: &sea_orm::DatabaseConnection,
@@ -105,6 +186,10 @@ pub async fn batch_fetch_episode_tmdb(
 ) -> anyhow::Result<usize> {
     let backend = db.get_database_backend();
     tracing::info!("Starting episode TMDb batch fetch...");
+
+    // First: download season images for all seasons
+    download_season_images(db, api_key).await;
+
     let rows = db.query_all(crate::db::helpers::portable_statement(
         backend,
         r#"SELECT e.id as episode_id, e.season_number, e.episode_number, p.provider_item_id as tmdb_id

@@ -36,6 +36,10 @@ pub fn parent_id_for_path(path: &Path, root: &Path, library_id: &str) -> String 
 }
 
 pub fn tv_folder_type(path: &Path, root: &Path, collection_type: &str) -> &'static str {
+    if collection_type == "movies" {
+        // Movie libraries store each movie as a folder — classify as "Movie"
+        return "Movie";
+    }
     if collection_type != "tvshows" && collection_type != "tv" {
         return "Folder";
     }

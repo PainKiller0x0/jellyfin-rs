@@ -83,6 +83,21 @@ async fn main() -> anyhow::Result<()> {
     }
     library::watcher::start_watching(state.clone());
 
+    // Fetch episode TMDb metadata in background (retries until data is available)
+    if let Some(api_key) = std::env::var("JELLYFIN_RS_TMDB_API_KEY").ok().filter(|k| !k.is_empty()) {
+        let ep_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                match library::tmdb_metadata::batch_fetch_episode_tmdb(&ep_state.db, &api_key).await {
+                    Ok(0) => {} // no episodes ready yet, keep trying
+                    Ok(n) => { tracing::info!("episode TMDb batch fetched {n} titles"); break; }
+                    Err(e) => { tracing::warn!("episode TMDb batch failed: {e:#}"); break; }
+                }
+            }
+        });
+    }
+
     let app = Router::new()
         .nest("/emby", jellyfin::routes::api_routes())
         .merge(jellyfin::routes::api_routes())

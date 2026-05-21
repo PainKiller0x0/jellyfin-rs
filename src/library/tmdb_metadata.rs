@@ -104,7 +104,7 @@ pub async fn batch_fetch_episode_tmdb(
     api_key: &str,
 ) -> anyhow::Result<usize> {
     let backend = db.get_database_backend();
-    // Find episodes with season/episode numbers whose parent series has a Tmdb ID
+    tracing::info!("Starting episode TMDb batch fetch...");
     let rows = db.query_all(crate::db::helpers::portable_statement(
         backend,
         r#"SELECT e.id as episode_id, e.season_number, e.episode_number, p.provider_item_id as tmdb_id
@@ -116,45 +116,82 @@ pub async fn batch_fetch_episode_tmdb(
         vec![],
     )).await?;
 
-    let client = build_client()?;
-    let mut count = 0usize;
+    // Deduplicate: only fetch each (tmdb_id, season, episode) once
+    let mut seen = std::collections::HashSet::new();
+    let mut tasks = Vec::new();
+
     for row in &rows {
-        let episode_id: String = row.get_str("episode_id")?;
-        let sn: i64 = row.get_i64("season_number")?;
-        let en: i64 = row.get_i64("episode_number")?;
-        let tmdb_id: String = row.get_str("tmdb_id")?;
+        let Ok(episode_id) = row.get_str("episode_id") else { continue };
+        let Ok(sn) = row.get_i64("season_number") else { continue };
+        let Ok(en) = row.get_i64("episode_number") else { continue };
+        let Ok(tmdb_id) = row.get_str("tmdb_id") else { continue };
 
-        let url = format!("https://api.themoviedb.org/3/tv/{tmdb_id}/season/{sn}/episode/{en}");
-        #[derive(serde::Deserialize)]
-        struct Ep { name: Option<String>, overview: Option<String>, still_path: Option<String> }
-        let resp = match client.get(&url).query(&[("api_key", api_key), ("language", "zh-CN")]).send().await {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let Ok(resp) = resp.error_for_status() else { continue };
-        let Ok(ep) = resp.json::<Ep>().await else { continue };
+        let key = format!("{tmdb_id}:{sn}:{en}");
+        if !seen.insert(key) {
+            continue;
+        }
+        tasks.push((episode_id, tmdb_id, sn, en));
+    }
 
-        if let Some(name) = ep.name.as_ref().filter(|n| !n.is_empty()) {
-            let _ = db.execute(crate::db::helpers::portable_statement(
-                backend, "UPDATE media_items SET title = ? WHERE id = ?",
-                vec![name.as_str().into(), episode_id.clone().into()],
-            )).await;
+    let total = tasks.len();
+    tracing::info!("Episode TMDb batch: {total} unique episodes to fetch");
+
+    let client = build_client()?;
+    let api_key = api_key.to_string();
+
+    // Process in concurrent batches (10 at a time)
+    let mut count = 0usize;
+    for chunk in tasks.chunks(10) {
+        let futures: Vec<_> = chunk.iter().map(|(ep_id, tmdb, sn, en)| {
+            let api_key = api_key.clone();
+            let ep_id = ep_id.clone();
+            let tmdb = tmdb.clone();
+            let sn = *sn;
+            let en = *en;
+            let client = client.clone();
+            async move {
+                let url = format!("https://api.themoviedb.org/3/tv/{tmdb}/season/{sn}/episode/{en}");
+                #[derive(serde::Deserialize)]
+                struct Ep { name: Option<String>, overview: Option<String>, still_path: Option<String> }
+                let resp = client.get(&url).query(&[("api_key", api_key.as_str()), ("language", "zh-CN")]).send().await.ok()?;
+                let resp = resp.error_for_status().ok()?;
+                let ep: Ep = resp.json().await.ok()?;
+                Some((ep, ep_id))
+            }
+        }).collect();
+
+        let results: Vec<_> = futures_util::future::join_all(futures).await;
+        for result in results.into_iter().flatten() {
+            let (ep, episode_id) = result;
+            let backend = db.get_database_backend();
+            if let Some(ref name) = ep.name {
+                if !name.is_empty() {
+                    let _ = db.execute(crate::db::helpers::portable_statement(
+                        backend, "UPDATE media_items SET title = ? WHERE id = ?",
+                        vec![name.as_str().into(), episode_id.clone().into()],
+                    )).await;
+                }
+            }
+            if let Some(ref overview) = ep.overview {
+                if !overview.is_empty() {
+                    let _ = db.execute(crate::db::helpers::portable_statement(
+                        backend, "UPDATE media_items SET overview = ? WHERE id = ?",
+                        vec![overview.as_str().into(), episode_id.clone().into()],
+                    )).await;
+                }
+            }
+            if let Some(ref still) = ep.still_path {
+                let img = format!("https://image.tmdb.org/t/p/w500{still}");
+                let _ = download_and_save_tmdb_image(db, &client, &episode_id, &img, "Primary").await;
+            }
+            count += 1;
         }
-        if let Some(overview) = ep.overview.as_ref().filter(|o| !o.is_empty()) {
-            let _ = db.execute(crate::db::helpers::portable_statement(
-                backend, "UPDATE media_items SET overview = ? WHERE id = ?",
-                vec![overview.as_str().into(), episode_id.clone().into()],
-            )).await;
+        if count % 100 == 0 || (count > 0 && count < 100) {
+            tracing::info!("Episode TMDb progress: {count}/{total}");
         }
-        if let Some(still) = ep.still_path.as_ref() {
-            let img = format!("https://image.tmdb.org/t/p/w500{still}");
-            let _ = download_and_save_tmdb_image(db, &client, &episode_id, &img, "Primary").await;
-        }
-        count += 1;
     }
-    if count > 0 {
-        tracing::info!("TMDb episode metadata fetched for {count} episodes");
-    }
+
+    tracing::info!("TMDb episode metadata fetched for {count} episodes");
     Ok(count)
 }
 

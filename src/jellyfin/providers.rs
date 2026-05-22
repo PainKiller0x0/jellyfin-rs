@@ -52,7 +52,7 @@ pub async fn tmdb_movie_details(
 ) -> anyhow::Result<Value> {
     let response = client
         .get(format!("https://api.themoviedb.org/3/movie/{tmdb_id}"))
-        .query(&[("api_key", api_key), ("language", "zh-CN"), ("append_to_response", "credits")])
+        .query(&[("api_key", api_key), ("language", "zh-CN"), ("append_to_response", "credits,release_dates")])
         .send()
         .await?
         .error_for_status()?
@@ -79,11 +79,45 @@ pub async fn tmdb_movie_details(
         })
         .collect::<Vec<_>>();
 
+    // Extract official rating (US certification preferred)
+    let official_rating = response.release_dates
+        .as_ref()
+        .map(|rd| {
+            rd.results.iter()
+                .filter(|r| r.iso_3166_1.as_deref() == Some("US"))
+                .flat_map(|r| &r.release_dates)
+                .find_map(|rd| rd.certification.as_ref().filter(|c| !c.is_empty()).cloned())
+                .or_else(|| {
+                    // Fallback: any non-empty certification
+                    rd.results.iter()
+                        .flat_map(|r| &r.release_dates)
+                        .find_map(|rd| rd.certification.as_ref().filter(|c| !c.is_empty()).cloned())
+                })
+        })
+        .flatten();
+
+    let countries: Vec<String> = response.production_countries
+        .iter()
+        .filter_map(|c| c.name.clone())
+        .collect();
+
+    let languages: Vec<String> = response.spoken_languages
+        .iter()
+        .filter_map(|l| l.name.clone())
+        .collect();
+
     Ok(json!({
         "Name": response.title,
         "Overview": response.overview,
         "ProductionYear": year,
         "CommunityRating": response.vote_average,
+        "OfficialRating": official_rating,
+        "Tagline": response.tagline,
+        "RuntimeTicks": response.runtime.map(|m| m * 60 * 10_000_000),
+        "Status": response.status,
+        "OriginalLanguage": response.original_language,
+        "Countries": countries,
+        "Languages": languages,
         "ProviderIds": {
             "Tmdb": response.id.to_string(),
             "IMDB": response.imdb_id.unwrap_or_default()
@@ -150,7 +184,7 @@ pub async fn tmdb_tv_details(
         .query(&[
             ("api_key", api_key),
             ("language", "zh-CN"),
-            ("append_to_response", "credits,external_ids"),
+            ("append_to_response", "credits,external_ids,content_ratings"),
         ])
         .send()
         .await?
@@ -187,11 +221,38 @@ pub async fn tmdb_tv_details(
         .as_ref()
         .and_then(|ids| ids.tvdb_id.map(|id| id.to_string()));
 
+    // Extract official rating (US content rating preferred)
+    let official_rating = response.content_ratings
+        .as_ref()
+        .map(|cr| {
+            cr.results.iter()
+                .filter(|r| r.iso_3166_1.as_deref() == Some("US"))
+                .find_map(|r| r.rating.as_ref().filter(|c| !c.is_empty()).cloned())
+                .or_else(|| {
+                    cr.results.iter()
+                        .find_map(|r| r.rating.as_ref().filter(|c| !c.is_empty()).cloned())
+                })
+        })
+        .flatten();
+
+    let runtime_minutes = response.episode_run_time.first().copied();
+    let countries: Vec<String> = response.origin_country.clone();
+    let languages: Vec<String> = response.spoken_languages
+        .iter()
+        .filter_map(|l| l.name.clone())
+        .collect();
+
     Ok(json!({
         "Name": response.name,
         "Overview": response.overview,
         "ProductionYear": year,
         "CommunityRating": response.vote_average,
+        "OfficialRating": official_rating,
+        "Tagline": response.tagline,
+        "RuntimeTicks": runtime_minutes.map(|m| m * 60 * 10_000_000),
+        "OriginalLanguage": response.original_language,
+        "Countries": countries,
+        "Languages": languages,
         "ProviderIds": {
             "Tmdb": response.id.to_string(),
             "IMDB": external_imdb.unwrap_or_default(),
@@ -203,7 +264,7 @@ pub async fn tmdb_tv_details(
         "ImageUrl": response.poster_path.map(|p| format!("https://image.tmdb.org/t/p/w500{p}")),
         "BackdropUrl": response.backdrop_path.map(|p| format!("https://image.tmdb.org/t/p/w1280{p}")),
         "Status": response.status,
-        "AirDays": response.episode_run_time.first().copied(),
+        "AirDays": runtime_minutes,
         "SeasonCount": response.number_of_seasons,
         "EpisodeCount": response.number_of_episodes,
     }))
@@ -389,11 +450,22 @@ struct TmdbMovieDetails {
     backdrop_path: Option<String>,
     imdb_id: Option<String>,
     vote_average: Option<f64>,
+    tagline: Option<String>,
+    runtime: Option<i64>,
+    status: Option<String>,
+    original_language: Option<String>,
+    budget: Option<i64>,
+    revenue: Option<i64>,
     #[serde(default)]
     genres: Vec<TmdbNamedItem>,
     #[serde(default)]
     production_companies: Vec<TmdbNamedItem>,
+    #[serde(default)]
+    production_countries: Vec<TmdbCountry>,
+    #[serde(default)]
+    spoken_languages: Vec<TmdbLanguage>,
     credits: Option<TmdbCredits>,
+    release_dates: Option<TmdbReleaseDates>,
 }
 
 #[derive(Deserialize)]
@@ -408,14 +480,21 @@ struct TmdbTvDetails {
     number_of_seasons: Option<i64>,
     number_of_episodes: Option<i64>,
     vote_average: Option<f64>,
+    tagline: Option<String>,
+    original_language: Option<String>,
     #[serde(default)]
     episode_run_time: Vec<i64>,
     #[serde(default)]
     genres: Vec<TmdbNamedItem>,
     #[serde(default)]
     networks: Vec<TmdbNamedItem>,
+    #[serde(default)]
+    origin_country: Vec<String>,
+    #[serde(default)]
+    spoken_languages: Vec<TmdbLanguage>,
     credits: Option<TmdbTvCredits>,
     external_ids: Option<TmdbExternalIds>,
+    content_ratings: Option<TmdbContentRatings>,
 }
 
 #[derive(Deserialize)]
@@ -442,6 +521,48 @@ struct TmdbTvRole {
 struct TmdbExternalIds {
     imdb_id: Option<String>,
     tvdb_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct TmdbCountry {
+    iso_3166_1: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TmdbLanguage {
+    iso_639_1: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TmdbReleaseDates {
+    #[serde(default)]
+    results: Vec<TmdbReleaseDateResult>,
+}
+
+#[derive(Deserialize)]
+struct TmdbReleaseDateResult {
+    iso_3166_1: Option<String>,
+    #[serde(default)]
+    release_dates: Vec<TmdbReleaseDateEntry>,
+}
+
+#[derive(Deserialize)]
+struct TmdbReleaseDateEntry {
+    certification: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TmdbContentRatings {
+    #[serde(default)]
+    results: Vec<TmdbContentRatingResult>,
+}
+
+#[derive(Deserialize)]
+struct TmdbContentRatingResult {
+    iso_3166_1: Option<String>,
+    rating: Option<String>,
 }
 
 #[derive(Deserialize)]

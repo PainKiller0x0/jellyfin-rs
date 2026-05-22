@@ -604,6 +604,28 @@ pub async fn fetch_and_apply_tmdb_metadata(
             .await;
     }
 
+    // Update official_rating (PG, R, etc.)
+    if let Some(rating) = metadata.get("OfficialRating").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        let _ = db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "UPDATE media_items SET official_rating = ? WHERE id = ?",
+                vec![rating.into(), item_id.into()],
+            ))
+            .await;
+    }
+
+    // Update runtime_ticks from TMDb runtime (minutes → ticks: 1 min = 60 * 10_000_000)
+    if let Some(ticks) = metadata.get("RuntimeTicks").and_then(|v| v.as_i64()).filter(|t| *t > 0) {
+        let _ = db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "UPDATE media_items SET runtime_ticks = ? WHERE id = ? AND runtime_ticks IS NULL",
+                vec![ticks.into(), item_id.into()],
+            ))
+            .await;
+    }
+
     // Store provider IDs
     if let Some(provider_ids) = metadata.get("ProviderIds") {
         if let Some(obj) = provider_ids.as_object() {

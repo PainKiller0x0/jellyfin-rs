@@ -52,6 +52,16 @@ pub async fn virtual_folders(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+pub async fn virtual_folders_query(State(state): State<Arc<AppState>>) -> Response {
+    match virtual_folders_inner(&state.db).await {
+        Ok(folders) => {
+            let total = folders.len();
+            Json(json!({ "Items": folders, "TotalRecordCount": total })).into_response()
+        }
+        Err(error) => internal_error(error),
+    }
+}
+
 pub async fn media_folders(State(state): State<Arc<AppState>>) -> Response {
     match virtual_folders_inner(&state.db).await {
         Ok(folders) => {

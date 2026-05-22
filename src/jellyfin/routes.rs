@@ -240,6 +240,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/Library/VirtualFolders",
             get(library::virtual_folders).post(library::create_virtual_folder),
         )
+        .route("/Library/VirtualFolders/Query", get(library::virtual_folders_query))
         .route("/Library/VirtualFolders/Name", post(common::no_content))
         .route(
             "/Library/VirtualFolders/LibraryOptions",

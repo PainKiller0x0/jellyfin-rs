@@ -265,5 +265,38 @@ pub fn optional_migrations() -> Vec<Migration> {
             "ALTER TABLE media_items ADD COLUMN critic_rating DOUBLE PRECISION",
             "add media_items.critic_rating",
         ),
+        // Performance indexes
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_people_person_id ON media_people(person_id)",
+            "add media_people.person_id index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_user_data_user_favorite ON user_data(user_id, is_favorite)",
+            "add user_data.user_id+is_favorite index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_folder_type ON media_items(is_folder, item_type)",
+            "add media_items.is_folder+item_type index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_genres_genre_id ON media_genres(genre_id)",
+            "add media_genres.genre_id index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_streams_type_codec ON media_streams(stream_type, codec)",
+            "add media_streams.stream_type+codec index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_library_type ON media_items(library_id, item_type, is_folder)",
+            "add media_items.library_id+item_type+is_folder index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_parent_type ON media_items(parent_id, item_type)",
+            "add media_items.parent_id+item_type index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_user_data_user_id ON user_data(user_id)",
+            "add user_data.user_id index",
+        ),
     ]
 }

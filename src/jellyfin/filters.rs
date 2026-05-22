@@ -311,7 +311,7 @@ async fn list_filter_items_inner(
                 let models = db
                     .query_all(crate::db::helpers::portable_statement(
                         db.get_database_backend(),
-                        "SELECT p.id, p.name FROM people p JOIN user_data ud ON ud.item_id = p.id WHERE ud.user_id = ? AND ud.is_favorite = 1 ORDER BY p.name ASC",
+                        "SELECT p.id, p.name, ia.etag AS primary_image_tag FROM people p JOIN user_data ud ON ud.item_id = p.id LEFT JOIN image_assets ia ON ia.item_id = p.id AND ia.image_type = 'Primary' WHERE ud.user_id = ? AND ud.is_favorite = 1 ORDER BY p.name ASC",
                         vec![uid.as_str().into()],
                     ))
                     .await
@@ -321,7 +321,13 @@ async fn list_filter_items_inner(
                     .filter_map(|r| {
                         let id = r.get_str("id").ok()?;
                         let name = r.get_str("name").ok()?;
-                        Some(json!({ "Name": name, "Id": id, "Type": kind.item_type(), "ImageTags": {} }))
+                        let image_tag = r.get_opt_str("primary_image_tag").ok().flatten().unwrap_or_default();
+                        let mut item = json!({ "Name": name, "Id": id, "Type": kind.item_type(), "ImageTags": {} });
+                        if !image_tag.is_empty() {
+                            item["PrimaryImageTag"] = json!(image_tag);
+                            item["ImageTags"] = json!({"Primary": image_tag});
+                        }
+                        Some(item)
                     })
                     .collect()
             } else {

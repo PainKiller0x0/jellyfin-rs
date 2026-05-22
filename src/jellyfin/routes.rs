@@ -339,13 +339,13 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Users/{user_id}/Policy", post(auth::update_user_policy))
         .route("/Items", get(items::items_root))
         .route("/Items/Filters", get(common::empty_object))
-        .route("/Items/Filters2", get(common::empty_object))
-        .route("/Items/Suggestions", get(common::empty_list))
+        .route("/Items/Filters2", get(super::user_extras::filters2))
+        .route("/Items/Suggestions", get(super::user_extras::items_suggestions))
         .route(
             "/Items/{item_id}",
             get(items::item_by_id_public).post(items::update_item),
         )
-        .route("/Items/{item_id}/Ancestors", get(common::empty_array))
+        .route("/Items/{item_id}/Ancestors", get(super::user_extras::item_ancestors))
         .route("/Items/{item_id}/CriticReviews", get(common::empty_list))
         .route("/Items/{item_id}/Download", get(common::empty_object))
         .route("/Items/{item_id}/File", get(common::empty_object))
@@ -353,6 +353,9 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Items/{item_id}/ThemeSongs", get(common::empty_array))
         .route("/Items/{item_id}/ThemeVideos", get(common::empty_array))
         .route("/Items/{item_id}/InstantMix", get(common::empty_list))
+        .route("/Items/{item_id}/Intros", get(super::user_extras::item_intros))
+        .route("/Items/{item_id}/LocalTrailers", get(super::user_extras::item_local_trailers))
+        .route("/Items/{item_id}/SpecialFeatures", get(super::user_extras::item_special_features))
         .route("/Items/{item_id}/Images", get(images::item_images))
         .route(
             "/Items/{item_id}/Images/{image_type}",
@@ -383,6 +386,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Artists/InstantMix", get(common::empty_list))
         .route("/Artists/{name}", get(common::empty_object))
         .route("/Artists/{item_id}/InstantMix", get(common::empty_list))
+        .route("/Artists/{name}/Images/{image_type}", get(super::user_extras::artist_image))
+        .route("/Artists/{name}/Images/{image_type}/{index}", get(super::user_extras::artist_image))
         .route("/Movies/Recommendations", get(items::movie_recommendations))
         .route("/Movies/{item_id}/Similar", get(items::similar_items))
         .route("/Shows/{item_id}/Similar", get(items::similar_items))
@@ -501,6 +506,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Sessions/Logout", post(common::no_content))
         .route("/Sessions/Viewing", post(common::no_content))
         .route("/Sessions/Playing/Ping", post(common::no_content))
+        .route("/Sessions/PlayQueue", get(super::user_extras::play_queue))
         .route("/Sessions/{session_id}/Viewing", post(common::no_content))
         .route("/Sessions/{session_id}/Command", post(common::no_content))
         .route(
@@ -541,9 +547,29 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/PlayingItems/{item_id}",
-            post(common::no_content).delete(common::no_content),
+            post(super::user_extras::playing_item_start).delete(super::user_extras::playing_item_stop),
         )
-        .route("/PlayingItems/{item_id}/Progress", post(common::no_content))
+        .route("/PlayingItems/{item_id}/Progress", post(super::user_extras::playing_item_progress))
+        .route(
+            "/UserSettings/{user_id}",
+            get(super::user_extras::get_user_settings).post(super::user_extras::update_user_settings),
+        )
+        .route(
+            "/Users/{user_id}/PlayingItems/{item_id}",
+            post(super::user_extras::playing_item_start).delete(super::user_extras::playing_item_stop),
+        )
+        .route(
+            "/Users/{user_id}/PlayingItems/{item_id}/Progress",
+            post(super::user_extras::playing_item_progress),
+        )
+        .route(
+            "/Users/{user_id}/TrackSelections/{track_type}",
+            delete(super::user_extras::clear_track_selections),
+        )
+        .route(
+            "/Users/{user_id}/TrackSelections/{track_type}/Delete",
+            post(super::user_extras::clear_track_selections),
+        )
         .route(
             "/DisplayPreferences/{prefs_id}",
             get(items::get_display_preferences).post(items::update_display_preferences),
@@ -568,6 +594,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(collect::get_playlist_items)
                 .post(collect::add_to_playlist)
                 .delete(collect::remove_from_playlist),
+        )
+        .route(
+            "/Playlists/{playlist_id}/Items/{item_id}/Move/{new_index}",
+            post(super::user_extras::playlist_move_item),
         )
         .route("/websocket", get(ws::ws_handler))
         .route("/WebSocket", get(ws::ws_handler))

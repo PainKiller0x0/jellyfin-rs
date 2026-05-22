@@ -567,7 +567,7 @@ enum PlaybackEvent {
     Stopped,
 }
 
-async fn upsert_playback_position(
+pub(crate) async fn upsert_playback_position(
     db: &DatabaseConnection,
     user_id: &str,
     item_id: &str,

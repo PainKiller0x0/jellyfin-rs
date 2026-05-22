@@ -13,3 +13,4 @@ pub mod providers;
 pub mod routes;
 pub mod sessions;
 pub mod system;
+pub mod user_extras;

@@ -810,3 +810,216 @@ pub async fn items_filters(
 pub async fn item_critic_reviews() -> Response {
     Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
 }
+
+/// GET /Genres/{name} — get genre by name
+pub async fn genre_by_name(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let backend = state.db.get_database_backend();
+    let row = state.db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT id, name FROM genres WHERE name = ?",
+            vec![name.into()],
+        ))
+        .await;
+
+    match row {
+        Ok(Some(r)) => {
+            let id = r.get_str("id").unwrap_or_default();
+            let name = r.get_str("name").unwrap_or_default();
+            Json(json!({ "Name": name, "Id": id, "Type": "Genre" })).into_response()
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// GET /Studios/{name} — get studio by name
+pub async fn studio_by_name(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let backend = state.db.get_database_backend();
+    let row = state.db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT id, name FROM studios WHERE name = ?",
+            vec![name.into()],
+        ))
+        .await;
+
+    match row {
+        Ok(Some(r)) => {
+            let id = r.get_str("id").unwrap_or_default();
+            let name = r.get_str("name").unwrap_or_default();
+            Json(json!({ "Name": name, "Id": id, "Type": "Studio" })).into_response()
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// GET /AudioCodecs — list audio codecs from media_streams
+pub async fn audio_codecs(
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let backend = state.db.get_database_backend();
+    let rows = state.db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT DISTINCT codec FROM media_streams WHERE stream_type = 'Audio' AND codec IS NOT NULL AND codec <> '' ORDER BY codec ASC",
+            vec![],
+        ))
+        .await
+        .unwrap_or_default();
+
+    let codecs: Vec<Value> = rows.iter()
+        .filter_map(|r| r.get_opt_str("codec").ok().flatten().map(|c| json!({"Name": c, "Id": c})))
+        .collect();
+
+    Json(json!({ "Items": codecs, "TotalRecordCount": codecs.len() })).into_response()
+}
+
+/// GET /AudioLayouts — list audio channel layouts
+pub async fn audio_layouts(
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let backend = state.db.get_database_backend();
+    let rows = state.db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT DISTINCT channels FROM media_streams WHERE stream_type = 'Audio' AND channels IS NOT NULL ORDER BY channels ASC",
+            vec![],
+        ))
+        .await
+        .unwrap_or_default();
+
+    let layouts: Vec<Value> = rows.iter()
+        .filter_map(|r| {
+            r.get_opt_i64("channels").ok().flatten().map(|ch| {
+                let name = match ch {
+                    1 => "Mono".to_string(),
+                    2 => "Stereo".to_string(),
+                    6 => "5.1".to_string(),
+                    8 => "7.1".to_string(),
+                    n => format!("{}ch", n),
+                };
+                json!({"Name": name, "Id": ch})
+            })
+        })
+        .collect();
+
+    Json(json!({ "Items": layouts, "TotalRecordCount": layouts.len() })).into_response()
+}
+
+/// GET /SubtitleCodecs — list subtitle codecs
+pub async fn subtitle_codecs(
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let backend = state.db.get_database_backend();
+    let rows = state.db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT DISTINCT codec FROM media_streams WHERE stream_type = 'Subtitle' AND codec IS NOT NULL AND codec <> '' ORDER BY codec ASC",
+            vec![],
+        ))
+        .await
+        .unwrap_or_default();
+
+    let codecs: Vec<Value> = rows.iter()
+        .filter_map(|r| r.get_opt_str("codec").ok().flatten().map(|c| json!({"Name": c, "Id": c})))
+        .collect();
+
+    Json(json!({ "Items": codecs, "TotalRecordCount": codecs.len() })).into_response()
+}
+
+/// GET /StreamLanguages — list stream languages
+pub async fn stream_languages(
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let backend = state.db.get_database_backend();
+    let rows = state.db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT DISTINCT language FROM media_streams WHERE language IS NOT NULL AND language <> '' ORDER BY language ASC",
+            vec![],
+        ))
+        .await
+        .unwrap_or_default();
+
+    let langs: Vec<Value> = rows.iter()
+        .filter_map(|r| r.get_opt_str("language").ok().flatten().map(|l| json!({"Name": l, "Id": l})))
+        .collect();
+
+    Json(json!({ "Items": langs, "TotalRecordCount": langs.len() })).into_response()
+}
+
+/// GET /ItemTypes — list item types
+pub async fn item_types() -> Response {
+    Json(json!([
+        {"Name": "Movie", "Id": "Movie"},
+        {"Name": "Series", "Id": "Series"},
+        {"Name": "Season", "Id": "Season"},
+        {"Name": "Episode", "Id": "Episode"},
+        {"Name": "Video", "Id": "Video"},
+        {"Name": "BoxSet", "Id": "BoxSet"},
+        {"Name": "Playlist", "Id": "Playlist"},
+    ]))
+    .into_response()
+}
+
+/// GET /Items/{id}/ThumbnailSet — trickplay thumbnail set
+pub async fn thumbnail_set(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    // Not implemented - would need trickplay image generation
+    StatusCode::NOT_FOUND.into_response()
+}
+
+/// GET /Genres/{name}/Images/{image_type} — genre image
+pub async fn genre_image(
+    State(_state): State<Arc<AppState>>,
+    Path((_name, _image_type)): Path<(String, String)>,
+) -> Response {
+    // Genre images not stored
+    StatusCode::NOT_FOUND.into_response()
+}
+
+/// GET /Studios/{name}/Images/{image_type} — studio image
+pub async fn studio_image(
+    State(_state): State<Arc<AppState>>,
+    Path((_name, _image_type)): Path<(String, String)>,
+) -> Response {
+    // Studio images not stored
+    StatusCode::NOT_FOUND.into_response()
+}
+
+/// GET /Playlists/{id}/AddToPlaylistInfo — info for adding to playlist
+pub async fn add_to_playlist_info(
+    State(state): State<Arc<AppState>>,
+    Path(playlist_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let user_id = query
+        .get("UserId")
+        .cloned()
+        .unwrap_or_else(|| state.user_id.to_string());
+    let ids = query.get("Ids").map(|v| v.split(',').collect::<Vec<_>>()).unwrap_or_default();
+
+    Json(json!({
+        "PlaylistId": playlist_id,
+        "Items": ids.iter().map(|id| json!({"Id": id})).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+/// GET /Users/{id}/Items/{id}/Intros — per-user intros
+pub async fn user_item_intros() -> Response {
+    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+}
+
+/// GET /Users/{id}/Items/{id}/LocalTrailers — per-user local trailers
+pub async fn user_item_local_trailers() -> Response {
+    Json(json!([])).into_response()
+}

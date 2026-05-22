@@ -297,6 +297,14 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/Users/{user_id}/Items/{item_id}", get(items::item_by_id))
         .route(
+            "/Users/{user_id}/Items/{item_id}/Intros",
+            get(super::user_extras::user_item_intros),
+        )
+        .route(
+            "/Users/{user_id}/Items/{item_id}/LocalTrailers",
+            get(super::user_extras::user_item_local_trailers),
+        )
+        .route(
             "/Users/{user_id}/Images/Primary",
             get(images::user_avatar)
                 .post(images::upload_user_avatar)
@@ -356,6 +364,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Items/{item_id}/Intros", get(super::user_extras::item_intros))
         .route("/Items/{item_id}/LocalTrailers", get(super::user_extras::item_local_trailers))
         .route("/Items/{item_id}/SpecialFeatures", get(super::user_extras::item_special_features))
+        .route("/Items/{item_id}/ThumbnailSet", get(super::user_extras::thumbnail_set))
         .route("/Items/{item_id}/Images", get(images::item_images))
         .route(
             "/Items/{item_id}/Images/{image_type}",
@@ -433,6 +442,9 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Shows/Upcoming", get(super::user_extras::shows_upcoming))
         .route("/Search/Hints", get(items::search_hints))
         .route("/Genres", get(filters::genres))
+        .route("/Genres/{name}", get(super::user_extras::genre_by_name))
+        .route("/Genres/{name}/Images/{image_type}", get(super::user_extras::genre_image))
+        .route("/Genres/{name}/Images/{image_type}/{index}", get(super::user_extras::genre_image))
         .route("/MusicGenres", get(common::empty_list))
         .route("/MusicGenres/InstantMix", get(common::empty_list))
         .route("/MusicGenres/{genre_name}", get(common::empty_object))
@@ -443,12 +455,20 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Persons/{name}/Images/{image_type}", get(persons::person_image))
         .route("/Persons/{name}/Images/{first}/{second}", get(persons::person_image_with_index))
         .route("/Studios", get(filters::studios))
+        .route("/Studios/{name}", get(super::user_extras::studio_by_name))
+        .route("/Studios/{name}/Images/{image_type}", get(super::user_extras::studio_image))
+        .route("/Studios/{name}/Images/{image_type}/{index}", get(super::user_extras::studio_image))
         .route("/Tags", get(filters::tags))
         .route("/Years", get(filters::years))
         .route("/OfficialRatings", get(filters::official_ratings))
         .route("/Containers", get(filters::containers))
         .route("/VideoCodecs", get(filters::video_codecs))
         .route("/ExtendedVideoTypes", get(filters::extended_video_types))
+        .route("/AudioCodecs", get(super::user_extras::audio_codecs))
+        .route("/AudioLayouts", get(super::user_extras::audio_layouts))
+        .route("/SubtitleCodecs", get(super::user_extras::subtitle_codecs))
+        .route("/StreamLanguages", get(super::user_extras::stream_languages))
+        .route("/ItemTypes", get(super::user_extras::item_types))
         .route("/Videos/{item_id}/AdditionalParts", get(super::user_extras::video_additional_parts))
         .route(
             "/Videos/{item_id}/Trickplay/{width}/tiles.m3u8",
@@ -607,6 +627,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(collect::get_playlist_items)
                 .post(collect::add_to_playlist)
                 .delete(collect::remove_from_playlist),
+        )
+        .route(
+            "/Playlists/{playlist_id}/AddToPlaylistInfo",
+            get(super::user_extras::add_to_playlist_info),
         )
         .route(
             "/Playlists/{playlist_id}/Items/{item_id}/Move/{new_index}",

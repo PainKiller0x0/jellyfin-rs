@@ -1145,13 +1145,13 @@ pub async fn home_sections(
     State(_state): State<Arc<AppState>>,
     Path(_user_id): Path<String>,
 ) -> Response {
-    // Return a standard home screen layout
+    // Return a standard home screen layout matching ContentSection SDK model
     let sections = json!([
-        { "Name": "Continue Watching", "SectionType": "Resume", "Id": "resume", "ViewType": "Resume" },
-        { "Name": "Next Up", "SectionType": "NextUp", "Id": "nextup", "ViewType": "NextUp" },
-        { "Name": "Latest Movies", "SectionType": "Latest", "Id": "latest-movies", "ViewType": "Latest" },
-        { "Name": "Latest TV Shows", "SectionType": "Latest", "Id": "latest-tvshows", "ViewType": "Latest" },
-        { "Name": "Suggestions", "SectionType": "Suggestions", "Id": "suggestions", "ViewType": "Suggestions" },
+        { "Name": "Continue Watching", "SectionType": "Resume", "ViewType": "Resume", "Id": "resume", "ScrollDirection": "Horizontal", "CardSizeOffset": 0 },
+        { "Name": "Next Up", "SectionType": "NextUp", "ViewType": "NextUp", "Id": "nextup", "ScrollDirection": "Horizontal", "CardSizeOffset": 0 },
+        { "Name": "Latest Movies", "SectionType": "Latest", "ViewType": "Latest", "CollectionType": "movies", "Id": "latest-movies", "ScrollDirection": "Horizontal", "CardSizeOffset": 0 },
+        { "Name": "Latest TV Shows", "SectionType": "Latest", "ViewType": "Latest", "CollectionType": "tvshows", "Id": "latest-tvshows", "ScrollDirection": "Horizontal", "CardSizeOffset": 0 },
+        { "Name": "Suggestions", "SectionType": "Suggestions", "ViewType": "Suggestions", "Id": "suggestions", "ScrollDirection": "Horizontal", "CardSizeOffset": 0 },
     ]);
     Json(sections).into_response()
 }

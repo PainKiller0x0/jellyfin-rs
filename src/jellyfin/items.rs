@@ -75,7 +75,7 @@ pub async fn user_items(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     match list_media_items(&state.db, &user_id, &query).await {
-        Ok(items) => media_list_response(items),
+        Ok((items, total)) => media_list_response_with_total(items, total),
         Err(error) => internal_error(error),
     }
 }
@@ -145,6 +145,10 @@ pub async fn show_episodes(
 
 pub(super) fn media_list_response(items: Vec<MediaItem>) -> Response {
     let total = items.len();
+    Json(json!({ "Items": items.into_iter().map(|item| strip_nulls(item.to_jellyfin_json())).collect::<Vec<_>>(), "TotalRecordCount": total })).into_response()
+}
+
+pub(super) fn media_list_response_with_total(items: Vec<MediaItem>, total: usize) -> Response {
     Json(json!({ "Items": items.into_iter().map(|item| strip_nulls(item.to_jellyfin_json())).collect::<Vec<_>>(), "TotalRecordCount": total })).into_response()
 }
 
@@ -361,7 +365,7 @@ pub async fn items_root(
         .cloned()
         .unwrap_or_else(|| state.user_id.to_string());
     match list_media_items(&state.db, &user_id, &query).await {
-        Ok(items) => media_list_response(items),
+        Ok((items, total)) => media_list_response_with_total(items, total),
         Err(error) => internal_error(error),
     }
 }

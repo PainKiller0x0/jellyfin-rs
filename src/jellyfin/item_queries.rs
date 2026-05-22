@@ -103,7 +103,7 @@ pub async fn list_media_items(
     db: &DatabaseConnection,
     user_id: &str,
     query: &HashMap<String, String>,
-) -> anyhow::Result<Vec<MediaItem>> {
+) -> anyhow::Result<(Vec<MediaItem>, usize)> {
     let has_list_item_ids = query.contains_key("ListItemIds") || query.contains_key("ListItemIds");
     let has_person_ids = query.contains_key("PersonIds") || query.contains_key("personIds");
     let parent_id = query
@@ -129,7 +129,7 @@ pub async fn list_media_items(
             .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>())
             .unwrap_or_default();
         if person_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let placeholders = person_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         // SQL template: LEFT JOIN user_data ON ... AND ud.user_id = ? (1st placeholder)
@@ -167,7 +167,8 @@ pub async fn list_media_items(
                 }
             }
         }
-        items
+        let total = items.len();
+        (items, total)
     } else {
         let has_search = search_term.is_some();
         let parent_id = parent_id.unwrap_or("movies");
@@ -235,6 +236,7 @@ pub async fn list_media_items(
         apply_item_filters(&mut items, query);
         apply_relation_filters(db, &mut items, query).await?;
         sort_media_items(&mut items, query);
+        let total_count = items.len();
         let mut items: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
         // Batch load image tags
         if !items.is_empty() {
@@ -247,7 +249,7 @@ pub async fn list_media_items(
                 }
             }
         }
-        items
+        (items, total_count)
     };
 
     Ok(items)

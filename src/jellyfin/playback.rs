@@ -449,6 +449,15 @@ async fn playback_progress_inner(
         return internal_error(error);
     }
 
+    // Save RunTimeTicks from client report if media_items doesn't have it yet
+    if let Some(runtime_ticks) = body.get("RunTimeTicks").and_then(JsonValue::as_i64).filter(|v| *v > 0) {
+        let _ = state.db.execute(crate::db::helpers::portable_statement(
+            state.db.get_database_backend(),
+            "UPDATE media_items SET runtime_ticks = ? WHERE id = ? AND runtime_ticks IS NULL",
+            vec![runtime_ticks.into(), item_id.into()],
+        )).await;
+    }
+
     match update_playback_session(
         &state,
         &headers,

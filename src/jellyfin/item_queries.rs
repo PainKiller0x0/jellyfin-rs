@@ -171,12 +171,21 @@ pub async fn list_media_items(
         (items, total)
     } else {
         let has_search = search_term.is_some();
+        let has_filters = query.get("Filters").is_some();
+        let original_parent_id = parent_id;
         let parent_id = parent_id.unwrap_or("movies");
-        let parent_is_collection = is_collection_or_playlist(db, parent_id).await?;
+        let parent_is_collection = if original_parent_id.is_some() {
+            is_collection_or_playlist(db, parent_id).await?
+        } else {
+            false
+        };
 
         let like_clause = search_term
             .as_ref()
             .map(|_| "AND LOWER(media_items.title) LIKE LOWER(?)");
+
+        // When no ParentId is specified (global query), use global search for SearchTerm or Filters
+        let needs_global_query = original_parent_id.is_none() && (has_search || has_filters);
 
         let rows = if parent_is_collection {
             let (sql, vals) = if let Some(like) = like_clause {
@@ -191,14 +200,22 @@ pub async fn list_media_items(
             };
             db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
                 .await
-        } else if has_search {
-            // Search takes priority over recursive - search globally with SQL LIKE
-            let base = media_item_select_sql("WHERE 1=1");
-            let sql = base.replace("ORDER BY", "AND LOWER(media_items.title) LIKE LOWER(?) ORDER BY");
-            let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
-            vals.push(search_term.as_ref().unwrap().as_str().into());
-            db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
-                .await
+        } else if needs_global_query {
+            // Global search/filter: no parent_id constraint, use SQL LIKE or just global query
+            if has_search {
+                let base = media_item_select_sql("WHERE 1=1");
+                let sql = base.replace("ORDER BY", "AND LOWER(media_items.title) LIKE LOWER(?) ORDER BY");
+                let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
+                vals.push(search_term.as_ref().unwrap().as_str().into());
+                db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
+                    .await
+            } else {
+                // Filters without SearchTerm, no ParentId — global query
+                let sql = media_item_select_sql("WHERE 1=1");
+                let vals: Vec<sea_orm::Value> = vec![user_id.into()];
+                db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
+                    .await
+            }
         } else if recursive {
             let (sql, vals) = if let Some(like) = like_clause {
                 let base = recursive_media_item_select_sql();

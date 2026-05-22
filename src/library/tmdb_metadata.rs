@@ -674,7 +674,7 @@ pub async fn fetch_and_apply_tmdb_metadata(
         let _ = db
             .execute(crate::db::helpers::portable_statement(
                 backend,
-                "INSERT INTO media_people (item_id, person_id, role, person_type, sort_order) VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id, person_id, person_type) DO NOTHING",
+                "INSERT INTO media_people (item_id, person_id, role, person_type, sort_order) VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id, person_id, person_type) DO UPDATE SET role = excluded.role WHERE excluded.role IS NOT NULL AND excluded.role <> ''",
                 vec![
                     item_id.into(),
                     person_id.clone().into(),

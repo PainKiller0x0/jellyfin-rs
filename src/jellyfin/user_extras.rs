@@ -441,3 +441,117 @@ pub async fn playlist_move_item(
     // Not implemented yet - would need sort_order in linked_children
     StatusCode::NO_CONTENT.into_response()
 }
+
+/// GET /Items/{item_id}/RemoteSearch/Subtitles/{language} — search remote subtitles
+pub async fn remote_subtitle_search(
+    State(state): State<Arc<AppState>>,
+    Path((item_id, language)): Path<(String, String)>,
+    Query(_query): Query<HashMap<String, String>>,
+) -> Response {
+    // Return empty - remote subtitle providers not implemented
+    Json(json!([])).into_response()
+}
+
+/// POST /Items/{item_id}/RemoteSearch/Subtitles/{subtitle_id} — download remote subtitle
+pub async fn download_remote_subtitle(
+    State(_state): State<Arc<AppState>>,
+    Path((item_id, subtitle_id)): Path<(String, String)>,
+) -> Response {
+    // Not implemented - would need subtitle provider integration
+    StatusCode::NOT_FOUND.into_response()
+}
+
+/// GET /Videos/{item_id}/{media_source_id}/Attachments/{index}/Stream — font attachments
+pub async fn attachment_stream(
+    State(state): State<Arc<AppState>>,
+    Path((item_id, _media_source_id, index)): Path<(String, String, String)>,
+) -> Response {
+    // Look for external subtitle attachment files
+    let backend = state.db.get_database_backend();
+    let row = state.db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT path FROM media_streams WHERE item_id = ? AND stream_type = 'Subtitle' AND is_external = 1 AND stream_index = ?",
+            vec![item_id.into(), index.parse::<i64>().unwrap_or(0).into()],
+        ))
+        .await;
+
+    match row {
+        Ok(Some(r)) => {
+            if let Ok(path) = r.get_str("path") {
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => {
+                        let content_type = if path.ends_with(".ttf") || path.ends_with(".otf") {
+                            "application/octet-stream"
+                        } else {
+                            "application/octet-stream"
+                        };
+                        return (
+                            [(axum::http::header::CONTENT_TYPE, content_type)],
+                            bytes,
+                        )
+                            .into_response();
+                    }
+                    Err(_) => return StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+            StatusCode::NOT_FOUND.into_response()
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// HEAD /Items/{item_id}/Images/{image_type} — HEAD request for image (ETag caching)
+pub async fn item_image_head(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((item_id, image_type)): Path<(String, String)>,
+) -> Response {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use crate::entities::image_assets::{Entity as ImageAssets, Column};
+
+    let model = ImageAssets::find()
+        .filter(Column::ItemId.eq(&item_id))
+        .filter(Column::ImageType.eq(&image_type))
+        .filter(Column::ImageIndex.eq(0))
+        .one(&state.db)
+        .await;
+
+    match model {
+        Ok(Some(m)) => {
+            let etag = m.etag.unwrap_or_default();
+            if headers
+                .get(axum::http::header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.trim_matches('"') == etag)
+            {
+                return StatusCode::NOT_MODIFIED.into_response();
+            }
+            let path = m.path.unwrap_or_default();
+            match tokio::fs::metadata(&path).await {
+                Ok(meta) => {
+                    let mut resp_headers = axum::http::HeaderMap::new();
+                    resp_headers.insert(
+                        axum::http::header::CONTENT_LENGTH,
+                        axum::http::HeaderValue::from_str(&meta.len().to_string()).unwrap(),
+                    );
+                    if let Ok(v) = axum::http::HeaderValue::from_str(&etag) {
+                        resp_headers.insert(axum::http::header::ETAG, v);
+                    }
+                    (resp_headers, StatusCode::OK).into_response()
+                }
+                Err(_) => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// HEAD /Items/{item_id}/Images/{image_type}/{index} — HEAD for indexed image
+pub async fn item_image_index_head(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((item_id, image_type, index)): Path<(String, String, i64)>,
+) -> Response {
+    item_image_head(State(state), headers, Path((item_id, image_type))).await
+}

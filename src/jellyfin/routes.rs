@@ -359,11 +359,15 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Items/{item_id}/Images", get(images::item_images))
         .route(
             "/Items/{item_id}/Images/{image_type}",
-            get(images::get_item_image).post(images::upload_item_image),
+            get(images::get_item_image)
+                .head(super::user_extras::item_image_head)
+                .post(images::upload_item_image),
         )
         .route(
             "/Items/{item_id}/Images/{first}/{second}",
-            get(images::get_item_image_with_index).post(images::upload_item_image_with_index),
+            get(images::get_item_image_with_index)
+                .head(super::user_extras::item_image_index_head)
+                .post(images::upload_item_image_with_index),
         )
         .route(
             "/Items/{item_id}/Images/{image_type}/Delete",
@@ -402,6 +406,14 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(common::empty_array),
         )
         .route("/Items/{item_id}/Subtitles", get(items::item_subtitles))
+        .route(
+            "/Items/{item_id}/RemoteSearch/Subtitles/{language}",
+            get(super::user_extras::remote_subtitle_search),
+        )
+        .route(
+            "/Items/{item_id}/RemoteSearch/Subtitles/{subtitle_id}",
+            post(super::user_extras::download_remote_subtitle),
+        )
         .route(
             "/Items/{item_id}/RemoteImages/Download",
             post(images::download_remote_image),
@@ -464,6 +476,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route(
             "/Videos/{item_id}/{media_source_id}/Subtitles/{index}/Stream.{format}",
             get(stream_subtitle_with_source).head(stream_subtitle_with_source_head),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/Attachments/{index}/Stream",
+            get(super::user_extras::attachment_stream),
         )
         .route(
             "/Audio/{item_id}/universal",

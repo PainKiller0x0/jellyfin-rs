@@ -301,15 +301,40 @@ async fn list_filter_items_inner(
                 .collect()
         }
         FilterKind::Person => {
-            let models = People::find()
-                .order_by_asc(crate::entities::people::Column::Name)
-                .all(db)
-                .await
-                .context("failed to list persons")?;
-            models
-                .into_iter()
-                .map(|m| json!({ "Name": m.name, "Id": m.id, "Type": kind.item_type(), "ImageTags": {} }))
-                .collect()
+            let filters = query.get("Filters").unwrap_or(&String::new()).clone();
+            let has_fav_filter = filters.contains("IsFavorite");
+            let user_id = query.get("UserId").or_else(|| query.get("userId"));
+
+            if has_fav_filter && user_id.is_some() {
+                // Filter persons by user_data.is_favorite
+                let uid = user_id.unwrap();
+                let models = db
+                    .query_all(crate::db::helpers::portable_statement(
+                        db.get_database_backend(),
+                        "SELECT p.id, p.name FROM people p JOIN user_data ud ON ud.item_id = p.id WHERE ud.user_id = ? AND ud.is_favorite = 1 ORDER BY p.name ASC",
+                        vec![uid.as_str().into()],
+                    ))
+                    .await
+                    .context("failed to list favorite persons")?;
+                models
+                    .iter()
+                    .filter_map(|r| {
+                        let id = r.get_str("id").ok()?;
+                        let name = r.get_str("name").ok()?;
+                        Some(json!({ "Name": name, "Id": id, "Type": kind.item_type(), "ImageTags": {} }))
+                    })
+                    .collect()
+            } else {
+                let models = People::find()
+                    .order_by_asc(crate::entities::people::Column::Name)
+                    .all(db)
+                    .await
+                    .context("failed to list persons")?;
+                models
+                    .into_iter()
+                    .map(|m| json!({ "Name": m.name, "Id": m.id, "Type": kind.item_type(), "ImageTags": {} }))
+                    .collect()
+            }
         }
         FilterKind::Studio => {
             let models = Studios::find()

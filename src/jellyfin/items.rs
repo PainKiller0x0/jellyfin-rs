@@ -561,6 +561,38 @@ async fn item_json_with_provider_ids(
                 value["MediaStreams"] = Value::Array(all_streams);
             }
         }
+    } else if !item.is_folder {
+        // For non-folder items (Episode/Video files), load media streams from DB
+        let streams = super::playback::media_streams_for_item(db, &item.id).await.unwrap_or_default();
+        if !streams.is_empty() {
+            // Rebuild MediaSources with streams included
+            let container = item.container.as_deref().unwrap_or("bin");
+            let source = json!({
+                "Id": item.id,
+                "Name": item.title,
+                "Path": item.path,
+                "Type": "Default",
+                "Protocol": "File",
+                "Container": container,
+                "Size": item.size_bytes,
+                "RunTimeTicks": item.runtime_ticks,
+                "SupportsDirectPlay": true,
+                "SupportsDirectStream": true,
+                "SupportsTranscoding": false,
+                "SupportsProbing": true,
+                "IsInfiniteStream": false,
+                "IsRemote": false,
+                "RequiresOpening": false,
+                "RequiresClosing": false,
+                "MediaStreams": streams,
+                "Formats": [],
+                "RequiredHttpHeaders": {},
+                "DirectStreamUrl": format!("/Videos/{}/stream.{}", item.id, container),
+                "VideoType": "VideoFile",
+            });
+            value["MediaSources"] = json!([source]);
+            value["MediaStreams"] = Value::Array(streams);
+        }
     }
 
     Ok(value)

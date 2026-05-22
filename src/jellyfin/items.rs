@@ -103,9 +103,110 @@ pub async fn resume_items(
     Path(user_id): Path<String>,
 ) -> Response {
     match resume_media_items(&state.db, &user_id).await {
-        Ok(items) => media_list_response(items),
+        Ok(items) => {
+            let total = items.len();
+            let enriched = enrich_resume_items(&state.db, items).await;
+            Json(json!({ "Items": enriched, "TotalRecordCount": total })).into_response()
+        }
         Err(error) => internal_error(error),
     }
+}
+
+async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>) -> Vec<Value> {
+    use std::collections::HashMap;
+    let backend = db.get_database_backend();
+
+    // Collect parent_ids for Episode items to look up series info
+    let parent_ids: Vec<&str> = items.iter()
+        .filter(|i| i.item_type == "Episode")
+        .map(|i| i.parent_id.as_str())
+        .collect();
+
+    // Batch lookup: parent_id -> (season_title, series_id, series_title)
+    let mut season_map: HashMap<String, (String, String, String)> = HashMap::new();
+    if !parent_ids.is_empty() {
+        let placeholders = parent_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT s.id AS season_id, s.title AS season_title, ser.id AS series_id, ser.title AS series_title \
+             FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id \
+             WHERE s.id IN ({placeholders})",
+        );
+        let mut vals: Vec<sea_orm::Value> = parent_ids.iter().map(|p| (*p).into()).collect();
+        if let Ok(rows) = db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals)).await {
+            for row in &rows {
+                if let (Ok(sid), Ok(st), Ok(srid), Ok(srt)) = (
+                    row.get_str("season_id"),
+                    row.get_str("season_title"),
+                    row.get_str("series_id"),
+                    row.get_str("series_title"),
+                ) {
+                    season_map.insert(sid, (st, srid, srt));
+                }
+            }
+        }
+    }
+
+    // Also batch load media sources for resume items (to get RunTimeTicks, MediaStreams)
+    let item_ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+    let mut source_map: HashMap<String, Vec<Value>> = HashMap::new();
+    if !item_ids.is_empty() {
+        for item_id in &item_ids {
+            if let Ok(sources) = super::playback::child_video_sources(db, item_id).await {
+                if !sources.is_empty() {
+                    source_map.insert(item_id.clone(), sources);
+                }
+            }
+        }
+    }
+
+    items.into_iter().map(|item| {
+        let mut value = item.to_jellyfin_json();
+
+        // Enrich Episode items with series/season info
+        if item.item_type == "Episode" {
+            if let Some((season_title, series_id, series_title)) = season_map.get(&item.parent_id) {
+                value["SeriesName"] = json!(series_title);
+                value["SeriesId"] = json!(series_id);
+                value["SeasonName"] = json!(season_title);
+                value["SeasonId"] = json!(item.parent_id);
+            }
+            value["SupportsResume"] = json!(true);
+        }
+
+        // Add MediaSources if available (for Movie/Episode folders)
+        if let Some(sources) = source_map.get(&item.id) {
+            if !sources.is_empty() {
+                value["MediaSources"] = Value::Array(sources.clone());
+                // Flatten streams to top-level
+                let mut all_streams = Vec::new();
+                for source in sources {
+                    if let Some(streams) = source.get("MediaStreams").and_then(Value::as_array) {
+                        all_streams.extend(streams.clone());
+                    }
+                }
+                value["MediaStreams"] = Value::Array(all_streams);
+
+                // Get RunTimeTicks from first source if item doesn't have it
+                if item.runtime_ticks.is_none() {
+                    if let Some(rt) = sources.first().and_then(|s| s.get("RunTimeTicks")).and_then(Value::as_i64) {
+                        value["RunTimeTicks"] = json!(rt);
+                    }
+                }
+            }
+        }
+
+        // Calculate PlayedPercentage if not set
+        if item.played_percentage.is_none() && item.playback_position_ticks > 0 {
+            if let Some(rt) = value.get("RunTimeTicks").and_then(Value::as_i64).filter(|v| *v > 0) {
+                let pct = (item.playback_position_ticks as f64 / rt as f64 * 100.0).min(100.0);
+                if let Some(ud) = value.get_mut("UserData") {
+                    ud["PlayedPercentage"] = json!(pct);
+                }
+            }
+        }
+
+        strip_nulls(value)
+    }).collect()
 }
 
 pub async fn show_seasons(

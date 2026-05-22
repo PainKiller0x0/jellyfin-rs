@@ -228,23 +228,24 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/System/Shutdown", post(system::shutdown_handler))
         .route("/System/Restart", post(system::shutdown_handler))
         .route("/Library/MediaFolders", get(library::media_folders))
+        .route("/Library/SelectableMediaFolders", get(library::selectable_media_folders))
         .route("/Libraries/AvailableOptions", get(common::empty_object))
         .route("/Library/PhysicalPaths", get(library::physical_paths))
-        .route("/Library/Movies/Added", post(common::no_content))
-        .route("/Library/Series/Added", post(common::no_content))
-        .route("/Library/Media/Updated", post(common::no_content))
-        .route("/Library/Movies/Updated", post(common::no_content))
-        .route("/Library/Series/Updated", post(common::no_content))
+        .route("/Library/Movies/Added", post(library::library_notify))
+        .route("/Library/Series/Added", post(library::library_notify))
+        .route("/Library/Media/Updated", post(library::library_notify))
+        .route("/Library/Movies/Updated", post(library::library_notify))
+        .route("/Library/Series/Updated", post(library::library_notify))
         .route("/Library/Refresh", post(library::refresh_library))
         .route(
             "/Library/VirtualFolders",
             get(library::virtual_folders).post(library::create_virtual_folder),
         )
         .route("/Library/VirtualFolders/Query", get(library::virtual_folders_query))
-        .route("/Library/VirtualFolders/Name", post(common::no_content))
+        .route("/Library/VirtualFolders/Name", post(library::rename_virtual_folder))
         .route(
             "/Library/VirtualFolders/LibraryOptions",
-            post(common::no_content),
+            post(library::update_library_options),
         )
         .route(
             "/Library/VirtualFolders/Paths",
@@ -252,7 +253,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/Library/VirtualFolders/Paths/Update",
-            post(common::no_content),
+            post(library::update_virtual_folder_path),
         )
         .route(
             "/Users/authenticatebyname",

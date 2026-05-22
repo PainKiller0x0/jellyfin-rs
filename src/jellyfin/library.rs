@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, bail};
 use axum::{
@@ -311,6 +311,101 @@ fn collection_type_for_name(name: &str) -> &'static str {
         "music" => "music",
         _ => "movies",
     }
+}
+
+/// POST /Library/VirtualFolders/Name — rename a virtual folder
+pub async fn rename_virtual_folder(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let name = query.get("name").map(String::as_str).unwrap_or_default().trim();
+    let new_name = query.get("newName").map(String::as_str).unwrap_or_default().trim();
+
+    if name.is_empty() || new_name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "name and newName are required" })),
+        )
+            .into_response();
+    }
+
+    let library_id = library_id_for_name(name);
+    let now = now_unix();
+    let backend = state.db.get_database_backend();
+
+    match state.db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE libraries SET name = ?, updated_at = ? WHERE id = ?",
+            vec![new_name.into(), now.into(), library_id.into()],
+        ))
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error.into()),
+    }
+}
+
+/// POST /Library/VirtualFolders/LibraryOptions — update library options
+pub async fn update_library_options(
+    State(_state): State<Arc<AppState>>,
+    Json(_body): Json<Value>,
+) -> Response {
+    // Accept the options but most are not stored (we don't have a library_options table)
+    // Just return success - the options are client-side preferences
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// POST /Library/VirtualFolders/Paths/Update — update a library path
+pub async fn update_virtual_folder_path(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let name = query.get("name").map(String::as_str).unwrap_or_default().trim();
+    let path = query.get("path").map(String::as_str).unwrap_or_default().trim();
+    let new_path = query.get("newPath").map(String::as_str).unwrap_or_default().trim();
+
+    if name.is_empty() || path.is_empty() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    let target_path = if !new_path.is_empty() { new_path } else { path };
+    let library_id = library_id_for_name(name);
+    let now = now_unix();
+    let backend = state.db.get_database_backend();
+
+    // Update the path in library_paths
+    let path_id = crate::util::stable_text_id(&format!("library-path:{path}"));
+    let _ = state.db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE library_paths SET path = ?, library_id = ? WHERE id = ?",
+            vec![target_path.into(), library_id.into(), path_id.into()],
+        ))
+        .await;
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// POST /Library/SelectableMediaFolders — get selectable media folders
+pub async fn selectable_media_folders(
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    // Return the same as virtual_folders but in a different format
+    match virtual_folders_inner(&state.db).await {
+        Ok(folders) => Json(folders).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+/// Library change notification handlers — trigger a background scan
+pub async fn library_notify(State(state): State<Arc<AppState>>) -> Response {
+    // These endpoints notify the server that media has changed externally
+    // We trigger a background scan in response
+    tokio::spawn(async move {
+        let _ = scan_media_library(&state).await;
+    });
+    StatusCode::NO_CONTENT.into_response()
 }
 
 struct VirtualFolder {

@@ -405,6 +405,24 @@ async fn item_json_with_provider_ids(
     value["Studios"] =
         Value::Array(relation_values(db, "studios", "media_studios", "studio_id", &item.id).await?);
     value["People"] = Value::Array(people_values(db, &item.id, Some(user_id)).await?);
+
+    // For Movie/Episode folders, load child video media sources (multi-version support)
+    if (item.item_type == "Movie" || item.item_type == "Episode") && item.is_folder {
+        if let Ok(sources) = super::playback::child_video_sources(db, &item.id).await {
+            if !sources.is_empty() {
+                value["MediaSources"] = Value::Array(sources.clone());
+                // Also flatten streams to top-level MediaStreams for clients that expect it
+                let mut all_streams = Vec::new();
+                for source in &sources {
+                    if let Some(streams) = source.get("MediaStreams").and_then(Value::as_array) {
+                        all_streams.extend(streams.clone());
+                    }
+                }
+                value["MediaStreams"] = Value::Array(all_streams);
+            }
+        }
+    }
+
     Ok(value)
 }
 

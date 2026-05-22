@@ -77,7 +77,7 @@ pub async fn playback_info(
     }
 }
 
-async fn media_streams_for_item(
+pub(crate) async fn media_streams_for_item(
     db: &DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Vec<JsonValue>> {
@@ -111,7 +111,7 @@ async fn media_streams_for_item(
 }
 
 /// For Movie folders, find child Video items and return their media sources
-async fn child_video_sources(
+pub(crate) async fn child_video_sources(
     db: &DatabaseConnection,
     parent_id: &str,
 ) -> anyhow::Result<Vec<JsonValue>> {

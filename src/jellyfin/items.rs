@@ -508,28 +508,36 @@ async fn item_json_with_provider_ids(
 ) -> anyhow::Result<Value> {
     let mut value = item.to_jellyfin_json();
     let backend = db.get_database_backend();
-    let rows = db
+
+    // Combine provider_ids and image_assets into one query
+    let meta_rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            "SELECT provider, provider_item_id FROM provider_ids WHERE item_id = ?",
-            vec![item.id.clone().into()],
+            "SELECT 'provider' AS src, provider AS key, provider_item_id AS val, NULL AS etag FROM provider_ids WHERE item_id = ? UNION ALL SELECT 'image' AS src, image_type AS key, NULL AS val, etag FROM image_assets WHERE item_id = ?",
+            vec![item.id.clone().into(), item.id.clone().into()],
         ))
         .await
-        .with_context(|| format!("failed to list provider ids for item: {}", item.id))?;
-    let provider_ids = rows
-        .iter()
-        .map(|row| -> anyhow::Result<(String, Value)> {
-            Ok((
-                row.get_str("provider")?,
-                Value::String(row.get_str("provider_item_id")?),
-            ))
-        })
-        .collect::<anyhow::Result<serde_json::Map<String, Value>>>()?;
+        .with_context(|| format!("failed to load metadata for item: {}", item.id))?;
+
+    let mut provider_ids = serde_json::Map::new();
+    let mut image_map = serde_json::Map::new();
+    for row in &meta_rows {
+        let src = row.get_str("src").unwrap_or_default();
+        let key = row.get_str("key").unwrap_or_default();
+        if src == "provider" {
+            if let Ok(val) = row.get_str("val") {
+                provider_ids.insert(key, Value::String(val));
+            }
+        } else if src == "image" {
+            if let Ok(etag) = row.get_str("etag") {
+                if !etag.is_empty() {
+                    image_map.insert(key, json!(etag));
+                }
+            }
+        }
+    }
     value["ProviderIds"] = Value::Object(provider_ids);
-    let image_tags = crate::jellyfin::images::item_image_tags(db, &item.id)
-        .await
-        .context("failed to load image tags")?;
-    // Rebuild BackdropImageTags from the fresh image_tags
+    let image_tags: Value = image_map.into();
     let backdrop_tags: Vec<Value> = image_tags
         .get("Backdrop")
         .and_then(|v| v.as_str())
@@ -538,12 +546,39 @@ async fn item_json_with_provider_ids(
         .unwrap_or_default();
     value["BackdropImageTags"] = Value::Array(backdrop_tags);
     value["ImageTags"] = image_tags;
-    value["GenreItems"] =
-        Value::Array(relation_values(db, "genres", "media_genres", "genre_id", &item.id).await?);
-    value["TagItems"] =
-        Value::Array(relation_values(db, "tags", "media_tags", "tag_id", &item.id).await?);
-    value["Studios"] =
-        Value::Array(relation_values(db, "studios", "media_studios", "studio_id", &item.id).await?);
+
+    // Combine genres, tags, studios into one UNION ALL query
+    let rel_rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            r#"SELECT 'genre' AS kind, g.id, g.name FROM genres g JOIN media_genres mg ON mg.genre_id = g.id WHERE mg.item_id = ?
+               UNION ALL
+               SELECT 'tag' AS kind, t.id, t.name FROM tags t JOIN media_tags mt ON mt.tag_id = t.id WHERE mt.item_id = ?
+               UNION ALL
+               SELECT 'studio' AS kind, s.id, s.name FROM studios s JOIN media_studios ms ON ms.studio_id = s.id WHERE ms.item_id = ?"#,
+            vec![item.id.clone().into(), item.id.clone().into(), item.id.clone().into()],
+        ))
+        .await
+        .with_context(|| format!("failed to load relations for item: {}", item.id))?;
+
+    let mut genres = Vec::new();
+    let mut tags = Vec::new();
+    let mut studios = Vec::new();
+    for row in &rel_rows {
+        let kind = row.get_str("kind").unwrap_or_default();
+        let id = row.get_str("id").unwrap_or_default();
+        let name = row.get_str("name").unwrap_or_default();
+        let entry = json!({"Name": name, "Id": id});
+        match kind.as_str() {
+            "genre" => genres.push(entry),
+            "tag" => tags.push(entry),
+            "studio" => studios.push(entry),
+            _ => {}
+        }
+    }
+    value["GenreItems"] = Value::Array(genres);
+    value["TagItems"] = Value::Array(tags);
+    value["Studios"] = Value::Array(studios);
     value["People"] = Value::Array(people_values(db, &item.id, Some(user_id)).await?);
 
     // For Movie/Episode folders, load child video media sources (multi-version support)

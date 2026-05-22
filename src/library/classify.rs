@@ -11,6 +11,8 @@ pub fn classify_media_path(path: &Path, collection_type: &str) -> Option<String>
         return Some(match collection_type {
             "tvshows" | "tv" => "Episode",
             "music" => "Audio",
+            // In movie libraries, files are "Video" — the folder itself is the "Movie"
+            "movies" => "Video",
             _ => "Movie",
         }
         .to_string());

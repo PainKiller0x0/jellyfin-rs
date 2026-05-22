@@ -7,15 +7,16 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde_json::{Value, json};
 
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
+    entities::people::Entity as People,
     jellyfin::{
-        common::internal_error,
-        item_queries::{latest_media_items, library_views, list_media_items, resume_media_items},
+        common::{internal_error, strip_nulls},
+        item_queries::{find_library_as_item, latest_media_items, library_views, list_media_items, resume_media_items},
     },
     library::{models::MediaItem, scanner::scan_media_library},
     util::now_unix,
@@ -30,9 +31,38 @@ pub use discovery::{search_hints, shows_missing, shows_next_up, similar_items};
 pub use item_operations::{delete_info, delete_items, update_item};
 pub use remote_metadata::{apply_remote_search, remote_search};
 
+/// Deduplicate episodes by (parent_id, season_number, episode_number).
+/// When multiple video files exist for the same episode (multi-version),
+/// keep the one with the largest size_bytes (highest quality).
+fn deduplicate_episodes(items: Vec<MediaItem>) -> Vec<MediaItem> {
+    let mut map: HashMap<(String, i64, i64), MediaItem> = HashMap::new();
+    for item in items {
+        let key = (
+            item.parent_id.clone(),
+            item.season_number.unwrap_or(0),
+            item.episode_number.unwrap_or(0),
+        );
+        let should_replace = match map.get(&key) {
+            Some(existing) => item.size_bytes > existing.size_bytes,
+            None => true,
+        };
+        if should_replace {
+            map.insert(key, item);
+        }
+    }
+    let mut result: Vec<_> = map.into_values().collect();
+    result.sort_by(|a, b| {
+        a.season_number.unwrap_or(0).cmp(&b.season_number.unwrap_or(0))
+            .then_with(|| a.episode_number.unwrap_or(0).cmp(&b.episode_number.unwrap_or(0)))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+    result
+}
+
 pub async fn views(State(state): State<Arc<AppState>>) -> Response {
     match library_views(&state.db).await {
         Ok(items) => {
+            let items: Vec<_> = items.into_iter().map(strip_nulls).collect();
             Json(json!({ "Items": items, "TotalRecordCount": items.len() })).into_response()
         }
         Err(error) => internal_error(error),
@@ -53,12 +83,14 @@ pub async fn user_items(
 pub async fn latest_items(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    match latest_media_items(&state.db, &user_id).await {
+    let parent_id = query.get("ParentId").map(String::as_str);
+    match latest_media_items(&state.db, &user_id, parent_id).await {
         Ok(items) => Json(
             items
                 .into_iter()
-                .map(|item| item.to_jellyfin_json())
+                .map(|item| strip_nulls(item.to_jellyfin_json()))
                 .collect::<Vec<_>>(),
         )
         .into_response(),
@@ -113,7 +145,7 @@ pub async fn show_episodes(
 
 pub(super) fn media_list_response(items: Vec<MediaItem>) -> Response {
     let total = items.len();
-    Json(json!({ "Items": items.into_iter().map(|item| item.to_jellyfin_json()).collect::<Vec<_>>(), "TotalRecordCount": total })).into_response()
+    Json(json!({ "Items": items.into_iter().map(|item| strip_nulls(item.to_jellyfin_json())).collect::<Vec<_>>(), "TotalRecordCount": total })).into_response()
 }
 
 async fn child_items_by_type(
@@ -138,10 +170,26 @@ async fn child_items_by_type(
         ))
         .await
         .with_context(|| format!("failed to list {item_type} children for: {parent_id}"))?;
-    rows.iter()
+    let mut items = rows.iter()
         .map(MediaItem::from_query_result)
         .collect::<Result<Vec<_>, _>>()
-        .context("failed to decode show child items")
+        .context("failed to decode show child items")?;
+    // Deduplicate episodes by (parent_id, season_number, episode_number), keep largest file
+    if item_type == "Episode" && items.len() > 1 {
+        items = deduplicate_episodes(items);
+    }
+    // Batch load image tags
+    if !items.is_empty() {
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        if let Ok(tags_map) = crate::jellyfin::item_queries::batch_item_image_tags(db, &ids).await {
+            for item in &mut items {
+                if let Some(tags) = tags_map.get(&item.id) {
+                    item.image_tags = Some(tags.clone());
+                }
+            }
+        }
+    }
+    Ok(items)
 }
 
 async fn descendant_episodes(
@@ -161,10 +209,26 @@ async fn descendant_episodes(
         ))
         .await
         .with_context(|| format!("failed to list episodes for show: {show_id}"))?;
-    rows.iter()
+    let mut items = rows.iter()
         .map(MediaItem::from_query_result)
         .collect::<Result<Vec<_>, _>>()
-        .context("failed to decode show episodes")
+        .context("failed to decode show episodes")?;
+    // Deduplicate episodes by (parent_id, season_number, episode_number), keep largest file
+    if items.len() > 1 {
+        items = deduplicate_episodes(items);
+    }
+    // Batch load image tags
+    if !items.is_empty() {
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        if let Ok(tags_map) = crate::jellyfin::item_queries::batch_item_image_tags(db, &ids).await {
+            for item in &mut items {
+                if let Some(tags) = tags_map.get(&item.id) {
+                    item.image_tags = Some(tags.clone());
+                }
+            }
+        }
+    }
+    Ok(items)
 }
 
 pub async fn item_by_id(
@@ -172,11 +236,21 @@ pub async fn item_by_id(
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Response {
     match find_media_item(&state.db, &user_id, &item_id).await {
-        Ok(Some(item)) => match item_json_with_provider_ids(&state.db, item).await {
-            Ok(item) => Json(item).into_response(),
+        Ok(Some(item)) => match item_json_with_provider_ids(&state.db, &user_id, item).await {
+            Ok(item) => Json(strip_nulls(item)).into_response(),
             Err(error) => internal_error(error),
         },
-        Ok(None) => Json(json!({ "Name": item_id, "Id": item_id, "Type": "Folder", "UserData": { "Played": false, "IsFavorite": false } })).into_response(),
+        Ok(None) => {
+            // Check if it's a library
+            if let Ok(Some(lib_item)) = find_library_as_item(&state.db, &item_id).await {
+                return Json(lib_item).into_response();
+            }
+            // Check if it's a person
+            if let Ok(Some(person_item)) = find_person_as_item(&state.db, &user_id, &item_id).await {
+                return Json(person_item).into_response();
+            }
+            Json(json!({ "Name": item_id, "Id": item_id, "Type": "Folder", "UserData": { "Played": false, "IsFavorite": false } })).into_response()
+        }
         Err(error) => internal_error(error),
     }
 }
@@ -187,12 +261,94 @@ pub async fn item_by_id_public(
 ) -> Response {
     let user_id = state.user_id.to_string();
     match find_media_item(&state.db, &user_id, &item_id).await {
-        Ok(Some(item)) => match item_json_with_provider_ids(&state.db, item).await {
-            Ok(item) => Json(item).into_response(),
+        Ok(Some(item)) => match item_json_with_provider_ids(&state.db, &user_id, item).await {
+            Ok(item) => Json(strip_nulls(item)).into_response(),
             Err(error) => internal_error(error),
         },
-        Ok(None) => Json(json!({ "Name": item_id, "Id": item_id, "Type": "Folder", "UserData": { "Played": false, "IsFavorite": false } })).into_response(),
+        Ok(None) => {
+            // Check if it's a library
+            if let Ok(Some(lib_item)) = find_library_as_item(&state.db, &item_id).await {
+                return Json(lib_item).into_response();
+            }
+            // Check if it's a person
+            if let Ok(Some(person_item)) = find_person_as_item(&state.db, &user_id, &item_id).await {
+                return Json(person_item).into_response();
+            }
+            Json(json!({ "Name": item_id, "Id": item_id, "Type": "Folder", "UserData": { "Played": false, "IsFavorite": false } })).into_response()
+        }
         Err(error) => internal_error(error),
+    }
+}
+
+/// Look up a person by ID and return as a BaseItemDto-like JSON object.
+async fn find_person_as_item(
+    db: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    person_id: &str,
+) -> anyhow::Result<Option<Value>> {
+    let model = People::find()
+        .filter(crate::entities::people::Column::Id.eq(person_id))
+        .one(db)
+        .await?;
+    match model {
+        Some(m) => {
+            let image_tags = crate::jellyfin::persons::person_images(db, &m.id).await?;
+            // Get favorite status from user_data
+            let backend = db.get_database_backend();
+            let is_favorite = db
+                .query_one(crate::db::helpers::portable_statement(
+                    backend,
+                    "SELECT is_favorite FROM user_data WHERE user_id = ? AND item_id = ?",
+                    vec![user_id.into(), m.id.clone().into()],
+                ))
+                .await?
+                .map(|r| r.get_i64("is_favorite").unwrap_or(0) != 0)
+                .unwrap_or(false);
+            Ok(Some(json!({
+                "Name": m.name,
+                "Id": m.id,
+                "ServerId": "jellyfin-rs",
+                "Type": "Person",
+                "Etag": null,
+                "Path": null,
+                "Overview": m.overview,
+                "ProductionYear": null,
+                "PremiereDate": null,
+                "EndDate": null,
+                "SortName": m.name,
+                "ProviderIds": {},
+                "CanDelete": false,
+                "CanDownload": false,
+                "PlayAccess": "Full",
+                "IsFolder": false,
+                "LocationType": null,
+                "MediaSources": [],
+                "ImageTags": image_tags,
+                "BackdropImageTags": [],
+                "ImageBlurHashes": {},
+                "Genres": [],
+                "GenreItems": [],
+                "Tags": [],
+                "Studios": [],
+                "UserData": {
+                    "ItemId": m.id,
+                    "Key": m.id,
+                    "Played": false,
+                    "IsFavorite": is_favorite,
+                    "PlayCount": 0,
+                    "PlaybackPositionTicks": 0,
+                    "PlayedPercentage": null,
+                    "Rating": null,
+                    "LastPlayedDate": null,
+                    "Likes": null,
+                    "UnplayedItemCount": null,
+                },
+                "LockData": false,
+                "LockedFields": [],
+                "ExternalUrls": [],
+            })))
+        }
+        None => Ok(None),
     }
 }
 
@@ -212,6 +368,7 @@ pub async fn items_root(
 
 async fn item_json_with_provider_ids(
     db: &DatabaseConnection,
+    user_id: &str,
     item: MediaItem,
 ) -> anyhow::Result<Value> {
     let mut value = item.to_jellyfin_json();
@@ -243,7 +400,7 @@ async fn item_json_with_provider_ids(
         Value::Array(relation_values(db, "tags", "media_tags", "tag_id", &item.id).await?);
     value["Studios"] =
         Value::Array(relation_values(db, "studios", "media_studios", "studio_id", &item.id).await?);
-    value["People"] = Value::Array(people_values(db, &item.id).await?);
+    value["People"] = Value::Array(people_values(db, &item.id, Some(user_id)).await?);
     Ok(value)
 }
 
@@ -276,24 +433,60 @@ async fn relation_values(
         .collect()
 }
 
-async fn people_values(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Vec<Value>> {
+async fn people_values(db: &DatabaseConnection, item_id: &str, user_id: Option<&str>) -> anyhow::Result<Vec<Value>> {
     let backend = db.get_database_backend();
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            "SELECT people.id, people.name, media_people.role, media_people.person_type FROM people JOIN media_people ON media_people.person_id = people.id WHERE media_people.item_id = ? ORDER BY media_people.sort_order ASC, people.name ASC",
+            "SELECT people.id, people.name, media_people.role, media_people.person_type, ia.etag AS primary_image_tag FROM people JOIN media_people ON media_people.person_id = people.id LEFT JOIN image_assets ia ON ia.item_id = people.id AND ia.image_type = 'Primary' WHERE media_people.item_id = ? ORDER BY media_people.sort_order ASC, people.name ASC",
             vec![item_id.into()],
         ))
         .await
         .with_context(|| format!("failed to list people for item: {item_id}"))?;
+
+    // Batch load user data for all people
+    let person_ids: Vec<String> = rows.iter()
+        .filter_map(|r| r.get_opt_str("id").ok().flatten())
+        .collect();
+    let fav_map = if user_id.is_some() && !person_ids.is_empty() {
+        let uid = user_id.unwrap();
+        let ph = person_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT item_id, is_favorite FROM user_data WHERE user_id = ? AND item_id IN ({})", ph);
+        let mut vals: Vec<sea_orm::Value> = vec![uid.into()];
+        for pid in &person_ids { vals.push(pid.as_str().into()); }
+        let fav_rows = db
+            .query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
+            .await?;
+        let mut m: HashMap<String, bool> = HashMap::new();
+        for r in &fav_rows {
+            if let (Ok(pid), Ok(fav)) = (r.get_str("item_id"), r.get_i64("is_favorite")) {
+                m.insert(pid, fav != 0);
+            }
+        }
+        m
+    } else {
+        HashMap::new()
+    };
+
     rows.iter()
         .map(|row| -> anyhow::Result<Value> {
-            Ok(json!({
-                "Id": row.get_str("id")?,
+            let id = row.get_str("id")?;
+            let is_favorite = fav_map.get(&id).copied().unwrap_or(false);
+            let mut value = json!({
+                "Id": id,
                 "Name": row.get_str("name")?,
                 "Role": row.get_opt_str("role")?,
                 "Type": row.get_opt_str("person_type")?,
-            }))
+                "UserData": {
+                    "IsFavorite": is_favorite,
+                },
+            });
+            if let Some(tag) = row.get_opt_str("primary_image_tag")? {
+                if !tag.is_empty() {
+                    value["PrimaryImageTag"] = json!(tag);
+                }
+            }
+            Ok(value)
         })
         .collect()
 }
@@ -569,4 +762,144 @@ pub async fn external_id_infos() -> Response {
         }
     ]))
     .into_response()
+}
+
+pub async fn movie_recommendations(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let user_id = query
+        .get("UserId")
+        .cloned()
+        .unwrap_or_else(|| state.user_id.to_string());
+    let parent_id = query.get("ParentId").map(String::as_str);
+    match movie_recommendations_inner(&state.db, &user_id, parent_id).await {
+        Ok(categories) => Json(categories).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+async fn movie_recommendations_inner(
+    db: &DatabaseConnection,
+    user_id: &str,
+    parent_id: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
+    let backend = db.get_database_backend();
+    let item_limit = 8;
+    let mut category_counter: i64 = 1;
+
+    // Get recently played Movie folders (is_folder=1, item_type='Movie')
+    let recent_movies = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &format!(
+                "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' AND COALESCE(user_data.played, 0) = 1 AND COALESCE(user_data.play_count, 0) > 0 {} ORDER BY user_data.last_played_at DESC LIMIT 12",
+                crate::jellyfin::item_queries::media_item_select_sql(""),
+                parent_id.map(|_p| "AND media_items.library_id = ?").unwrap_or(""),
+            ),
+            if parent_id.is_some() {
+                vec![user_id.into(), parent_id.unwrap().into()]
+            } else {
+                vec![user_id.into()]
+            },
+        ))
+        .await
+        .context("failed to get recent movies")?;
+
+    let recent_movies = crate::jellyfin::item_queries::decode_media_items(&recent_movies)?;
+    if recent_movies.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut categories = Vec::new();
+
+    // Category 1: Similar by genre to recently played
+    let mut similar_items = Vec::new();
+    for movie in &recent_movies[..recent_movies.len().min(4)] {
+        let rows = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend,
+                r#"SELECT mg_rel.item_id FROM media_genres mg_src JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id AND mg_src.item_id <> mg_rel.item_id WHERE mg_src.item_id = ? GROUP BY mg_rel.item_id ORDER BY COUNT(*) DESC LIMIT 8"#,
+                vec![movie.id.clone().into()],
+            ))
+            .await?;
+        for row in &rows {
+            if let Ok(id) = row.get_str("item_id") {
+                if !similar_items.contains(&id) {
+                    similar_items.push(id);
+                }
+            }
+        }
+    }
+
+    if !similar_items.is_empty() {
+        let ph = similar_items.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let items = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend,
+                &format!("{} WHERE media_items.id IN ({}) ORDER BY media_items.production_year DESC LIMIT {item_limit}", crate::jellyfin::item_queries::media_item_select_sql(""), ph),
+                {
+                    let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
+                    for id in &similar_items { vals.push(id.as_str().into()); }
+                    vals
+                },
+            ))
+            .await?;
+        let items = crate::jellyfin::item_queries::decode_media_items(&items)?;
+        if !items.is_empty() {
+            categories.push(json!({
+                "Items": items.into_iter().map(|i| i.to_jellyfin_json()).collect::<Vec<_>>(),
+                "RecommendationType": "SimilarToRecentlyPlayed",
+                "BaselineItemName": recent_movies[0].title.clone(),
+                "CategoryId": category_counter,
+            }));
+            category_counter += 1;
+        }
+    }
+
+    // Category 2: Movies with same actors
+    let mut actor_items = Vec::new();
+    for movie in &recent_movies[..recent_movies.len().min(3)] {
+        let rows = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend,
+                r#"SELECT mp2.item_id FROM media_people mp1 JOIN media_people mp2 ON mp1.person_id = mp2.person_id AND mp1.item_id <> mp2.item_id WHERE mp1.item_id = ? AND mp2.item_id NOT IN (SELECT id FROM media_items WHERE item_type IN ('Video', 'Episode')) GROUP BY mp2.item_id LIMIT 4"#,
+                vec![movie.id.clone().into()],
+            ))
+            .await?;
+        for row in &rows {
+            if let Ok(id) = row.get_str("item_id") {
+                if !actor_items.contains(&id) {
+                    actor_items.push(id);
+                }
+            }
+        }
+    }
+
+    if !actor_items.is_empty() {
+        let ph = actor_items.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let items = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend,
+                &format!("{} WHERE media_items.id IN ({}) LIMIT {item_limit}", crate::jellyfin::item_queries::media_item_select_sql(""), ph),
+                {
+                    let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
+                    for id in &actor_items { vals.push(id.as_str().into()); }
+                    vals
+                },
+            ))
+            .await?;
+        let items = crate::jellyfin::item_queries::decode_media_items(&items)?;
+        if !items.is_empty() {
+            categories.push(json!({
+                "Items": items.into_iter().map(|i| i.to_jellyfin_json()).collect::<Vec<_>>(),
+                "RecommendationType": "HasActorFromRecentlyPlayed",
+                "BaselineItemName": recent_movies[0].title.clone(),
+                "CategoryId": category_counter,
+            }));
+            category_counter += 1;
+        }
+    }
+
+    Ok(categories)
 }

@@ -244,5 +244,18 @@ pub fn optional_migrations() -> Vec<Migration> {
             "ALTER TABLE image_assets DROP CONSTRAINT IF EXISTS image_assets_item_id_fkey",
             "drop image_assets FK to allow person images",
         ),
+        (
+            // Drop FK on user_data.item_id to allow favoriting people (not just media_items)
+            "ALTER TABLE user_data DROP CONSTRAINT IF EXISTS user_data_item_id_fkey",
+            "drop user_data FK to allow person favorites",
+        ),
+        (
+            "ALTER TABLE people ADD COLUMN overview TEXT",
+            "add people.overview (biography)",
+        ),
+        (
+            "ALTER TABLE people ADD COLUMN tmdb_id TEXT",
+            "add people.tmdb_id",
+        ),
     ]
 }

@@ -650,15 +650,35 @@ pub async fn request_user_id_or_default(
 ) -> String {
     match authenticated_user_id(&state.db, headers, query).await {
         Ok(Some(user_id)) => user_id,
-        Ok(None) => query
-            .get("UserId")
-            .cloned()
+        Ok(None) => request_user_id_from_headers(headers)
+            .or_else(|| query.get("UserId").cloned())
             .unwrap_or_else(|| state.user_id.to_string()),
         Err(error) => {
             tracing::warn!("failed to resolve request user: {error:#}");
-            state.user_id.to_string()
+            request_user_id_from_headers(headers)
+                .or_else(|| query.get("UserId").cloned())
+                .unwrap_or_else(|| state.user_id.to_string())
         }
     }
+}
+
+/// Extract UserId from Emby-style auth headers.
+/// Supports: `Emby UserId="xxx", Client="...", Token="..."` and
+///           `MediaBrowser UserId="xxx", Client="...", Token="..."`
+fn request_user_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    for header_name in ["X-Emby-Authorization", header::AUTHORIZATION.as_str()] {
+        if let Some(value) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
+            for part in value.split(',') {
+                let part = part.trim();
+                if let Some(id) = part.strip_prefix("UserId=\"").and_then(|s| s.find('"').map(|end| &s[..end])) {
+                    if !id.is_empty() {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn request_token(headers: &HeaderMap, query: &HashMap<String, String>) -> Option<String> {

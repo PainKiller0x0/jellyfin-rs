@@ -22,7 +22,7 @@ pub fn extract_tmdb_id(path: &Path) -> Option<String> {
     None
 }
 
-/// Clean title by removing `{tmdb-XXXXX}` and similar provider ID tags
+/// Clean title by removing `{tmdb-XXXXX}`, `[tmdbid=XXXXX]`, and `(YYYY)` tags
 pub fn clean_provider_tags(title: &str) -> String {
     let mut result = title.to_string();
     for (open, close) in [('{', '}'), ('[', ']'), ('(', ')')] {
@@ -31,11 +31,50 @@ pub fn clean_provider_tags(title: &str) -> String {
                 let tag = &result[start + 1..end].to_ascii_lowercase();
                 if tag.starts_with("tmdb-") || tag.starts_with("tmdbid=") {
                     result.replace_range(start..=end, "");
+                } else if tag.len() == 4 && tag.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(y) = tag.parse::<i64>() {
+                        if (1880..=2100).contains(&y) {
+                            result.replace_range(start..=end, "");
+                        }
+                    }
                 }
             }
         }
     }
+    result = result.split_whitespace().collect::<Vec<_>>().join(" ");
     result.trim().to_string()
+}
+
+/// Clean title AND extract year separately, returning (title, year).
+/// e.g. "X战警 (2000) {tmdb-36657}" → ("X战警", Some(2000))
+pub fn clean_title_with_year(title: &str) -> (String, Option<i64>) {
+    let mut result = title.to_string();
+    let mut year: Option<i64> = None;
+
+    // First remove provider tags like {tmdb-XXXXX}
+    for (open, close) in [('{', '}'), ('[', ']')] {
+        if let (Some(start), Some(end)) = (result.rfind(open), result.rfind(close)) {
+            if start < end {
+                result.replace_range(start..=end, "");
+            }
+        }
+    }
+
+    // Then extract year from (YYYY) at the end
+    if let (Some(start), Some(end)) = (result.rfind('('), result.rfind(')')) {
+        if start < end {
+            let tag = result[start + 1..end].trim();
+            if let Ok(y) = tag.parse::<i64>() {
+                if (1880..=2100).contains(&y) {
+                    year = Some(y);
+                    result.replace_range(start..=end, "");
+                }
+            }
+        }
+    }
+
+    let cleaned = result.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_string();
+    (cleaned, year)
 }
 
 /// Fetch TMDb episode details using series TMDb ID + season/episode numbers
@@ -280,39 +319,150 @@ pub async fn batch_fetch_episode_tmdb(
     Ok(count)
 }
 
-/// Look up the TMDb series ID for an episode by walking up the parent chain
-pub async fn lookup_series_tmdb_id(
+/// Look up a stored TMDb ID from the provider_ids table for the given item
+pub async fn lookup_stored_tmdb_id(
     db: &sea_orm::DatabaseConnection,
     item_id: &str,
-) -> anyhow::Result<Option<(String, String)>> {
-    // Walk up: Episode → Season → Series, check provider_ids at each level
+) -> anyhow::Result<Option<String>> {
     let backend = db.get_database_backend();
-    let mut current_id = item_id.to_string();
-    for _ in 0..3 {
-        let row = db.query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT parent_id, item_type FROM media_items WHERE id = ?",
-            vec![current_id.clone().into()],
-        )).await?;
-        let Some(row) = row else { break };
-        let parent_id: String = row.get_str("parent_id")?;
-        let item_type: String = row.get_str("item_type")?;
-        // Check parent for TMDb ID
-        if let Some(tmdb_id) = db.query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
-            vec![parent_id.clone().into()],
-        )).await?.and_then(|r| r.get_opt_str("provider_item_id").ok().flatten())
-        {
-            return Ok(Some((parent_id, tmdb_id)));
+    let row = db.query_one(crate::db::helpers::portable_statement(
+        backend,
+        "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
+        vec![item_id.into()],
+    )).await?;
+    Ok(row.and_then(|r| r.get_opt_str("provider_item_id").ok().flatten()))
+}
+
+/// Parse a folder name into (title, optional year) by cleaning provider tags
+/// e.g. "X战警 (2000) {tmdb-36657}" → ("X战警", Some(2000))
+fn parse_folder_name(path: &Path) -> Option<(String, Option<i64>)> {
+    let name = path.file_name()?.to_str()?;
+    let cleaned = clean_provider_tags(name);
+    // Extract year from "(YYYY)" at the end or embedded
+    let mut title = cleaned.clone();
+    let mut year = None;
+    // Try to find a 4-digit year in parentheses or brackets
+    for (open, close) in [('{', '}'), ('[', ']'), ('(', ')')] {
+        if let Some(start) = cleaned.rfind(open) {
+            if let Some(end) = cleaned[start..].find(close) {
+                let inner = &cleaned[start + 1..start + end];
+                // Check if it's purely a 4-digit year
+                if let Ok(y) = inner.trim().parse::<i64>() {
+                    if (1880..=2100).contains(&y) {
+                        year = Some(y);
+                        title = format!("{}{}", &cleaned[..start], &cleaned[start + end + 1..]);
+                        break;
+                    }
+                }
+            }
         }
-        if item_type == "Season" {
-            current_id = parent_id;
-        } else {
-            break;
+    }
+    // If no year found in parens, try to find any 4-digit year in the string
+    if year.is_none() {
+        for window in title.as_bytes().windows(4) {
+            if let Ok(digits) = std::str::from_utf8(window) {
+                if let Ok(y) = digits.parse::<i64>() {
+                    if (1880..=2100).contains(&y) {
+                        year = Some(y);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    Some((title, year))
+}
+
+/// Search TMDb by name+year and return the first match's TMDb ID
+async fn lookup_tmdb_id_by_name(
+    client: &reqwest::Client,
+    api_key: &str,
+    name: &str,
+    year: Option<i64>,
+    is_tv: bool,
+) -> anyhow::Result<Option<String>> {
+    let url = if is_tv {
+        "https://api.themoviedb.org/3/search/tv"
+    } else {
+        "https://api.themoviedb.org/3/search/movie"
+    };
+    let mut request = client.get(url).query(&[("api_key", api_key), ("query", name), ("language", "zh-CN")]);
+    let year_param: String;
+    if let Some(year) = year {
+        year_param = year.to_string();
+        let key = if is_tv { "first_air_date_year" } else { "year" };
+        request = request.query(&[(key, year_param.as_str())]);
+    }
+    let response = request.send().await?.error_for_status()?.json::<serde_json::Value>().await?;
+    if let Some(results) = response.get("results").and_then(|v| v.as_array()) {
+        if let Some(first) = results.first() {
+            return Ok(first.get("id").and_then(|v| v.as_i64()).map(|id| id.to_string()));
         }
     }
     Ok(None)
+}
+
+/// Fill in missing TMDb metadata for existing Movie/Series items by searching by name
+pub async fn fill_missing_tmdb(
+    db: &sea_orm::DatabaseConnection,
+    api_key: &str,
+) -> anyhow::Result<usize> {
+    let backend = db.get_database_backend();
+    let rows = db.query_all(crate::db::helpers::portable_statement(
+        backend,
+        r#"SELECT mi.id, mi.title, mi.path, mi.item_type FROM media_items mi WHERE mi.is_folder = 1 AND mi.item_type IN ('Movie', 'Series') AND NOT EXISTS (SELECT 1 FROM provider_ids p WHERE p.item_id = mi.id AND p.provider = 'Tmdb')"#,
+        vec![],
+    )).await?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let total = rows.len();
+    tracing::info!("fill_missing_tmdb: {total} items need name-based TMDb lookup");
+
+    let client = build_client()?;
+    let mut count = 0usize;
+
+    for row in &rows {
+        let Ok(item_id) = row.get_str("id") else { continue };
+        let title: String = row.get_str("title").unwrap_or_default();
+        let item_type: String = row.get_str("item_type").unwrap_or_default();
+        let path_str: String = row.get_str("path").unwrap_or_default();
+        let is_tv = item_type == "Series";
+
+        // Try to parse name from path first, fall back to title
+        let (name, year) = parse_folder_name(Path::new(&path_str))
+            .unwrap_or_else(|| (title.clone(), None));
+
+        match lookup_tmdb_id_by_name(&client, api_key, &name, year, is_tv).await {
+            Ok(Some(tmdb_id)) => {
+                let _ = db.execute(crate::db::helpers::portable_statement(
+                    backend,
+                    "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
+                    vec![item_id.clone().into(), tmdb_id.clone().into()],
+                )).await;
+                tracing::info!("fill_missing_tmdb: matched '{name}' → tmdb-{tmdb_id}");
+
+                // Now fetch full metadata
+                let _ = fetch_and_apply_tmdb_metadata(db, &item_id, &item_type, Path::new(&path_str), api_key).await;
+                count += 1;
+            }
+            Ok(None) => {
+                tracing::warn!("fill_missing_tmdb: no match for '{name}' (type: {item_type})");
+            }
+            Err(e) => {
+                tracing::warn!("fill_missing_tmdb: search failed for '{name}': {e:#}");
+            }
+        }
+    }
+
+    tracing::info!("fill_missing_tmdb: filled {count}/{total} items");
+    Ok(count)
 }
 
 /// Fetch TMDb metadata for a Series or Movie and store it in the database
@@ -323,12 +473,46 @@ pub async fn fetch_and_apply_tmdb_metadata(
     path: &Path,
     api_key: &str,
 ) -> anyhow::Result<()> {
-    let Some(tmdb_id) = extract_tmdb_id(path) else {
+    let is_tv = item_type == "Series" || item_type == "Season" || item_type == "Episode";
+
+    // Step 1: check for existing TMDb ID already stored (e.g. from NFO parsing)
+    let mut tmdb_id = lookup_stored_tmdb_id(db, item_id).await
+        .ok().flatten()
+        .or_else(|| extract_tmdb_id(path));
+
+    // Step 2: name-based search fallback — only for Movie and Series (Season names like "Season 1" are not searchable)
+    if tmdb_id.is_none() && (item_type == "Movie" || item_type == "Series") {
+        if let Some((name, year)) = parse_folder_name(path) {
+            let client = build_client()?;
+            match lookup_tmdb_id_by_name(&client, api_key, &name, year, is_tv).await {
+                Ok(Some(id)) => {
+                    tmdb_id = Some(id);
+                    // Store the found TMDb ID so next time we don't need to search
+                    let backend = db.get_database_backend();
+                    let _ = db.execute(crate::db::helpers::portable_statement(
+                        backend,
+                        "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
+                        vec![item_id.into(), tmdb_id.as_ref().unwrap().into()],
+                    )).await;
+                    tracing::info!("TMDb name search matched '{name}' → tmdb-{}", tmdb_id.as_ref().unwrap());
+                }
+                Ok(None) => {
+                    tracing::info!("TMDb name search found no results for '{name}'");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!("TMDb name search failed for '{name}': {e:#}");
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let Some(tmdb_id) = tmdb_id else {
         return Ok(());
     };
 
     let client = build_client()?;
-    let metadata = if item_type == "Series" || item_type == "Season" || item_type == "Episode" {
+    let metadata = if is_tv {
         providers::tmdb_tv_details(&client, api_key, &tmdb_id).await
     } else {
         providers::tmdb_movie_details(&client, api_key, &tmdb_id).await
@@ -551,4 +735,124 @@ async fn download_and_save_tmdb_image(
         ))
         .await;
     Ok(())
+}
+
+/// Search TMDb for a person by name and return the first match's TMDb ID
+pub async fn search_person_tmdb(name: &str, api_key: &str) -> anyhow::Result<Option<String>> {
+    let client = build_client()?;
+    let url = "https://api.themoviedb.org/3/search/person";
+    #[derive(serde::Deserialize)]
+    struct TmdbSearchResults {
+        results: Vec<TmdbSearchPerson>,
+    }
+    #[derive(serde::Deserialize)]
+    struct TmdbSearchPerson {
+        id: i64,
+    }
+    let resp: TmdbSearchResults = client
+        .get(url)
+        .query(&[("api_key", api_key), ("query", name)])
+        .send().await?
+        .error_for_status()?
+        .json().await?;
+    Ok(resp.results.into_iter().next().map(|p| p.id.to_string()))
+}
+
+/// Fetch person details from TMDb and update the database
+pub async fn fetch_person_tmdb(
+    db: &sea_orm::DatabaseConnection,
+    person_id: &str,
+    tmdb_id: &str,
+    api_key: &str,
+) -> anyhow::Result<()> {
+    let client = build_client()?;
+    let url = format!("https://api.themoviedb.org/3/person/{tmdb_id}");
+    #[derive(serde::Deserialize)]
+    struct TmdbPerson {
+        biography: Option<String>,
+    }
+    let resp: TmdbPerson = client
+        .get(&url)
+        .query(&[("api_key", api_key)])
+        .send().await?
+        .error_for_status()?
+        .json().await?;
+    let backend = db.get_database_backend();
+    if let Some(biography) = resp.biography.filter(|b| !b.is_empty()) {
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE people SET overview = ?, tmdb_id = ? WHERE id = ?",
+            vec![biography.into(), tmdb_id.into(), person_id.into()],
+        )).await?;
+    } else {
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE people SET tmdb_id = ? WHERE id = ?",
+            vec![tmdb_id.into(), person_id.into()],
+        )).await?;
+    }
+    // Also try to fetch TMDb image
+    let img_url = format!("https://api.themoviedb.org/3/person/{tmdb_id}/images?api_key={api_key}");
+    #[derive(serde::Deserialize)]
+    struct TmdbPersonImages {
+        profiles: Vec<TmdbPersonProfile>,
+    }
+    #[derive(serde::Deserialize)]
+    struct TmdbPersonProfile {
+        file_path: String,
+    }
+    if let Ok(resp) = client.get(&img_url).send().await.and_then(|r| r.error_for_status()) {
+        if let Ok(images) = resp.json::<TmdbPersonImages>().await {
+            if let Some(img) = images.profiles.first() {
+                let img_url = format!("https://image.tmdb.org/t/p/w780{}", img.file_path);
+                let _ = download_and_save_tmdb_image(db, &client, person_id, &img_url, "Primary").await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Try to find and fetch TMDb metadata for a person by name
+pub async fn try_fetch_person_tmdb(
+    db: &sea_orm::DatabaseConnection,
+    person_id: &str,
+    person_name: &str,
+    api_key: &str,
+) {
+    if api_key.is_empty() {
+        return;
+    }
+    match search_person_tmdb(person_name, api_key).await {
+        Ok(Some(tmdb_id)) => {
+            let _ = fetch_person_tmdb(db, person_id, &tmdb_id, api_key).await;
+        }
+        Ok(None) => {}
+        Err(e) => tracing::debug!("failed to search TMDb for person {person_name}: {e:#}"),
+    }
+}
+
+/// Batch fetch TMDb metadata for people without biography.
+/// Returns the number of people updated.
+pub async fn batch_fetch_person_tmdb(
+    db: &sea_orm::DatabaseConnection,
+    api_key: &str,
+) -> anyhow::Result<usize> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT id, name FROM people WHERE (overview IS NULL OR tmdb_id IS NULL) AND name IS NOT NULL AND name <> '' LIMIT 50",
+            vec![],
+        ))
+        .await
+        .context("failed to list people without biography")?;
+
+    let mut count = 0;
+    for row in &rows {
+        let id: String = row.get_str("id")?;
+        let name: String = row.get_str("name")?;
+        let _ = try_fetch_person_tmdb(db, &id, &name, api_key).await;
+        count += 1;
+    }
+    Ok(count)
 }

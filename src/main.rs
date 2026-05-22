@@ -87,6 +87,21 @@ async fn main() -> anyhow::Result<()> {
     if let Some(api_key) = std::env::var("JELLYFIN_RS_TMDB_API_KEY").ok().filter(|k| !k.is_empty()) {
         let ep_state = state.clone();
         tokio::spawn(async move {
+            // First: fill in missing TMDb IDs for movies/series without tags
+            match library::tmdb_metadata::fill_missing_tmdb(&ep_state.db, &api_key).await {
+                Ok(0) => { tracing::info!("No missing TMDb metadata to fill"); }
+                Ok(n) => { tracing::info!("Filled TMDb metadata for {n} items via name search"); }
+                Err(e) => { tracing::warn!("fill_missing_tmdb failed: {e:#}"); }
+            }
+
+            // Fetch person biographies and images in background
+            match library::tmdb_metadata::batch_fetch_person_tmdb(&ep_state.db, &api_key).await {
+                Ok(0) => { tracing::info!("No missing TMDb person data to fill"); }
+                Ok(n) => { tracing::info!("Fetched TMDb data for {n} people"); }
+                Err(e) => { tracing::warn!("batch_fetch_person_tmdb failed: {e:#}"); }
+            }
+
+            // Then: fetch episode details in loop
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 match library::tmdb_metadata::batch_fetch_episode_tmdb(&ep_state.db, &api_key).await {

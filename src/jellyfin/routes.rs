@@ -12,8 +12,9 @@ use crate::{
         system,
     },
     playback::streaming::{
-        stream_audio, stream_audio_head, stream_subtitle, stream_subtitle_head, stream_video,
-        stream_video_head,
+        stream_audio, stream_audio_head, stream_subtitle, stream_subtitle_head,
+        stream_subtitle_with_source, stream_subtitle_with_source_head,
+        stream_video, stream_video_head,
     },
     ws,
 };
@@ -94,6 +95,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
                 .delete(common::no_content),
         )
         .route("/Playback/BitrateTest", get(system::bitrate_test))
+        .route("/System/Ext/ServerDomains", get(system::system_ext_server_domains))
         .route("/Dlna/ProfileInfos", get(dlna::profile_infos))
         .route("/Dlna/Profiles/Default", get(dlna::default_profile))
         .route("/Dlna/Profiles/{profile_id}", get(dlna::profile_by_id))
@@ -301,7 +303,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/UserViews/GroupingOptions", get(common::empty_array))
         .route(
             "/Users/{user_id}/FavoriteItems/{item_id}",
-            post(playback::favorite_item),
+            post(playback::favorite_item).delete(playback::unfavorite_item),
         )
         .route(
             "/Users/{user_id}/FavoriteItems/{item_id}/Delete",
@@ -374,8 +376,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Artists/InstantMix", get(common::empty_list))
         .route("/Artists/{name}", get(common::empty_object))
         .route("/Artists/{item_id}/InstantMix", get(common::empty_list))
+        .route("/Movies/Recommendations", get(items::movie_recommendations))
         .route("/Movies/{item_id}/Similar", get(items::similar_items))
-        .route("/Movies/Recommendations", get(common::empty_list))
         .route("/Shows/{item_id}/Similar", get(items::similar_items))
         .route("/Trailers/{item_id}/Similar", get(items::similar_items))
         .route(
@@ -417,6 +419,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Persons", get(filters::persons))
         .route("/Persons/{name}", get(persons::person_by_name))
         .route("/Persons/{name}/Items", get(persons::person_items))
+        .route("/Persons/{name}/Images/{image_type}", get(persons::person_image))
+        .route("/Persons/{name}/Images/{first}/{second}", get(persons::person_image_with_index))
         .route("/Studios", get(filters::studios))
         .route("/Tags", get(filters::tags))
         .route("/Years", get(filters::years))
@@ -444,6 +448,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route(
             "/Videos/{item_id}/Subtitles/{index}/Stream.{format}",
             get(stream_subtitle).head(stream_subtitle_head),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/Subtitles/{index}/Stream.{format}",
+            get(stream_subtitle_with_source).head(stream_subtitle_with_source_head),
         )
         .route(
             "/Audio/{item_id}/universal",
@@ -518,7 +526,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/UserItems/Resume", get(common::empty_list))
         .route(
             "/UserItems/{item_id}/UserData",
-            get(common::empty_object).post(common::no_content),
+            get(playback::get_user_item_data).post(playback::update_user_item_data),
         )
         .route(
             "/UserPlayedItems/{item_id}",

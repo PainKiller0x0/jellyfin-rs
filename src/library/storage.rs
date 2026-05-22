@@ -37,6 +37,7 @@ impl ScannedMediaItem {
         title: String,
         item_type: &str,
         modified_at: i64,
+        production_year: Option<i64>,
     ) -> Self {
         Self {
             id,
@@ -50,7 +51,7 @@ impl ScannedMediaItem {
             overview: None,
             official_rating: None,
             extended_video_type: None,
-            production_year: None,
+            production_year,
             runtime_ticks: None,
             size_bytes: None,
             season_number: None,

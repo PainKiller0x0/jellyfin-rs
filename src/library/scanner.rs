@@ -104,7 +104,8 @@ async fn scan_root(
         if resolved.is_directory {
             seen_paths.push(path_string.clone());
             let folder_type = tv_folder_type(path, &root, &collection_type);
-            let folder_title = crate::library::tmdb_metadata::clean_provider_tags(&resolved.name);
+            let (folder_title, year) =
+                crate::library::tmdb_metadata::clean_title_with_year(&resolved.name);
             let item = ScannedMediaItem::folder_with_type(
                 resolved.id,
                 library_id.clone(),
@@ -113,6 +114,7 @@ async fn scan_root(
                 folder_title,
                 folder_type,
                 resolved.modified_at,
+                year,
             );
             if let Err(e) = upsert_media_item(&db, &item).await {
                 tracing::warn!("failed to upsert folder {}: {e:#}", item.path);

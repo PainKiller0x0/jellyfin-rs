@@ -23,70 +23,242 @@ pub async fn library_views(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>
         .collect()
 }
 
+/// Look up a library by ID and return it as a BaseItemDto-like JSON object.
+/// Used when `/Items/{libraryId}` is called — returns the library as a "CollectionFolder".
+pub async fn find_library_as_item(
+    db: &DatabaseConnection,
+    library_id: &str,
+) -> anyhow::Result<Option<Value>> {
+    let backend = db.get_database_backend();
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT id, name, collection_type, created_at, updated_at FROM libraries WHERE id = ?",
+            vec![library_id.into()],
+        ))
+        .await
+        .context("failed to find library")?;
+    match row {
+        Some(row) => {
+            let id: String = row.get_str("id")?;
+            let name: String = row.get_str("name")?;
+            let collection_type: String = row.get_str("collection_type")?;
+            let created_at: i64 = row.get_i64("created_at")?;
+            let updated_at: i64 = row.get_i64("updated_at")?;
+            Ok(Some(json!({
+                "Name": name,
+                "Id": id,
+                "CollectionType": collection_type,
+                "Type": "CollectionFolder",
+                "ServerId": null,
+                "Etag": null,
+                "Path": null,
+                "ParentId": null,
+                "LibraryId": null,
+                "Overview": null,
+                "ProductionYear": null,
+                "PremiereDate": null,
+                "SortName": name,
+                "ProviderIds": {},
+                "CanDelete": false,
+                "CanDownload": false,
+                "HasSubtitles": null,
+                "PlayAccess": "Full",
+                "IsFolder": true,
+                "LocationType": null,
+                "MediaSources": [],
+                "ImageTags": {},
+                "BackdropImageTags": [],
+                "Genres": [],
+                "GenreItems": [],
+                "Tags": [],
+                "TagItems": [],
+                "Studios": [],
+                "People": [],
+                "UserData": {
+                    "ItemId": id,
+                    "Key": id,
+                    "Played": false,
+                    "IsFavorite": false,
+                    "PlayCount": 0,
+                    "PlaybackPositionTicks": 0,
+                    "PlayedPercentage": null,
+                    "Rating": null,
+                    "LastPlayedDate": null,
+                    "Likes": null,
+                    "UnplayedItemCount": null,
+                },
+                "DateCreated": crate::util::unix_to_jellyfin_date(created_at),
+                "DateLastMediaAdded": crate::util::unix_to_jellyfin_date(updated_at),
+                "LockData": false,
+                "LockedFields": [],
+                "ExternalUrls": [],
+            })))
+        }
+        None => Ok(None),
+    }
+}
+
 pub async fn list_media_items(
     db: &DatabaseConnection,
     user_id: &str,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<MediaItem>> {
-    let has_list_item_ids = query.contains_key("ListItemIds");
+    let has_list_item_ids = query.contains_key("ListItemIds") || query.contains_key("ListItemIds");
+    let has_person_ids = query.contains_key("PersonIds") || query.contains_key("personIds");
     let parent_id = query
         .get("ParentId")
-        .map(String::as_str)
-        .unwrap_or("movies");
+        .or_else(|| query.get("parentId"))
+        .map(String::as_str);
     let limit = query_u32(query, "Limit", 50).min(200) as usize;
     let offset = query_u32(query, "StartIndex", 0) as usize;
     let recursive = query_bool(query, "Recursive", false);
 
-    let parent_is_collection = is_collection_or_playlist(db, parent_id).await?;
     let backend = db.get_database_backend();
 
-    let rows = if parent_is_collection {
-        db.query_all(crate::db::helpers::portable_statement(
-            backend,
-            &linked_children_select_sql(),
-            vec![user_id.into(), parent_id.into()],
-        ))
-        .await
-    } else if recursive {
-        db.query_all(crate::db::helpers::portable_statement(
-            backend,
-            &recursive_media_item_select_sql(),
-            vec![parent_id.into(), user_id.into(), parent_id.into()],
-        ))
-        .await
-    } else if has_list_item_ids {
-        db.query_all(crate::db::helpers::portable_statement(
-            backend,
-            &media_item_select_sql(""),
-            vec![user_id.into()],
-        ))
-        .await
-    } else {
-        db.query_all(crate::db::helpers::portable_statement(
-            backend,
-            &media_item_select_sql("WHERE media_items.parent_id = ?"),
-            vec![user_id.into(), parent_id.into()],
-        ))
-        .await
-    }
-    .context("failed to list media items")?;
-    let mut items = decode_media_items(&rows)?;
-    apply_item_filters(&mut items, query);
-    apply_relation_filters(db, &mut items, query).await?;
-    sort_media_items(&mut items, query);
-    let mut items: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
-    // Batch load image tags
-    if !items.is_empty() {
-        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-        if let Ok(tags_map) = batch_item_image_tags(db, &ids).await {
-            for item in &mut items {
-                if let Some(tags) = tags_map.get(&item.id) {
-                    item.image_tags = Some(tags.clone());
+    let search_term = query
+        .get("SearchTerm")
+        .filter(|v| !v.is_empty())
+        .map(|v| format!("%{}%", v));
+
+    // Special path: query by PersonIds directly (for person filmography pages)
+    let items = if has_person_ids && parent_id.is_none() {
+        let person_ids = query
+            .get("PersonIds")
+            .or_else(|| query.get("personIds"))
+            .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if person_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = person_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        // SQL template: LEFT JOIN user_data ON ... AND ud.user_id = ? (1st placeholder)
+        //              WHERE mp.person_id IN (?, ...) (next placeholders)
+        //              LIMIT ? OFFSET ? (last two placeholders)
+        let mut values: Vec<sea_orm::Value> = Vec::new();
+        values.push(user_id.into());
+        for id in &person_ids {
+            values.push(id.as_str().into());
+        }
+        values.push((limit as i64).into());
+        values.push((offset as i64).into());
+
+        let sql = format!(
+            "{} WHERE mp.person_id IN ({}) ORDER BY mp.sort_order ASC, mi.title ASC LIMIT ? OFFSET ?",
+            media_item_select_sql_from_person(""),
+            placeholders,
+        );
+        let rows = db
+            .query_all(crate::db::helpers::portable_statement(backend, &sql, values))
+            .await
+            .context("failed to list items by person ids")?;
+        let mut items = decode_media_items(&rows)?;
+        apply_item_filters(&mut items, query);
+        sort_media_items(&mut items, query);
+        let mut items: Vec<_> = items.into_iter().collect();
+        // Batch load image tags
+        if !items.is_empty() {
+            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+            if let Ok(tags_map) = batch_item_image_tags(db, &ids).await {
+                for item in &mut items {
+                    if let Some(tags) = tags_map.get(&item.id) {
+                        item.image_tags = Some(tags.clone());
+                    }
                 }
             }
         }
-    }
+        items
+    } else {
+        let has_search = search_term.is_some();
+        let parent_id = parent_id.unwrap_or("movies");
+        let parent_is_collection = is_collection_or_playlist(db, parent_id).await?;
+
+        let like_clause = search_term
+            .as_ref()
+            .map(|_| "AND LOWER(media_items.title) LIKE LOWER(?)");
+
+        let rows = if parent_is_collection {
+            let (sql, vals) = if let Some(like) = like_clause {
+                let base = linked_children_select_sql();
+                let like_for_alias = like.replace("media_items.", "mi.");
+                let sql = base.replace("ORDER BY", &format!("{} ORDER BY", like_for_alias));
+                let mut vals: Vec<sea_orm::Value> = vec![user_id.into(), parent_id.into()];
+                vals.push(search_term.as_ref().unwrap().as_str().into());
+                (sql, vals)
+            } else {
+                (linked_children_select_sql(), vec![user_id.into(), parent_id.into()])
+            };
+            db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
+                .await
+        } else if has_search {
+            // Search takes priority over recursive - search globally with SQL LIKE
+            let base = media_item_select_sql("WHERE 1=1");
+            let sql = base.replace("ORDER BY", "AND LOWER(media_items.title) LIKE LOWER(?) ORDER BY");
+            let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
+            vals.push(search_term.as_ref().unwrap().as_str().into());
+            db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
+                .await
+        } else if recursive {
+            let (sql, vals) = if let Some(like) = like_clause {
+                let base = recursive_media_item_select_sql();
+                let sql = base.replace(
+                    "WHERE media_items.id IN",
+                    &format!("WHERE {} AND media_items.id IN", like.trim_start_matches("AND ")),
+                );
+                let mut vals: Vec<sea_orm::Value> = vec![parent_id.into(), user_id.into(), parent_id.into()];
+                vals.push(search_term.as_ref().unwrap().as_str().into());
+                (sql, vals)
+            } else {
+                (recursive_media_item_select_sql(), vec![parent_id.into(), user_id.into(), parent_id.into()])
+            };
+            db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
+                .await
+        } else if has_list_item_ids {
+            let (sql, vals) = if let Some(like) = like_clause {
+                let base = media_item_select_sql("WHERE 1=1");
+                let sql = base.replace("ORDER BY", &format!("{} ORDER BY", like));
+                let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
+                vals.push(search_term.as_ref().unwrap().as_str().into());
+                (sql, vals)
+            } else {
+                (media_item_select_sql(""), vec![user_id.into()])
+            };
+            db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
+                .await
+        } else {
+            let (sql, vals) = (media_item_select_sql("WHERE media_items.parent_id = ?"), vec![user_id.into(), parent_id.into()]);
+            db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
+                .await
+        }
+        .context("failed to list media items")?;
+        let mut items = decode_media_items(&rows)?;
+        apply_item_filters(&mut items, query);
+        apply_relation_filters(db, &mut items, query).await?;
+        sort_media_items(&mut items, query);
+        let mut items: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
+        // Batch load image tags
+        if !items.is_empty() {
+            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+            if let Ok(tags_map) = batch_item_image_tags(db, &ids).await {
+                for item in &mut items {
+                    if let Some(tags) = tags_map.get(&item.id) {
+                        item.image_tags = Some(tags.clone());
+                    }
+                }
+            }
+        }
+        items
+    };
+
     Ok(items)
+}
+
+/// SQL SELECT for querying items joined through media_people.
+/// Includes the media_items columns + user_data join.
+fn media_item_select_sql_from_person(where_clause: &str) -> String {
+    format!(
+        r#"SELECT mi.id, mi.title, mi.path, mi.library_id, libraries.collection_type, mi.parent_id, mi.item_type, mi.is_folder, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.season_number, mi.episode_number, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? LEFT JOIN libraries ON libraries.id = mi.library_id {where_clause}"#
+    )
 }
 
 async fn is_collection_or_playlist(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<bool> {
@@ -109,19 +281,109 @@ fn linked_children_select_sql() -> String {
 pub async fn latest_media_items(
     db: &DatabaseConnection,
     user_id: &str,
+    parent_id: Option<&str>,
 ) -> anyhow::Result<Vec<MediaItem>> {
     let backend = db.get_database_backend();
-    decode_media_items(
-        &db.query_all(crate::db::helpers::portable_statement(
-            backend,
-            &media_item_select_sql(
-                "WHERE media_items.is_folder = 0 ORDER BY media_items.modified_at DESC LIMIT 16",
-            ),
-            vec![user_id.into()],
-        ))
-        .await
-        .context("failed to list latest media items")?,
-    )
+
+    if let Some(pid) = parent_id {
+        // Determine the collection type for this library
+        let collection_type = db
+            .query_one(crate::db::helpers::portable_statement(
+                backend,
+                "SELECT collection_type FROM libraries WHERE id = ?",
+                vec![pid.into()],
+            ))
+            .await
+            .context("failed to get library collection type")?
+            .and_then(|r| r.get_opt_str("collection_type").ok().flatten())
+            .unwrap_or_default();
+
+        let item_type_filter = match collection_type.as_str() {
+            "movies" => "'Movie'",
+            "tvshows" => "'Series'",
+            _ => "'Movie'",
+        };
+
+        let where_clause = format!(
+            "WHERE media_items.library_id = ? AND media_items.item_type = {} ORDER BY media_items.modified_at DESC LIMIT 16",
+            item_type_filter
+        );
+        let mut items = decode_media_items(
+            &db.query_all(crate::db::helpers::portable_statement(
+                backend,
+                &media_item_select_sql(&where_clause),
+                vec![user_id.into(), pid.into()],
+            ))
+            .await
+            .context("failed to list latest media items")?,
+        )?;
+        if !items.is_empty() {
+            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+            if let Ok(tags_map) = batch_item_image_tags(db, &ids).await {
+                for item in &mut items {
+                    if let Some(tags) = tags_map.get(&item.id) {
+                        item.image_tags = Some(tags.clone());
+                    }
+                }
+            }
+        }
+        Ok(items)
+    } else {
+        // No parent specified: query each library separately and merge
+        let libraries = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend,
+                "SELECT id, collection_type FROM libraries ORDER BY name ASC",
+                vec![],
+            ))
+            .await
+            .context("failed to list libraries")?;
+
+        let mut all_items = Vec::new();
+        for row in &libraries {
+            let lib_id: String = row.get_str("id")?;
+            let collection_type = row
+                .get_opt_str("collection_type")?
+                .unwrap_or_default();
+
+            let item_type_filter = match collection_type.as_str() {
+                "movies" => "'Movie'",
+                "tvshows" => "'Series'",
+                _ => continue,
+            };
+
+            let where_clause = format!(
+                "WHERE media_items.library_id = ? AND media_items.item_type = {} ORDER BY media_items.modified_at DESC LIMIT 8",
+                item_type_filter
+            );
+            let items = decode_media_items(
+                &db.query_all(crate::db::helpers::portable_statement(
+                    backend,
+                    &media_item_select_sql(&where_clause),
+                    vec![user_id.into(), lib_id.clone().into()],
+                ))
+                .await?
+            )?;
+            all_items.extend(items);
+        }
+
+        // Sort all items by modified_at desc and limit
+        all_items.sort_by_key(|i| std::cmp::Reverse(i.modified_at));
+        all_items.truncate(16);
+
+        // Batch load image tags
+        if !all_items.is_empty() {
+            let ids: Vec<String> = all_items.iter().map(|i| i.id.clone()).collect();
+            if let Ok(tags_map) = batch_item_image_tags(db, &ids).await {
+                for item in &mut all_items {
+                    if let Some(tags) = tags_map.get(&item.id) {
+                        item.image_tags = Some(tags.clone());
+                    }
+                }
+            }
+        }
+        Ok(all_items)
+    }
 }
 
 pub async fn resume_media_items(
@@ -129,17 +391,29 @@ pub async fn resume_media_items(
     user_id: &str,
 ) -> anyhow::Result<Vec<MediaItem>> {
     let backend = db.get_database_backend();
-    decode_media_items(
+    let mut items = decode_media_items(
         &db.query_all(crate::db::helpers::portable_statement(
             backend,
             &media_item_select_sql(
-                "WHERE media_items.is_folder = 0 AND COALESCE(user_data.playback_position_ticks, 0) > 0 ORDER BY user_data.updated_at DESC LIMIT 50",
+                "WHERE media_items.is_folder = 0 AND media_items.item_type <> 'Video' AND COALESCE(user_data.playback_position_ticks, 0) > 0 ORDER BY user_data.updated_at DESC LIMIT 50",
             ),
             vec![user_id.into()],
         ))
         .await
         .context("failed to list resume media items")?,
-    )
+    )?;
+    // Batch load image tags
+    if !items.is_empty() {
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        if let Ok(tags_map) = batch_item_image_tags(db, &ids).await {
+            for item in &mut items {
+                if let Some(tags) = tags_map.get(&item.id) {
+                    item.image_tags = Some(tags.clone());
+                }
+            }
+        }
+    }
+    Ok(items)
 }
 
 pub async fn find_media_item(
@@ -181,7 +455,7 @@ pub fn decode_media_items(rows: &[sea_orm::QueryResult]) -> anyhow::Result<Vec<M
         .context("failed to decode media items")
 }
 
-async fn batch_item_image_tags(
+pub(super) async fn batch_item_image_tags(
     db: &DatabaseConnection,
     item_ids: &[String],
 ) -> anyhow::Result<HashMap<String, serde_json::Value>> {
@@ -231,6 +505,10 @@ fn apply_item_filters(items: &mut Vec<MediaItem>, query: &HashMap<String, String
     {
         let include_types = include_types.split(',').map(str::trim).collect::<Vec<_>>();
         items.retain(|item| {
+            // Video files are playback-only items in movie libraries, not shown in listings
+            if item.item_type == "Video" {
+                return false;
+            }
             include_types
                 .iter()
                 .any(|item_type| *item_type == item.item_type)
@@ -254,7 +532,7 @@ fn apply_item_filters(items: &mut Vec<MediaItem>, query: &HashMap<String, String
                 "Video" => items.retain(|item| {
                     matches!(
                         item.item_type.as_str(),
-                        "Movie" | "Series" | "Season" | "Episode" | "Video"
+                        "Movie" | "Series" | "Season" | "Episode"
                     )
                 }),
                 "Audio" => {

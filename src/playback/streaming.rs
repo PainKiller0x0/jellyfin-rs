@@ -73,6 +73,22 @@ pub async fn stream_subtitle_head(
     stream_subtitle_item(state, item_id, index, Method::HEAD).await
 }
 
+/// Subtitle streaming with mediaSourceId path segment for Emby client compatibility.
+pub async fn stream_subtitle_with_source(
+    State(state): State<Arc<AppState>>,
+    Path((item_id, _media_source_id, index, _format)): Path<(String, String, i64, String)>,
+) -> Response {
+    // media_source_id is ignored; route to the same handler
+    stream_subtitle_item(state, item_id, index, Method::GET).await
+}
+
+pub async fn stream_subtitle_with_source_head(
+    State(state): State<Arc<AppState>>,
+    Path((item_id, _media_source_id, index, _format)): Path<(String, String, i64, String)>,
+) -> Response {
+    stream_subtitle_item(state, item_id, index, Method::HEAD).await
+}
+
 async fn stream_subtitle_item(
     state: Arc<AppState>,
     item_id: String,

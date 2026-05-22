@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose};
-use serde_json::json;
+use serde_json::{Map, Value as JsonValue, json};
 
 pub async fn not_found() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, Json(json!({ "Error": "Not found" })))
@@ -47,4 +47,23 @@ pub async fn image() -> Response {
         HeaderValue::from_static("jellyfin-rs-placeholder"),
     );
     (headers, Body::from(bytes)).into_response()
+}
+
+/// Recursively remove null fields from a JSON object.
+/// Matches Jellyfin's DefaultIgnoreCondition = WhenWritingNull behavior.
+pub fn strip_nulls(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(map) => {
+            let cleaned: Map<String, JsonValue> = map
+                .into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k, strip_nulls(v)))
+                .collect();
+            JsonValue::Object(cleaned)
+        }
+        JsonValue::Array(arr) => {
+            JsonValue::Array(arr.into_iter().map(strip_nulls).collect())
+        }
+        other => other,
+    }
 }

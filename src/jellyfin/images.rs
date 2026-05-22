@@ -521,7 +521,7 @@ fn extension_from_url(url: &str) -> Option<&'static str> {
     }
 }
 
-fn content_type_from_path(path: &str) -> &'static str {
+pub fn content_type_from_path(path: &str) -> &'static str {
     match std::path::Path::new(path)
         .extension()
         .and_then(|extension| extension.to_str())

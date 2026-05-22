@@ -7,6 +7,8 @@ pub struct Model {
     pub id: String,
     pub name: String,
     pub created_at: i64,
+    pub overview: Option<String>,
+    pub tmdb_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

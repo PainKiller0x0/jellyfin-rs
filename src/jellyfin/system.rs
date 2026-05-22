@@ -448,3 +448,8 @@ pub async fn shutdown_handler() -> Response {
     });
     axum::http::StatusCode::NO_CONTENT.into_response()
 }
+
+/// Stub for emby_ext_domains plugin — returns null when plugin is not installed.
+pub async fn system_ext_server_domains() -> Response {
+    Json(JsonValue::Null).into_response()
+}

@@ -28,7 +28,19 @@ pub async fn similar_items(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(12);
     match similar_items_inner(&state.db, &item_id, limit).await {
-        Ok(items) => media_list_response(items),
+        Ok(mut items) => {
+            if !items.is_empty() {
+                let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+                if let Ok(tags_map) = crate::jellyfin::item_queries::batch_item_image_tags(&state.db, &ids).await {
+                    for item in &mut items {
+                        if let Some(tags) = tags_map.get(&item.id) {
+                            item.image_tags = Some(tags.clone());
+                        }
+                    }
+                }
+            }
+            media_list_response(items)
+        }
         Err(error) => internal_error(error),
     }
 }
@@ -88,7 +100,7 @@ pub async fn search_hints(
         .cloned()
         .unwrap_or_else(|| state.user_id.to_string());
     let search_term = match query.get("SearchTerm").filter(|value| !value.is_empty()) {
-        Some(term) => term.to_ascii_lowercase(),
+        Some(term) => term.clone(),
         None => return Json(json!({ "SearchHints": [], "TotalRecordCount": 0 })).into_response(),
     };
     let limit = query
@@ -100,7 +112,11 @@ pub async fn search_hints(
         .get("IncludeItemTypes")
         .map(|v| v.split(',').map(str::trim).collect::<Vec<_>>());
 
-    match search_hints_inner(&state.db, &user_id, &search_term, include_types, limit).await {
+    let parent_id = query.get("ParentId").map(String::as_str);
+
+    match search_hints_inner(&state.db, &user_id, &search_term, include_types, parent_id, limit)
+        .await
+    {
         Ok(hints) => {
             let total = hints.len();
             Json(json!({ "SearchHints": hints, "TotalRecordCount": total })).into_response()
@@ -114,42 +130,86 @@ async fn search_hints_inner(
     user_id: &str,
     search_term: &str,
     include_types: Option<Vec<&str>>,
+    parent_id: Option<&str>,
     limit: usize,
 ) -> anyhow::Result<Vec<Value>> {
     let backend = db.get_database_backend();
-    let sql = item_queries::media_item_select_sql(
-        "WHERE media_items.is_folder = 0 ORDER BY media_items.title ASC",
-    );
+    let like_pattern = format!("%{}%", search_term);
+
+    let mut where_parts = vec!["media_items.is_folder = 0".to_string()];
+    where_parts.push("LOWER(media_items.title) LIKE LOWER(?)".to_string());
+
+    if parent_id.is_some() {
+        where_parts.push("media_items.parent_id = ?".to_string());
+    }
+
+    if let Some(types) = &include_types {
+        if !types.is_empty() {
+            let placeholders = types.iter().map(|_| "LOWER(media_items.item_type) = LOWER(?)").collect::<Vec<_>>().join(" OR ");
+            where_parts.push(format!("({})", placeholders));
+        }
+    }
+
+    let where_clause = format!("WHERE {} ORDER BY media_items.title ASC", where_parts.join(" AND "));
+    let sql = item_queries::media_item_select_sql(&where_clause);
+
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    values.push(user_id.into());
+    values.push(like_pattern.clone().into());
+    if let Some(pid) = parent_id {
+        values.push(pid.into());
+    }
+    if let Some(types) = &include_types {
+        for t in types {
+            values.push((*t).into());
+        }
+    }
+    values.push((i64::try_from(limit).unwrap_or(25)).into());
+
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
             &sql,
-            vec![user_id.into()],
+            values,
         ))
         .await
         .context("failed to fetch search hints")?;
 
     let items = item_queries::decode_media_items(&rows)?;
+
+    // Batch load image tags for PrimaryImageTag
+    let image_tags_map = if !items.is_empty() {
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        item_queries::batch_item_image_tags(db, &ids)
+            .await
+            .unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let mut hints: Vec<Value> = items
         .into_iter()
-        .filter(|item| {
-            item.title.to_ascii_lowercase().contains(search_term)
-                && include_types.as_ref().is_none_or(|types| {
-                    types
-                        .iter()
-                        .any(|t| t.eq_ignore_ascii_case(&item.item_type))
-                })
-        })
-        .take(limit)
         .map(|item| {
-            json!({
+            let primary_image_tag = image_tags_map
+                .get(&item.id)
+                .and_then(|tags| tags.get("Primary"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            let mut hint = json!({
+                "ItemId": item.id,
                 "Id": item.id,
                 "Name": item.title,
                 "Type": item.item_type,
                 "ProductionYear": item.production_year,
                 "RunTimeTicks": item.runtime_ticks,
                 "MediaType": item.item_type,
-            })
+                "MatchedTerm": item.title,
+            });
+            if let Some(tag) = primary_image_tag {
+                hint["PrimaryImageTag"] = json!(tag);
+            }
+            hint
         })
         .collect();
 

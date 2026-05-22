@@ -13,7 +13,7 @@ use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
     jellyfin::{
-        common::internal_error,
+        common::{internal_error, strip_nulls},
         item_queries,
         playback::upsert_playback_position,
     },
@@ -444,8 +444,8 @@ pub async fn playlist_move_item(
 
 /// GET /Items/{item_id}/RemoteSearch/Subtitles/{language} — search remote subtitles
 pub async fn remote_subtitle_search(
-    State(state): State<Arc<AppState>>,
-    Path((item_id, language)): Path<(String, String)>,
+    State(_state): State<Arc<AppState>>,
+    Path((_item_id, _language)): Path<(String, String)>,
     Query(_query): Query<HashMap<String, String>>,
 ) -> Response {
     // Return empty - remote subtitle providers not implemented
@@ -455,7 +455,7 @@ pub async fn remote_subtitle_search(
 /// POST /Items/{item_id}/RemoteSearch/Subtitles/{subtitle_id} — download remote subtitle
 pub async fn download_remote_subtitle(
     State(_state): State<Arc<AppState>>,
-    Path((item_id, subtitle_id)): Path<(String, String)>,
+    Path((_item_id, _subtitle_id)): Path<(String, String)>,
 ) -> Response {
     // Not implemented - would need subtitle provider integration
     StatusCode::NOT_FOUND.into_response()
@@ -551,7 +551,262 @@ pub async fn item_image_head(
 pub async fn item_image_index_head(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, image_type, index)): Path<(String, String, i64)>,
+    Path((item_id, image_type, _index)): Path<(String, String, i64)>,
 ) -> Response {
     item_image_head(State(state), headers, Path((item_id, image_type))).await
+}
+
+/// GET /Items/{item_id}/Download — download item file
+pub async fn download_item(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    let backend = state.db.get_database_backend();
+    let row = state.db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT path, title, container FROM media_items WHERE id = ?",
+            vec![item_id.into()],
+        ))
+        .await;
+
+    match row {
+        Ok(Some(r)) => {
+            if let Ok(path) = r.get_str("path") {
+                let title = r.get_opt_str("title").ok().flatten().unwrap_or_default();
+                let container = r.get_opt_str("container").ok().flatten().unwrap_or_default();
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => {
+                        let filename = format!("{}.{}", title, container);
+                        return (
+                            [
+                                (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                                (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename)),
+                            ],
+                            bytes,
+                        ).into_response();
+                    }
+                    Err(_) => return StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+            StatusCode::NOT_FOUND.into_response()
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// GET /Items/{item_id}/File — get item file info
+pub async fn item_file_info(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    let backend = state.db.get_database_backend();
+    let row = state.db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT path, title, container, size_bytes FROM media_items WHERE id = ?",
+            vec![item_id.into()],
+        ))
+        .await;
+
+    match row {
+        Ok(Some(r)) => {
+            let path = r.get_opt_str("path").ok().flatten().unwrap_or_default();
+            let title = r.get_opt_str("title").ok().flatten().unwrap_or_default();
+            let container = r.get_opt_str("container").ok().flatten().unwrap_or_default();
+            let size = r.get_opt_i64("size_bytes").ok().flatten();
+            Json(json!({
+                "Path": path,
+                "Name": format!("{}.{}", title, container),
+                "Size": size,
+            })).into_response()
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// GET /Videos/{item_id}/AdditionalParts — multi-part video support
+pub async fn video_additional_parts(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    // Check if this video has additional parts (same parent folder, same type)
+    let backend = state.db.get_database_backend();
+    let row = state.db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT parent_id, item_type FROM media_items WHERE id = ?",
+            vec![item_id.clone().into()],
+        ))
+        .await;
+
+    match row {
+        Ok(Some(r)) => {
+            let parent_id = r.get_opt_str("parent_id").ok().flatten().unwrap_or_default();
+            let item_type = r.get_opt_str("item_type").ok().flatten().unwrap_or_default();
+
+            let rows = state.db
+                .query_all(crate::db::helpers::portable_statement(
+                    backend,
+                    "SELECT id, title, path, container, size_bytes FROM media_items WHERE parent_id = ? AND item_type = ? AND id <> ? ORDER BY title ASC",
+                    vec![parent_id.into(), item_type.into(), item_id.into()],
+                ))
+                .await
+                .unwrap_or_default();
+
+            let parts: Vec<Value> = rows.iter().filter_map(|r| {
+                let id = r.get_str("id").ok()?;
+                let title = r.get_str("title").ok()?;
+                let path = r.get_str("path").ok()?;
+                let container = r.get_opt_str("container").ok().flatten()?;
+                let size = r.get_opt_i64("size_bytes").ok().flatten();
+                Some(json!({
+                    "Id": id,
+                    "Name": title,
+                    "Path": path,
+                    "Container": container,
+                    "Size": size,
+                }))
+            }).collect();
+
+            Json(json!({ "Items": parts, "TotalRecordCount": parts.len() })).into_response()
+        }
+        _ => Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response(),
+    }
+}
+
+/// GET /Shows/Upcoming — upcoming episodes (recently aired)
+pub async fn shows_upcoming(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let user_id = query
+        .get("UserId")
+        .cloned()
+        .unwrap_or_else(|| state.user_id.to_string());
+    let limit = query
+        .get("Limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16);
+
+    let backend = state.db.get_database_backend();
+    let sql = format!(
+        "{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 ORDER BY media_items.created_at DESC LIMIT ?",
+        crate::jellyfin::item_queries::media_item_select_sql("")
+    );
+    let rows = state.db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &sql,
+            vec![user_id.into(), (limit as i64).into()],
+        ))
+        .await
+        .unwrap_or_default();
+
+    let items = crate::jellyfin::item_queries::decode_media_items(&rows).unwrap_or_default();
+    let total = items.len();
+    Json(json!({ "Items": items.into_iter().map(|i| crate::jellyfin::common::strip_nulls(i.to_jellyfin_json())).collect::<Vec<_>>(), "TotalRecordCount": total })).into_response()
+}
+
+/// GET /Items/{item_id}/InstantMix — instant mix from item
+pub async fn item_instant_mix(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let user_id = query
+        .get("UserId")
+        .cloned()
+        .unwrap_or_else(|| state.user_id.to_string());
+    let limit = query
+        .get("Limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16);
+
+    // Use similar items logic (same genre-based approach)
+    let backend = state.db.get_database_backend();
+    let sql = r#"SELECT mg_rel.item_id FROM media_genres mg_src JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id AND mg_src.item_id <> mg_rel.item_id WHERE mg_src.item_id = ? GROUP BY mg_rel.item_id ORDER BY COUNT(*) DESC LIMIT ?"#;
+    let similar_rows = state.db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            sql,
+            vec![item_id.into(), (limit as i64).into()],
+        ))
+        .await
+        .unwrap_or_default();
+
+    let ids: Vec<String> = similar_rows.iter()
+        .filter_map(|r| r.get_opt_str("item_id").ok().flatten())
+        .collect();
+
+    if ids.is_empty() {
+        return Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response();
+    }
+
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let item_sql = format!(
+        "{} WHERE media_items.id IN ({})",
+        crate::jellyfin::item_queries::media_item_select_sql(""),
+        placeholders
+    );
+    let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
+    for id in &ids { vals.push(id.as_str().into()); }
+
+    let rows = state.db
+        .query_all(crate::db::helpers::portable_statement(backend, &item_sql, vals))
+        .await
+        .unwrap_or_default();
+
+    let items = crate::jellyfin::item_queries::decode_media_items(&rows).unwrap_or_default();
+    let total = items.len();
+    Json(json!({ "Items": items.into_iter().map(|i| crate::jellyfin::common::strip_nulls(i.to_jellyfin_json())).collect::<Vec<_>>(), "TotalRecordCount": total })).into_response()
+}
+
+/// GET /Items/{item_id}/ThemeSongs — theme songs (empty for video server)
+pub async fn item_theme_songs() -> Response {
+    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+}
+
+/// GET /Items/{item_id}/ThemeVideos — theme videos (empty)
+pub async fn item_theme_videos() -> Response {
+    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+}
+
+/// GET /Items/{item_id}/ThemeMedia — theme media (empty)
+pub async fn item_theme_media() -> Response {
+    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+}
+
+/// GET /MediaSegments/{item_id} — chapter markers
+pub async fn media_segments(
+    State(_state): State<Arc<AppState>>,
+    Path(_item_id): Path<String>,
+) -> Response {
+    // Return empty segments - chapter data not stored
+    Json(json!({ "Segments": [] })).into_response()
+}
+
+/// GET /UserItems/Resume — alternative resume path
+pub async fn user_items_resume(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let user_id = query
+        .get("UserId")
+        .cloned()
+        .unwrap_or_else(|| state.user_id.to_string());
+    crate::jellyfin::items::resume_items(State(state), Path(user_id)).await
+}
+
+/// GET /Items/Filters — older filters endpoint (same as Filters2)
+pub async fn items_filters(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    filters2(State(state), Query(query)).await
+}
+
+/// GET /Items/{id}/CriticReviews — critic reviews
+pub async fn item_critic_reviews() -> Response {
+    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
 }

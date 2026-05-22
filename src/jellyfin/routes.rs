@@ -338,7 +338,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/Users/{user_id}/Policy", post(auth::update_user_policy))
         .route("/Items", get(items::items_root))
-        .route("/Items/Filters", get(common::empty_object))
+        .route("/Items/Filters", get(super::user_extras::items_filters))
         .route("/Items/Filters2", get(super::user_extras::filters2))
         .route("/Items/Suggestions", get(super::user_extras::items_suggestions))
         .route(
@@ -346,13 +346,13 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(items::item_by_id_public).post(items::update_item),
         )
         .route("/Items/{item_id}/Ancestors", get(super::user_extras::item_ancestors))
-        .route("/Items/{item_id}/CriticReviews", get(common::empty_list))
-        .route("/Items/{item_id}/Download", get(common::empty_object))
-        .route("/Items/{item_id}/File", get(common::empty_object))
-        .route("/Items/{item_id}/ThemeMedia", get(common::empty_object))
-        .route("/Items/{item_id}/ThemeSongs", get(common::empty_array))
-        .route("/Items/{item_id}/ThemeVideos", get(common::empty_array))
-        .route("/Items/{item_id}/InstantMix", get(common::empty_list))
+        .route("/Items/{item_id}/CriticReviews", get(super::user_extras::item_critic_reviews))
+        .route("/Items/{item_id}/Download", get(super::user_extras::download_item))
+        .route("/Items/{item_id}/File", get(super::user_extras::item_file_info))
+        .route("/Items/{item_id}/ThemeMedia", get(super::user_extras::item_theme_media))
+        .route("/Items/{item_id}/ThemeSongs", get(super::user_extras::item_theme_songs))
+        .route("/Items/{item_id}/ThemeVideos", get(super::user_extras::item_theme_videos))
+        .route("/Items/{item_id}/InstantMix", get(super::user_extras::item_instant_mix))
         .route("/Items/{item_id}/Intros", get(super::user_extras::item_intros))
         .route("/Items/{item_id}/LocalTrailers", get(super::user_extras::item_local_trailers))
         .route("/Items/{item_id}/SpecialFeatures", get(super::user_extras::item_special_features))
@@ -433,7 +433,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Shows/{show_id}/Seasons", get(items::show_seasons))
         .route("/Shows/NextUp", get(items::shows_next_up))
         .route("/Shows/Missing", get(items::shows_missing))
-        .route("/Shows/Upcoming", get(common::empty_list))
+        .route("/Shows/Upcoming", get(super::user_extras::shows_upcoming))
         .route("/Search/Hints", get(items::search_hints))
         .route("/Genres", get(filters::genres))
         .route("/MusicGenres", get(common::empty_list))
@@ -452,7 +452,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Containers", get(filters::containers))
         .route("/VideoCodecs", get(filters::video_codecs))
         .route("/ExtendedVideoTypes", get(filters::extended_video_types))
-        .route("/Videos/{item_id}/AdditionalParts", get(common::empty_list))
+        .route("/Videos/{item_id}/AdditionalParts", get(super::user_extras::video_additional_parts))
         .route(
             "/Videos/{item_id}/Trickplay/{width}/tiles.m3u8",
             get(common::empty_object),
@@ -500,7 +500,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(common::no_content),
         )
         .route("/Providers/Lyrics/{lyric_id}", get(common::empty_object))
-        .route("/MediaSegments/{item_id}", get(common::empty_object))
+        .route("/MediaSegments/{item_id}", get(super::user_extras::media_segments))
         .route("/Albums/{item_id}/InstantMix", get(common::empty_list))
         .route("/Playlists/{item_id}/InstantMix", get(common::empty_list))
         .route("/Songs/{item_id}/InstantMix", get(common::empty_list))
@@ -552,7 +552,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/ScheduledTasks/Running/{task_id}",
             post(items::scan_handler).delete(common::no_content),
         )
-        .route("/UserItems/Resume", get(common::empty_list))
+        .route("/UserItems/Resume", get(super::user_extras::user_items_resume))
         .route(
             "/UserItems/{item_id}/UserData",
             get(playback::get_user_item_data).post(playback::update_user_item_data),

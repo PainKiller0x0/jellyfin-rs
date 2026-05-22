@@ -83,6 +83,7 @@ pub async fn tmdb_movie_details(
         "Name": response.title,
         "Overview": response.overview,
         "ProductionYear": year,
+        "CommunityRating": response.vote_average,
         "ProviderIds": {
             "Tmdb": response.id.to_string(),
             "IMDB": response.imdb_id.unwrap_or_default()
@@ -190,6 +191,7 @@ pub async fn tmdb_tv_details(
         "Name": response.name,
         "Overview": response.overview,
         "ProductionYear": year,
+        "CommunityRating": response.vote_average,
         "ProviderIds": {
             "Tmdb": response.id.to_string(),
             "IMDB": external_imdb.unwrap_or_default(),
@@ -386,6 +388,7 @@ struct TmdbMovieDetails {
     poster_path: Option<String>,
     backdrop_path: Option<String>,
     imdb_id: Option<String>,
+    vote_average: Option<f64>,
     #[serde(default)]
     genres: Vec<TmdbNamedItem>,
     #[serde(default)]
@@ -404,6 +407,7 @@ struct TmdbTvDetails {
     status: Option<String>,
     number_of_seasons: Option<i64>,
     number_of_episodes: Option<i64>,
+    vote_average: Option<f64>,
     #[serde(default)]
     episode_run_time: Vec<i64>,
     #[serde(default)]

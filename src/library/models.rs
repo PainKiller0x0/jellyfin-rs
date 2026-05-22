@@ -21,6 +21,8 @@ pub struct MediaItem {
     pub size_bytes: Option<i64>,
     pub season_number: Option<i64>,
     pub episode_number: Option<i64>,
+    pub community_rating: Option<f64>,
+    pub critic_rating: Option<f64>,
     pub created_at: i64,
     pub modified_at: i64,
     pub is_favorite: bool,
@@ -52,6 +54,8 @@ impl MediaItem {
             size_bytes: row.get_opt_i64("size_bytes")?,
             season_number: row.get_opt_i64("season_number").ok().flatten(),
             episode_number: row.get_opt_i64("episode_number").ok().flatten(),
+            community_rating: row.get_f64("community_rating").ok().flatten(),
+            critic_rating: row.get_f64("critic_rating").ok().flatten(),
             created_at: row.get_i64("created_at")?,
             modified_at: row.get_i64("modified_at")?,
             is_favorite: row.get_bool_from_i64("is_favorite")?,
@@ -140,7 +144,16 @@ impl MediaItem {
         map.insert("DateCreated".into(), JsonValue::String(unix_to_jellyfin_date(self.created_at)));
         map.insert("DateLastMediaAdded".into(), JsonValue::String(unix_to_jellyfin_date(self.modified_at)));
         map.insert("ImageTags".into(), self.image_tags.clone().unwrap_or_else(|| json!({})));
-        map.insert("BackdropImageTags".into(), json!([]));
+
+        // Build BackdropImageTags from image_tags
+        let backdrop_tags: Vec<JsonValue> = self.image_tags
+            .as_ref()
+            .and_then(|tags| tags.get("Backdrop"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|etag| vec![JsonValue::String(etag.to_string())])
+            .unwrap_or_default();
+        map.insert("BackdropImageTags".into(), JsonValue::Array(backdrop_tags));
         map.insert("ScreenshotImageTags".into(), json!([]));
         map.insert("PrimaryImageAspectRatio".into(), JsonValue::Null);
         map.insert("ImageBlurHashes".into(), json!({}));
@@ -178,8 +191,8 @@ impl MediaItem {
         map.insert("IsPremiere".into(), JsonValue::Null);
         map.insert("PlaylistItemId".into(), JsonValue::Null);
         map.insert("SourceType".into(), JsonValue::Null);
-        map.insert("CommunityRating".into(), JsonValue::Null);
-        map.insert("CriticRating".into(), JsonValue::Null);
+        map.insert("CommunityRating".into(), opt_f64(self.community_rating));
+        map.insert("CriticRating".into(), opt_f64(self.critic_rating));
         map.insert("ExternalUrls".into(), json!([]));
         map.insert("Album".into(), JsonValue::Null);
         map.insert("AlbumId".into(), JsonValue::Null);
@@ -208,6 +221,10 @@ impl MediaItem {
 
 fn opt_i64(val: Option<i64>) -> JsonValue {
     val.map(|n| JsonValue::Number(serde_json::Number::from(n))).unwrap_or(JsonValue::Null)
+}
+
+fn opt_f64(val: Option<f64>) -> JsonValue {
+    val.and_then(|n| serde_json::Number::from_f64(n).map(JsonValue::Number)).unwrap_or(JsonValue::Null)
 }
 
 fn opt_str(val: &Option<String>) -> JsonValue {

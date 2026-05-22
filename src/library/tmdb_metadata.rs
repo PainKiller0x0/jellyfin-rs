@@ -593,6 +593,16 @@ pub async fn fetch_and_apply_tmdb_metadata(
             ))
             .await;
     }
+    // Update community_rating (TMDb vote_average is 0-10, store as-is)
+    if let Some(rating) = metadata.get("CommunityRating").and_then(|v| v.as_f64()).filter(|r| *r > 0.0) {
+        let _ = db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "UPDATE media_items SET community_rating = ? WHERE id = ?",
+                vec![rating.into(), item_id.into()],
+            ))
+            .await;
+    }
 
     // Store provider IDs
     if let Some(provider_ids) = metadata.get("ProviderIds") {

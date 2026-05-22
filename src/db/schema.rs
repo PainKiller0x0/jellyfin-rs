@@ -257,5 +257,13 @@ pub fn optional_migrations() -> Vec<Migration> {
             "ALTER TABLE people ADD COLUMN tmdb_id TEXT",
             "add people.tmdb_id",
         ),
+        (
+            "ALTER TABLE media_items ADD COLUMN community_rating DOUBLE PRECISION",
+            "add media_items.community_rating",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN critic_rating DOUBLE PRECISION",
+            "add media_items.critic_rating",
+        ),
     ]
 }

@@ -395,9 +395,18 @@ async fn item_json_with_provider_ids(
         })
         .collect::<anyhow::Result<serde_json::Map<String, Value>>>()?;
     value["ProviderIds"] = Value::Object(provider_ids);
-    value["ImageTags"] = crate::jellyfin::images::item_image_tags(db, &item.id)
+    let image_tags = crate::jellyfin::images::item_image_tags(db, &item.id)
         .await
         .context("failed to load image tags")?;
+    // Rebuild BackdropImageTags from the fresh image_tags
+    let backdrop_tags: Vec<Value> = image_tags
+        .get("Backdrop")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|etag| vec![Value::String(etag.to_string())])
+        .unwrap_or_default();
+    value["BackdropImageTags"] = Value::Array(backdrop_tags);
+    value["ImageTags"] = image_tags;
     value["GenreItems"] =
         Value::Array(relation_values(db, "genres", "media_genres", "genre_id", &item.id).await?);
     value["TagItems"] =

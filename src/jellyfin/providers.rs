@@ -170,7 +170,7 @@ pub async fn tmdb_tv_details(
         .into_iter()
         .take(20)
         .map(|person| {
-            let mut entry = json!({ "Name": person.name, "Role": person.roles.first().map(|r| r.character.clone()).unwrap_or_default(), "Type": "Actor" });
+            let mut entry = json!({ "Name": person.name, "Role": person.character.or_else(|| person.roles.first().map(|r| r.character.clone())).unwrap_or_default(), "Type": "Actor" });
             if let Some(ref profile) = person.profile_path {
                 entry["ImageUrl"] = json!(format!("https://image.tmdb.org/t/p/w185{profile}"));
             }
@@ -427,6 +427,7 @@ struct TmdbTvCredits {
 #[derive(Deserialize)]
 struct TmdbTvCastMember {
     name: String,
+    character: Option<String>,
     profile_path: Option<String>,
     #[serde(default)]
     roles: Vec<TmdbTvRole>,

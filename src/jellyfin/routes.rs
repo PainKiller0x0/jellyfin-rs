@@ -407,12 +407,9 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/Items/{item_id}/Subtitles", get(items::item_subtitles))
         .route(
-            "/Items/{item_id}/RemoteSearch/Subtitles/{language}",
-            get(super::user_extras::remote_subtitle_search),
-        )
-        .route(
-            "/Items/{item_id}/RemoteSearch/Subtitles/{subtitle_id}",
-            post(super::user_extras::download_remote_subtitle),
+            "/Items/{item_id}/RemoteSearch/Subtitles/{param}",
+            get(super::user_extras::remote_subtitle_search)
+                .post(super::user_extras::download_remote_subtitle),
         )
         .route(
             "/Items/{item_id}/RemoteImages/Download",

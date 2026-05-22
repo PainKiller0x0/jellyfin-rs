@@ -445,7 +445,7 @@ pub async fn playlist_move_item(
 /// GET /Items/{item_id}/RemoteSearch/Subtitles/{language} — search remote subtitles
 pub async fn remote_subtitle_search(
     State(_state): State<Arc<AppState>>,
-    Path((_item_id, _language)): Path<(String, String)>,
+    Path((_item_id, _param)): Path<(String, String)>,
     Query(_query): Query<HashMap<String, String>>,
 ) -> Response {
     // Return empty - remote subtitle providers not implemented
@@ -455,7 +455,7 @@ pub async fn remote_subtitle_search(
 /// POST /Items/{item_id}/RemoteSearch/Subtitles/{subtitle_id} — download remote subtitle
 pub async fn download_remote_subtitle(
     State(_state): State<Arc<AppState>>,
-    Path((_item_id, _subtitle_id)): Path<(String, String)>,
+    Path((_item_id, _param)): Path<(String, String)>,
 ) -> Response {
     // Not implemented - would need subtitle provider integration
     StatusCode::NOT_FOUND.into_response()

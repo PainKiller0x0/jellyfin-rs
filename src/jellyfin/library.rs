@@ -87,6 +87,46 @@ pub async fn create_virtual_folder(
     }
 }
 
+/// DELETE /Library/VirtualFolders — delete a virtual folder
+pub async fn delete_virtual_folder(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let name = query.get("name").map(String::as_str).unwrap_or_default().trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "name is required" })),
+        )
+            .into_response();
+    }
+
+    let library_id = library_id_for_name(name);
+    let backend = state.db.get_database_backend();
+
+    // Delete library paths first (foreign key)
+    let _ = state.db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "DELETE FROM library_paths WHERE library_id = ?",
+            vec![library_id.clone().into()],
+        ))
+        .await;
+
+    // Delete the library
+    match state.db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "DELETE FROM libraries WHERE id = ?",
+            vec![library_id.into()],
+        ))
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error.into()),
+    }
+}
+
 pub async fn add_virtual_folder_path(
     State(state): State<Arc<AppState>>,
     Query(query): Query<LibraryPathQuery>,

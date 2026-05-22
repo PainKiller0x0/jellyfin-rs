@@ -239,7 +239,13 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Library/Refresh", post(library::refresh_library))
         .route(
             "/Library/VirtualFolders",
-            get(library::virtual_folders).post(library::create_virtual_folder),
+            get(library::virtual_folders)
+                .post(library::create_virtual_folder)
+                .delete(library::delete_virtual_folder),
+        )
+        .route(
+            "/Library/VirtualFolders/Delete",
+            post(library::delete_virtual_folder),
         )
         .route("/Library/VirtualFolders/Query", get(library::virtual_folders_query))
         .route("/Library/VirtualFolders/Name", post(library::rename_virtual_folder))

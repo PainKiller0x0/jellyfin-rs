@@ -217,6 +217,72 @@ async fn serve_item_image(
     }
 
     let path = model.path.unwrap_or_default();
+
+    // Check processed image cache before doing expensive re-processing
+    if should_process(query) {
+        let cache_key = format!(
+            "{}_{}_{}_{}_{}_{}",
+            item_id,
+            image_type,
+            image_index,
+            options.width.unwrap_or(0),
+            options.height.unwrap_or(0),
+            options.quality,
+        );
+        let cache_ext = match options.format {
+            EncodedImageFormat::Jpeg => "jpg",
+            EncodedImageFormat::Png => "png",
+            EncodedImageFormat::Webp => "webp",
+        };
+        let cache_path = format!("data/image_cache/{cache_key}.{cache_ext}");
+
+        if let Ok(cached_bytes) = tokio::fs::read(&cache_path).await {
+            let mut response_headers = HeaderMap::new();
+            response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(options.format.content_type()));
+            response_headers.insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&cached_bytes.len().to_string())
+                    .unwrap_or_else(|_| HeaderValue::from_static("0")),
+            );
+            if let Ok(value) = HeaderValue::from_str(&etag) {
+                response_headers.insert(header::ETAG, value);
+            }
+            return (response_headers, Body::from(cached_bytes)).into_response();
+        }
+
+        // Cache miss — read, process, save to cache
+        let mut bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "Error": format!("failed to read image file: {error}") })),
+                )
+                    .into_response();
+            }
+        };
+        match process_image(&bytes, &options) {
+            Ok(processed) => {
+                // Save to cache (ignore errors)
+                let _ = tokio::fs::create_dir_all("data/image_cache").await;
+                let _ = tokio::fs::write(&cache_path, &processed).await;
+                let mut response_headers = HeaderMap::new();
+                response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(options.format.content_type()));
+                response_headers.insert(
+                    header::CONTENT_LENGTH,
+                    HeaderValue::from_str(&processed.len().to_string())
+                        .unwrap_or_else(|_| HeaderValue::from_static("0")),
+                );
+                if let Ok(value) = HeaderValue::from_str(&etag) {
+                    response_headers.insert(header::ETAG, value);
+                }
+                return (response_headers, Body::from(processed)).into_response();
+            }
+            Err(error) => return internal_error(error),
+        }
+    }
+
+    // No processing needed — serve original file directly
     let mut bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -228,17 +294,7 @@ async fn serve_item_image(
         }
     };
 
-    let content_type = if should_process(query) {
-        match process_image(&bytes, &options) {
-            Ok(processed) => {
-                bytes = processed;
-                options.format.content_type()
-            }
-            Err(error) => return internal_error(error),
-        }
-    } else {
-        content_type_from_path(&path)
-    };
+    let content_type = content_type_from_path(&path);
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));

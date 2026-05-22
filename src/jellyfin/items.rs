@@ -150,11 +150,36 @@ async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>) -> 
     let item_ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
     let mut source_map: HashMap<String, Vec<Value>> = HashMap::new();
     if !item_ids.is_empty() {
-        for item_id in &item_ids {
-            if let Ok(sources) = super::playback::child_video_sources(db, item_id).await {
-                if !sources.is_empty() {
-                    source_map.insert(item_id.clone(), sources);
+        for item in &items {
+            if item.is_folder {
+                // Folder items (Movie/Episode) - load child video sources
+                if let Ok(sources) = super::playback::child_video_sources(db, &item.id).await {
+                    if !sources.is_empty() {
+                        source_map.insert(item.id.clone(), sources);
+                    }
                 }
+            } else {
+                // Non-folder items - build MediaSource directly from the item itself
+                let stream_jsons = super::playback::media_streams_for_item(db, &item.id).await.unwrap_or_default();
+                let container = item.container.as_deref().unwrap_or("bin");
+                let source = json!({
+                    "Id": item.id,
+                    "Name": item.title,
+                    "Path": item.path,
+                    "Type": "Default",
+                    "Container": container,
+                    "Size": item.size_bytes,
+                    "RunTimeTicks": item.runtime_ticks,
+                    "SupportsDirectPlay": true,
+                    "SupportsDirectStream": true,
+                    "SupportsTranscoding": false,
+                    "IsInfiniteStream": false,
+                    "MediaStreams": stream_jsons,
+                    "Formats": [],
+                    "RequiredHttpHeaders": {},
+                    "DirectStreamUrl": format!("/Videos/{}/stream.{}", item.id, container),
+                });
+                source_map.insert(item.id.clone(), vec![source]);
             }
         }
     }
@@ -173,7 +198,7 @@ async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>) -> 
             value["SupportsResume"] = json!(true);
         }
 
-        // Add MediaSources if available (for Movie/Episode folders)
+        // Add MediaSources if available
         if let Some(sources) = source_map.get(&item.id) {
             if !sources.is_empty() {
                 value["MediaSources"] = Value::Array(sources.clone());
@@ -188,11 +213,16 @@ async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>) -> 
 
                 // Get RunTimeTicks from first source if item doesn't have it
                 if item.runtime_ticks.is_none() {
-                    if let Some(rt) = sources.first().and_then(|s| s.get("RunTimeTicks")).and_then(Value::as_i64) {
+                    if let Some(rt) = sources.first().and_then(|s| s.get("RunTimeTicks")).and_then(Value::as_i64).filter(|v| *v > 0) {
                         value["RunTimeTicks"] = json!(rt);
                     }
                 }
             }
+        }
+
+        // Ensure RunTimeTicks is set from item if available
+        if item.runtime_ticks.is_some() && value.get("RunTimeTicks").and_then(Value::as_i64).is_none() {
+            value["RunTimeTicks"] = json!(item.runtime_ticks);
         }
 
         // Calculate PlayedPercentage if not set

@@ -288,6 +288,12 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Users/{user_id}/Items", get(items::user_items))
         .route("/Users/{user_id}/Items/Latest", get(items::latest_items))
         .route("/Users/{user_id}/Items/Resume", get(items::resume_items))
+        .route("/Users/{user_id}/Suggestions", get(items::user_suggestions))
+        .route("/Users/{user_id}/HomeSections", get(items::home_sections))
+        .route(
+            "/Users/{user_id}/Sections/{section_id}/Items",
+            get(items::home_section_items),
+        )
         .route("/Users/{user_id}/Items/{item_id}", get(items::item_by_id))
         .route(
             "/Users/{user_id}/Images/Primary",

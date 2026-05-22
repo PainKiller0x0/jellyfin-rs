@@ -1097,3 +1097,136 @@ async fn movie_recommendations_inner(
 
     Ok(categories)
 }
+
+/// GET /Users/{user_id}/Suggestions — personalized suggestions
+pub async fn user_suggestions(
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let limit = query
+        .get("Limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16);
+    let parent_id = query.get("ParentId").map(String::as_str);
+
+    // Return recently added unplayed items as suggestions
+    let backend = state.db.get_database_backend();
+    let (sql, vals) = if let Some(pid) = parent_id {
+        (
+            format!(
+                "{} WHERE media_items.is_folder = 1 AND media_items.item_type IN ('Movie', 'Series') AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC LIMIT ?",
+                super::item_queries::media_item_select_sql("AND media_items.library_id = ?")
+            ),
+            vec![user_id.clone().into(), pid.into(), (limit as i64).into()],
+        )
+    } else {
+        (
+            format!(
+                "{} WHERE media_items.is_folder = 1 AND media_items.item_type IN ('Movie', 'Series') AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC LIMIT ?",
+                super::item_queries::media_item_select_sql("")
+            ),
+            vec![user_id.clone().into(), (limit as i64).into()],
+        )
+    };
+
+    match state.db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals)).await {
+        Ok(rows) => {
+            let items = super::item_queries::decode_media_items(&rows).unwrap_or_default();
+            let total = items.len();
+            Json(json!({ "Items": items.into_iter().map(|i| strip_nulls(i.to_jellyfin_json())).collect::<Vec<_>>(), "TotalRecordCount": total })).into_response()
+        }
+        Err(error) => internal_error(error.into()),
+    }
+}
+
+/// GET /Users/{user_id}/HomeSections — home screen layout
+pub async fn home_sections(
+    State(_state): State<Arc<AppState>>,
+    Path(_user_id): Path<String>,
+) -> Response {
+    // Return a standard home screen layout
+    let sections = json!([
+        { "Name": "Continue Watching", "SectionType": "Resume", "Id": "resume", "ViewType": "Resume" },
+        { "Name": "Next Up", "SectionType": "NextUp", "Id": "nextup", "ViewType": "NextUp" },
+        { "Name": "Latest Movies", "SectionType": "Latest", "Id": "latest-movies", "ViewType": "Latest" },
+        { "Name": "Latest TV Shows", "SectionType": "Latest", "Id": "latest-tvshows", "ViewType": "Latest" },
+        { "Name": "Suggestions", "SectionType": "Suggestions", "Id": "suggestions", "ViewType": "Suggestions" },
+    ]);
+    Json(sections).into_response()
+}
+
+/// GET /Users/{user_id}/Sections/{section_id}/Items — items for a home section
+pub async fn home_section_items(
+    State(state): State<Arc<AppState>>,
+    Path((user_id, section_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let limit = query
+        .get("Limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16);
+
+    match section_id.as_str() {
+        "resume" => {
+            match resume_media_items(&state.db, &user_id).await {
+                Ok(items) => {
+                    let total = items.len();
+                    let enriched = enrich_resume_items(&state.db, items).await;
+                    Json(json!({ "Items": enriched, "TotalRecordCount": total })).into_response()
+                }
+        Err(error) => internal_error(error.into()),
+            }
+        }
+        "nextup" => {
+            let user_id_ref = query
+                .get("UserId")
+                .cloned()
+                .unwrap_or_else(|| user_id.clone());
+            match super::items::discovery::shows_next_up(State(state), Query(query)).await {
+                resp => resp,
+            }
+        }
+        "latest-movies" | "latest-tvshows" => {
+            let collection_type = if section_id == "latest-movies" { "movies" } else { "tvshows" };
+            let backend = state.db.get_database_backend();
+            // Find libraries matching the collection type
+            let lib_rows = state.db
+                .query_all(crate::db::helpers::portable_statement(
+                    backend,
+                    "SELECT id FROM libraries WHERE collection_type = ?",
+                    vec![collection_type.into()],
+                ))
+                .await
+                .unwrap_or_default();
+
+            let mut all_items = Vec::new();
+            for row in &lib_rows {
+                if let Ok(lib_id) = row.get_str("id") {
+                    if let Ok(items) = super::item_queries::latest_media_items(&state.db, &user_id, Some(&lib_id)).await {
+                        all_items.extend(items);
+                    }
+                }
+            }
+            all_items.sort_by_key(|i| std::cmp::Reverse(i.modified_at));
+            all_items.truncate(limit);
+
+            if !all_items.is_empty() {
+                let ids: Vec<String> = all_items.iter().map(|i| i.id.clone()).collect();
+                if let Ok(tags_map) = super::item_queries::batch_item_image_tags(&state.db, &ids).await {
+                    for item in &mut all_items {
+                        if let Some(tags) = tags_map.get(&item.id) {
+                            item.image_tags = Some(tags.clone());
+                        }
+                    }
+                }
+            }
+
+            Json(json!(all_items.into_iter().map(|i| strip_nulls(i.to_jellyfin_json())).collect::<Vec<_>>())).into_response()
+        }
+        "suggestions" => {
+            user_suggestions(State(state), Path(user_id), Query(query)).await
+        }
+        _ => Json(json!([])).into_response(),
+    }
+}

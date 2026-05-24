@@ -630,7 +630,56 @@ async fn item_json_with_provider_ids(
         }
     }
 
+    // Enrich Episode items with series/season info
+    if item.item_type == "Episode" {
+        if let Some((series_name, series_id, season_name, season_id)) =
+            get_episode_parent_info(db, &item.parent_id).await
+        {
+            value["SeriesName"] = json!(series_name);
+            value["SeriesId"] = json!(series_id);
+            value["SeasonName"] = json!(season_name);
+            value["SeasonId"] = json!(season_id);
+        }
+    }
+
+    // Enrich Season items with series info
+    if item.item_type == "Season" {
+        if let Ok(Some(row)) = db
+            .query_one(crate::db::helpers::portable_statement(
+                db.get_database_backend(),
+                "SELECT id, title FROM media_items WHERE id = ?",
+                vec![item.parent_id.clone().into()],
+            ))
+            .await
+        {
+            if let (Ok(id), Ok(title)) = (row.get_str("id"), row.get_str("title")) {
+                value["SeriesName"] = json!(title);
+                value["SeriesId"] = json!(id);
+            }
+        }
+    }
+
     Ok(value)
+}
+
+/// Get series name, series ID, season name, season ID for an episode's parent
+async fn get_episode_parent_info(
+    db: &DatabaseConnection,
+    season_id: &str,
+) -> Option<(String, String, String, String)> {
+    let backend = db.get_database_backend();
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT s.title AS season_title, s.parent_id AS series_id, ser.title AS series_title FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id WHERE s.id = ?",
+            vec![season_id.into()],
+        ))
+        .await
+        .ok()??;
+    let season_title = row.get_str("season_title").ok()?;
+    let series_id = row.get_str("series_id").ok()?;
+    let series_title = row.get_str("series_title").ok()?;
+    Some((series_title, series_id, season_title, season_id.to_string()))
 }
 
 async fn relation_values(

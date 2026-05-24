@@ -184,6 +184,19 @@ async fn scan_root(
         }
         upsert_sidecar_subtitles(&db, path, &item.id).await?;
         scanned += 1;
+
+        // Fetch episode TMDb metadata (name, overview, still image)
+        if item.item_type == "Episode" {
+            if let (Some(snum), Some(enum_)) = (item.season_number, item.episode_number) {
+                if let Some(api_key) = std::env::var("JELLYFIN_RS_TMDB_API_KEY").ok().filter(|k| !k.is_empty()) {
+                    if let Some(series_tmdb_id) = get_series_tmdb_id_for_episode(&db, &item.id).await {
+                        let _ = crate::library::tmdb_metadata::fetch_episode_tmdb_metadata(
+                            &db, &item.id, snum, enum_, &series_tmdb_id, &api_key,
+                        ).await;
+                    }
+                }
+            }
+        }
     }
 
     Ok((scanned, seen_paths))
@@ -195,6 +208,29 @@ async fn try_fetch_tmdb(db: &sea_orm::DatabaseConnection, item: &ScannedMediaIte
         .filter(|k| !k.is_empty()) else { return };
     let check_path = if item.is_folder { path.to_path_buf() } else { path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.to_path_buf()) };
     let _ = crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(db, &item.id, &item.item_type, &check_path, &api_key).await;
+}
+
+async fn get_series_tmdb_id_for_episode(db: &sea_orm::DatabaseConnection, episode_id: &str) -> Option<String> {
+    let backend = db.get_database_backend();
+    // Episode -> parent Season -> parent Series -> TMDb ID
+    let row = db.query_one(crate::db::helpers::portable_statement(
+        backend,
+        "SELECT parent_id FROM media_items WHERE id = ?",
+        vec![episode_id.into()],
+    )).await.ok()??;
+    let season_id: String = row.get_str("parent_id").ok()?;
+    let row = db.query_one(crate::db::helpers::portable_statement(
+        backend,
+        "SELECT parent_id FROM media_items WHERE id = ?",
+        vec![season_id.into()],
+    )).await.ok()??;
+    let series_id: String = row.get_str("parent_id").ok()?;
+    let row = db.query_one(crate::db::helpers::portable_statement(
+        backend,
+        "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
+        vec![series_id.into()],
+    )).await.ok()??;
+    row.get_str("provider_item_id").ok()
 }
 
 fn has_sidecar_nfo(path: &std::path::Path) -> bool {

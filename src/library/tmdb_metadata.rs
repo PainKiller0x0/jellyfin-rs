@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use sea_orm::{ConnectionTrait, Value};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Value};
 
 use crate::{db::row_ext::QueryResultExt, jellyfin::providers};
 
@@ -727,6 +727,36 @@ pub async fn fetch_and_apply_tmdb_metadata(
         let _ = download_and_save_tmdb_image(db, &client, item_id, backdrop, "Backdrop").await;
     }
 
+    // For Season items, fetch season-specific poster from TMDb
+    if item_type == "Season" {
+        if let Some(season_number) = extract_season_number(path) {
+            // Get the parent series TMDb ID
+            if let Some(series_tmdb_id) = get_parent_series_tmdb_id(db, item_id).await {
+                let season_url = format!(
+                    "https://api.themoviedb.org/3/tv/{}/season/{}",
+                    series_tmdb_id, season_number
+                );
+                #[derive(serde::Deserialize)]
+                struct TmdbSeason {
+                    poster_path: Option<String>,
+                }
+                if let Ok(resp) = client
+                    .get(&season_url)
+                    .query(&[("api_key", api_key)])
+                    .send()
+                    .await
+                {
+                    if let Ok(season) = resp.json::<TmdbSeason>().await {
+                        if let Some(poster) = season.poster_path {
+                            let img_url = format!("https://image.tmdb.org/t/p/w500{}", poster);
+                            let _ = download_and_save_tmdb_image(db, &client, item_id, &img_url, "Primary").await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -767,6 +797,48 @@ async fn download_and_save_tmdb_image(
         ))
         .await;
     Ok(())
+}
+
+fn extract_season_number(path: &Path) -> Option<i64> {
+    let name = path.file_name()?.to_str()?;
+    // Look for "Season X" or "Season X" pattern
+    let lower = name.to_ascii_lowercase();
+    if let Some(pos) = lower.find("season ") {
+        let rest = &name[pos + 7..];
+        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        return num_str.parse().ok();
+    }
+    // Look for "S01" pattern
+    if let Some(pos) = lower.find('s') {
+        let rest = &name[pos + 1..];
+        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        return num_str.parse().ok();
+    }
+    None
+}
+
+async fn get_parent_series_tmdb_id(db: &DatabaseConnection, season_item_id: &str) -> Option<String> {
+    let backend = db.get_database_backend();
+    // Get the parent_id of the season, then get its TMDb ID
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT parent_id FROM media_items WHERE id = ?",
+            vec![season_item_id.into()],
+        ))
+        .await
+        .ok()??;
+    let parent_id: String = row.get_str("parent_id").ok()?;
+    // Get the TMDb ID from provider_ids
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
+            vec![parent_id.into()],
+        ))
+        .await
+        .ok()??;
+    row.get_str("provider_item_id").ok()
 }
 
 /// Search TMDb for a person by name and return the first match's TMDb ID

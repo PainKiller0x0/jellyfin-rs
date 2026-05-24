@@ -746,6 +746,28 @@ pub async fn fetch_and_apply_tmdb_metadata(
         let _ = download_and_save_tmdb_image(db, &client, item_id, backdrop, "Backdrop").await;
     }
 
+    // Fetch additional images (logo, banner, art) from TMDb /images endpoint
+    let images_url = if is_tv {
+        format!("https://api.themoviedb.org/3/tv/{}/images?api_key={}", tmdb_id, api_key)
+    } else {
+        format!("https://api.themoviedb.org/3/movie/{}/images?api_key={}", tmdb_id, api_key)
+    };
+    if let Ok(resp) = client.get(&images_url).send().await {
+        if let Ok(images) = resp.json::<TmdbImagesResponse>().await {
+            // Download logo (clearlogo)
+            if let Some(logo) = images.logos.first() {
+                let url = format!("https://image.tmdb.org/t/p/w500{}", logo.file_path);
+                let _ = download_and_save_tmdb_image(db, &client, item_id, &url, "Logo").await;
+            }
+            // Download banner
+            if let Some(banner) = images.backdrops.first() {
+                // Use first backdrop as banner fallback
+                let url = format!("https://image.tmdb.org/t/p/w1280{}", banner.file_path);
+                let _ = download_and_save_tmdb_image(db, &client, item_id, &url, "Banner").await;
+            }
+        }
+    }
+
     // For Season items, fetch season-specific poster from TMDb
     if item_type == "Season" {
         if let Some(season_number) = extract_season_number(path) {
@@ -834,6 +856,21 @@ fn extract_season_number(path: &Path) -> Option<i64> {
         return num_str.parse().ok();
     }
     None
+}
+
+#[derive(serde::Deserialize)]
+struct TmdbImagesResponse {
+    #[serde(default)]
+    logos: Vec<TmdbImageEntry>,
+    #[serde(default)]
+    backdrops: Vec<TmdbImageEntry>,
+    #[serde(default)]
+    posters: Vec<TmdbImageEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct TmdbImageEntry {
+    file_path: String,
 }
 
 async fn get_parent_series_tmdb_id(db: &DatabaseConnection, season_item_id: &str) -> Option<String> {

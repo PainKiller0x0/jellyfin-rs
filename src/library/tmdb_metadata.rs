@@ -175,17 +175,36 @@ async fn download_season_images(db: &sea_orm::DatabaseConnection, api_key: &str)
                 let resp = client.get(&url).send().await.ok()?;
                 let resp = resp.error_for_status().ok()?;
                 #[derive(serde::Deserialize)]
-                struct SeasonResp { poster_path: Option<String> }
+                struct SeasonResp { poster_path: Option<String>, name: Option<String>, overview: Option<String> }
                 let season: SeasonResp = resp.json().await.ok()?;
-                season.poster_path.map(|p| (season_id, p))
+                Some((season_id, season.poster_path, season.name, season.overview))
             }
         }).collect();
 
         let results = futures_util::future::join_all(futures).await;
-        for (season_id, poster_path) in results.into_iter().flatten() {
-            let img_url = format!("https://image.tmdb.org/t/p/w500{poster_path}");
-            if download_and_save_tmdb_image(db, &client, &season_id, &img_url, "Primary").await.is_ok() {
-                downloaded += 1;
+        for (season_id, poster_path, name, overview) in results.into_iter().flatten() {
+            // Update season name from TMDb
+            if let Some(ref n) = name.as_ref().filter(|s| !s.is_empty()) {
+                let _ = db.execute(crate::db::helpers::portable_statement(
+                    backend,
+                    "UPDATE media_items SET title = ? WHERE id = ?",
+                    vec![n.as_str().into(), season_id.as_str().into()],
+                )).await;
+            }
+            // Update season overview from TMDb
+            if let Some(ref o) = overview.as_ref().filter(|s| !s.is_empty()) {
+                let _ = db.execute(crate::db::helpers::portable_statement(
+                    backend,
+                    "UPDATE media_items SET overview = ? WHERE id = ?",
+                    vec![o.as_str().into(), season_id.as_str().into()],
+                )).await;
+            }
+            // Download season poster
+            if let Some(poster_path) = poster_path {
+                let img_url = format!("https://image.tmdb.org/t/p/w500{}", poster_path);
+                if download_and_save_tmdb_image(db, &client, &season_id, &img_url, "Primary").await.is_ok() {
+                    downloaded += 1;
+                }
             }
         }
     }

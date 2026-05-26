@@ -1291,7 +1291,15 @@ pub async fn movie_recommendations(
         .cloned()
         .unwrap_or_else(|| state.user_id.to_string());
     let parent_id = query.get("ParentId").map(String::as_str);
-    match movie_recommendations_inner(&state.db, &user_id, parent_id).await {
+    let category_limit = query
+        .get("CategoryLimit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(5);
+    let item_limit = query
+        .get("ItemLimit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8);
+    match movie_recommendations_inner(&state.db, &user_id, parent_id, category_limit, item_limit).await {
         Ok(categories) => Json(categories).into_response(),
         Err(error) => internal_error(error),
     }
@@ -1301,9 +1309,10 @@ async fn movie_recommendations_inner(
     db: &DatabaseConnection,
     user_id: &str,
     parent_id: Option<&str>,
+    category_limit: usize,
+    item_limit: usize,
 ) -> anyhow::Result<Vec<Value>> {
     let backend = db.get_database_backend();
-    let item_limit = 8;
     let mut category_counter: i64 = 1;
 
     // Get recently played Movie folders (is_folder=1, item_type='Movie')
@@ -1325,11 +1334,56 @@ async fn movie_recommendations_inner(
         .context("failed to get recent movies")?;
 
     let recent_movies = crate::jellyfin::item_queries::decode_media_items(&recent_movies)?;
-    if recent_movies.is_empty() {
-        return Ok(Vec::new());
-    }
 
     let mut categories = Vec::new();
+
+    // Fallback: when no playback history, return top-rated and recently added
+    if recent_movies.is_empty() {
+        // Category: Top rated movies
+        let top_rated_sql = format!(
+            "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' AND media_items.community_rating IS NOT NULL {} ORDER BY media_items.community_rating DESC LIMIT ?",
+            crate::jellyfin::item_queries::media_item_select_sql(""),
+            parent_id.map(|_| "AND media_items.library_id = ?").unwrap_or(""),
+        );
+        let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
+        if let Some(pid) = parent_id { vals.push(pid.into()); }
+        vals.push((item_limit as i64).into());
+        if let Ok(rows) = db.query_all(crate::db::helpers::portable_statement(backend, &top_rated_sql, vals)).await {
+            let items = crate::jellyfin::item_queries::decode_media_items(&rows)?;
+            if !items.is_empty() {
+                categories.push(json!({
+                    "Items": items.into_iter().map(|i| i.to_jellyfin_json()).collect::<Vec<_>>(),
+                    "RecommendationType": "SimilarToRecentlyPlayed",
+                    "BaselineItemName": "Top Rated",
+                    "CategoryId": category_counter,
+                }));
+                category_counter += 1;
+            }
+        }
+        if categories.len() >= category_limit { return Ok(categories); }
+
+        // Category: Recently added movies
+        let recent_sql = format!(
+            "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' {} ORDER BY media_items.created_at DESC LIMIT ?",
+            crate::jellyfin::item_queries::media_item_select_sql(""),
+            parent_id.map(|_| "AND media_items.library_id = ?").unwrap_or(""),
+        );
+        let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
+        if let Some(pid) = parent_id { vals.push(pid.into()); }
+        vals.push((item_limit as i64).into());
+        if let Ok(rows) = db.query_all(crate::db::helpers::portable_statement(backend, &recent_sql, vals)).await {
+            let items = crate::jellyfin::item_queries::decode_media_items(&rows)?;
+            if !items.is_empty() {
+                categories.push(json!({
+                    "Items": items.into_iter().map(|i| i.to_jellyfin_json()).collect::<Vec<_>>(),
+                    "RecommendationType": "HasActorFromRecentlyPlayed",
+                    "BaselineItemName": "Recently Added",
+                    "CategoryId": category_counter,
+                }));
+            }
+        }
+        return Ok(categories);
+    }
 
     // Category 1: Similar by genre to recently played
     let mut similar_items = Vec::new();
@@ -1374,6 +1428,7 @@ async fn movie_recommendations_inner(
             category_counter += 1;
         }
     }
+    if categories.len() >= category_limit { return Ok(categories); }
 
     // Category 2: Movies with same actors
     let mut actor_items = Vec::new();
@@ -1458,7 +1513,26 @@ pub async fn user_suggestions(
         Ok(rows) => {
             let items = super::item_queries::decode_media_items(&rows).unwrap_or_default();
             let total = items.len();
-            Json(json!({ "Items": items.into_iter().map(|i| strip_nulls(i.to_jellyfin_json())).collect::<Vec<_>>(), "TotalRecordCount": total })).into_response()
+
+            // Batch load image tags
+            let image_tags_map = if !items.is_empty() {
+                let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+                super::item_queries::batch_item_image_tags(&state.db, &ids).await.unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
+
+            let json_items: Vec<Value> = items.into_iter().map(|i| {
+                let mut json = strip_nulls(i.to_jellyfin_json());
+                if let Some(tags) = image_tags_map.get(&i.id) {
+                    if let Some(primary) = tags.get("Primary") {
+                        json["PrimaryImageTag"] = primary.clone();
+                    }
+                }
+                json
+            }).collect();
+
+            Json(json!({ "Items": json_items, "TotalRecordCount": total })).into_response()
         }
         Err(error) => internal_error(error.into()),
     }

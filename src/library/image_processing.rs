@@ -129,7 +129,19 @@ pub fn create_placeholder(
 
 fn resize_to_options(image: DynamicImage, options: &ImageRequestOptions) -> DynamicImage {
     match (options.width, options.height) {
-        (Some(width), Some(height)) => crop_resize(&image, width.max(1), height.max(1)),
+        (Some(width), Some(height)) => {
+            // Fit within the bounding box while preserving aspect ratio
+            let (src_w, src_h) = image.dimensions();
+            if src_w == 0 || src_h == 0 {
+                return image;
+            }
+            let scale_w = width as f64 / src_w as f64;
+            let scale_h = height as f64 / src_h as f64;
+            let scale = scale_w.min(scale_h);
+            let new_w = ((src_w as f64 * scale) as u32).max(1);
+            let new_h = ((src_h as f64 * scale) as u32).max(1);
+            image.resize(new_w, new_h, FilterType::Lanczos3)
+        }
         (Some(width), None) => image.resize(width.max(1), u32::MAX, FilterType::Lanczos3),
         (None, Some(height)) => image.resize(u32::MAX, height.max(1), FilterType::Lanczos3),
         (None, None) => image,

@@ -243,7 +243,10 @@ pub async fn shows_next_up(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(25);
     match next_up_inner(&state.db, &user_id, series_id.as_deref(), limit).await {
-        Ok(items) => media_list_response(items),
+        Ok(items) => {
+            let json_items = crate::jellyfin::items::enrich_episode_list(&state.db, items).await;
+            Json(json!({ "Items": json_items, "TotalRecordCount": json_items.len() })).into_response()
+        }
         Err(error) => internal_error(error),
     }
 }
@@ -256,9 +259,15 @@ async fn next_up_inner(
 ) -> anyhow::Result<Vec<MediaItem>> {
     let backend = db.get_database_backend();
     let (sql, values) = if let Some(series_id) = series_id {
+        // For a specific series: return all unwatched episodes, sorted by season and episode number
         (
             format!(
-                r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND (COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) = 0) AND media_items.parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season') ORDER BY media_items.modified_at DESC LIMIT ?"#,
+                r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0
+                    AND media_items.parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season')
+                    AND COALESCE(user_data.played, 0) = 0
+                    AND COALESCE(user_data.playback_position_ticks, 0) = 0
+                    ORDER BY media_items.parent_id ASC, media_items.episode_number ASC
+                    LIMIT ?"#,
                 item_queries::media_item_select_sql("")
             ),
             vec![
@@ -268,12 +277,26 @@ async fn next_up_inner(
             ],
         )
     } else {
+        // Global next up: for each series, show the next unwatched episode
         (
             format!(
-                r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND (COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) = 0) ORDER BY media_items.modified_at DESC LIMIT ?"#,
+                r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0
+                    AND COALESCE(user_data.played, 0) = 0
+                    AND COALESCE(user_data.playback_position_ticks, 0) = 0
+                    AND media_items.episode_number = (
+                        SELECT MIN(mi3.episode_number) FROM media_items mi3
+                        LEFT JOIN user_data ud3 ON ud3.item_id = mi3.id AND ud3.user_id = ?
+                        WHERE mi3.parent_id = media_items.parent_id
+                            AND mi3.item_type = 'Episode' AND mi3.is_folder = 0
+                            AND COALESCE(ud3.played, 0) = 0
+                            AND COALESCE(ud3.playback_position_ticks, 0) = 0
+                    )
+                    ORDER BY media_items.modified_at DESC
+                    LIMIT ?"#,
                 item_queries::media_item_select_sql("")
             ),
             vec![
+                user_id.into(),
                 user_id.into(),
                 i64::try_from(limit).unwrap_or(i64::MAX).into(),
             ],

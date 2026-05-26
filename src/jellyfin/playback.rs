@@ -40,7 +40,7 @@ pub async fn playback_info(
             let profile = dlna::request_device_profile(body.as_ref().map(|Json(value)| value));
 
             // For Movie/Episode folders with child Video files (multi-version), return their media sources
-            let media_sources = if (item.item_type == "Movie" || item.item_type == "Episode") && item.is_folder {
+            let media_sources = if item.is_folder && (item.item_type == "Movie" || item.item_type == "Episode") {
                 match child_video_sources(&state.db, &item.id).await {
                     Ok(sources) if !sources.is_empty() => sources,
                     Ok(_) => {
@@ -56,6 +56,9 @@ pub async fn playback_info(
                     }
                     Err(e) => return internal_error(e),
                 }
+            } else if item.is_folder {
+                // Season/Series/other folders: return empty sources, client should pick a specific item
+                vec![]
             } else {
                 match media_streams_for_item(&state.db, &item.id).await {
                     Ok(streams) => {

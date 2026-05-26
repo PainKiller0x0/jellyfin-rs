@@ -1,4 +1,4 @@
-use std::{path::Path, process::Command};
+use std::{path::Path, process::Command, time::Duration};
 
 use serde::Deserialize;
 
@@ -31,14 +31,43 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
         .arg("json")
         .arg("-show_format")
         .arg("-show_streams")
+        .arg("-analyzeduration")
+        .arg("5000000")  // 5 seconds max analysis
+        .arg("-probesize")
+        .arg("5000000")  // 5MB max probe size
         .arg(path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()
+        .and_then(|mut child| {
+            // Wait with timeout (30 seconds)
+            let timeout = Duration::from_secs(30);
+            let start = std::time::Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let stdout = child.wait_with_output().ok()?.stdout;
+                        if !status.success() {
+                            return None;
+                        }
+                        return Some(stdout);
+                    }
+                    Ok(None) => {
+                        if start.elapsed() > timeout {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            tracing::warn!("ffprobe timed out for: {}", path.display());
+                            return None;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(_) => return None,
+                }
+            }
+        })?;
 
-    let response = serde_json::from_slice::<FfprobeResponse>(&output.stdout).ok()?;
+    let response = serde_json::from_slice::<FfprobeResponse>(&output).ok()?;
     Some(MediaProbe {
         runtime_ticks: response
             .format

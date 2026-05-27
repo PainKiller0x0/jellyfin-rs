@@ -780,6 +780,21 @@ pub async fn users_query(
     }
 }
 
+/// GET /Users/{id}/Authenticate — legacy auth endpoint (stub)
+pub async fn user_authenticate_legacy() -> Response {
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// POST /Users/{id}/Connect/Link — link user to Emby Connect (stub)
+pub async fn user_connect_link() -> Response {
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// DELETE /Users/{id}/Connect/Link — unlink from Emby Connect (stub)
+pub async fn user_connect_link_delete() -> Response {
+    StatusCode::NO_CONTENT.into_response()
+}
+
 enum AuthError {
     Unauthorized(String),
     Internal(anyhow::Error),

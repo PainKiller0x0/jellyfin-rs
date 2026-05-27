@@ -280,3 +280,38 @@ pub async fn merge_versions(
 
     StatusCode::NO_CONTENT.into_response()
 }
+
+/// GET /Videos/ActiveEncodings — list active transcodings (stub)
+pub async fn active_encodings() -> Response {
+    Json(json!([])).into_response()
+}
+
+/// DELETE /Videos/ActiveEncodings — stop all encodings (stub)
+pub async fn stop_encodings() -> Response {
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// GET /Videos/{id}/AlternateSources — alternate video sources (stub)
+pub async fn alternate_sources() -> Response {
+    Json(json!([])).into_response()
+}
+
+/// DELETE /Videos/{id}/AlternateSources — delete alternate source (stub)
+pub async fn delete_alternate_source() -> Response {
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// GET /AudioBooks/NextUp — audiobooks next up (stub)
+pub async fn audiobooks_next_up() -> Response {
+    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+}
+
+/// GET /LiveTv/AvailableRecordingOptions — recording options (stub)
+pub async fn available_recording_options() -> Response {
+    Json(json!({})).into_response()
+}
+
+/// GET /Providers/Subtitles/Subtitles/{id} — subtitle provider (stub)
+pub async fn subtitle_provider_info() -> Response {
+    Json(json!({})).into_response()
+}

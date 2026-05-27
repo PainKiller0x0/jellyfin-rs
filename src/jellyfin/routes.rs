@@ -16,6 +16,7 @@ use crate::{
         stream_audio_simple, stream_audio_simple_head,
         stream_subtitle, stream_subtitle_head,
         stream_subtitle_with_source, stream_subtitle_with_source_head,
+        stream_subtitle_with_ticks, stream_subtitle_with_ticks_head,
         stream_video, stream_video_head,
     },
     ws,
@@ -83,7 +84,9 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/System/ReleaseNotes/Versions", get(system::system_release_notes_versions))
         .route("/System/Logs/Query", get(system::system_logs_query))
         .route("/System/WakeOnLanInfo", get(system::system_wake_on_lan_info))
+        .route("/System/Logs/{name}", get(system::system_log_download))
         .route("/System/Logs/{name}/Lines", get(system::system_log_lines))
+        .route("/System/Configuration/Partial", post(system::update_server_configuration_partial))
         .route("/QuickConnect/Enabled", get(system::quick_connect_enabled))
         .route(
             "/QuickConnect/Authorize",
@@ -192,6 +195,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/LiveTv/Programs/Recommended", get(common::empty_list))
         .route("/LiveTv/Programs/{program_id}", get(common::empty_object))
         .route("/LiveTv/Recordings", get(common::empty_list))
+        .route("/LiveTv/AvailableRecordingOptions", get(items::available_recording_options))
         .route("/LiveTv/Recordings/Series", get(common::empty_list))
         .route("/LiveTv/Recordings/Folders", get(common::empty_array))
         .route("/LiveTv/Recordings/Groups", get(common::empty_list))
@@ -365,6 +369,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(auth::update_user_configuration),
         )
         .route("/Users/{user_id}/Policy", post(auth::update_user_policy))
+        .route("/Users/{user_id}/Authenticate", get(auth::user_authenticate_legacy))
+        .route("/Users/{user_id}/Connect/Link", post(auth::user_connect_link).delete(auth::user_connect_link_delete))
         .route("/Items", get(items::items_root))
         .route("/Items/Filters", get(super::user_extras::items_filters))
         .route("/Items/Filters2", get(super::user_extras::filters2))
@@ -468,6 +474,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Shows/NextUp", get(items::shows_next_up))
         .route("/Shows/Missing", get(items::shows_missing))
         .route("/Shows/Upcoming", get(super::user_extras::shows_upcoming))
+        .route("/AudioBooks/NextUp", get(items::audiobooks_next_up))
         .route("/Search/Hints", get(items::search_hints))
         .route("/Genres", get(filters::genres))
         .route("/Genres/{name}", get(super::user_extras::genre_by_name))
@@ -503,6 +510,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/ItemTypes", get(super::user_extras::item_types))
         .route("/Videos/{item_id}/AdditionalParts", get(super::user_extras::video_additional_parts))
         .route("/Videos/MergeVersions", post(items::merge_versions))
+        .route("/Videos/ActiveEncodings", get(items::active_encodings).delete(items::stop_encodings))
+        .route("/Videos/{item_id}/AlternateSources", get(items::alternate_sources).delete(items::delete_alternate_source))
         .route(
             "/Videos/{item_id}/Trickplay/{width}/tiles.m3u8",
             get(common::empty_object),
@@ -526,6 +535,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route(
             "/Videos/{item_id}/{media_source_id}/Subtitles/{index}/Stream.{format}",
             get(stream_subtitle_with_source).head(stream_subtitle_with_source_head),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/Subtitles/{index}/{start_ticks}/Stream.{format}",
+            get(stream_subtitle_with_ticks).head(stream_subtitle_with_ticks_head),
         )
         .route(
             "/Videos/{item_id}/{media_source_id}/Attachments/{index}/Stream",
@@ -558,6 +571,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(common::no_content),
         )
         .route("/Providers/Lyrics/{lyric_id}", get(common::empty_object))
+        .route("/Providers/Subtitles/Subtitles/{param}", get(items::subtitle_provider_info))
         .route("/MediaSegments/{item_id}", get(super::user_extras::media_segments))
         .route("/Albums/{item_id}/InstantMix", get(common::empty_list))
         .route("/Playlists/{item_id}/InstantMix", get(common::empty_list))
@@ -598,7 +612,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/Sessions/{session_id}/User/{user_id}",
-            post(common::no_content).delete(common::no_content),
+            post(sessions::session_add_user).delete(sessions::session_remove_user),
         )
         .route("/ScheduledTasks", get(system::scheduled_tasks))
         .route("/ScheduledTasks/{task_id}", get(common::empty_object))

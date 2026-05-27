@@ -8,8 +8,8 @@ use axum::{
     response::IntoResponse,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set,
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -21,6 +21,7 @@ use crate::{
         app_settings::Entity as AppSettings, task_results, task_results::Entity as TaskResults,
         users, users::Entity as Users,
     },
+    db::row_ext::QueryResultExt,
     jellyfin::common::internal_error,
     library::path_utils,
     util::now_unix,
@@ -564,4 +565,59 @@ pub async fn system_log_lines(
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// GET /System/Logs/{name} — download a log file
+pub async fn system_log_download(
+    Path(name): Path<String>,
+) -> Response {
+    let paths = [format!("logs/{}", name), name.clone()];
+    for path in &paths {
+        if let Ok(data) = std::fs::read(path) {
+            return (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                data,
+            ).into_response();
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+/// POST /System/Configuration/Partial — partial configuration update
+pub async fn update_server_configuration_partial(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<JsonValue>,
+) -> Response {
+    // Merge with existing config
+    let backend = state.db.get_database_backend();
+    let row = state.db.query_one(crate::db::helpers::portable_statement(
+        backend,
+        "SELECT value FROM app_settings WHERE key = 'server_config'",
+        vec![],
+    )).await;
+
+    let mut config: JsonValue = match row {
+        Ok(Some(r)) => {
+            let v: String = r.get_str("value").unwrap_or_else(|_| "{}".to_string());
+            serde_json::from_str(&v).unwrap_or(json!({}))
+        }
+        _ => json!({}),
+    };
+
+    // Merge body into config
+    if let (Some(obj), Some(patch)) = (config.as_object_mut(), body.as_object()) {
+        for (k, v) in patch {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+
+    let now = crate::util::now_unix();
+    let _ = state.db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "INSERT INTO app_settings (key, value, updated_at) VALUES ('server_config', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        vec![config.to_string().into(), now.into()],
+    )).await;
+
+    StatusCode::NO_CONTENT.into_response()
 }

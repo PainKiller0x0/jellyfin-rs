@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -190,5 +190,31 @@ impl Default for CapabilitiesRequest {
             supports_media_control: true,
             supports_persistent_identifier: true,
         }
+    }
+}
+
+/// POST /Sessions/{session_id}/Users/{user_id} — add user to session (stub)
+pub async fn session_add_user(
+    State(state): State<Arc<AppState>>,
+    Path((session_id, user_id)): Path<(String, String)>,
+) -> Response {
+    let sessions = state.playback_sessions.read().await;
+    if sessions.contains_key(&session_id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+/// DELETE /Sessions/{session_id}/Users/{user_id} — remove user from session (stub)
+pub async fn session_remove_user(
+    State(state): State<Arc<AppState>>,
+    Path((session_id, user_id)): Path<(String, String)>,
+) -> Response {
+    let sessions = state.playback_sessions.read().await;
+    if sessions.contains_key(&session_id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
     }
 }

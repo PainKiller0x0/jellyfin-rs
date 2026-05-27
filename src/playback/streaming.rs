@@ -89,6 +89,21 @@ pub async fn stream_subtitle_with_source_head(
     stream_subtitle_item(state, item_id, index, Method::HEAD).await
 }
 
+/// Subtitle streaming with mediaSourceId and start position ticks (Emby compatibility).
+pub async fn stream_subtitle_with_ticks(
+    State(state): State<Arc<AppState>>,
+    Path((item_id, _media_source_id, index, _start_ticks, _format)): Path<(String, String, i64, i64, String)>,
+) -> Response {
+    stream_subtitle_item(state, item_id, index, Method::GET).await
+}
+
+pub async fn stream_subtitle_with_ticks_head(
+    State(state): State<Arc<AppState>>,
+    Path((item_id, _media_source_id, index, _start_ticks, _format)): Path<(String, String, i64, i64, String)>,
+) -> Response {
+    stream_subtitle_item(state, item_id, index, Method::HEAD).await
+}
+
 async fn stream_subtitle_item(
     state: Arc<AppState>,
     item_id: String,

@@ -10,11 +10,23 @@ use tracing::info;
 use uuid::Uuid;
 
 mod app;
+mod chapters;
+mod chinese;
+mod config;
 mod db;
 mod entities;
+mod fingerprint;
+mod intro_skip;
 mod jellyfin;
 mod library;
+mod mediainfo;
+mod merge;
 mod playback;
+mod queue;
+mod scheduler;
+mod strm;
+mod thumbnails;
+mod tmdb_ext;
 mod util;
 mod ws;
 
@@ -62,16 +74,32 @@ async fn main() -> anyhow::Result<()> {
         }
         builder.build().context("failed to build HTTP client")?
     };
+    let sa_config = config::StrmAssistantConfig::load(&db).await;
+    let intro_detector = Arc::new(intro_skip::detector::IntroDetector::new(
+        sa_config.max_intro_duration_secs,
+        sa_config.max_credits_duration_secs,
+        sa_config.min_opening_plot_duration_secs,
+    ));
+    let queue_manager = Arc::new(queue::QueueManager::new(
+        sa_config.max_concurrent_count,
+        sa_config.tier2_max_concurrent_count,
+    ));
+
+    let tmdb_api_key = app::state::load_tmdb_api_key(&db).await;
+
     let state = Arc::new(AppState {
         user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, default_username.as_bytes()),
         access_token: Uuid::new_v4().simple().to_string(),
         db,
         media_dirs: app::state::media_dirs_from_env(),
         http_client,
-        tmdb_api_key: std::env::var("JELLYFIN_RS_TMDB_API_KEY").ok(),
+        tmdb_api_key: tmdb_api_key.clone(),
         playback_sessions: RwLock::new(HashMap::new()),
         session_capabilities: RwLock::new(HashMap::new()),
         ws_event_tx,
+        sa_config,
+        intro_detector,
+        queue_manager,
     });
 
     db::seed_default_data(&state).await?;
@@ -84,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     library::watcher::start_watching(state.clone());
 
     // Fetch episode TMDb metadata in background (retries until data is available)
-    if let Some(api_key) = std::env::var("JELLYFIN_RS_TMDB_API_KEY").ok().filter(|k| !k.is_empty()) {
+    if let Some(api_key) = tmdb_api_key.filter(|k| !k.is_empty()) {
         let ep_state = state.clone();
         tokio::spawn(async move {
             // First: fill in missing TMDb IDs for movies/series without tags

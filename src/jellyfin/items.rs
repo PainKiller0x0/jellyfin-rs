@@ -899,6 +899,24 @@ async fn item_json_with_provider_ids(
         }
     }
 
+    // Load chapters (intro/credits markers)
+    if let Ok(chapters) = crate::chapters::get_chapters(db, &item.id).await {
+        if !chapters.is_empty() {
+            let chapter_values: Vec<Value> = chapters
+                .iter()
+                .map(|ch| {
+                    json!({
+                        "StartPositionTicks": ch.start_position_ticks,
+                        "Name": ch.name,
+                        "MarkerType": ch.marker_type,
+                    })
+                })
+                .collect();
+            value["Chapters"] = Value::Array(chapter_values);
+            value["HasSegments"] = json!(true);
+        }
+    }
+
     Ok(value)
 }
 

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use sea_orm::DatabaseConnection;
 use serde::Serialize;
@@ -20,6 +20,10 @@ pub struct AppState {
     pub playback_sessions: RwLock<HashMap<String, PlaybackSession>>,
     pub session_capabilities: RwLock<HashMap<String, SessionCapabilities>>,
     pub ws_event_tx: broadcast::Sender<crate::ws::WsEvent>,
+    // StrmAssistant integration
+    pub sa_config: crate::config::StrmAssistantConfig,
+    pub intro_detector: Arc<crate::intro_skip::detector::IntroDetector>,
+    pub queue_manager: Arc<crate::queue::QueueManager>,
 }
 
 #[derive(Clone, Serialize)]
@@ -118,4 +122,28 @@ pub fn session_timeout_seconds() -> i64 {
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(120)
+}
+
+/// Load TMDB API key from database app_settings, falling back to env var.
+pub async fn load_tmdb_api_key(db: &sea_orm::DatabaseConnection) -> Option<String> {
+    use sea_orm::ConnectionTrait;
+    use crate::db::row_ext::QueryResultExt;
+
+    let backend = db.get_database_backend();
+    if let Ok(Some(row)) = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT value FROM app_settings WHERE key = 'tmdb_api_key'",
+            vec![],
+        ))
+        .await
+    {
+        if let Ok(val) = row.get_str("value") {
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    // Fallback to env var
+    std::env::var("JELLYFIN_RS_TMDB_API_KEY").ok().filter(|k| !k.is_empty())
 }

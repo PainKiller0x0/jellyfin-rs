@@ -298,5 +298,26 @@ pub fn optional_migrations() -> Vec<Migration> {
             "CREATE INDEX IF NOT EXISTS idx_user_data_user_id ON user_data(user_id)",
             "add user_data.user_id index",
         ),
+        // --- StrmAssistant integration tables ---
+        (
+            r#"CREATE TABLE IF NOT EXISTS chapters (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, start_position_ticks BIGINT NOT NULL, name TEXT NOT NULL DEFAULT '', marker_type TEXT, source TEXT NOT NULL DEFAULT 'manual', created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE)"#,
+            "create chapters table",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_chapters_item_id ON chapters(item_id)",
+            "create chapters.item_id index",
+        ),
+        (
+            r#"CREATE TABLE IF NOT EXISTS audio_fingerprints (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, fingerprint BLOB NOT NULL, duration_seconds REAL, created_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, UNIQUE(item_id))"#,
+            "create audio_fingerprints table",
+        ),
+        (
+            r#"CREATE TABLE IF NOT EXISTS trickplay_images (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, width BIGINT NOT NULL, tile_count BIGINT NOT NULL, interval_ticks BIGINT NOT NULL, path TEXT NOT NULL, created_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, UNIQUE(item_id, width))"#,
+            "create trickplay_images table",
+        ),
+        (
+            r#"CREATE TABLE IF NOT EXISTS merge_groups (id TEXT PRIMARY KEY, representative_id TEXT NOT NULL, member_id TEXT NOT NULL, provider TEXT NOT NULL, provider_item_id TEXT NOT NULL, created_at BIGINT NOT NULL, FOREIGN KEY(representative_id) REFERENCES media_items(id) ON DELETE CASCADE, FOREIGN KEY(member_id) REFERENCES media_items(id) ON DELETE CASCADE, UNIQUE(member_id))"#,
+            "create merge_groups table",
+        ),
     ]
 }

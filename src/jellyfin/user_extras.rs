@@ -777,13 +777,50 @@ pub async fn item_theme_media() -> Response {
     Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
 }
 
-/// GET /MediaSegments/{item_id} — chapter markers
+/// GET /MediaSegments/{item_id} — chapter markers (intro/credits segments)
 pub async fn media_segments(
-    State(_state): State<Arc<AppState>>,
-    Path(_item_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
 ) -> Response {
-    // Return empty segments - chapter data not stored
-    Json(json!({ "Segments": [] })).into_response()
+    let mut segments = Vec::new();
+
+    // Get intro markers
+    if let Ok(Some((intro_start, intro_end))) =
+        crate::chapters::get_intro_markers(&state.db, &item_id).await
+    {
+        segments.push(json!({
+            "Type": "Intro",
+            "StartTicks": intro_start,
+            "EndTicks": intro_end
+        }));
+    }
+
+    // Get credits marker
+    if let Ok(Some(credits_start)) =
+        crate::chapters::get_credits_marker(&state.db, &item_id).await
+    {
+        // Get runtime to compute end ticks
+        let runtime = state
+            .db
+            .query_one(crate::db::helpers::portable_statement(
+                state.db.get_database_backend(),
+                "SELECT runtime_ticks FROM media_items WHERE id = ?",
+                vec![item_id.clone().into()],
+            ))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.get_i64("runtime_ticks").ok())
+            .unwrap_or(0);
+
+        segments.push(json!({
+            "Type": "Credits",
+            "StartTicks": credits_start,
+            "EndTicks": runtime
+        }));
+    }
+
+    Json(json!({ "Segments": segments })).into_response()
 }
 
 /// GET /UserItems/Resume — alternative resume path

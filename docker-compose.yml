@@ -21,11 +21,11 @@ services:
       - "8096:8096"
     environment:
       JELLYFIN_RS_DATABASE_URL: postgresql://jellyfin:jellyfin@db/jellyfin
+      JELLYFIN_RS_MEDIA_DIRS: "/media"
       RUST_LOG: info
     volumes:
       - media_data:/data
-      # Mount your media directory like:
-      # - "D:/project/CloudDrive:/media:ro"
+      - "./data/test_media:/media:ro"
     depends_on:
       db:
         condition: service_healthy

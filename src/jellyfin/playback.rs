@@ -461,6 +461,56 @@ async fn playback_progress_inner(
         )).await;
     }
 
+    // Hook intro_skip behavior detection
+    if state.sa_config.intro_skip_enabled {
+        let is_paused = body.get("IsPaused").and_then(JsonValue::as_bool).unwrap_or(false);
+        let default_session_id = format!("{user_id}:{item_id}");
+        let play_session_id = body
+            .get("PlaySessionId")
+            .and_then(JsonValue::as_str)
+            .unwrap_or(&default_session_id);
+        let client = body
+            .get("Client")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("Unknown");
+
+        match event {
+            PlaybackEvent::Progress => {
+                // Get runtime ticks for the session
+                let runtime_ticks = body.get("RunTimeTicks").and_then(JsonValue::as_i64).unwrap_or(0);
+
+                // Check if session exists, if not create it
+                {
+                    let sessions = state.playback_sessions.read().await;
+                    if !sessions.contains_key(play_session_id) {
+                        drop(sessions);
+                        state.intro_detector.on_playback_start(
+                            play_session_id,
+                            item_id,
+                            &user_id,
+                            client,
+                            runtime_ticks,
+                            position_ticks,
+                        );
+                    }
+                }
+
+                state.intro_detector.on_playback_progress(
+                    play_session_id,
+                    position_ticks,
+                    is_paused,
+                );
+            }
+            PlaybackEvent::Stopped => {
+                state.intro_detector.on_playback_stopped(
+                    play_session_id,
+                    position_ticks,
+                );
+            }
+            _ => {}
+        }
+    }
+
     match update_playback_session(
         &state,
         &headers,

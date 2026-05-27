@@ -80,7 +80,7 @@ fn is_subtitle_path(path: &Path) -> bool {
         .map(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "srt" | "ass" | "ssa" | "vtt" | "sub"
+                "srt" | "ass" | "ssa" | "vtt" | "sub" | "smi" | "sami" | "mpl"
             )
         })
         .unwrap_or_default()

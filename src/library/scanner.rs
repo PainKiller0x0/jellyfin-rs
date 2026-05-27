@@ -20,6 +20,7 @@ use crate::{
         },
         subtitles::upsert_sidecar_subtitles,
     },
+    strm,
     util::{infer_library_id_from_path, now_unix},
 };
 
@@ -31,14 +32,16 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
     }
 
     let mut tasks = tokio::task::JoinSet::new();
+    let api_key = state.tmdb_api_key.clone().unwrap_or_default();
     for (root, library_id, collection_type) in roots {
         if !root.exists() {
             tracing::warn!("media directory does not exist: {}", root.display());
             continue;
         }
         let db = state.db.clone();
+        let api_key = api_key.clone();
         tasks.spawn(async move {
-            scan_root(db, root, library_id, collection_type).await
+            scan_root(db, root, library_id, collection_type, &api_key).await
         });
     }
 
@@ -59,8 +62,8 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
     tracing::info!("media scan indexed {total} item(s) across all libraries");
 
     // Post-scan: fetch TMDb episode metadata (series provider_ids are ready now)
-    if let Some(api_key) = std::env::var("JELLYFIN_RS_TMDB_API_KEY").ok().filter(|k| !k.is_empty()) {
-        if let Err(e) = crate::library::tmdb_metadata::batch_fetch_episode_tmdb(&state.db, &api_key).await {
+    if let Some(api_key) = state.tmdb_api_key.as_deref().filter(|k| !k.is_empty()) {
+        if let Err(e) = crate::library::tmdb_metadata::batch_fetch_episode_tmdb(&state.db, api_key).await {
             tracing::warn!("episode TMDb fetch failed: {e:#}");
         }
     }
@@ -73,6 +76,7 @@ async fn scan_root(
     root: PathBuf,
     library_id: String,
     collection_type: String,
+    api_key: &str,
 ) -> anyhow::Result<(usize, Vec<String>)> {
     let mut scanned = 0usize;
     let mut seen_paths = Vec::new();
@@ -121,11 +125,31 @@ async fn scan_root(
                 continue;
             }
             upsert_sidecar_images(&db, path, &item.id).await?;
-            try_fetch_tmdb(&db, &item, path).await;
+            try_fetch_tmdb(&db, &item, path, api_key).await;
             continue;
         }
 
-        let Some(item_type) = classify_media_path(path, &collection_type) else {
+        // Handle STRM files: classify based on the resolved target's extension
+        let (classify_path, probe_path) = if strm::is_strm_path(path) {
+            match strm::resolve_strm_path(path) {
+                Ok(resolved_target) => {
+                    let ext_path = if resolved_target.extension().is_some() {
+                        resolved_target.clone()
+                    } else {
+                        path.to_path_buf()
+                    };
+                    (ext_path, Some(resolved_target))
+                }
+                Err(e) => {
+                    tracing::warn!("failed to resolve STRM {}: {e}", path.display());
+                    continue;
+                }
+            }
+        } else {
+            (path.to_path_buf(), None)
+        };
+
+        let Some(item_type) = classify_media_path(&classify_path, &collection_type) else {
             continue;
         };
 
@@ -142,7 +166,9 @@ async fn scan_root(
         } else {
             parsed_name.title.clone()
         };
-        let probe = probe_media(path);
+        // Probe the resolved media path (for STRM) or the original path
+        let media_path = probe_path.as_deref().unwrap_or(path);
+        let probe = probe_media(media_path);
         let item = ScannedMediaItem {
             id: resolved.id,
             title,
@@ -151,7 +177,7 @@ async fn scan_root(
             parent_id,
             item_type,
             is_folder: false,
-            container: path
+            container: classify_path
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .map(|extension| extension.to_ascii_lowercase()),
@@ -183,17 +209,30 @@ async fn scan_root(
             upsert_default_media_stream(&db, &item).await?;
         }
         upsert_sidecar_subtitles(&db, path, &item.id).await?;
+
+        // Try to restore from mediainfo sidecar if available and streams are empty
+        if !probed && probe.is_none() {
+            if let Ok(restored) = crate::mediainfo::deserialize_mediainfo(
+                &db,
+                &item.id,
+                media_path,
+                None,
+            ).await {
+                if restored {
+                    tracing::debug!("restored mediainfo from sidecar for {}", item.path);
+                }
+            }
+        }
+
         scanned += 1;
 
         // Fetch episode TMDb metadata (name, overview, still image)
-        if item.item_type == "Episode" {
+        if item.item_type == "Episode" && !api_key.is_empty() {
             if let (Some(snum), Some(enum_)) = (item.season_number, item.episode_number) {
-                if let Some(api_key) = std::env::var("JELLYFIN_RS_TMDB_API_KEY").ok().filter(|k| !k.is_empty()) {
-                    if let Some(series_tmdb_id) = get_series_tmdb_id_for_episode(&db, &item.id).await {
-                        let _ = crate::library::tmdb_metadata::fetch_episode_tmdb_metadata(
-                            &db, &item.id, snum, enum_, &series_tmdb_id, &api_key,
-                        ).await;
-                    }
+                if let Some(series_tmdb_id) = get_series_tmdb_id_for_episode(&db, &item.id).await {
+                    let _ = crate::library::tmdb_metadata::fetch_episode_tmdb_metadata(
+                        &db, &item.id, snum, enum_, &series_tmdb_id, api_key,
+                    ).await;
                 }
             }
         }
@@ -202,12 +241,10 @@ async fn scan_root(
     Ok((scanned, seen_paths))
 }
 
-async fn try_fetch_tmdb(db: &sea_orm::DatabaseConnection, item: &ScannedMediaItem, path: &std::path::Path) {
-    let Some(api_key) = std::env::var("JELLYFIN_RS_TMDB_API_KEY")
-        .ok()
-        .filter(|k| !k.is_empty()) else { return };
+async fn try_fetch_tmdb(db: &sea_orm::DatabaseConnection, item: &ScannedMediaItem, path: &std::path::Path, api_key: &str) {
+    if api_key.is_empty() { return; }
     let check_path = if item.is_folder { path.to_path_buf() } else { path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.to_path_buf()) };
-    let _ = crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(db, &item.id, &item.item_type, &check_path, &api_key).await;
+    let _ = crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(db, &item.id, &item.item_type, &check_path, api_key).await;
 }
 
 async fn get_series_tmdb_id_for_episode(db: &sea_orm::DatabaseConnection, episode_id: &str) -> Option<String> {

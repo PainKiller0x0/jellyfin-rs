@@ -4,6 +4,16 @@ use crate::util::stable_item_id;
 
 pub fn classify_media_path(path: &Path, collection_type: &str) -> Option<String> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    // STRM files are classified based on their content (handled in scanner.rs)
+    if extension == "strm" {
+        return Some(match collection_type {
+            "tvshows" | "tv" => "Episode",
+            "music" => "Audio",
+            "movies" => "Video",
+            _ => "Movie",
+        }
+        .to_string());
+    }
     if matches!(
         extension.as_str(),
         "mkv" | "mp4" | "m4v" | "mov" | "avi" | "wmv" | "webm" | "ts" | "m2ts" | "flv"

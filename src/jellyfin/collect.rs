@@ -17,6 +17,21 @@ use crate::{
     util::{now_unix, stable_text_id},
 };
 
+/// Filter IDs to only those that exist in media_items.
+async fn filter_existing_ids(db: &DatabaseConnection, ids: &[String]) -> Vec<String> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let backend = db.get_database_backend();
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT id FROM media_items WHERE id IN ({placeholders})");
+    let vals: Vec<sea_orm::Value> = ids.iter().map(|id| id.as_str().into()).collect();
+    match db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals)).await {
+        Ok(rows) => rows.iter().filter_map(|r| r.get_str("id").ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 pub async fn create_collection(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
@@ -75,8 +90,9 @@ async fn create_collection_inner(
     .await
     .context("failed to create collection")?;
 
-    for (index, item_id) in ids.iter().enumerate() {
-        db.execute(crate::db::helpers::portable_statement(
+    let valid_ids = filter_existing_ids(db, ids).await;
+    for (index, item_id) in valid_ids.iter().enumerate() {
+        let _ = db.execute(crate::db::helpers::portable_statement(
             backend,
             "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?) ON CONFLICT(parent_id, item_id) DO NOTHING",
             vec![
@@ -85,8 +101,7 @@ async fn create_collection_inner(
                 i64::try_from(index).unwrap_or(0).into(),
             ],
         ))
-        .await
-        .context("failed to link item to collection")?;
+        .await;
     }
 
     Ok(id)
@@ -249,8 +264,9 @@ async fn create_playlist_inner(
     .await
     .context("failed to create playlist")?;
 
-    for (index, item_id) in ids.iter().enumerate() {
-        db.execute(crate::db::helpers::portable_statement(
+    let valid_ids = filter_existing_ids(db, ids).await;
+    for (index, item_id) in valid_ids.iter().enumerate() {
+        let _ = db.execute(crate::db::helpers::portable_statement(
             backend,
             "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?) ON CONFLICT(parent_id, item_id) DO NOTHING",
             vec![
@@ -259,8 +275,7 @@ async fn create_playlist_inner(
                 i64::try_from(index).unwrap_or(0).into(),
             ],
         ))
-        .await
-        .context("failed to link item to playlist")?;
+        .await;
     }
 
     Ok(id)

@@ -587,20 +587,20 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/PlayingItems/{item_id}",
-            post(super::user_extras::playing_item_start).delete(super::user_extras::playing_item_stop),
+            post(playback::playing_item_start).delete(playback::playing_item_stop),
         )
-        .route("/PlayingItems/{item_id}/Progress", post(super::user_extras::playing_item_progress))
+        .route("/PlayingItems/{item_id}/Progress", post(playback::playing_item_progress))
         .route(
             "/UserSettings/{user_id}",
             get(super::user_extras::get_user_settings).post(super::user_extras::update_user_settings),
         )
         .route(
             "/Users/{user_id}/PlayingItems/{item_id}",
-            post(super::user_extras::playing_item_start).delete(super::user_extras::playing_item_stop),
+            post(playback::playing_item_start).delete(playback::playing_item_stop),
         )
         .route(
             "/Users/{user_id}/PlayingItems/{item_id}/Progress",
-            post(super::user_extras::playing_item_progress),
+            post(playback::playing_item_progress),
         )
         .route(
             "/Users/{user_id}/TrackSelections/{track_type}",

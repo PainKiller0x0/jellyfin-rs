@@ -87,7 +87,7 @@ pub async fn create_virtual_folder(
     }
 }
 
-/// DELETE /Library/VirtualFolders — delete a virtual folder
+/// DELETE /Library/VirtualFolders — delete a virtual folder and all its media
 pub async fn delete_virtual_folder(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
@@ -104,25 +104,90 @@ pub async fn delete_virtual_folder(
     let library_id = library_id_for_name(name);
     let backend = state.db.get_database_backend();
 
-    // Delete library paths first (foreign key)
-    let _ = state.db
-        .execute(crate::db::helpers::portable_statement(
+    // Get all item IDs belonging to this library
+    let item_rows = match state.db
+        .query_all(crate::db::helpers::portable_statement(
             backend,
-            "DELETE FROM library_paths WHERE library_id = ?",
+            "SELECT id FROM media_items WHERE library_id = ?",
             vec![library_id.clone().into()],
-        ))
-        .await;
-
-    // Delete the library
-    match state.db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
-            "DELETE FROM libraries WHERE id = ?",
-            vec![library_id.into()],
         ))
         .await
     {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(rows) => rows,
+        Err(error) => return internal_error(error.into()),
+    };
+
+    let item_ids: Vec<String> = item_rows
+        .iter()
+        .filter_map(|r| r.get_str("id").ok())
+        .collect();
+
+    if item_ids.is_empty() {
+        // No items, just delete library and paths
+        let _ = state.db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "DELETE FROM library_paths WHERE library_id = ?",
+            vec![library_id.clone().into()],
+        )).await;
+
+        return match state.db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "DELETE FROM libraries WHERE id = ?",
+            vec![library_id.into()],
+        )).await {
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => internal_error(error.into()),
+        };
+    }
+
+    // Build comma-separated list for SQL IN clause
+    let placeholders: Vec<String> = item_ids.iter().map(|_| "?".to_string()).collect();
+    let in_clause = placeholders.join(",");
+    let params: Vec<sea_orm::Value> = item_ids.iter().map(|id| id.as_str().into()).collect();
+
+    // Delete related data in order (junction tables first, then items)
+    let tables = [
+        "media_genres", "media_tags", "media_studios", "media_people",
+        "media_game_genres", "media_streams", "user_data", "image_assets",
+        "provider_ids", "linked_children", "chapters", "trickplay_images",
+    ];
+
+    for table in tables {
+        let sql = format!("DELETE FROM {} WHERE item_id IN ({})", table, in_clause);
+        let _ = state.db.execute(crate::db::helpers::portable_statement(
+            backend, &sql, params.clone(),
+        )).await;
+    }
+
+    // Also delete linked_children where parent_id references items in this library
+    let sql = format!("DELETE FROM linked_children WHERE parent_id IN ({})", in_clause);
+    let _ = state.db.execute(crate::db::helpers::portable_statement(
+        backend, &sql, params.clone(),
+    )).await;
+
+    // Delete the media items
+    let sql = format!("DELETE FROM media_items WHERE id IN ({})", in_clause);
+    let _ = state.db.execute(crate::db::helpers::portable_statement(
+        backend, &sql, params,
+    )).await;
+
+    // Delete library paths
+    let _ = state.db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "DELETE FROM library_paths WHERE library_id = ?",
+        vec![library_id.clone().into()],
+    )).await;
+
+    // Delete the library
+    match state.db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "DELETE FROM libraries WHERE id = ?",
+        vec![library_id.into()],
+    )).await {
+        Ok(_) => {
+            tracing::info!("Deleted library '{}' with {} media items", name, item_ids.len());
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error) => internal_error(error.into()),
     }
 }

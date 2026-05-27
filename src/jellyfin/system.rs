@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use axum::{
     Json,
     body::Body,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
@@ -452,4 +452,83 @@ pub async fn shutdown_handler() -> Response {
 /// Stub for emby_ext_domains plugin — returns null when plugin is not installed.
 pub async fn system_ext_server_domains() -> Response {
     Json(JsonValue::Null).into_response()
+}
+
+/// GET /System/ReleaseNotes — return release notes (stub)
+pub async fn system_release_notes() -> Response {
+    Json(json!({
+        "Version": env!("CARGO_PKG_VERSION"),
+        "ReleaseNotes": "jellyfin-rs media server",
+        "ReleaseDate": "2025-01-01T00:00:00Z"
+    }))
+    .into_response()
+}
+
+/// GET /System/ReleaseNotes/Versions — return version list (stub)
+pub async fn system_release_notes_versions() -> Response {
+    Json(json!([
+        {
+            "Version": env!("CARGO_PKG_VERSION"),
+            "ReleaseNotes": "jellyfin-rs media server",
+            "ReleaseDate": "2025-01-01T00:00:00Z"
+        }
+    ]))
+    .into_response()
+}
+
+/// GET /System/Logs/Query — paginated log query
+pub async fn system_logs_query(
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let start_index = query.get("StartIndex").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    let limit = query.get("Limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(50);
+
+    let log_dir = std::path::PathBuf::from("logs");
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&log_dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    files.push(json!({
+                        "Name": entry.file_name().to_string_lossy(),
+                        "Size": meta.len(),
+                        "DateModified": meta.modified().ok().and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0),
+                    }));
+                }
+            }
+        }
+    }
+    // Also check current directory for log files
+    if let Ok(entries) = std::fs::read_dir(".") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".log") || name.ends_with("_err.log") {
+                if let Ok(meta) = entry.metadata() {
+                    files.push(json!({
+                        "Name": name,
+                        "Size": meta.len(),
+                        "DateModified": meta.modified().ok().and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0),
+                    }));
+                }
+            }
+        }
+    }
+
+    let total = files.len();
+    let items: Vec<_> = files.into_iter().skip(start_index).take(limit).collect();
+    Json(json!({ "Items": items, "TotalRecordCount": total })).into_response()
+}
+
+/// POST /Items/{id}/MetadataEditor — update metadata via editor
+pub async fn metadata_editor(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Json(body): Json<JsonValue>,
+) -> Response {
+    // Delegate to update_item_inner
+    match crate::jellyfin::items::update_item_inner(&state.db, &item_id, body).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => internal_error(error),
+    }
 }

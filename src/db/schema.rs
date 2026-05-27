@@ -319,5 +319,13 @@ pub fn optional_migrations() -> Vec<Migration> {
             r#"CREATE TABLE IF NOT EXISTS merge_groups (id TEXT PRIMARY KEY, representative_id TEXT NOT NULL, member_id TEXT NOT NULL, provider TEXT NOT NULL, provider_item_id TEXT NOT NULL, created_at BIGINT NOT NULL, FOREIGN KEY(representative_id) REFERENCES media_items(id) ON DELETE CASCADE, FOREIGN KEY(member_id) REFERENCES media_items(id) ON DELETE CASCADE, UNIQUE(member_id))"#,
             "create merge_groups table",
         ),
+        (
+            r#"CREATE TABLE IF NOT EXISTS game_genres (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at BIGINT NOT NULL)"#,
+            "create game_genres table",
+        ),
+        (
+            r#"CREATE TABLE IF NOT EXISTS media_game_genres (item_id TEXT NOT NULL, game_genre_id TEXT NOT NULL, PRIMARY KEY(item_id, game_genre_id), FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, FOREIGN KEY(game_genre_id) REFERENCES game_genres(id) ON DELETE CASCADE)"#,
+            "create media_game_genres table",
+        ),
     ]
 }

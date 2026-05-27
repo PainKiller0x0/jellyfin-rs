@@ -228,3 +228,55 @@ pub async fn external_id_infos() -> Response {
     ]))
     .into_response()
 }
+
+/// POST /Videos/MergeVersions — merge multiple video items into one multi-version item
+pub async fn merge_versions(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(ids) = body.get("Ids").and_then(Value::as_array) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "Error": "Ids is required" }))).into_response();
+    };
+    let item_ids: Vec<String> = ids.iter().filter_map(|v| v.as_str().map(ToString::to_string)).collect();
+    if item_ids.len() < 2 {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "Error": "Need at least 2 items to merge" }))).into_response();
+    }
+
+    let backend = state.db.get_database_backend();
+    // Find the parent of the first item — this becomes the target parent
+    let first_id = &item_ids[0];
+    let parent_row = state.db.query_one(crate::db::helpers::portable_statement(
+        backend,
+        "SELECT parent_id, item_type FROM media_items WHERE id = ?",
+        vec![first_id.as_str().into()],
+    )).await;
+
+    let (parent_id, item_type) = match parent_row {
+        Ok(Some(r)) => {
+            let pid = r.get_str("parent_id").unwrap_or_default();
+            let it = r.get_str("item_type").unwrap_or_default();
+            (pid, it)
+        }
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    // If the first item doesn't have a parent (it's a top-level item), create a folder for it
+    let target_parent = if parent_id.is_empty() || parent_id == *first_id {
+        // The first item IS the folder — move others into it
+        first_id.clone()
+    } else {
+        parent_id
+    };
+
+    // Move all other items to be children of the target parent
+    let now = crate::util::now_unix();
+    for id in &item_ids[1..] {
+        let _ = state.db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE media_items SET parent_id = ?, updated_at = ? WHERE id = ? AND item_type = 'Video'",
+            vec![target_parent.clone().into(), now.into(), id.as_str().into()],
+        )).await;
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}

@@ -77,6 +77,9 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/Localization/ParentalRatings",
             get(system::parental_ratings),
         )
+        .route("/System/ReleaseNotes", get(system::system_release_notes))
+        .route("/System/ReleaseNotes/Versions", get(system::system_release_notes_versions))
+        .route("/System/Logs/Query", get(system::system_logs_query))
         .route("/QuickConnect/Enabled", get(system::quick_connect_enabled))
         .route(
             "/QuickConnect/Authorize",
@@ -274,6 +277,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(auth::authenticate_by_name),
         )
         .route("/Users", get(auth::list_users))
+        .route("/Users/Prefixes", get(filters::users_prefixes))
         .route("/Users/Configuration", post(common::no_content))
         .route("/Users/Password", post(common::no_content))
         .route("/Users/ForgotPassword", post(auth::forgot_password))
@@ -404,6 +408,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Artists", get(common::empty_list))
         .route("/Artists/AlbumArtists", get(common::empty_list))
         .route("/Artists/InstantMix", get(common::empty_list))
+        .route("/Artists/Prefixes", get(filters::artists_prefixes))
         .route("/Artists/{name}", get(common::empty_object))
         .route("/Artists/{item_id}/InstantMix", get(common::empty_list))
         .route("/Artists/{name}/Images/{image_type}", get(super::user_extras::artist_image))
@@ -422,6 +427,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(common::empty_array),
         )
         .route("/Items/{item_id}/Subtitles", get(items::item_subtitles))
+        .route("/Items/{item_id}/Subtitles/{index}/Delete", post(items::delete_item_subtitle))
         .route(
             "/Items/{item_id}/RemoteSearch/Subtitles/{param}",
             get(super::user_extras::remote_subtitle_search)
@@ -433,6 +439,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/Items/{item_id}/DeleteInfo", get(items::delete_info))
         .route("/Items/Delete", post(items::delete_items))
+        .route("/Items/Prefixes", get(filters::items_prefixes))
+        .route("/Items/{item_id}/Tags/Add", post(items::add_item_tag))
+        .route("/Items/{item_id}/Tags/Delete", post(items::delete_item_tag))
+        .route("/Items/{item_id}/MetadataEditor", post(super::system::metadata_editor))
         .route(
             "/Items/RemoteSearch/{item_type}",
             post(items::remote_search),
@@ -452,6 +462,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Genres/{name}", get(super::user_extras::genre_by_name))
         .route("/Genres/{name}/Images/{image_type}", get(super::user_extras::genre_image))
         .route("/Genres/{name}/Images/{image_type}/{index}", get(super::user_extras::genre_image))
+        .route("/GameGenres", get(filters::game_genres))
+        .route("/GameGenres/{name}", get(super::user_extras::genre_by_name))
+        .route("/GameGenres/{name}/Images/{image_type}", get(super::user_extras::genre_image))
+        .route("/GameGenres/{name}/Images/{image_type}/{index}", get(super::user_extras::genre_image))
         .route("/MusicGenres", get(common::empty_list))
         .route("/MusicGenres/InstantMix", get(common::empty_list))
         .route("/MusicGenres/{genre_name}", get(common::empty_object))
@@ -477,6 +491,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/StreamLanguages", get(super::user_extras::stream_languages))
         .route("/ItemTypes", get(super::user_extras::item_types))
         .route("/Videos/{item_id}/AdditionalParts", get(super::user_extras::video_additional_parts))
+        .route("/Videos/MergeVersions", post(items::merge_versions))
         .route(
             "/Videos/{item_id}/Trickplay/{width}/tiles.m3u8",
             get(common::empty_object),

@@ -13,8 +13,8 @@ use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
     entities::{
-        genres::Entity as Genres, people::Entity as People, studios::Entity as Studios,
-        tags::Entity as Tags,
+        game_genres::Entity as GameGenres, genres::Entity as Genres, people::Entity as People,
+        studios::Entity as Studios, tags::Entity as Tags,
     },
     jellyfin::common::internal_error,
 };
@@ -45,6 +45,13 @@ pub async fn studios(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     list_filter_items(&state.db, FilterKind::Studio, &query).await
+}
+
+pub async fn game_genres(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    list_filter_items(&state.db, FilterKind::GameGenre, &query).await
 }
 
 pub async fn years(
@@ -125,6 +132,56 @@ async fn list_extended_video_types_inner(
         .collect();
     filter_by_search_and_paginate(&mut items, query);
     Ok(items)
+}
+
+/// Return unique first characters of item titles (for alphabetical index navigation)
+pub async fn items_prefixes(
+    State(state): State<Arc<AppState>>,
+    Query(_query): Query<HashMap<String, String>>,
+) -> Response {
+    match list_prefixes(&state.db, "media_items", "title").await {
+        Ok(prefixes) => Json(prefixes).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+/// Return unique first characters of artist/person names
+pub async fn artists_prefixes(
+    State(state): State<Arc<AppState>>,
+    Query(_query): Query<HashMap<String, String>>,
+) -> Response {
+    match list_prefixes(&state.db, "people", "name").await {
+        Ok(prefixes) => Json(prefixes).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+/// Return unique first characters of usernames
+pub async fn users_prefixes(
+    State(state): State<Arc<AppState>>,
+    Query(_query): Query<HashMap<String, String>>,
+) -> Response {
+    match list_prefixes(&state.db, "users", "username").await {
+        Ok(prefixes) => Json(prefixes).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+async fn list_prefixes(db: &DatabaseConnection, table: &str, column: &str) -> anyhow::Result<Vec<Value>> {
+    let backend = db.get_database_backend();
+    let sql = format!(
+        "SELECT DISTINCT UPPER(SUBSTR({}, 1, 1)) AS prefix FROM {} WHERE {} IS NOT NULL AND {} <> '' ORDER BY prefix ASC",
+        column, table, column, column
+    );
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(backend, &sql, vec![]))
+        .await
+        .context("failed to list prefixes")?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.get_str("prefix").ok())
+        .map(|p| json!(p))
+        .collect())
 }
 
 async fn list_years(db: &DatabaseConnection, query: &HashMap<String, String>) -> Response {
@@ -353,6 +410,17 @@ async fn list_filter_items_inner(
                 .map(|m| json!({ "Name": m.name, "Id": m.id, "Type": kind.item_type(), "ImageTags": {} }))
                 .collect()
         }
+        FilterKind::GameGenre => {
+            let models = GameGenres::find()
+                .order_by_asc(crate::entities::game_genres::Column::Name)
+                .all(db)
+                .await
+                .context("failed to list game genres")?;
+            models
+                .into_iter()
+                .map(|m| json!({ "Name": m.name, "Id": m.id, "Type": kind.item_type(), "ImageTags": {} }))
+                .collect()
+        }
     };
 
     filter_by_search_and_paginate(&mut items, query);
@@ -365,6 +433,7 @@ enum FilterKind {
     Tag,
     Person,
     Studio,
+    GameGenre,
 }
 
 impl FilterKind {
@@ -374,6 +443,7 @@ impl FilterKind {
             Self::Tag => "Tag",
             Self::Person => "Person",
             Self::Studio => "Studio",
+            Self::GameGenre => "GameGenre",
         }
     }
 }

@@ -146,7 +146,7 @@ async fn delete_item_records(db: &DatabaseConnection, item_id: &str) -> anyhow::
     Ok(())
 }
 
-pub(super) async fn update_item_inner(
+pub(crate) async fn update_item_inner(
     db: &DatabaseConnection,
     item_id: &str,
     body: Value,
@@ -315,4 +315,83 @@ async fn update_people(db: &DatabaseConnection, item_id: &str, body: &Value) -> 
         .with_context(|| format!("failed to link person to item: {item_id}"))?;
     }
     Ok(())
+}
+
+/// POST /Items/{id}/Tags/Add — add a single tag to an item
+pub async fn add_item_tag(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(name) = body.get("Name").and_then(Value::as_str).filter(|v| !v.trim().is_empty()) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "Error": "Name is required" }))).into_response();
+    };
+    let backend = state.db.get_database_backend();
+    let id = stable_text_id(&format!("tags:{}", name.trim().to_ascii_lowercase()));
+    if let Err(e) = state.db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "INSERT INTO tags (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING",
+        vec![id.clone().into(), name.trim().into(), now_unix().into()],
+    )).await {
+        return internal_error(e.into());
+    }
+    if let Err(e) = state.db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "INSERT INTO media_tags (item_id, tag_id) VALUES (?, ?) ON CONFLICT(item_id, tag_id) DO NOTHING",
+        vec![item_id.into(), id.into()],
+    )).await {
+        return internal_error(e.into());
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// POST /Items/{id}/Tags/Delete — remove a single tag from an item
+pub async fn delete_item_tag(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(name) = body.get("Name").and_then(Value::as_str).filter(|v| !v.trim().is_empty()) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "Error": "Name is required" }))).into_response();
+    };
+    let backend = state.db.get_database_backend();
+    let id = stable_text_id(&format!("tags:{}", name.trim().to_ascii_lowercase()));
+    if let Err(e) = state.db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "DELETE FROM media_tags WHERE item_id = ? AND tag_id = ?",
+        vec![item_id.into(), id.into()],
+    )).await {
+        return internal_error(e.into());
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// POST /Items/{id}/Subtitles/{index}/Delete — delete an external subtitle
+pub async fn delete_item_subtitle(
+    State(state): State<Arc<AppState>>,
+    Path((item_id, index)): Path<(String, i64)>,
+) -> Response {
+    let backend = state.db.get_database_backend();
+    // Find the subtitle stream to get its file path
+    let row = state.db.query_one(crate::db::helpers::portable_statement(
+        backend,
+        "SELECT path FROM media_streams WHERE item_id = ? AND stream_index = ? AND stream_type = 'Subtitle' AND is_external = 1",
+        vec![item_id.clone().into(), index.into()],
+    )).await;
+
+    match row {
+        Ok(Some(r)) => {
+            if let Ok(path) = r.get_str("path") {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+            // Remove from media_streams
+            let _ = state.db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "DELETE FROM media_streams WHERE item_id = ? AND stream_index = ? AND stream_type = 'Subtitle'",
+                vec![item_id.into(), index.into()],
+            )).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }

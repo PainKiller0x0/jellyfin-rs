@@ -12,7 +12,9 @@ use crate::{
         system,
     },
     playback::streaming::{
-        stream_audio, stream_audio_head, stream_subtitle, stream_subtitle_head,
+        stream_audio, stream_audio_container, stream_audio_container_head, stream_audio_head,
+        stream_audio_simple, stream_audio_simple_head,
+        stream_subtitle, stream_subtitle_head,
         stream_subtitle_with_source, stream_subtitle_with_source_head,
         stream_video, stream_video_head,
     },
@@ -80,6 +82,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/System/ReleaseNotes", get(system::system_release_notes))
         .route("/System/ReleaseNotes/Versions", get(system::system_release_notes_versions))
         .route("/System/Logs/Query", get(system::system_logs_query))
+        .route("/System/WakeOnLanInfo", get(system::system_wake_on_lan_info))
+        .route("/System/Logs/{name}/Lines", get(system::system_log_lines))
         .route("/QuickConnect/Enabled", get(system::quick_connect_enabled))
         .route(
             "/QuickConnect/Authorize",
@@ -127,9 +131,11 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(common::no_content),
         )
         .route("/Plugins/{plugin_id}/{version}/Image", get(common::image))
+        .route("/Plugins/{plugin_id}/Thumb", get(common::image))
         .route("/Packages", get(common::empty_array))
         .route("/Packages/{name}", get(common::empty_object))
         .route("/Packages/Installed/{name}", post(common::no_content))
+        .route("/Packages/Updates", get(common::empty_array))
         .route(
             "/Packages/Installing/{package_id}",
             delete(common::no_content),
@@ -165,6 +171,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(common::empty_object),
         )
         .route("/LiveTv/ListingProviders/Lineups", get(common::empty_array))
+        .route("/LiveTv/ListingProviders/Delete", post(common::no_content))
         .route(
             "/LiveTv/ListingProviders/SchedulesDirect/Countries",
             get(system::localization_countries),
@@ -174,6 +181,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(common::empty_array).post(common::no_content),
         )
         .route("/LiveTv/TunerHosts/Types", get(common::empty_array))
+        .route("/LiveTv/TunerHosts/Delete", post(common::no_content))
         .route("/LiveTv/Tuners/Discover", get(common::empty_array))
         .route("/LiveTv/Tuners/Discvover", get(common::empty_array))
         .route("/LiveTv/Tuners/{tuner_id}/Reset", post(common::no_content))
@@ -277,6 +285,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(auth::authenticate_by_name),
         )
         .route("/Users", get(auth::list_users))
+        .route("/Users/Query", get(auth::users_query))
         .route("/Users/Prefixes", get(filters::users_prefixes))
         .route("/Users/Configuration", post(common::no_content))
         .route("/Users/Password", post(common::no_content))
@@ -443,6 +452,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Items/{item_id}/Tags/Add", post(items::add_item_tag))
         .route("/Items/{item_id}/Tags/Delete", post(items::delete_item_tag))
         .route("/Items/{item_id}/MetadataEditor", post(super::system::metadata_editor))
+        .route("/Items/{item_id}/MakePrivate", post(items::make_item_private))
+        .route("/Items/{item_id}/MakePublic", post(items::make_item_public))
         .route(
             "/Items/RemoteSearch/{item_type}",
             post(items::remote_search),
@@ -523,6 +534,14 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route(
             "/Audio/{item_id}/universal",
             get(stream_audio).head(stream_audio_head),
+        )
+        .route(
+            "/Audio/{item_id}/stream",
+            get(stream_audio_simple).head(stream_audio_simple_head),
+        )
+        .route(
+            "/Audio/{item_id}/stream.{container}",
+            get(stream_audio_container).head(stream_audio_container_head),
         )
         .route(
             "/Audio/{item_id}/Lyrics",
@@ -637,8 +656,9 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Collections", post(collect::create_collection))
         .route(
             "/Collections/{collection_id}/Items",
-            post(collect::add_to_collection).delete(collect::remove_from_collection),
+            post(collect::add_to_collection).delete(collect::remove_from_collection_delete),
         )
+        .route("/Collections/{collection_id}/Items/Delete", post(collect::remove_from_collection_batch))
         .route("/Playlists", post(collect::create_playlist))
         .route(
             "/Playlists/{playlist_id}",

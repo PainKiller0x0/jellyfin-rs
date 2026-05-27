@@ -395,3 +395,37 @@ pub async fn delete_item_subtitle(
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
+
+/// POST /Items/{id}/MakePrivate — restrict item visibility to owner
+pub async fn make_item_private(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    let backend = state.db.get_database_backend();
+    let now = now_unix();
+    match state.db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "UPDATE media_items SET is_public = 0, updated_at = ? WHERE id = ?",
+        vec![now.into(), item_id.into()],
+    )).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error(e.into()),
+    }
+}
+
+/// POST /Items/{id}/MakePublic — make item visible to all users
+pub async fn make_item_public(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    let backend = state.db.get_database_backend();
+    let now = now_unix();
+    match state.db.execute(crate::db::helpers::portable_statement(
+        backend,
+        "UPDATE media_items SET is_public = 1, updated_at = ? WHERE id = ?",
+        vec![now.into(), item_id.into()],
+    )).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error(e.into()),
+    }
+}

@@ -545,3 +545,63 @@ async fn playlist_items_inner(
         })
         .collect())
 }
+
+/// POST /Collections/{id}/Items/Delete — batch remove items from collection
+pub async fn remove_from_collection_batch(
+    State(state): State<Arc<AppState>>,
+    Path(collection_id): Path<String>,
+    Json(body): Json<JsonValue>,
+) -> Response {
+    let ids: Vec<String> = body
+        .get("Ids")
+        .and_then(JsonValue::as_array)
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(ToString::to_string)).collect())
+        .unwrap_or_default();
+
+    if ids.is_empty() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    let backend = state.db.get_database_backend();
+    for item_id in &ids {
+        let _ = state.db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "DELETE FROM linked_children WHERE parent_id = ? AND item_id = ?",
+            vec![collection_id.clone().into(), item_id.as_str().into()],
+        )).await;
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// DELETE /Collections/{id}/Items — remove items from collection (query param version)
+pub async fn remove_from_collection_delete(
+    State(state): State<Arc<AppState>>,
+    Path(collection_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let ids: Vec<String> = query
+        .get("ids")
+        .or_else(|| query.get("Ids"))
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if ids.is_empty() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    let backend = state.db.get_database_backend();
+    for item_id in &ids {
+        let _ = state.db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "DELETE FROM linked_children WHERE parent_id = ? AND item_id = ?",
+            vec![collection_id.clone().into(), item_id.as_str().into()],
+        )).await;
+    }
+    StatusCode::NO_CONTENT.into_response()
+}

@@ -741,6 +741,45 @@ fn default_user_configuration() -> JsonValue {
     })
 }
 
+/// GET /Users/Query — paginated user list with filtering
+pub async fn users_query(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let start_index = query.get("StartIndex").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    let limit = query.get("Limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(100);
+    let search_term = query.get("SearchTerm").map(String::as_str);
+    let is_disabled = query.get("IsDisabled").and_then(|v| v.parse::<bool>().ok());
+    let is_admin = query.get("IsAdministrator").and_then(|v| v.parse::<bool>().ok());
+
+    match list_users_inner(&state.db).await {
+        Ok(mut users) => {
+            // Apply filters
+            if let Some(term) = search_term {
+                let term_lower = term.to_lowercase();
+                users.retain(|u| {
+                    u.get("Name").and_then(JsonValue::as_str).unwrap_or("").to_lowercase().contains(&term_lower)
+                });
+            }
+            if let Some(disabled) = is_disabled {
+                users.retain(|u| {
+                    u.get("IsDisabled").and_then(JsonValue::as_bool).unwrap_or(false) == disabled
+                });
+            }
+            if let Some(admin) = is_admin {
+                users.retain(|u| {
+                    u.get("IsAdministrator").and_then(JsonValue::as_bool).unwrap_or(false) == admin
+                });
+            }
+
+            let total = users.len();
+            let items: Vec<_> = users.into_iter().skip(start_index).take(limit).collect();
+            Json(json!({ "Items": items, "TotalRecordCount": total })).into_response()
+        }
+        Err(error) => internal_error(error),
+    }
+}
+
 enum AuthError {
     Unauthorized(String),
     Internal(anyhow::Error),

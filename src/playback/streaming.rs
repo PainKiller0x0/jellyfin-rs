@@ -268,3 +268,43 @@ fn media_content_type(item: &MediaItem) -> &'static str {
         _ => "application/octet-stream",
     }
 }
+
+/// GET /Audio/{id}/stream — alias for stream_audio
+pub async fn stream_audio_simple(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    stream_media_item(state, item_id, headers, query, Method::GET).await
+}
+
+/// HEAD /Audio/{id}/stream — alias for stream_audio_head
+pub async fn stream_audio_simple_head(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    stream_media_item(state, item_id, headers, query, Method::HEAD).await
+}
+
+/// GET /Audio/{id}/stream.{Container} — audio stream with container specified
+pub async fn stream_audio_container(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((item_id, _container)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    stream_media_item(state, item_id, headers, query, Method::GET).await
+}
+
+/// HEAD /Audio/{id}/stream.{Container} — HEAD for audio stream with container
+pub async fn stream_audio_container_head(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((item_id, _container)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    stream_media_item(state, item_id, headers, query, Method::HEAD).await
+}

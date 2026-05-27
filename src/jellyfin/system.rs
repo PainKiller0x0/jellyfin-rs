@@ -532,3 +532,36 @@ pub async fn metadata_editor(
         Err(error) => internal_error(error),
     }
 }
+
+/// GET /System/WakeOnLanInfo — return WoL-capable MAC addresses (stub)
+pub async fn system_wake_on_lan_info() -> Response {
+    Json(json!([])).into_response()
+}
+
+/// GET /System/Logs/{name}/Lines — return tail of a log file
+pub async fn system_log_lines(
+    Path(name): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let limit = query.get("Limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1000);
+
+    // Try logs/ directory first, then current directory
+    let paths = [format!("logs/{}", name), name.clone()];
+    let mut content = None;
+    for path in &paths {
+        if let Ok(data) = std::fs::read_to_string(path) {
+            content = Some(data);
+            break;
+        }
+    }
+
+    match content {
+        Some(data) => {
+            let lines: Vec<&str> = data.lines().collect();
+            let start = lines.len().saturating_sub(limit);
+            let tail: String = lines[start..].join("\n");
+            (StatusCode::OK, tail).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}

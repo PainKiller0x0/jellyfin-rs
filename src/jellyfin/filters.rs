@@ -54,6 +54,13 @@ pub async fn game_genres(
     list_filter_items(&state.db, FilterKind::GameGenre, &query).await
 }
 
+pub async fn music_genres(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    list_filter_items(&state.db, FilterKind::MusicGenre, &query).await
+}
+
 pub async fn years(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
@@ -421,6 +428,17 @@ async fn list_filter_items_inner(
                 .map(|m| json!({ "Name": m.name, "Id": m.id, "Type": kind.item_type(), "ImageTags": {} }))
                 .collect()
         }
+        FilterKind::MusicGenre => {
+            let models = Genres::find()
+                .order_by_asc(crate::entities::genres::Column::Name)
+                .all(db)
+                .await
+                .context("failed to list music genres")?;
+            models
+                .into_iter()
+                .map(|m| json!({ "Name": m.name, "Id": m.id, "Type": kind.item_type(), "ImageTags": {} }))
+                .collect()
+        }
     };
 
     filter_by_search_and_paginate(&mut items, query);
@@ -434,6 +452,7 @@ enum FilterKind {
     Person,
     Studio,
     GameGenre,
+    MusicGenre,
 }
 
 impl FilterKind {
@@ -444,6 +463,7 @@ impl FilterKind {
             Self::Person => "Person",
             Self::Studio => "Studio",
             Self::GameGenre => "GameGenre",
+            Self::MusicGenre => "MusicGenre",
         }
     }
 }

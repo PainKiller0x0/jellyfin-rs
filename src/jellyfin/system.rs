@@ -621,3 +621,61 @@ pub async fn update_server_configuration_partial(
 
     StatusCode::NO_CONTENT.into_response()
 }
+
+/// GET /Features — return server feature support
+pub async fn features() -> Response {
+    Json(json!({
+        "Name": "jellyfin-rs",
+        "Version": env!("CARGO_PKG_VERSION"),
+        "Features": [
+            "ContentUploading",
+            "MediaPlayback",
+            "ExternalContent",
+            "FileOrganization",
+            "UserData",
+            "Sharing",
+            "Playlists",
+            "Collections"
+        ]
+    }))
+    .into_response()
+}
+
+/// GET /Notifications/Types — return supported notification types
+pub async fn notification_types() -> Response {
+    Json(json!([
+        {
+            "Name": "TaskCompleted",
+            "Category": "Task",
+            "Enabled": true,
+            "DisabledOnlineFeatures": []
+        },
+        {
+            "Name": "LibraryChanged",
+            "Category": "Library",
+            "Enabled": true,
+            "DisabledOnlineFeatures": []
+        },
+        {
+            "Name": "UserActivity",
+            "Category": "User",
+            "Enabled": true,
+            "DisabledOnlineFeatures": []
+        }
+    ]))
+    .into_response()
+}
+
+/// GET /Notifications/Services/Defaults — return default notification services
+pub async fn notification_services_defaults() -> Response {
+    Json(json!([
+        {
+            "Name": "Email",
+            "DefaultTitle": "jellyfin-rs Notification",
+            "DefaultDescription": "A notification from jellyfin-rs",
+            "DefaultUrl": "http://127.0.0.1:8096",
+            "SupportedCommands": ["NotificationAdmin"]
+        }
+    ]))
+    .into_response()
+}

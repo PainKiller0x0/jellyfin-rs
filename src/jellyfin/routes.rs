@@ -8,8 +8,8 @@ use axum::{
 use crate::{
     app::state::AppState,
     jellyfin::{
-        auth, collect, common, dlna, filters, images, items, library, persons, playback, sessions,
-        system,
+        auth, backup, collect, common, dlna, filters, images, items, library, persons, playback,
+        sessions, system,
     },
     playback::streaming::{
         stream_audio, stream_audio_container, stream_audio_container_head, stream_audio_head,
@@ -109,10 +109,6 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Dlna/ProfileInfos", get(dlna::profile_infos))
         .route("/Dlna/Profiles/Default", get(dlna::default_profile))
         .route("/Dlna/Profiles/{profile_id}", get(dlna::profile_by_id))
-        .route(
-            "/Dlna/{server_id}/description.xml",
-            get(dlna::device_description),
-        )
         .route("/description.xml", get(dlna::device_description))
         .route("/ClientLog/Document", post(common::no_content))
         .route("/Auth/Keys", get(auth::api_keys).post(auth::create_api_key))
@@ -148,9 +144,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/Tmdb/ClientConfiguration",
             get(system::tmdb_client_configuration),
         )
-        .route("/Devices", get(system::devices))
         .route("/Devices/Info", get(system::device_options))
-        .route("/Devices/Options", get(system::device_options))
         .route("/Auth/Providers", get(common::empty_array))
         .route("/Auth/PasswordResetProviders", get(common::empty_array))
         .route("/Channels", get(common::empty_list))
@@ -377,7 +371,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Items/Suggestions", get(super::user_extras::items_suggestions))
         .route(
             "/Items/{item_id}",
-            get(items::item_by_id_public).post(items::update_item),
+            get(items::item_by_id_public).post(items::update_item).delete(items::delete_single_item),
         )
         .route("/Items/{item_id}/Ancestors", get(super::user_extras::item_ancestors))
         .route("/Items/{item_id}/CriticReviews", get(super::user_extras::item_critic_reviews))
@@ -396,13 +390,15 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/Items/{item_id}/Images/{image_type}",
             get(images::get_item_image)
                 .head(super::user_extras::item_image_head)
-                .post(images::upload_item_image),
+                .post(images::upload_item_image)
+                .delete(common::no_content),
         )
         .route(
             "/Items/{item_id}/Images/{first}/{second}",
             get(images::get_item_image_with_index)
                 .head(super::user_extras::item_image_index_head)
-                .post(images::upload_item_image_with_index),
+                .post(images::upload_item_image_with_index)
+                .delete(common::no_content),
         )
         .route(
             "/Items/{item_id}/Images/{image_type}/Delete",
@@ -439,7 +435,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Items/{item_id}/RemoteImages", get(images::remote_images))
         .route(
             "/Items/{item_id}/RemoteImages/Providers",
-            get(common::empty_array),
+            get(images::remote_images_providers),
         )
         .route("/Items/{item_id}/Subtitles", get(items::item_subtitles))
         .route("/Items/{item_id}/Subtitles/{index}/Delete", post(items::delete_item_subtitle))
@@ -484,9 +480,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/GameGenres/{name}", get(super::user_extras::genre_by_name))
         .route("/GameGenres/{name}/Images/{image_type}", get(super::user_extras::genre_image))
         .route("/GameGenres/{name}/Images/{image_type}/{index}", get(super::user_extras::genre_image))
-        .route("/MusicGenres", get(common::empty_list))
         .route("/MusicGenres/InstantMix", get(common::empty_list))
-        .route("/MusicGenres/{genre_name}", get(common::empty_object))
         .route("/MusicGenres/{name}/InstantMix", get(common::empty_list))
         .route("/Persons", get(filters::persons))
         .route("/Persons/{name}", get(persons::person_by_name))
@@ -691,6 +685,216 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route(
             "/Playlists/{playlist_id}/Items/{item_id}/Move/{new_index}",
             post(super::user_extras::playlist_move_item),
+        )
+        // ── Backup / Restore ──
+        .route("/BackupRestore/BackupInfo", get(backup::backup_info))
+        .route("/BackupRestore/Restore", post(backup::create_backup))
+        .route("/BackupRestore/RestoreData", post(backup::restore_backup))
+        // ── Branding CSS ──
+        .route("/Branding/Css", get(common::empty_object))
+        .route("/Branding/Css.css", get(common::empty_object))
+        // ── Connect ──
+        .route("/Connect/Exchange", get(common::empty_object))
+        .route("/Connect/Pending", get(common::empty_array))
+        .route(
+            "/Users/{user_id}/Connect/Link/Delete",
+            post(common::no_content),
+        )
+        // ── Devices 补全 ──
+        .route("/Devices", get(system::devices).delete(common::no_content))
+        .route(
+            "/Devices/CameraUploads",
+            get(common::empty_array).post(common::no_content),
+        )
+        .route("/Devices/Delete", post(common::no_content))
+        .route("/Devices/Options", get(system::device_options).post(common::no_content))
+        // ── Environment 补全 ──
+        .route("/Environment/NetworkDevices", get(common::empty_array))
+        .route("/Environment/NetworkShares", get(common::empty_array))
+        // ── Feature ──
+        .route("/Features", get(system::features))
+        // ── GenericUI ──
+        .route("/UI/View", get(common::empty_object))
+        .route("/UI/Command", post(common::no_content))
+        // ── User Images 补全 ──
+        .route(
+            "/Users/{user_id}/Images/{image_type}",
+            get(images::user_avatar).delete(common::no_content),
+        )
+        .route(
+            "/Users/{user_id}/Images/{image_type}/{index}",
+            get(images::user_avatar).delete(common::no_content),
+        )
+        // ── MusicGenres 补全 ──
+        .route("/MusicGenres", get(filters::music_genres))
+        .route(
+            "/MusicGenres/{name}",
+            get(super::user_extras::genre_by_name),
+        )
+        .route(
+            "/MusicGenres/{name}/Images/{image_type}",
+            get(super::user_extras::genre_image),
+        )
+        .route(
+            "/MusicGenres/{name}/Images/{image_type}/{index}",
+            get(super::user_extras::genre_image),
+        )
+        // ── Notifications ──
+        .route("/Notifications/Types", get(system::notification_types))
+        .route("/Notifications/Admin", post(common::no_content))
+        .route(
+            "/Notifications/Services/Defaults",
+            get(system::notification_services_defaults),
+        )
+        .route("/Notifications/Services/Test", post(common::no_content))
+        // ── OpenApi / Swagger ──
+        .route("/openapi", get(common::empty_object))
+        .route("/openapi.json", get(common::empty_object))
+        .route("/swagger", get(common::empty_object))
+        .route("/swagger.json", get(common::empty_object))
+        // ── Party / SyncPlay ──
+        .route("/Parties", get(common::empty_array).post(common::no_content))
+        .route("/Parties/Info", get(common::empty_object))
+        .route("/Parties/{id}/Join", post(common::no_content))
+        .route("/Parties/Leave", post(common::no_content))
+        // ── Sync ──
+        .route("/Sync/Items/Ready", get(common::empty_array))
+        .route("/Sync/JobItems", get(common::empty_array))
+        .route("/Sync/JobItems/{id}", get(common::empty_object))
+        .route("/Sync/JobItems/{id}/File", get(common::not_found))
+        .route(
+            "/Sync/JobItems/{id}/AdditionalFiles",
+            get(common::empty_array),
+        )
+        .route("/Sync/Jobs", get(common::empty_array).post(common::no_content))
+        .route(
+            "/Sync/Jobs/{id}",
+            get(common::empty_object).post(common::no_content),
+        )
+        .route("/Sync/Jobs/{id}/Delete", post(common::no_content))
+        .route("/Sync/Options", get(common::empty_object))
+        .route("/Sync/Targets", get(common::empty_array))
+        .route("/Sync/Data", post(common::no_content))
+        .route("/Sync/Items/Cancel", post(common::no_content))
+        .route("/Sync/OfflineActions", post(common::no_content))
+        .route("/Sync/{item_id}/Status", post(common::no_content))
+        .route(
+            "/Sync/{target_id}/Items",
+            delete(common::no_content),
+        )
+        .route(
+            "/Sync/{target_id}/Items/Delete",
+            post(common::no_content),
+        )
+        .route("/Sync/JobItems/{id}/Delete", post(common::no_content))
+        .route("/Sync/JobItems/{id}/Enable", post(common::no_content))
+        .route(
+            "/Sync/JobItems/{id}/MarkForRemoval",
+            post(common::no_content),
+        )
+        .route(
+            "/Sync/JobItems/{id}/Transferred",
+            post(common::no_content),
+        )
+        .route(
+            "/Sync/JobItems/{id}/UnmarkForRemoval",
+            post(common::no_content),
+        )
+        // ── User 补全 ──
+        .route(
+            "/Users/{user_id}/Configuration/Partial",
+            post(auth::update_user_configuration),
+        )
+        .route("/Users/ItemAccess", get(common::empty_object))
+        .route(
+            "/Users/{user_id}/TypedSettings/{key}",
+            get(common::empty_object).post(common::no_content),
+        )
+        // ── UserLibrary 补全 ──
+        .route(
+            "/Users/{user_id}/Items/Root",
+            get(items::items_root),
+        )
+        .route("/Items/Access", post(common::no_content))
+        .route("/Items/Shared/Leave", post(common::no_content))
+        // ── Trailers ──
+        .route("/Trailers", get(common::empty_array))
+        // ── WebApp 补全 ──
+        .route("/web/strings", get(common::empty_object))
+        .route("/web/stringset", get(common::empty_object))
+        // ── LibraryStructure 补全 ──
+        .route(
+            "/Library/VirtualFolders/Paths/Delete",
+            post(library::delete_virtual_folder_path),
+        )
+        // ── LiveTv 补全 ──
+        .route("/LiveTv/ChannelTags", get(common::empty_array))
+        .route("/LiveTv/ChannelTags/Prefixes", get(common::empty_array))
+        .route("/LiveTv/EPG", get(common::empty_object))
+        .route("/LiveTv/Folder", get(common::empty_object))
+        .route(
+            "/LiveTv/ListingProviders/Available",
+            get(common::empty_array),
+        )
+        .route("/LiveTv/Manage/Channels", get(common::empty_list))
+        .route(
+            "/LiveTv/Manage/Channels/{id}/Disabled",
+            post(common::no_content),
+        )
+        .route(
+            "/LiveTv/Manage/Channels/{id}/SortIndex",
+            post(common::no_content),
+        )
+        .route(
+            "/LiveTv/Recordings/{id}/Delete",
+            post(common::no_content),
+        )
+        .route(
+            "/LiveTv/SeriesTimers/{id}/Delete",
+            post(common::no_content),
+        )
+        .route(
+            "/LiveTv/Timers/{id}/Delete",
+            post(common::no_content),
+        )
+        .route(
+            "/LiveTv/TunerHosts/Default/{type}",
+            get(common::empty_object),
+        )
+        // ── DlnaServer ──
+        .route(
+            "/Dlna/{id}/description",
+            get(dlna::device_description),
+        )
+        .route(
+            "/Dlna/{id}/description.xml",
+            get(dlna::device_description),
+        )
+        .route("/Dlna/{id}/icons/{filename}", get(common::image))
+        .route("/Dlna/icons/{filename}", get(common::image))
+        .route(
+            "/Dlna/{id}/connectionmanager/connectionmanager",
+            get(common::empty_object),
+        )
+        .route(
+            "/Dlna/{id}/connectionmanager/connectionmanager.xml",
+            get(common::empty_object),
+        )
+        .route(
+            "/Dlna/{id}/contentdirectory/contentdirectory",
+            get(common::empty_object),
+        )
+        .route(
+            "/Dlna/{id}/contentdirectory/contentdirectory.xml",
+            get(common::empty_object),
+        )
+        .route(
+            "/Dlna/{id}/connectionmanager/control",
+            post(common::no_content),
+        )
+        .route(
+            "/Dlna/{id}/contentdirectory/control",
+            post(common::no_content),
         )
         .route("/websocket", get(ws::ws_handler))
         .route("/WebSocket", get(ws::ws_handler))

@@ -50,6 +50,16 @@ pub async fn delete_items(
     }
 }
 
+pub async fn delete_single_item(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    match delete_items_inner(&state, &[&item_id]).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
 pub async fn update_item(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,

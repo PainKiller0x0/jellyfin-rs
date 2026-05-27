@@ -27,7 +27,7 @@ use crate::{
 
 mod remote;
 
-pub use remote::{download_remote_image, remote_images};
+pub use remote::{download_remote_image, remote_images, remote_images_providers};
 
 pub async fn item_images(
     State(state): State<Arc<AppState>>,

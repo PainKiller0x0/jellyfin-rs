@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod backup;
 pub mod collect;
 pub mod common;
 pub mod dlna;

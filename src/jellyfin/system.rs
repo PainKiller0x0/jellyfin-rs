@@ -199,11 +199,29 @@ pub async fn utc_time() -> impl IntoResponse {
 pub async fn tmdb_client_configuration(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let enabled = state
         .tmdb_api_key
+        .read()
+        .await
         .as_deref()
         .is_some_and(|key| !key.is_empty());
     Json(json!({
         "IsTmdbEnabled": enabled
     }))
+}
+
+#[derive(Deserialize)]
+pub struct TmdbApiKeyRequest {
+    #[serde(rename = "TmdbApiKey")]
+    tmdb_api_key: String,
+}
+
+pub async fn update_tmdb_api_key(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TmdbApiKeyRequest>,
+) -> Response {
+    match state.set_tmdb_api_key(request.tmdb_api_key.trim()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
 }
 
 pub async fn system_logs() -> impl IntoResponse {

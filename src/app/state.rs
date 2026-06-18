@@ -16,7 +16,7 @@ pub struct AppState {
     pub db: DatabaseConnection,
     pub media_dirs: Vec<PathBuf>,
     pub http_client: reqwest::Client,
-    pub tmdb_api_key: Option<String>,
+    pub tmdb_api_key: RwLock<Option<String>>,
     pub playback_sessions: RwLock<HashMap<String, PlaybackSession>>,
     pub session_capabilities: RwLock<HashMap<String, SessionCapabilities>>,
     pub ws_event_tx: broadcast::Sender<crate::ws::WsEvent>,
@@ -124,7 +124,7 @@ pub fn session_timeout_seconds() -> i64 {
         .unwrap_or(120)
 }
 
-/// Load TMDB API key from database app_settings, falling back to env var.
+/// Load TMDB API key from database app_settings.
 pub async fn load_tmdb_api_key(db: &sea_orm::DatabaseConnection) -> Option<String> {
     use sea_orm::ConnectionTrait;
     use crate::db::row_ext::QueryResultExt;
@@ -144,6 +144,21 @@ pub async fn load_tmdb_api_key(db: &sea_orm::DatabaseConnection) -> Option<Strin
             }
         }
     }
-    // Fallback to env var
-    std::env::var("JELLYFIN_RS_TMDB_API_KEY").ok().filter(|k| !k.is_empty())
+    None
+}
+
+impl AppState {
+    /// Update the TMDB API key in both database and runtime state.
+    pub async fn set_tmdb_api_key(&self, key: &str) -> anyhow::Result<()> {
+        use sea_orm::ConnectionTrait;
+        let backend = self.db.get_database_backend();
+        let now = crate::util::now_unix();
+        self.db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO app_settings (key, value, updated_at) VALUES ('tmdb_api_key', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            vec![key.to_string().into(), now.into()],
+        )).await?;
+        *self.tmdb_api_key.write().await = if key.is_empty() { None } else { Some(key.to_string()) };
+        Ok(())
+    }
 }

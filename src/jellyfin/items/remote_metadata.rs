@@ -36,13 +36,13 @@ pub async fn remote_search(
         .cloned()
         .unwrap_or_else(|| "jellyfin-rs".to_string());
 
-    if let Some(api_key) = state.tmdb_api_key.as_deref().filter(|key| !key.is_empty()) {
+    if let Some(api_key) = state.tmdb_api_key.read().await.clone().filter(|key| !key.is_empty()) {
         let search_result = if item_type.eq_ignore_ascii_case("Movie") {
-            providers::tmdb_movie_search(&state.http_client, api_key, name, production_year).await
+            providers::tmdb_movie_search(&state.http_client, &api_key, name, production_year).await
         } else if item_type.eq_ignore_ascii_case("Series") {
-            providers::tmdb_tv_search(&state.http_client, api_key, name, production_year).await
+            providers::tmdb_tv_search(&state.http_client, &api_key, name, production_year).await
         } else if item_type.eq_ignore_ascii_case("Person") {
-            providers::tmdb_person_search(&state.http_client, api_key, name).await
+            providers::tmdb_person_search(&state.http_client, &api_key, name).await
         } else {
             Err(anyhow::anyhow!("unsupported item type"))
         };
@@ -102,7 +102,7 @@ pub async fn apply_remote_search(
 }
 
 async fn enrich_remote_search_result(state: &AppState, body: Value) -> Value {
-    let Some(api_key) = state.tmdb_api_key.as_deref().filter(|key| !key.is_empty()) else {
+    let Some(api_key) = state.tmdb_api_key.read().await.clone().filter(|key| !key.is_empty()) else {
         return body;
     };
     let Some(tmdb_id) = body
@@ -118,11 +118,11 @@ async fn enrich_remote_search_result(state: &AppState, body: Value) -> Value {
     let item_type = body.get("Type").and_then(Value::as_str).unwrap_or("");
 
     let details = if item_type.eq_ignore_ascii_case("Series") {
-        providers::tmdb_tv_details(&state.http_client, api_key, tmdb_id).await
+        providers::tmdb_tv_details(&state.http_client, &api_key, tmdb_id).await
     } else if item_type.eq_ignore_ascii_case("Person") {
-        providers::tmdb_person_details(&state.http_client, api_key, tmdb_id).await
+        providers::tmdb_person_details(&state.http_client, &api_key, tmdb_id).await
     } else {
-        providers::tmdb_movie_details(&state.http_client, api_key, tmdb_id).await
+        providers::tmdb_movie_details(&state.http_client, &api_key, tmdb_id).await
     };
 
     match details {

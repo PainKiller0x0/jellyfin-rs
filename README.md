@@ -34,8 +34,7 @@ export JELLYFIN_RS_MEDIA_DIRS="/data/movies;/data/tvshows"
 export JELLYFIN_RS_USER="admin"
 export JELLYFIN_RS_PASSWORD="your-password"
 
-# 可选：TMDb API Key 用于元数据
-export JELLYFIN_RS_TMDB_API_KEY="your-tmdb-key"
+# 可选：TMDb API Key 通过管理接口配置
 
 cargo run --release
 ```
@@ -53,7 +52,6 @@ cargo run --release
 | `JELLYFIN_RS_SCAN_ON_STARTUP` | `true` | 启动时扫描媒体库 |
 | `JELLYFIN_RS_USER` | `tsukimi` | 默认管理员用户名 |
 | `JELLYFIN_RS_PASSWORD` | `tsukimi` | 默认管理员密码 |
-| `JELLYFIN_RS_TMDB_API_KEY` | (无) | TMDb API Key |
 | `JELLYFIN_RS_FFPROBE_PATH` | (系统 PATH) | ffprobe 路径 |
 | `JELLYFIN_RS_SESSION_TIMEOUT_SECONDS` | `120` | 会话超时秒数 |
 

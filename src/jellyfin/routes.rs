@@ -144,6 +144,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/Tmdb/ClientConfiguration",
             get(system::tmdb_client_configuration),
         )
+        .route(
+            "/System/Configuration/TmdbApiKey",
+            post(system::update_tmdb_api_key),
+        )
         .route("/Devices/Info", get(system::device_options))
         .route("/Auth/Providers", get(common::empty_array))
         .route("/Auth/PasswordResetProviders", get(common::empty_array))

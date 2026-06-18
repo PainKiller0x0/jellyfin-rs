@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         media_dirs: app::state::media_dirs_from_env(),
         http_client,
-        tmdb_api_key: tmdb_api_key.clone(),
+        tmdb_api_key: RwLock::new(tmdb_api_key),
         playback_sessions: RwLock::new(HashMap::new()),
         session_capabilities: RwLock::new(HashMap::new()),
         ws_event_tx,
@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     library::watcher::start_watching(state.clone());
 
     // Fetch episode TMDb metadata in background (retries until data is available)
-    if let Some(api_key) = tmdb_api_key.filter(|k| !k.is_empty()) {
+    if let Some(api_key) = state.tmdb_api_key.read().await.clone().filter(|k| !k.is_empty()) {
         let ep_state = state.clone();
         tokio::spawn(async move {
             // First: fill in missing TMDb IDs for movies/series without tags

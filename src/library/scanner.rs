@@ -32,7 +32,7 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
     }
 
     let mut tasks = tokio::task::JoinSet::new();
-    let api_key = state.tmdb_api_key.clone().unwrap_or_default();
+    let api_key = state.tmdb_api_key.read().await.clone().unwrap_or_default();
     for (root, library_id, collection_type) in roots {
         if !root.exists() {
             tracing::warn!("media directory does not exist: {}", root.display());
@@ -62,7 +62,7 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
     tracing::info!("media scan indexed {total} item(s) across all libraries");
 
     // Post-scan: fetch TMDb episode metadata (series provider_ids are ready now)
-    if let Some(api_key) = state.tmdb_api_key.as_deref().filter(|k| !k.is_empty()) {
+    if let Some(api_key) = state.tmdb_api_key.read().await.as_deref().filter(|k| !k.is_empty()) {
         if let Err(e) = crate::library::tmdb_metadata::batch_fetch_episode_tmdb(&state.db, api_key).await {
             tracing::warn!("episode TMDb fetch failed: {e:#}");
         }

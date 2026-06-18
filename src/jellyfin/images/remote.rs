@@ -28,6 +28,8 @@ pub async fn remote_images_providers(
 
     if state
         .tmdb_api_key
+        .read()
+        .await
         .as_deref()
         .is_some_and(|key| !key.is_empty())
     {
@@ -71,13 +73,13 @@ pub async fn remote_images(
 
     let mut all_images: Vec<Value> = Vec::new();
 
-    let tmdb_id = if let Some(api_key) = state.tmdb_api_key.as_deref().filter(|key| !key.is_empty())
+    let tmdb_id = if let Some(api_key) = state.tmdb_api_key.read().await.clone().filter(|key| !key.is_empty())
     {
         let tmdb_id = lookup_tmdb_id(&state.db, &item_id).await.ok().flatten();
         match tmdb_id {
             Some(ref tmdb_id) => {
                 let images_result =
-                    fetch_remote_images_by_type(&state, api_key, &item_id, tmdb_id).await;
+                    fetch_remote_images_by_type(&state, &api_key, &item_id, tmdb_id).await;
                 match images_result {
                     Ok(images) => all_images.extend(images),
                     Err(error) => {
@@ -88,7 +90,7 @@ pub async fn remote_images(
             }
             None => {
                 if let Ok(Some(found)) = search_tmdb_id_by_item(&state, &item_id).await {
-                    match providers::tmdb_movie_images(&state.http_client, api_key, &found).await {
+                    match providers::tmdb_movie_images(&state.http_client, &api_key, &found).await {
                         Ok(images) => all_images.extend(images),
                         Err(error) => {
                             tracing::warn!("TMDb images search failed for {item_id}: {error:#}")
@@ -236,7 +238,9 @@ async fn lookup_tmdb_id(db: &DatabaseConnection, item_id: &str) -> anyhow::Resul
 async fn search_tmdb_id_by_item(state: &AppState, item_id: &str) -> anyhow::Result<Option<String>> {
     let api_key = state
         .tmdb_api_key
-        .as_deref()
+        .read()
+        .await
+        .clone()
         .filter(|key| !key.is_empty())
         .context("no TMDb API key configured")?;
     let backend = state.db.get_database_backend();
@@ -257,9 +261,9 @@ async fn search_tmdb_id_by_item(state: &AppState, item_id: &str) -> anyhow::Resu
     let item_type: String = row.get_str("item_type")?;
 
     let results = if item_type.eq_ignore_ascii_case("Series") {
-        providers::tmdb_tv_search(&state.http_client, api_key, &name, year).await?
+        providers::tmdb_tv_search(&state.http_client, &api_key, &name, year).await?
     } else {
-        providers::tmdb_movie_search(&state.http_client, api_key, &name, year).await?
+        providers::tmdb_movie_search(&state.http_client, &api_key, &name, year).await?
     };
 
     Ok(results

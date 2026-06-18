@@ -16,12 +16,12 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::{
     app::state::{AppState, SERVER_NAME, VERSION},
+    db::row_ext::QueryResultExt,
     entities::{
         activity_log, activity_log::Entity as ActivityLog, app_settings,
         app_settings::Entity as AppSettings, task_results, task_results::Entity as TaskResults,
         users, users::Entity as Users,
     },
-    db::row_ext::QueryResultExt,
     jellyfin::common::internal_error,
     library::path_utils,
     util::now_unix,
@@ -496,11 +496,15 @@ pub async fn system_release_notes_versions() -> Response {
 }
 
 /// GET /System/Logs/Query — paginated log query
-pub async fn system_logs_query(
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    let start_index = query.get("StartIndex").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
-    let limit = query.get("Limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(50);
+pub async fn system_logs_query(Query(query): Query<HashMap<String, String>>) -> Response {
+    let start_index = query
+        .get("StartIndex")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let limit = query
+        .get("Limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(50);
 
     let log_dir = std::path::PathBuf::from("logs");
     let mut files = Vec::new();
@@ -562,7 +566,10 @@ pub async fn system_log_lines(
     Path(name): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let limit = query.get("Limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1000);
+    let limit = query
+        .get("Limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1000);
 
     // Try logs/ directory first, then current directory
     let paths = [format!("logs/{}", name), name.clone()];
@@ -586,17 +593,19 @@ pub async fn system_log_lines(
 }
 
 /// GET /System/Logs/{name} — download a log file
-pub async fn system_log_download(
-    Path(name): Path<String>,
-) -> Response {
+pub async fn system_log_download(Path(name): Path<String>) -> Response {
     let paths = [format!("logs/{}", name), name.clone()];
     for path in &paths {
         if let Ok(data) = std::fs::read(path) {
             return (
                 StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                )],
                 data,
-            ).into_response();
+            )
+                .into_response();
         }
     }
     StatusCode::NOT_FOUND.into_response()
@@ -609,11 +618,14 @@ pub async fn update_server_configuration_partial(
 ) -> Response {
     // Merge with existing config
     let backend = state.db.get_database_backend();
-    let row = state.db.query_one(crate::db::helpers::portable_statement(
-        backend,
-        "SELECT value FROM app_settings WHERE key = 'server_config'",
-        vec![],
-    )).await;
+    let row = state
+        .db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT value FROM app_settings WHERE key = 'server_config'",
+            vec![],
+        ))
+        .await;
 
     let mut config: JsonValue = match row {
         Ok(Some(r)) => {

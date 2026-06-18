@@ -13,7 +13,10 @@ use crate::{
     app::state::{AppState, PlaybackSession, PlaybackState},
     entities::user_data::{self, Entity as UserData},
     jellyfin::{
-        auth::request_user_id_or_default, common::{internal_error, strip_nulls}, dlna, items::find_media_item,
+        auth::request_user_id_or_default,
+        common::{internal_error, strip_nulls},
+        dlna,
+        items::find_media_item,
     },
     library::models::media_source_json_with_streams,
     util::{now_unix, unix_to_jellyfin_date},
@@ -124,17 +127,27 @@ async fn playback_progress_inner(
     }
 
     // Save RunTimeTicks from client report if media_items doesn't have it yet
-    if let Some(runtime_ticks) = body.get("RunTimeTicks").and_then(JsonValue::as_i64).filter(|v| *v > 0) {
-        let _ = state.db.execute(crate::db::helpers::portable_statement(
-            state.db.get_database_backend(),
-            "UPDATE media_items SET runtime_ticks = ? WHERE id = ? AND runtime_ticks IS NULL",
-            vec![runtime_ticks.into(), item_id.into()],
-        )).await;
+    if let Some(runtime_ticks) = body
+        .get("RunTimeTicks")
+        .and_then(JsonValue::as_i64)
+        .filter(|v| *v > 0)
+    {
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                state.db.get_database_backend(),
+                "UPDATE media_items SET runtime_ticks = ? WHERE id = ? AND runtime_ticks IS NULL",
+                vec![runtime_ticks.into(), item_id.into()],
+            ))
+            .await;
     }
 
     // Hook intro_skip behavior detection
     if state.sa_config.intro_skip_enabled {
-        let is_paused = body.get("IsPaused").and_then(JsonValue::as_bool).unwrap_or(false);
+        let is_paused = body
+            .get("IsPaused")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
         let default_session_id = format!("{user_id}:{item_id}");
         let play_session_id = body
             .get("PlaySessionId")
@@ -148,7 +161,10 @@ async fn playback_progress_inner(
         match event {
             PlaybackEvent::Progress => {
                 // Get runtime ticks for the session
-                let runtime_ticks = body.get("RunTimeTicks").and_then(JsonValue::as_i64).unwrap_or(0);
+                let runtime_ticks = body
+                    .get("RunTimeTicks")
+                    .and_then(JsonValue::as_i64)
+                    .unwrap_or(0);
 
                 // Check if session exists, if not create it
                 {
@@ -173,10 +189,9 @@ async fn playback_progress_inner(
                 );
             }
             PlaybackEvent::Stopped => {
-                state.intro_detector.on_playback_stopped(
-                    play_session_id,
-                    position_ticks,
-                );
+                state
+                    .intro_detector
+                    .on_playback_stopped(play_session_id, position_ticks);
             }
             _ => {}
         }
@@ -340,12 +355,19 @@ pub async fn playing_item_start(
     }
 
     // Save RunTimeTicks if provided
-    if let Some(rt) = body.as_ref().and_then(|b| b.get("RunTimeTicks").and_then(JsonValue::as_i64)).filter(|v| *v > 0) {
-        let _ = state.db.execute(crate::db::helpers::portable_statement(
-            state.db.get_database_backend(),
-            "UPDATE media_items SET runtime_ticks = ? WHERE id = ? AND runtime_ticks IS NULL",
-            vec![rt.into(), item_id.into()],
-        )).await;
+    if let Some(rt) = body
+        .as_ref()
+        .and_then(|b| b.get("RunTimeTicks").and_then(JsonValue::as_i64))
+        .filter(|v| *v > 0)
+    {
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                state.db.get_database_backend(),
+                "UPDATE media_items SET runtime_ticks = ? WHERE id = ? AND runtime_ticks IS NULL",
+                vec![rt.into(), item_id.into()],
+            ))
+            .await;
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -389,7 +411,10 @@ pub async fn playing_item_progress(
     let position_ticks = query
         .get("PositionTicks")
         .and_then(|v| v.parse::<i64>().ok())
-        .or_else(|| body.as_ref().and_then(|b| b.get("PositionTicks").and_then(JsonValue::as_i64)))
+        .or_else(|| {
+            body.as_ref()
+                .and_then(|b| b.get("PositionTicks").and_then(JsonValue::as_i64))
+        })
         .unwrap_or(0);
 
     let result = upsert_playback_position(&state.db, &user_id, &item_id, position_ticks).await;

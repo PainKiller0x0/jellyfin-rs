@@ -2,8 +2,8 @@ pub mod tasks;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -11,10 +11,12 @@ use tokio_util::sync::CancellationToken;
 use crate::app::state::AppState;
 use crate::util::now_unix;
 
+#[allow(dead_code)]
 pub type TaskHandler = Arc<
     dyn Fn(Arc<AppState>) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync,
 >;
 
+#[allow(dead_code)]
 pub struct ScheduledTask {
     pub id: String,
     pub name: String,
@@ -27,6 +29,7 @@ pub struct ScheduledTask {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TaskResult {
     pub status: String,
     pub start_time: i64,
@@ -34,11 +37,13 @@ pub struct TaskResult {
     pub message: Option<String>,
 }
 
+#[allow(dead_code)]
 pub struct TaskScheduler {
     tasks: Vec<ScheduledTask>,
     cancel: CancellationToken,
 }
 
+#[allow(dead_code)]
 impl TaskScheduler {
     pub fn new() -> Self {
         Self {
@@ -47,8 +52,14 @@ impl TaskScheduler {
         }
     }
 
-    pub fn register<F, Fut>(&mut self, id: &str, name: &str, category: &str, cron_expr: &str, handler: F)
-    where
+    pub fn register<F, Fut>(
+        &mut self,
+        id: &str,
+        name: &str,
+        category: &str,
+        cron_expr: &str,
+        handler: F,
+    ) where
         F: Fn(Arc<AppState>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
@@ -185,7 +196,14 @@ impl TaskScheduler {
     pub fn list_tasks(&self) -> Vec<(&str, &str, &str, &str)> {
         self.tasks
             .iter()
-            .map(|t| (t.id.as_str(), t.name.as_str(), t.description.as_str(), t.category.as_str()))
+            .map(|t| {
+                (
+                    t.id.as_str(),
+                    t.name.as_str(),
+                    t.description.as_str(),
+                    t.category.as_str(),
+                )
+            })
             .collect()
     }
 

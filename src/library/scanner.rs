@@ -40,9 +40,8 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
         }
         let db = state.db.clone();
         let api_key = api_key.clone();
-        tasks.spawn(async move {
-            scan_root(db, root, library_id, collection_type, &api_key).await
-        });
+        tasks
+            .spawn(async move { scan_root(db, root, library_id, collection_type, &api_key).await });
     }
 
     let mut total = 0usize;
@@ -62,8 +61,16 @@ pub async fn scan_media_library(state: &AppState) -> anyhow::Result<usize> {
     tracing::info!("media scan indexed {total} item(s) across all libraries");
 
     // Post-scan: fetch TMDb episode metadata (series provider_ids are ready now)
-    if let Some(api_key) = state.tmdb_api_key.read().await.as_deref().filter(|k| !k.is_empty()) {
-        if let Err(e) = crate::library::tmdb_metadata::batch_fetch_episode_tmdb(&state.db, api_key).await {
+    if let Some(api_key) = state
+        .tmdb_api_key
+        .read()
+        .await
+        .as_deref()
+        .filter(|k| !k.is_empty())
+    {
+        if let Err(e) =
+            crate::library::tmdb_metadata::batch_fetch_episode_tmdb(&state.db, api_key).await
+        {
             tracing::warn!("episode TMDb fetch failed: {e:#}");
         }
     }
@@ -212,12 +219,9 @@ async fn scan_root(
 
         // Try to restore from mediainfo sidecar if available and streams are empty
         if !probed && probe.is_none() {
-            if let Ok(restored) = crate::mediainfo::deserialize_mediainfo(
-                &db,
-                &item.id,
-                media_path,
-                None,
-            ).await {
+            if let Ok(restored) =
+                crate::mediainfo::deserialize_mediainfo(&db, &item.id, media_path, None).await
+            {
                 if restored {
                     tracing::debug!("restored mediainfo from sidecar for {}", item.path);
                 }
@@ -231,8 +235,14 @@ async fn scan_root(
             if let (Some(snum), Some(enum_)) = (item.season_number, item.episode_number) {
                 if let Some(series_tmdb_id) = get_series_tmdb_id_for_episode(&db, &item.id).await {
                     let _ = crate::library::tmdb_metadata::fetch_episode_tmdb_metadata(
-                        &db, &item.id, snum, enum_, &series_tmdb_id, api_key,
-                    ).await;
+                        &db,
+                        &item.id,
+                        snum,
+                        enum_,
+                        &series_tmdb_id,
+                        api_key,
+                    )
+                    .await;
                 }
             }
         }
@@ -241,32 +251,64 @@ async fn scan_root(
     Ok((scanned, seen_paths))
 }
 
-async fn try_fetch_tmdb(db: &sea_orm::DatabaseConnection, item: &ScannedMediaItem, path: &std::path::Path, api_key: &str) {
-    if api_key.is_empty() { return; }
-    let check_path = if item.is_folder { path.to_path_buf() } else { path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.to_path_buf()) };
-    let _ = crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(db, &item.id, &item.item_type, &check_path, api_key).await;
+async fn try_fetch_tmdb(
+    db: &sea_orm::DatabaseConnection,
+    item: &ScannedMediaItem,
+    path: &std::path::Path,
+    api_key: &str,
+) {
+    if api_key.is_empty() {
+        return;
+    }
+    let check_path = if item.is_folder {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+    let _ = crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(
+        db,
+        &item.id,
+        &item.item_type,
+        &check_path,
+        api_key,
+    )
+    .await;
 }
 
-async fn get_series_tmdb_id_for_episode(db: &sea_orm::DatabaseConnection, episode_id: &str) -> Option<String> {
+async fn get_series_tmdb_id_for_episode(
+    db: &sea_orm::DatabaseConnection,
+    episode_id: &str,
+) -> Option<String> {
     let backend = db.get_database_backend();
     // Episode -> parent Season -> parent Series -> TMDb ID
-    let row = db.query_one(crate::db::helpers::portable_statement(
-        backend,
-        "SELECT parent_id FROM media_items WHERE id = ?",
-        vec![episode_id.into()],
-    )).await.ok()??;
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT parent_id FROM media_items WHERE id = ?",
+            vec![episode_id.into()],
+        ))
+        .await
+        .ok()??;
     let season_id: String = row.get_str("parent_id").ok()?;
-    let row = db.query_one(crate::db::helpers::portable_statement(
-        backend,
-        "SELECT parent_id FROM media_items WHERE id = ?",
-        vec![season_id.into()],
-    )).await.ok()??;
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT parent_id FROM media_items WHERE id = ?",
+            vec![season_id.into()],
+        ))
+        .await
+        .ok()??;
     let series_id: String = row.get_str("parent_id").ok()?;
-    let row = db.query_one(crate::db::helpers::portable_statement(
-        backend,
-        "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
-        vec![series_id.into()],
-    )).await.ok()??;
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
+            vec![series_id.into()],
+        ))
+        .await
+        .ok()??;
     row.get_str("provider_item_id").ok()
 }
 

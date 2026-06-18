@@ -9,11 +9,7 @@ use axum::{
 use sea_orm::ConnectionTrait;
 use serde_json::{Value, json};
 
-use crate::{
-    app::state::AppState,
-    db::row_ext::QueryResultExt,
-    jellyfin::common::internal_error,
-};
+use crate::{app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error};
 
 /// GET /UserSettings/{user_id} — get user settings
 pub async fn get_user_settings(
@@ -21,7 +17,8 @@ pub async fn get_user_settings(
     Path(user_id): Path<String>,
 ) -> Response {
     let backend = state.db.get_database_backend();
-    let rows = state.db
+    let rows = state
+        .db
         .query_all(crate::db::helpers::portable_statement(
             backend,
             "SELECT key, value FROM app_settings WHERE key LIKE ?",
@@ -34,7 +31,9 @@ pub async fn get_user_settings(
             let mut settings = serde_json::Map::new();
             for row in &rows {
                 if let (Ok(key), Ok(value)) = (row.get_str("key"), row.get_str("value")) {
-                    let short_key = key.strip_prefix(&format!("user_settings:{}:", user_id)).unwrap_or(&key);
+                    let short_key = key
+                        .strip_prefix(&format!("user_settings:{}:", user_id))
+                        .unwrap_or(&key);
                     settings.insert(short_key.to_string(), json!(value));
                 }
             }
@@ -109,11 +108,14 @@ pub async fn add_to_playlist_info(
     Path(playlist_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
+    let _user_id = query
         .get("UserId")
         .cloned()
         .unwrap_or_else(|| state.user_id.to_string());
-    let ids = query.get("Ids").map(|v| v.split(',').collect::<Vec<_>>()).unwrap_or_default();
+    let ids = query
+        .get("Ids")
+        .map(|v| v.split(',').collect::<Vec<_>>())
+        .unwrap_or_default();
 
     Json(json!({
         "PlaylistId": playlist_id,

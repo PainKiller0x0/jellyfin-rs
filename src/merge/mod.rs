@@ -7,6 +7,7 @@ use crate::db::row_ext::QueryResultExt;
 use crate::util::{now_unix, stable_item_id};
 
 /// Union-Find data structure with path compression and union by rank.
+#[allow(dead_code)]
 pub struct UnionFind {
     parent: HashMap<String, String>,
     rank: HashMap<String, usize>,
@@ -67,6 +68,7 @@ impl UnionFind {
 }
 
 /// Find and merge duplicate movies across libraries using provider IDs.
+#[allow(dead_code)]
 pub async fn merge_multi_version(db: &DatabaseConnection) -> anyhow::Result<usize> {
     let backend = db.get_database_backend();
 
@@ -103,7 +105,7 @@ pub async fn merge_multi_version(db: &DatabaseConnection) -> anyhow::Result<usiz
 
     // Build union-find for items sharing the same provider ID within the same library
     let mut uf = UnionFind::new();
-    for (_provider_id, items) in &provider_groups {
+    for items in provider_groups.values() {
         if items.len() < 2 {
             continue;
         }
@@ -124,7 +126,7 @@ pub async fn merge_multi_version(db: &DatabaseConnection) -> anyhow::Result<usiz
     }
 
     let now = now_unix();
-    for (_root, members) in &groups {
+    for members in groups.values() {
         if members.len() < 2 {
             continue;
         }
@@ -162,7 +164,9 @@ pub async fn merge_multi_version(db: &DatabaseConnection) -> anyhow::Result<usiz
                 })
                 .unwrap_or_default();
 
-            let merge_id = stable_item_id(std::path::Path::new(&format!("merge:{representative}:{member}")));
+            let merge_id = stable_item_id(std::path::Path::new(&format!(
+                "merge:{representative}:{member}"
+            )));
 
             // Upsert merge group record
             db.execute(portable_statement(

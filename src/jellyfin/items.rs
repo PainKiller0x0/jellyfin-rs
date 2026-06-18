@@ -12,11 +12,20 @@ pub use crate::jellyfin::item_queries::find_media_item;
 pub use discovery::{search_hints, shows_missing, shows_next_up, similar_items};
 pub use display_prefs::{get_display_preferences, update_display_preferences};
 pub use item_detail::{enrich_episode_list, enrich_resume_items, item_by_id, item_by_id_public};
-pub use item_operations::{add_item_tag, delete_info, delete_item_subtitle, delete_item_tag, delete_items, delete_single_item, make_item_private, make_item_public, update_item};
 pub(crate) use item_operations::update_item_inner;
-pub use lists::{items_root, latest_items, resume_items, user_items, views};
+pub use item_operations::{
+    add_item_tag, delete_info, delete_item_subtitle, delete_item_tag, delete_items,
+    delete_single_item, make_item_private, make_item_public, update_item,
+};
 pub(super) use lists::media_list_response;
-pub use metadata_mgmt::{active_encodings, alternate_sources, audiobooks_next_up, available_recording_options, delete_alternate_source, external_id_infos, item_counts, item_subtitles, merge_versions, metadata_reset, scan_handler, stop_encodings, subtitle_provider_info};
-pub use recommendations::{home_section_items, home_sections, movie_recommendations, user_suggestions};
+pub use lists::{items_root, latest_items, resume_items, user_items, views};
+pub use metadata_mgmt::{
+    active_encodings, alternate_sources, audiobooks_next_up, available_recording_options,
+    delete_alternate_source, external_id_infos, item_counts, item_subtitles, merge_versions,
+    metadata_reset, scan_handler, stop_encodings, subtitle_provider_info,
+};
+pub use recommendations::{
+    home_section_items, home_sections, movie_recommendations, user_suggestions,
+};
 pub use remote_metadata::{apply_remote_search, remote_search};
 pub use tv_shows::{show_episodes, show_seasons};

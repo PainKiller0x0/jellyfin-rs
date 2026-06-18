@@ -333,16 +333,28 @@ pub async fn add_item_tag(
     Path(item_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let Some(name) = body.get("Name").and_then(Value::as_str).filter(|v| !v.trim().is_empty()) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "Error": "Name is required" }))).into_response();
+    let Some(name) = body
+        .get("Name")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "Name is required" })),
+        )
+            .into_response();
     };
     let backend = state.db.get_database_backend();
     let id = stable_text_id(&format!("tags:{}", name.trim().to_ascii_lowercase()));
-    if let Err(e) = state.db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "INSERT INTO tags (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING",
-        vec![id.clone().into(), name.trim().into(), now_unix().into()],
-    )).await {
+    if let Err(e) = state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO tags (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING",
+            vec![id.clone().into(), name.trim().into(), now_unix().into()],
+        ))
+        .await
+    {
         return internal_error(e.into());
     }
     if let Err(e) = state.db.execute(crate::db::helpers::portable_statement(
@@ -361,16 +373,28 @@ pub async fn delete_item_tag(
     Path(item_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let Some(name) = body.get("Name").and_then(Value::as_str).filter(|v| !v.trim().is_empty()) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "Error": "Name is required" }))).into_response();
+    let Some(name) = body
+        .get("Name")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "Name is required" })),
+        )
+            .into_response();
     };
     let backend = state.db.get_database_backend();
     let id = stable_text_id(&format!("tags:{}", name.trim().to_ascii_lowercase()));
-    if let Err(e) = state.db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "DELETE FROM media_tags WHERE item_id = ? AND tag_id = ?",
-        vec![item_id.into(), id.into()],
-    )).await {
+    if let Err(e) = state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "DELETE FROM media_tags WHERE item_id = ? AND tag_id = ?",
+            vec![item_id.into(), id.into()],
+        ))
+        .await
+    {
         return internal_error(e.into());
     }
     StatusCode::NO_CONTENT.into_response()
@@ -413,11 +437,15 @@ pub async fn make_item_private(
 ) -> Response {
     let backend = state.db.get_database_backend();
     let now = now_unix();
-    match state.db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "UPDATE media_items SET is_public = 0, updated_at = ? WHERE id = ?",
-        vec![now.into(), item_id.into()],
-    )).await {
+    match state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE media_items SET is_public = 0, updated_at = ? WHERE id = ?",
+            vec![now.into(), item_id.into()],
+        ))
+        .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error(e.into()),
     }
@@ -430,11 +458,15 @@ pub async fn make_item_public(
 ) -> Response {
     let backend = state.db.get_database_backend();
     let now = now_unix();
-    match state.db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "UPDATE media_items SET is_public = 1, updated_at = ? WHERE id = ?",
-        vec![now.into(), item_id.into()],
-    )).await {
+    match state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE media_items SET is_public = 1, updated_at = ? WHERE id = ?",
+            vec![now.into(), item_id.into()],
+        ))
+        .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error(e.into()),
     }

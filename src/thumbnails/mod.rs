@@ -3,6 +3,7 @@ use std::process::Command;
 
 /// Generate a trickplay tile strip using ffmpeg.
 /// Extracts frames at regular intervals and arranges them in a horizontal strip.
+#[allow(dead_code)]
 pub fn generate_trickplay_tiles(
     media_path: &Path,
     output_dir: &Path,
@@ -79,6 +80,7 @@ pub fn generate_trickplay_tiles(
     })
 }
 
+#[allow(dead_code)]
 pub struct TrickplayResult {
     pub tile_count: u32,
     pub interval_ticks: i64,
@@ -87,6 +89,7 @@ pub struct TrickplayResult {
     pub tile_paths: Vec<std::path::PathBuf>,
 }
 
+#[allow(dead_code)]
 fn get_video_duration(path: &Path, ffprobe_path: &str) -> anyhow::Result<f64> {
     let output = Command::new(ffprobe_path)
         .args([
@@ -107,6 +110,7 @@ fn get_video_duration(path: &Path, ffprobe_path: &str) -> anyhow::Result<f64> {
         .map_err(|e| anyhow::anyhow!("failed to parse duration: {e}"))
 }
 
+#[allow(dead_code)]
 fn create_tile_strip(
     frames: &[std::path::PathBuf],
     output: &Path,
@@ -129,9 +133,7 @@ fn create_tile_strip(
     } else {
         format!(
             "{}scale={tile_width}:{tile_height},tile={n}x1",
-            (0..n)
-                .map(|i| format!("[{i}:v]"))
-                .collect::<String>()
+            (0..n).map(|i| format!("[{i}:v]")).collect::<String>()
         )
     };
 

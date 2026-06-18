@@ -37,8 +37,14 @@ fn deduplicate_episodes(items: Vec<MediaItem>) -> Vec<MediaItem> {
     }
     let mut result: Vec<_> = map.into_values().collect();
     result.sort_by(|a, b| {
-        a.season_number.unwrap_or(0).cmp(&b.season_number.unwrap_or(0))
-            .then_with(|| a.episode_number.unwrap_or(0).cmp(&b.episode_number.unwrap_or(0)))
+        a.season_number
+            .unwrap_or(0)
+            .cmp(&b.season_number.unwrap_or(0))
+            .then_with(|| {
+                a.episode_number
+                    .unwrap_or(0)
+                    .cmp(&b.episode_number.unwrap_or(0))
+            })
             .then_with(|| a.title.cmp(&b.title))
     });
     result
@@ -56,7 +62,8 @@ pub async fn show_seasons(
     match child_items_by_type(&state.db, &user_id, &show_id, "Season").await {
         Ok(items) => {
             let json_items = enrich_season_list(&state.db, &user_id, items).await;
-            Json(json!({ "Items": json_items, "TotalRecordCount": json_items.len() })).into_response()
+            Json(json!({ "Items": json_items, "TotalRecordCount": json_items.len() }))
+                .into_response()
         }
         Err(error) => internal_error(error),
     }
@@ -79,18 +86,28 @@ pub async fn show_episodes(
     match result {
         Ok(items) => {
             let json_items = super::enrich_episode_list(&state.db, items).await;
-            Json(json!({ "Items": json_items, "TotalRecordCount": json_items.len() })).into_response()
+            Json(json!({ "Items": json_items, "TotalRecordCount": json_items.len() }))
+                .into_response()
         }
         Err(error) => internal_error(error),
     }
 }
 
 /// Batch-enrich season items with RecursiveItemCount and UnplayedItemCount.
-async fn enrich_season_list(db: &sea_orm::DatabaseConnection, user_id: &str, items: Vec<MediaItem>) -> Vec<Value> {
+async fn enrich_season_list(
+    db: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    items: Vec<MediaItem>,
+) -> Vec<Value> {
     let season_ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
 
     // Collect unique series IDs (parent_id of each season)
-    let series_ids: Vec<String> = items.iter().map(|i| i.parent_id.clone()).collect::<std::collections::HashSet<_>>().into_iter().collect();
+    let series_ids: Vec<String> = items
+        .iter()
+        .map(|i| i.parent_id.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
 
     // Batch query: series id -> title
     let mut series_map: HashMap<String, String> = HashMap::new();
@@ -99,7 +116,12 @@ async fn enrich_season_list(db: &sea_orm::DatabaseConnection, user_id: &str, ite
         let placeholders = series_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!("SELECT id, title FROM media_items WHERE id IN ({placeholders})");
         let values: Vec<sea_orm::Value> = series_ids.iter().map(|id| id.as_str().into()).collect();
-        if let Ok(rows) = db.query_all(crate::db::helpers::portable_statement(backend, &sql, values)).await {
+        if let Ok(rows) = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend, &sql, values,
+            ))
+            .await
+        {
             for row in &rows {
                 if let (Ok(id), Ok(title)) = (row.get_str("id"), row.get_str("title")) {
                     series_map.insert(id, title);
@@ -117,7 +139,12 @@ async fn enrich_season_list(db: &sea_orm::DatabaseConnection, user_id: &str, ite
             "SELECT parent_id, COUNT(*) AS cnt FROM media_items WHERE parent_id IN ({placeholders}) AND item_type = 'Episode' GROUP BY parent_id"
         );
         let values: Vec<sea_orm::Value> = season_ids.iter().map(|id| id.as_str().into()).collect();
-        if let Ok(rows) = db.query_all(crate::db::helpers::portable_statement(backend, &sql, values)).await {
+        if let Ok(rows) = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend, &sql, values,
+            ))
+            .await
+        {
             for row in &rows {
                 if let (Ok(pid), Ok(cnt)) = (row.get_str("parent_id"), row.get_i64("cnt")) {
                     count_map.insert(pid, cnt);
@@ -134,9 +161,15 @@ async fn enrich_season_list(db: &sea_orm::DatabaseConnection, user_id: &str, ite
         let sql = format!(
             "SELECT mi.parent_id, COUNT(*) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id IN ({placeholders}) AND mi.item_type = 'Episode' AND ud.user_id = ? AND ud.played = 1 GROUP BY mi.parent_id"
         );
-        let mut values: Vec<sea_orm::Value> = season_ids.iter().map(|id| id.as_str().into()).collect();
+        let mut values: Vec<sea_orm::Value> =
+            season_ids.iter().map(|id| id.as_str().into()).collect();
         values.push(user_id.into());
-        if let Ok(rows) = db.query_all(crate::db::helpers::portable_statement(backend, &sql, values)).await {
+        if let Ok(rows) = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend, &sql, values,
+            ))
+            .await
+        {
             for row in &rows {
                 if let (Ok(pid), Ok(cnt)) = (row.get_str("parent_id"), row.get_i64("cnt")) {
                     played_map.insert(pid, cnt);
@@ -145,19 +178,22 @@ async fn enrich_season_list(db: &sea_orm::DatabaseConnection, user_id: &str, ite
         }
     }
 
-    items.into_iter().map(|item| {
-        let mut val = item.to_jellyfin_json();
-        let total = count_map.get(&item.id).copied().unwrap_or(0);
-        let played = played_map.get(&item.id).copied().unwrap_or(0);
-        val["RecursiveItemCount"] = json!(total);
-        val["UserData"]["UnplayedItemCount"] = json!(total - played);
-        // Add SeriesId and SeriesName
-        val["SeriesId"] = json!(item.parent_id);
-        if let Some(series_name) = series_map.get(&item.parent_id) {
-            val["SeriesName"] = json!(series_name);
-        }
-        strip_nulls(val)
-    }).collect()
+    items
+        .into_iter()
+        .map(|item| {
+            let mut val = item.to_jellyfin_json();
+            let total = count_map.get(&item.id).copied().unwrap_or(0);
+            let played = played_map.get(&item.id).copied().unwrap_or(0);
+            val["RecursiveItemCount"] = json!(total);
+            val["UserData"]["UnplayedItemCount"] = json!(total - played);
+            // Add SeriesId and SeriesName
+            val["SeriesId"] = json!(item.parent_id);
+            if let Some(series_name) = series_map.get(&item.parent_id) {
+                val["SeriesName"] = json!(series_name);
+            }
+            strip_nulls(val)
+        })
+        .collect()
 }
 
 async fn child_items_by_type(
@@ -175,14 +211,15 @@ async fn child_items_by_type(
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            &crate::jellyfin::item_queries::media_item_select_sql(
-                &format!("WHERE media_items.parent_id = ? AND media_items.item_type = ? {order}"),
-            ),
+            &crate::jellyfin::item_queries::media_item_select_sql(&format!(
+                "WHERE media_items.parent_id = ? AND media_items.item_type = ? {order}"
+            )),
             vec![user_id.into(), parent_id.into(), item_type.into()],
         ))
         .await
         .with_context(|| format!("failed to list {item_type} children for: {parent_id}"))?;
-    let mut items = rows.iter()
+    let mut items = rows
+        .iter()
         .map(MediaItem::from_query_result)
         .collect::<Result<Vec<_>, _>>()
         .context("failed to decode show child items")?;
@@ -221,7 +258,8 @@ async fn descendant_episodes(
         ))
         .await
         .with_context(|| format!("failed to list episodes for show: {show_id}"))?;
-    let mut items = rows.iter()
+    let mut items = rows
+        .iter()
         .map(MediaItem::from_query_result)
         .collect::<Result<Vec<_>, _>>()
         .context("failed to decode show episodes")?;

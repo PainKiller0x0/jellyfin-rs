@@ -11,11 +11,8 @@ use sea_orm::ConnectionTrait;
 use serde_json::{Value, json};
 
 use crate::{
-    app::state::AppState,
-    db::row_ext::QueryResultExt,
-    jellyfin::common::internal_error,
-    library::scanner::scan_media_library,
-    util::now_unix,
+    app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error,
+    library::scanner::scan_media_library, util::now_unix,
 };
 
 pub async fn item_subtitles(
@@ -30,7 +27,10 @@ pub async fn item_subtitles(
     }
 }
 
-async fn subtitle_list_inner(db: &sea_orm::DatabaseConnection, item_id: &str) -> anyhow::Result<Vec<Value>> {
+async fn subtitle_list_inner(
+    db: &sea_orm::DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<Vec<Value>> {
     let backend = db.get_database_backend();
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
@@ -235,23 +235,37 @@ pub async fn merge_versions(
     Json(body): Json<Value>,
 ) -> Response {
     let Some(ids) = body.get("Ids").and_then(Value::as_array) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "Error": "Ids is required" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "Ids is required" })),
+        )
+            .into_response();
     };
-    let item_ids: Vec<String> = ids.iter().filter_map(|v| v.as_str().map(ToString::to_string)).collect();
+    let item_ids: Vec<String> = ids
+        .iter()
+        .filter_map(|v| v.as_str().map(ToString::to_string))
+        .collect();
     if item_ids.len() < 2 {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "Error": "Need at least 2 items to merge" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "Need at least 2 items to merge" })),
+        )
+            .into_response();
     }
 
     let backend = state.db.get_database_backend();
     // Find the parent of the first item — this becomes the target parent
     let first_id = &item_ids[0];
-    let parent_row = state.db.query_one(crate::db::helpers::portable_statement(
-        backend,
-        "SELECT parent_id, item_type FROM media_items WHERE id = ?",
-        vec![first_id.as_str().into()],
-    )).await;
+    let parent_row = state
+        .db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT parent_id, item_type FROM media_items WHERE id = ?",
+            vec![first_id.as_str().into()],
+        ))
+        .await;
 
-    let (parent_id, item_type) = match parent_row {
+    let (parent_id, _item_type) = match parent_row {
         Ok(Some(r)) => {
             let pid = r.get_str("parent_id").unwrap_or_default();
             let it = r.get_str("item_type").unwrap_or_default();

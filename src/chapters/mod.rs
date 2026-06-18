@@ -16,7 +16,10 @@ pub struct ChapterInfo {
 }
 
 /// Get all chapters for an item, ordered by start_position_ticks.
-pub async fn get_chapters(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Vec<ChapterInfo>> {
+pub async fn get_chapters(
+    db: &DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<Vec<ChapterInfo>> {
     let backend = db.get_database_backend();
     let rows = db
         .query_all(portable_statement(
@@ -34,13 +37,19 @@ pub async fn get_chapters(db: &DatabaseConnection, item_id: &str) -> anyhow::Res
             start_position_ticks: row.get_i64("start_position_ticks").unwrap_or(0),
             name: row.get_str("name").unwrap_or_default(),
             marker_type: row.get_str("marker_type").ok(),
-            source: row.get_str("source").unwrap_or_else(|_| "manual".to_string()),
+            source: row
+                .get_str("source")
+                .unwrap_or_else(|_| "manual".to_string()),
         })
         .collect())
 }
 
 /// Save chapters for an item. Deletes existing chapters and inserts new ones.
-pub async fn save_chapters(db: &DatabaseConnection, item_id: &str, chapters: &[ChapterInfo]) -> anyhow::Result<()> {
+pub async fn save_chapters(
+    db: &DatabaseConnection,
+    item_id: &str,
+    chapters: &[ChapterInfo],
+) -> anyhow::Result<()> {
     let backend = db.get_database_backend();
     // Delete existing chapters
     db.execute(portable_statement(
@@ -53,7 +62,10 @@ pub async fn save_chapters(db: &DatabaseConnection, item_id: &str, chapters: &[C
     let now = now_unix();
     for ch in chapters {
         let id = if ch.id.is_empty() {
-            stable_item_id(std::path::Path::new(&format!("{}:{}:{}", item_id, ch.start_position_ticks, ch.name)))
+            stable_item_id(std::path::Path::new(&format!(
+                "{}:{}:{}",
+                item_id, ch.start_position_ticks, ch.name
+            )))
         } else {
             ch.id.clone()
         };
@@ -77,7 +89,11 @@ pub async fn save_chapters(db: &DatabaseConnection, item_id: &str, chapters: &[C
 }
 
 /// Clear all intro/credits markers for an item.
-pub async fn clear_intro_credits_markers(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<()> {
+#[allow(dead_code)]
+pub async fn clear_intro_credits_markers(
+    db: &DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<()> {
     let backend = db.get_database_backend();
     db.execute(portable_statement(
         backend,
@@ -89,7 +105,10 @@ pub async fn clear_intro_credits_markers(db: &DatabaseConnection, item_id: &str)
 }
 
 /// Get intro markers (start, end) for an item.
-pub async fn get_intro_markers(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Option<(i64, i64)>> {
+pub async fn get_intro_markers(
+    db: &DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<Option<(i64, i64)>> {
     let backend = db.get_database_backend();
     let start_row = db.query_one(portable_statement(
         backend,
@@ -117,7 +136,10 @@ pub async fn get_intro_markers(db: &DatabaseConnection, item_id: &str) -> anyhow
 }
 
 /// Get credits start position for an item.
-pub async fn get_credits_marker(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Option<i64>> {
+pub async fn get_credits_marker(
+    db: &DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<Option<i64>> {
     let backend = db.get_database_backend();
     let row = db.query_one(portable_statement(
         backend,
@@ -128,6 +150,7 @@ pub async fn get_credits_marker(db: &DatabaseConnection, item_id: &str) -> anyho
 }
 
 /// Update intro markers for an episode and propagate to siblings in the same season.
+#[allow(dead_code)]
 pub async fn update_intro_for_season(
     db: &DatabaseConnection,
     episode_id: &str,
@@ -150,7 +173,9 @@ pub async fn update_intro_for_season(
         .await?
         .and_then(|r| r.get_str("parent_id").ok());
 
-    let Some(season_id) = season_id else { return Ok(()) };
+    let Some(season_id) = season_id else {
+        return Ok(());
+    };
 
     let episodes = db
         .query_all(portable_statement(
@@ -182,8 +207,12 @@ pub async fn update_intro_for_season(
         .await?;
 
         // Insert new markers
-        let start_id = stable_item_id(std::path::Path::new(&format!("{ep_id}:IntroStart:{intro_start}")));
-        let end_id = stable_item_id(std::path::Path::new(&format!("{ep_id}:IntroEnd:{intro_end}")));
+        let start_id = stable_item_id(std::path::Path::new(&format!(
+            "{ep_id}:IntroStart:{intro_start}"
+        )));
+        let end_id = stable_item_id(std::path::Path::new(&format!(
+            "{ep_id}:IntroEnd:{intro_end}"
+        )));
 
         db.execute(portable_statement(
             backend,
@@ -222,6 +251,7 @@ pub async fn update_intro_for_season(
 }
 
 /// Update credits marker for an episode and propagate to siblings in the same season.
+#[allow(dead_code)]
 pub async fn update_credits_for_season(
     db: &DatabaseConnection,
     episode_id: &str,
@@ -238,7 +268,9 @@ pub async fn update_credits_for_season(
         .await?
         .and_then(|r| r.get_str("parent_id").ok());
 
-    let Some(season_id) = season_id else { return Ok(()) };
+    let Some(season_id) = season_id else {
+        return Ok(());
+    };
 
     let episodes = db
         .query_all(portable_statement(
@@ -278,7 +310,9 @@ pub async fn update_credits_for_season(
         ))
         .await?;
 
-        let marker_id = stable_item_id(std::path::Path::new(&format!("{ep_id}:CreditsStart:{ep_credits_start}")));
+        let marker_id = stable_item_id(std::path::Path::new(&format!(
+            "{ep_id}:CreditsStart:{ep_credits_start}"
+        )));
         db.execute(portable_statement(
             backend,
             "INSERT INTO chapters (id, item_id, start_position_ticks, name, marker_type, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",

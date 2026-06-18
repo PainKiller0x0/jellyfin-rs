@@ -81,7 +81,11 @@ impl MediaItem {
             _ => None,
         };
 
-        let location_type = if !self.path.is_empty() { Some("FileSystem") } else { None };
+        let location_type = if !self.path.is_empty() {
+            Some("FileSystem")
+        } else {
+            None
+        };
 
         let mut map = Map::new();
         map.insert("Name".into(), JsonValue::String(self.title.clone()));
@@ -90,7 +94,10 @@ impl MediaItem {
         map.insert("ServerId".into(), JsonValue::Null);
         map.insert("Etag".into(), JsonValue::Null);
         map.insert("Path".into(), JsonValue::String(self.path.clone()));
-        map.insert("LibraryId".into(), JsonValue::String(self.library_id.clone()));
+        map.insert(
+            "LibraryId".into(),
+            JsonValue::String(self.library_id.clone()),
+        );
         map.insert("ParentId".into(), JsonValue::String(self.parent_id.clone()));
         map.insert("RunTimeTicks".into(), opt_i64(self.runtime_ticks));
         map.insert("Container".into(), opt_str(&self.container));
@@ -100,10 +107,15 @@ impl MediaItem {
         map.insert("Overview".into(), opt_str(&self.overview));
         map.insert("OfficialRating".into(), opt_str(&self.official_rating));
         map.insert("CustomRating".into(), JsonValue::Null);
-        map.insert("ExtendedVideoType".into(), opt_str(&self.extended_video_type));
+        map.insert(
+            "ExtendedVideoType".into(),
+            opt_str(&self.extended_video_type),
+        );
         map.insert("OriginalTitle".into(), JsonValue::Null);
         map.insert("ProductionYear".into(), opt_i64(self.production_year));
-        let premiere_date = self.production_year.map(|y| format!("{y}-01-01T00:00:00.0000000Z"));
+        let premiere_date = self
+            .production_year
+            .map(|y| format!("{y}-01-01T00:00:00.0000000Z"));
         map.insert("PremiereDate".into(), opt_str(&premiere_date));
         map.insert("EndDate".into(), JsonValue::Null);
         map.insert("IndexNumber".into(), opt_i64(self.episode_number));
@@ -136,17 +148,37 @@ impl MediaItem {
         map.insert("Width".into(), JsonValue::Null);
         map.insert("Height".into(), JsonValue::Null);
         map.insert("IsHD".into(), JsonValue::Null);
-        map.insert("CollectionType".into(), if self.collection_type.is_empty() { JsonValue::Null } else { JsonValue::String(self.collection_type.clone()) });
-        map.insert("DisplayPreferencesId".into(), JsonValue::String(self.id.clone()));
+        map.insert(
+            "CollectionType".into(),
+            if self.collection_type.is_empty() {
+                JsonValue::Null
+            } else {
+                JsonValue::String(self.collection_type.clone())
+            },
+        );
+        map.insert(
+            "DisplayPreferencesId".into(),
+            JsonValue::String(self.id.clone()),
+        );
         map.insert("PreferredMetadataLanguage".into(), JsonValue::Null);
         map.insert("PreferredMetadataCountryCode".into(), JsonValue::Null);
         map.insert("UserData".into(), build_user_data(self));
-        map.insert("DateCreated".into(), JsonValue::String(unix_to_jellyfin_date(self.created_at)));
-        map.insert("DateLastMediaAdded".into(), JsonValue::String(unix_to_jellyfin_date(self.modified_at)));
-        map.insert("ImageTags".into(), self.image_tags.clone().unwrap_or_else(|| json!({})));
+        map.insert(
+            "DateCreated".into(),
+            JsonValue::String(unix_to_jellyfin_date(self.created_at)),
+        );
+        map.insert(
+            "DateLastMediaAdded".into(),
+            JsonValue::String(unix_to_jellyfin_date(self.modified_at)),
+        );
+        map.insert(
+            "ImageTags".into(),
+            self.image_tags.clone().unwrap_or_else(|| json!({})),
+        );
 
         // Build BackdropImageTags from image_tags
-        let backdrop_tags: Vec<JsonValue> = self.image_tags
+        let backdrop_tags: Vec<JsonValue> = self
+            .image_tags
             .as_ref()
             .and_then(|tags| tags.get("Backdrop"))
             .and_then(|v| v.as_str())
@@ -220,19 +252,24 @@ impl MediaItem {
 // Helper functions for Map-based JSON construction
 
 fn opt_i64(val: Option<i64>) -> JsonValue {
-    val.map(|n| JsonValue::Number(serde_json::Number::from(n))).unwrap_or(JsonValue::Null)
+    val.map(|n| JsonValue::Number(serde_json::Number::from(n)))
+        .unwrap_or(JsonValue::Null)
 }
 
 fn opt_f64(val: Option<f64>) -> JsonValue {
-    val.and_then(|n| serde_json::Number::from_f64(n).map(JsonValue::Number)).unwrap_or(JsonValue::Null)
+    val.and_then(|n| serde_json::Number::from_f64(n).map(JsonValue::Number))
+        .unwrap_or(JsonValue::Null)
 }
 
 fn opt_str(val: &Option<String>) -> JsonValue {
-    val.as_ref().map(|s| JsonValue::String(s.clone())).unwrap_or(JsonValue::Null)
+    val.as_ref()
+        .map(|s| JsonValue::String(s.clone()))
+        .unwrap_or(JsonValue::Null)
 }
 
 fn opt_str_val(val: Option<&str>) -> JsonValue {
-    val.map(|s| JsonValue::String(s.to_string())).unwrap_or(JsonValue::Null)
+    val.map(|s| JsonValue::String(s.to_string()))
+        .unwrap_or(JsonValue::Null)
 }
 
 fn build_user_data(item: &MediaItem) -> JsonValue {
@@ -241,9 +278,20 @@ fn build_user_data(item: &MediaItem) -> JsonValue {
     map.insert("Key".into(), JsonValue::String(item.id.clone()));
     map.insert("Rating".into(), JsonValue::Null);
     map.insert("Played".into(), JsonValue::Bool(item.played));
-    map.insert("PlayCount".into(), JsonValue::Number(serde_json::Number::from(item.play_count)));
-    map.insert("LastPlayedDate".into(), item.last_played_at.map(|ts| JsonValue::String(unix_to_jellyfin_date(ts))).unwrap_or(JsonValue::Null));
-    map.insert("PlaybackPositionTicks".into(), JsonValue::Number(serde_json::Number::from(item.playback_position_ticks)));
+    map.insert(
+        "PlayCount".into(),
+        JsonValue::Number(serde_json::Number::from(item.play_count)),
+    );
+    map.insert(
+        "LastPlayedDate".into(),
+        item.last_played_at
+            .map(|ts| JsonValue::String(unix_to_jellyfin_date(ts)))
+            .unwrap_or(JsonValue::Null),
+    );
+    map.insert(
+        "PlaybackPositionTicks".into(),
+        JsonValue::Number(serde_json::Number::from(item.playback_position_ticks)),
+    );
     let played_pct = if item.played {
         JsonValue::Number(serde_json::Number::from_f64(100.0).unwrap())
     } else {
@@ -262,18 +310,22 @@ pub fn media_source_json(item: &MediaItem) -> JsonValue {
     media_source_json_with_streams(item, Vec::new())
 }
 
-pub fn media_source_json_with_streams(item: &MediaItem, media_streams: Vec<JsonValue>) -> JsonValue {
+pub fn media_source_json_with_streams(
+    item: &MediaItem,
+    media_streams: Vec<JsonValue>,
+) -> JsonValue {
     let container = item.container.as_deref().unwrap_or("bin");
     let stream_path = match item.item_type.as_str() {
         "Audio" => format!("/Audio/{}/universal", item.id),
         _ => format!("/Videos/{}/stream.{container}", item.id),
     };
 
-    let video_type = if item.item_type == "Video" || item.item_type == "Movie" || item.item_type == "Episode" {
-        JsonValue::String("VideoFile".to_string())
-    } else {
-        JsonValue::Null
-    };
+    let video_type =
+        if item.item_type == "Video" || item.item_type == "Movie" || item.item_type == "Episode" {
+            JsonValue::String("VideoFile".to_string())
+        } else {
+            JsonValue::Null
+        };
 
     let mut map = Map::new();
     map.insert("Id".into(), JsonValue::String(item.id.clone()));
@@ -319,7 +371,10 @@ pub fn media_source_json_with_streams(item: &MediaItem, media_streams: Vec<JsonV
     map.insert("EncoderProtocol".into(), JsonValue::Null);
     map.insert("BufferMs".into(), JsonValue::Null);
     map.insert("AnalyzeDurationMs".into(), JsonValue::Null);
-    map.insert("UseMostCompatibleTranscodingProfile".into(), JsonValue::Bool(false));
+    map.insert(
+        "UseMostCompatibleTranscodingProfile".into(),
+        JsonValue::Bool(false),
+    );
     map.insert("LiveStreamId".into(), JsonValue::Null);
     map.insert("OpenToken".into(), JsonValue::Null);
     map.insert("ETag".into(), JsonValue::String(item.id.clone()));
@@ -367,7 +422,10 @@ impl MediaStreamRow {
         let display_title = compute_stream_display_title(self);
 
         let mut map = Map::new();
-        map.insert("Index".into(), JsonValue::Number(serde_json::Number::from(self.stream_index)));
+        map.insert(
+            "Index".into(),
+            JsonValue::Number(serde_json::Number::from(self.stream_index)),
+        );
         map.insert("Type".into(), JsonValue::String(self.stream_type.clone()));
         map.insert("Codec".into(), opt_str(&self.codec));
         map.insert("CodecTag".into(), JsonValue::Null);
@@ -375,7 +433,14 @@ impl MediaStreamRow {
         map.insert("Title".into(), opt_str(&self.title));
         map.insert("Comment".into(), JsonValue::Null);
         map.insert("DisplayTitle".into(), JsonValue::String(display_title));
-        map.insert("Path".into(), if self.is_external { opt_str(&self.path) } else { JsonValue::Null });
+        map.insert(
+            "Path".into(),
+            if self.is_external {
+                opt_str(&self.path)
+            } else {
+                JsonValue::Null
+            },
+        );
         map.insert("BitRate".into(), opt_i64(self.bit_rate));
         map.insert("Width".into(), opt_i64(self.width));
         map.insert("Height".into(), opt_i64(self.height));
@@ -411,7 +476,10 @@ impl MediaStreamRow {
         map.insert("Channels".into(), opt_i64(self.channels));
         map.insert("ChannelLayout".into(), JsonValue::Null);
         map.insert("SampleRate".into(), opt_i64(self.sample_rate));
-        map.insert("AudioSpatialFormat".into(), JsonValue::String("None".to_string()));
+        map.insert(
+            "AudioSpatialFormat".into(),
+            JsonValue::String("None".to_string()),
+        );
         map.insert("DeliveryMethod".into(), opt_str_val(delivery_method));
         map.insert("DeliveryUrl".into(), opt_str_val(delivery_url.as_deref()));
         map.insert("IsExternal".into(), JsonValue::Bool(self.is_external));
@@ -447,7 +515,15 @@ fn compute_stream_display_title(stream: &MediaStreamRow) -> String {
             parts.push(title.clone());
         }
         if let (Some(_w), Some(h)) = (stream.width, stream.height) {
-            let label = if h >= 2160 { "4K" } else if h >= 1080 { "1080p" } else if h >= 720 { "720p" } else { "SD" };
+            let label = if h >= 2160 {
+                "4K"
+            } else if h >= 1080 {
+                "1080p"
+            } else if h >= 720 {
+                "720p"
+            } else {
+                "SD"
+            };
             parts.push(label.to_string());
         }
         if let Some(ref codec) = stream.codec {
@@ -504,7 +580,10 @@ fn compute_stream_display_title(stream: &MediaStreamRow) -> String {
             parts.join(" - ")
         }
     } else {
-        stream.title.clone().unwrap_or_else(|| "Unknown".to_string())
+        stream
+            .title
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_string())
     }
 }
 
@@ -528,7 +607,10 @@ pub fn child_video_source_json(
     map.insert("Container".into(), JsonValue::String(container.to_string()));
     map.insert("Size".into(), opt_i64(size));
     map.insert("RunTimeTicks".into(), opt_i64(runtime_ticks));
-    map.insert("VideoType".into(), JsonValue::String("VideoFile".to_string()));
+    map.insert(
+        "VideoType".into(),
+        JsonValue::String("VideoFile".to_string()),
+    );
     map.insert("IsoType".into(), JsonValue::Null);
     map.insert("Video3DFormat".into(), JsonValue::Null);
     map.insert("Timestamp".into(), JsonValue::Null);
@@ -558,12 +640,18 @@ pub fn child_video_source_json(
     map.insert("TranscodingUrl".into(), JsonValue::Null);
     map.insert("TranscodingContainer".into(), JsonValue::Null);
     map.insert("TranscodingSubProtocol".into(), JsonValue::Null);
-    map.insert("DirectStreamUrl".into(), JsonValue::String(format!("/Videos/{id}/stream.{container}")));
+    map.insert(
+        "DirectStreamUrl".into(),
+        JsonValue::String(format!("/Videos/{id}/stream.{container}")),
+    );
     map.insert("EncoderPath".into(), JsonValue::Null);
     map.insert("EncoderProtocol".into(), JsonValue::Null);
     map.insert("BufferMs".into(), JsonValue::Null);
     map.insert("AnalyzeDurationMs".into(), JsonValue::Null);
-    map.insert("UseMostCompatibleTranscodingProfile".into(), JsonValue::Bool(false));
+    map.insert(
+        "UseMostCompatibleTranscodingProfile".into(),
+        JsonValue::Bool(false),
+    );
     map.insert("LiveStreamId".into(), JsonValue::Null);
     map.insert("OpenToken".into(), JsonValue::Null);
     map.insert("ETag".into(), JsonValue::String(id.to_string()));

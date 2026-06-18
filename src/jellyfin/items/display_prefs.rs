@@ -11,9 +11,7 @@ use sea_orm::ConnectionTrait;
 use serde_json::{Value, json};
 
 use crate::{
-    app::state::AppState,
-    db::row_ext::QueryResultExt,
-    jellyfin::common::internal_error,
+    app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error,
     util::now_unix,
 };
 

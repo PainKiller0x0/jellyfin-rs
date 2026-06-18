@@ -6,26 +6,30 @@ pub fn classify_media_path(path: &Path, collection_type: &str) -> Option<String>
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     // STRM files are classified based on their content (handled in scanner.rs)
     if extension == "strm" {
-        return Some(match collection_type {
-            "tvshows" | "tv" => "Episode",
-            "music" => "Audio",
-            "movies" => "Video",
-            _ => "Movie",
-        }
-        .to_string());
+        return Some(
+            match collection_type {
+                "tvshows" | "tv" => "Episode",
+                "music" => "Audio",
+                "movies" => "Video",
+                _ => "Movie",
+            }
+            .to_string(),
+        );
     }
     if matches!(
         extension.as_str(),
         "mkv" | "mp4" | "m4v" | "mov" | "avi" | "wmv" | "webm" | "ts" | "m2ts" | "flv"
     ) {
-        return Some(match collection_type {
-            "tvshows" | "tv" => "Episode",
-            "music" => "Audio",
-            // In movie libraries, files are "Video" — the folder itself is the "Movie"
-            "movies" => "Video",
-            _ => "Movie",
-        }
-        .to_string());
+        return Some(
+            match collection_type {
+                "tvshows" | "tv" => "Episode",
+                "music" => "Audio",
+                // In movie libraries, files are "Video" — the folder itself is the "Movie"
+                "movies" => "Video",
+                _ => "Movie",
+            }
+            .to_string(),
+        );
     }
     if matches!(
         extension.as_str(),
@@ -43,7 +47,7 @@ pub fn parent_id_for_path(path: &Path, root: &Path, library_id: &str) -> String 
     let root = std::path::Path::new(&norm_root);
     path.parent()
         .filter(|parent| *parent != root)
-        .map(|parent| stable_item_id(parent))
+        .map(stable_item_id)
         .unwrap_or_else(|| library_id.to_string())
 }
 

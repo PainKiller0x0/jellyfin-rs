@@ -61,14 +61,26 @@ pub(crate) async fn child_video_sources(
         let video_id: String = row.get_str("id")?;
         let title: String = row.get_str("title")?;
         let path: String = row.get_str("path")?;
-        let container = row.get_opt_str("container")?.unwrap_or_else(|| "bin".to_string());
+        let container = row
+            .get_opt_str("container")?
+            .unwrap_or_else(|| "bin".to_string());
         let size = row.get_opt_i64("size_bytes")?;
         let runtime_ticks = row.get_opt_i64("runtime_ticks")?;
 
         // Add media streams for this video
-        let streams = media_streams_for_item(db, &video_id).await.unwrap_or_default();
+        let streams = media_streams_for_item(db, &video_id)
+            .await
+            .unwrap_or_default();
 
-        let source = child_video_source_json(&video_id, &title, &path, &container, size, runtime_ticks, streams);
+        let source = child_video_source_json(
+            &video_id,
+            &title,
+            &path,
+            &container,
+            size,
+            runtime_ticks,
+            streams,
+        );
         sources.push(source);
     }
 

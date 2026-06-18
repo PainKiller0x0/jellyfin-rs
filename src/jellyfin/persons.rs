@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json,
-    body::{Body, Bytes},
+    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
@@ -64,7 +64,8 @@ async fn person_detail(
         .map(String::as_str);
     let is_favorite = if let Some(uid) = user_id {
         let backend = state.db.get_database_backend();
-        state.db
+        state
+            .db
             .query_one(crate::db::helpers::portable_statement(
                 backend,
                 "SELECT is_favorite FROM user_data WHERE user_id = ? AND item_id = ?",
@@ -283,7 +284,8 @@ async fn fetch_tagged_items(
         ))
         .await?;
 
-    let item_ids: Vec<String> = rows.iter()
+    let item_ids: Vec<String> = rows
+        .iter()
         .filter_map(|row| row.get_opt_str("id").ok().flatten())
         .collect();
 
@@ -291,7 +293,9 @@ async fn fetch_tagged_items(
     let tags_map = if item_ids.is_empty() {
         Default::default()
     } else {
-        crate::jellyfin::item_queries::batch_item_image_tags(db, &item_ids).await.unwrap_or_default()
+        crate::jellyfin::item_queries::batch_item_image_tags(db, &item_ids)
+            .await
+            .unwrap_or_default()
     };
 
     let items = rows
@@ -474,7 +478,8 @@ async fn serve_person_image(
     response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     response_headers.insert(
         header::CONTENT_LENGTH,
-        HeaderValue::from_str(&bytes.len().to_string()).unwrap_or_else(|_| HeaderValue::from_static("0")),
+        HeaderValue::from_str(&bytes.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
     if let Ok(value) = HeaderValue::from_str(etag) {
         response_headers.insert(header::ETAG, value);

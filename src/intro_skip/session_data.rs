@@ -2,6 +2,7 @@ use std::time::Instant;
 
 /// Per-play-session state for behavior-based intro/credits detection.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PlaySessionData {
     pub item_id: String,
     pub user_id: String,
@@ -31,6 +32,7 @@ pub struct PlaySessionData {
 }
 
 impl PlaySessionData {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         item_id: String,
         user_id: String,

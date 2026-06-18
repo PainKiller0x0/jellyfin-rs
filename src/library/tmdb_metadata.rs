@@ -73,7 +73,12 @@ pub fn clean_title_with_year(title: &str) -> (String, Option<i64>) {
         }
     }
 
-    let cleaned = result.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_string();
+    let cleaned = result
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
     (cleaned, year)
 }
 
@@ -99,24 +104,30 @@ pub async fn fetch_episode_tmdb_metadata(
     let ep: TmdbEpisode = client
         .get(&url)
         .query(&[("api_key", api_key), ("language", "zh-CN")])
-        .send().await?
+        .send()
+        .await?
         .error_for_status()?
-        .json().await?;
+        .json()
+        .await?;
 
     let backend = db.get_database_backend();
     if let Some(name) = ep.name.as_ref().filter(|n| !n.is_empty()) {
-        let _ = db.execute(crate::db::helpers::portable_statement(
-            backend,
-            "UPDATE media_items SET title = ? WHERE id = ?",
-            vec![name.as_str().into(), item_id.into()],
-        )).await;
+        let _ = db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "UPDATE media_items SET title = ? WHERE id = ?",
+                vec![name.as_str().into(), item_id.into()],
+            ))
+            .await;
     }
     if let Some(overview) = ep.overview.as_ref().filter(|o| !o.is_empty()) {
-        let _ = db.execute(crate::db::helpers::portable_statement(
-            backend,
-            "UPDATE media_items SET overview = ? WHERE id = ?",
-            vec![overview.as_str().into(), item_id.into()],
-        )).await;
+        let _ = db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "UPDATE media_items SET overview = ? WHERE id = ?",
+                vec![overview.as_str().into(), item_id.into()],
+            ))
+            .await;
     }
     if let Some(still) = ep.still_path.as_ref() {
         let img_url = format!("https://image.tmdb.org/t/p/w500{still}");
@@ -140,25 +151,32 @@ fn build_client() -> anyhow::Result<reqwest::Client> {
 /// Download poster images for all seasons that belong to a TMDb series
 async fn download_season_images(db: &sea_orm::DatabaseConnection, api_key: &str) {
     let backend = db.get_database_backend();
-    let rows = db.query_all(crate::db::helpers::portable_statement(
-        backend,
-        r#"SELECT s.id as season_id, s.title, p.provider_item_id as series_tmdb_id
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            r#"SELECT s.id as season_id, s.title, p.provider_item_id as series_tmdb_id
            FROM media_items s
            JOIN media_items series ON series.id = s.parent_id
            JOIN provider_ids p ON p.item_id = series.id AND p.provider = 'Tmdb'
            WHERE s.item_type = 'Season'
            AND NOT EXISTS (SELECT 1 FROM image_assets ia WHERE ia.item_id = s.id)"#,
-        vec![],
-    )).await;
+            vec![],
+        ))
+        .await;
     let Ok(rows) = rows else { return };
-    if rows.is_empty() { return };
+    if rows.is_empty() {
+        return;
+    };
 
     let total = rows.len();
     tracing::info!("Downloading {total} season poster images...");
 
     let client = match build_client() {
         Ok(c) => c,
-        Err(e) => { tracing::warn!("Failed to build HTTP client: {e:#}"); return },
+        Err(e) => {
+            tracing::warn!("Failed to build HTTP client: {e:#}");
+            return;
+        }
     };
     let mut downloaded = 0usize;
 
@@ -184,25 +202,32 @@ async fn download_season_images(db: &sea_orm::DatabaseConnection, api_key: &str)
         let results = futures_util::future::join_all(futures).await;
         for (season_id, poster_path, name, overview) in results.into_iter().flatten() {
             // Update season name from TMDb
-            if let Some(ref n) = name.as_ref().filter(|s| !s.is_empty()) {
-                let _ = db.execute(crate::db::helpers::portable_statement(
-                    backend,
-                    "UPDATE media_items SET title = ? WHERE id = ?",
-                    vec![n.as_str().into(), season_id.as_str().into()],
-                )).await;
+            if let Some(n) = name.as_ref().filter(|s| !s.is_empty()) {
+                let _ = db
+                    .execute(crate::db::helpers::portable_statement(
+                        backend,
+                        "UPDATE media_items SET title = ? WHERE id = ?",
+                        vec![n.as_str().into(), season_id.as_str().into()],
+                    ))
+                    .await;
             }
             // Update season overview from TMDb
-            if let Some(ref o) = overview.as_ref().filter(|s| !s.is_empty()) {
-                let _ = db.execute(crate::db::helpers::portable_statement(
-                    backend,
-                    "UPDATE media_items SET overview = ? WHERE id = ?",
-                    vec![o.as_str().into(), season_id.as_str().into()],
-                )).await;
+            if let Some(o) = overview.as_ref().filter(|s| !s.is_empty()) {
+                let _ = db
+                    .execute(crate::db::helpers::portable_statement(
+                        backend,
+                        "UPDATE media_items SET overview = ? WHERE id = ?",
+                        vec![o.as_str().into(), season_id.as_str().into()],
+                    ))
+                    .await;
             }
             // Download season poster
             if let Some(poster_path) = poster_path {
                 let img_url = format!("https://image.tmdb.org/t/p/w500{}", poster_path);
-                if download_and_save_tmdb_image(db, &client, &season_id, &img_url, "Primary").await.is_ok() {
+                if download_and_save_tmdb_image(db, &client, &season_id, &img_url, "Primary")
+                    .await
+                    .is_ok()
+                {
                     downloaded += 1;
                 }
             }
@@ -217,7 +242,9 @@ fn parse_season_number(title: &str) -> Option<i64> {
     // Try "season 1"
     if let Some(pos) = title_lower.find("season") {
         let rest = &title_lower[pos + 6..];
-        return rest.trim().split_whitespace().next()
+        return rest
+            .split_whitespace()
+            .next()
             .and_then(|s| s.parse::<i64>().ok());
     }
     // Try "第1季"
@@ -228,8 +255,7 @@ fn parse_season_number(title: &str) -> Option<i64> {
         }
     }
     // Try "S01" at start
-    if title_lower.starts_with('s') {
-        let rest = &title_lower[1..];
+    if let Some(rest) = title_lower.strip_prefix('s') {
         if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
             return rest[..end].parse::<i64>().ok();
         }
@@ -264,10 +290,18 @@ pub async fn batch_fetch_episode_tmdb(
     let mut tasks = Vec::new();
 
     for row in &rows {
-        let Ok(episode_id) = row.get_str("episode_id") else { continue };
-        let Ok(sn) = row.get_i64("season_number") else { continue };
-        let Ok(en) = row.get_i64("episode_number") else { continue };
-        let Ok(tmdb_id) = row.get_str("tmdb_id") else { continue };
+        let Ok(episode_id) = row.get_str("episode_id") else {
+            continue;
+        };
+        let Ok(sn) = row.get_i64("season_number") else {
+            continue;
+        };
+        let Ok(en) = row.get_i64("episode_number") else {
+            continue;
+        };
+        let Ok(tmdb_id) = row.get_str("tmdb_id") else {
+            continue;
+        };
 
         let key = format!("{tmdb_id}:{sn}:{en}");
         if !seen.insert(key) {
@@ -285,23 +319,36 @@ pub async fn batch_fetch_episode_tmdb(
     // Process in concurrent batches (10 at a time)
     let mut count = 0usize;
     for chunk in tasks.chunks(10) {
-        let futures: Vec<_> = chunk.iter().map(|(ep_id, tmdb, sn, en)| {
-            let api_key = api_key.clone();
-            let ep_id = ep_id.clone();
-            let tmdb = tmdb.clone();
-            let sn = *sn;
-            let en = *en;
-            let client = client.clone();
-            async move {
-                let url = format!("https://api.themoviedb.org/3/tv/{tmdb}/season/{sn}/episode/{en}");
-                #[derive(serde::Deserialize)]
-                struct Ep { name: Option<String>, overview: Option<String>, still_path: Option<String> }
-                let resp = client.get(&url).query(&[("api_key", api_key.as_str()), ("language", "zh-CN")]).send().await.ok()?;
-                let resp = resp.error_for_status().ok()?;
-                let ep: Ep = resp.json().await.ok()?;
-                Some((ep, ep_id))
-            }
-        }).collect();
+        let futures: Vec<_> = chunk
+            .iter()
+            .map(|(ep_id, tmdb, sn, en)| {
+                let api_key = api_key.clone();
+                let ep_id = ep_id.clone();
+                let tmdb = tmdb.clone();
+                let sn = *sn;
+                let en = *en;
+                let client = client.clone();
+                async move {
+                    let url =
+                        format!("https://api.themoviedb.org/3/tv/{tmdb}/season/{sn}/episode/{en}");
+                    #[derive(serde::Deserialize)]
+                    struct Ep {
+                        name: Option<String>,
+                        overview: Option<String>,
+                        still_path: Option<String>,
+                    }
+                    let resp = client
+                        .get(&url)
+                        .query(&[("api_key", api_key.as_str()), ("language", "zh-CN")])
+                        .send()
+                        .await
+                        .ok()?;
+                    let resp = resp.error_for_status().ok()?;
+                    let ep: Ep = resp.json().await.ok()?;
+                    Some((ep, ep_id))
+                }
+            })
+            .collect();
 
         let results: Vec<_> = futures_util::future::join_all(futures).await;
         for result in results.into_iter().flatten() {
@@ -309,23 +356,30 @@ pub async fn batch_fetch_episode_tmdb(
             let backend = db.get_database_backend();
             if let Some(ref name) = ep.name {
                 if !name.is_empty() {
-                    let _ = db.execute(crate::db::helpers::portable_statement(
-                        backend, "UPDATE media_items SET title = ? WHERE id = ?",
-                        vec![name.as_str().into(), episode_id.clone().into()],
-                    )).await;
+                    let _ = db
+                        .execute(crate::db::helpers::portable_statement(
+                            backend,
+                            "UPDATE media_items SET title = ? WHERE id = ?",
+                            vec![name.as_str().into(), episode_id.clone().into()],
+                        ))
+                        .await;
                 }
             }
             if let Some(ref overview) = ep.overview {
                 if !overview.is_empty() {
-                    let _ = db.execute(crate::db::helpers::portable_statement(
-                        backend, "UPDATE media_items SET overview = ? WHERE id = ?",
-                        vec![overview.as_str().into(), episode_id.clone().into()],
-                    )).await;
+                    let _ = db
+                        .execute(crate::db::helpers::portable_statement(
+                            backend,
+                            "UPDATE media_items SET overview = ? WHERE id = ?",
+                            vec![overview.as_str().into(), episode_id.clone().into()],
+                        ))
+                        .await;
                 }
             }
             if let Some(ref still) = ep.still_path {
                 let img = format!("https://image.tmdb.org/t/p/w500{still}");
-                let _ = download_and_save_tmdb_image(db, &client, &episode_id, &img, "Primary").await;
+                let _ =
+                    download_and_save_tmdb_image(db, &client, &episode_id, &img, "Primary").await;
             }
             count += 1;
         }
@@ -344,11 +398,13 @@ pub async fn lookup_stored_tmdb_id(
     item_id: &str,
 ) -> anyhow::Result<Option<String>> {
     let backend = db.get_database_backend();
-    let row = db.query_one(crate::db::helpers::portable_statement(
-        backend,
-        "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
-        vec![item_id.into()],
-    )).await?;
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
+            vec![item_id.into()],
+        ))
+        .await?;
     Ok(row.and_then(|r| r.get_opt_str("provider_item_id").ok().flatten()))
 }
 
@@ -389,7 +445,12 @@ fn parse_folder_name(path: &Path) -> Option<(String, Option<i64>)> {
             }
         }
     }
-    let title = title.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_string();
+    let title = title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
     if title.is_empty() {
         return None;
     }
@@ -409,17 +470,28 @@ async fn lookup_tmdb_id_by_name(
     } else {
         "https://api.themoviedb.org/3/search/movie"
     };
-    let mut request = client.get(url).query(&[("api_key", api_key), ("query", name), ("language", "zh-CN")]);
+    let mut request =
+        client
+            .get(url)
+            .query(&[("api_key", api_key), ("query", name), ("language", "zh-CN")]);
     let year_param: String;
     if let Some(year) = year {
         year_param = year.to_string();
         let key = if is_tv { "first_air_date_year" } else { "year" };
         request = request.query(&[(key, year_param.as_str())]);
     }
-    let response = request.send().await?.error_for_status()?.json::<serde_json::Value>().await?;
+    let response = request
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await?;
     if let Some(results) = response.get("results").and_then(|v| v.as_array()) {
         if let Some(first) = results.first() {
-            return Ok(first.get("id").and_then(|v| v.as_i64()).map(|id| id.to_string()));
+            return Ok(first
+                .get("id")
+                .and_then(|v| v.as_i64())
+                .map(|id| id.to_string()));
         }
     }
     Ok(None)
@@ -448,15 +520,17 @@ pub async fn fill_missing_tmdb(
     let mut count = 0usize;
 
     for row in &rows {
-        let Ok(item_id) = row.get_str("id") else { continue };
+        let Ok(item_id) = row.get_str("id") else {
+            continue;
+        };
         let title: String = row.get_str("title").unwrap_or_default();
         let item_type: String = row.get_str("item_type").unwrap_or_default();
         let path_str: String = row.get_str("path").unwrap_or_default();
         let is_tv = item_type == "Series";
 
         // Try to parse name from path first, fall back to title
-        let (name, year) = parse_folder_name(Path::new(&path_str))
-            .unwrap_or_else(|| (title.clone(), None));
+        let (name, year) =
+            parse_folder_name(Path::new(&path_str)).unwrap_or_else(|| (title.clone(), None));
 
         match lookup_tmdb_id_by_name(&client, api_key, &name, year, is_tv).await {
             Ok(Some(tmdb_id)) => {
@@ -468,7 +542,14 @@ pub async fn fill_missing_tmdb(
                 tracing::info!("fill_missing_tmdb: matched '{name}' → tmdb-{tmdb_id}");
 
                 // Now fetch full metadata
-                let _ = fetch_and_apply_tmdb_metadata(db, &item_id, &item_type, Path::new(&path_str), api_key).await;
+                let _ = fetch_and_apply_tmdb_metadata(
+                    db,
+                    &item_id,
+                    &item_type,
+                    Path::new(&path_str),
+                    api_key,
+                )
+                .await;
                 count += 1;
             }
             Ok(None) => {
@@ -495,8 +576,10 @@ pub async fn fetch_and_apply_tmdb_metadata(
     let is_tv = item_type == "Series" || item_type == "Season" || item_type == "Episode";
 
     // Step 1: check for existing TMDb ID already stored (e.g. from NFO parsing)
-    let mut tmdb_id = lookup_stored_tmdb_id(db, item_id).await
-        .ok().flatten()
+    let mut tmdb_id = lookup_stored_tmdb_id(db, item_id)
+        .await
+        .ok()
+        .flatten()
         .or_else(|| extract_tmdb_id(path));
 
     // Step 2: name-based search fallback — only for Movie and Series (Season names like "Season 1" are not searchable)
@@ -513,7 +596,10 @@ pub async fn fetch_and_apply_tmdb_metadata(
                         "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
                         vec![item_id.into(), tmdb_id.as_ref().unwrap().into()],
                     )).await;
-                    tracing::info!("TMDb name search matched '{name}' → tmdb-{}", tmdb_id.as_ref().unwrap());
+                    tracing::info!(
+                        "TMDb name search matched '{name}' → tmdb-{}",
+                        tmdb_id.as_ref().unwrap()
+                    );
                 }
                 Ok(None) => {
                     tracing::info!("TMDb name search found no results for '{name}'");
@@ -551,9 +637,7 @@ pub async fn fetch_and_apply_tmdb_metadata(
         .get("Overview")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
-    let year = metadata
-        .get("ProductionYear")
-        .and_then(|v| v.as_i64());
+    let year = metadata.get("ProductionYear").and_then(|v| v.as_i64());
     let genres: Vec<String> = metadata
         .get("Genres")
         .and_then(|v| v.as_array())
@@ -582,7 +666,11 @@ pub async fn fetch_and_apply_tmdb_metadata(
                         p.get("Name")?.as_str()?.to_string(),
                         p.get("Role")?.as_str()?.to_string(),
                         p.get("Type")?.as_str()?.to_string(),
-                        p.get("ImageUrl").and_then(|v| v.as_str().filter(|s| !s.is_empty()).map(ToString::to_string)),
+                        p.get("ImageUrl").and_then(|v| {
+                            v.as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(ToString::to_string)
+                        }),
                     ))
                 })
                 .collect()
@@ -590,7 +678,9 @@ pub async fn fetch_and_apply_tmdb_metadata(
         .unwrap_or_default();
     let people_with_images = people.iter().filter(|(_, _, _, img)| img.is_some()).count();
     if people_with_images > 0 {
-        tracing::info!("Found {people_with_images} cast members with profile images for {item_type} {tmdb_id}");
+        tracing::info!(
+            "Found {people_with_images} cast members with profile images for {item_type} {tmdb_id}"
+        );
     }
 
     // Update media item
@@ -613,7 +703,11 @@ pub async fn fetch_and_apply_tmdb_metadata(
             .await;
     }
     // Update community_rating (TMDb vote_average is 0-10, store as-is)
-    if let Some(rating) = metadata.get("CommunityRating").and_then(|v| v.as_f64()).filter(|r| *r > 0.0) {
+    if let Some(rating) = metadata
+        .get("CommunityRating")
+        .and_then(|v| v.as_f64())
+        .filter(|r| *r > 0.0)
+    {
         let _ = db
             .execute(crate::db::helpers::portable_statement(
                 backend,
@@ -624,7 +718,11 @@ pub async fn fetch_and_apply_tmdb_metadata(
     }
 
     // Update official_rating (PG, R, etc.)
-    if let Some(rating) = metadata.get("OfficialRating").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(rating) = metadata
+        .get("OfficialRating")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         let _ = db
             .execute(crate::db::helpers::portable_statement(
                 backend,
@@ -635,7 +733,11 @@ pub async fn fetch_and_apply_tmdb_metadata(
     }
 
     // Update runtime_ticks from TMDb runtime (minutes → ticks: 1 min = 60 * 10_000_000)
-    if let Some(ticks) = metadata.get("RuntimeTicks").and_then(|v| v.as_i64()).filter(|t| *t > 0) {
+    if let Some(ticks) = metadata
+        .get("RuntimeTicks")
+        .and_then(|v| v.as_i64())
+        .filter(|t| *t > 0)
+    {
         let _ = db
             .execute(crate::db::helpers::portable_statement(
                 backend,
@@ -711,7 +813,10 @@ pub async fn fetch_and_apply_tmdb_metadata(
                 vec![person_id.clone().into(), name.as_str().into(), now.into()],
             ))
             .await;
-        let sort_order = people.iter().position(|(n, _, _, _)| n == name).unwrap_or(0) as i64;
+        let sort_order = people
+            .iter()
+            .position(|(n, _, _, _)| n == name)
+            .unwrap_or(0) as i64;
         let _ = db
             .execute(crate::db::helpers::portable_statement(
                 backend,
@@ -727,7 +832,10 @@ pub async fn fetch_and_apply_tmdb_metadata(
             .await;
         // Download person profile image
         if let Some(img_url) = image_url {
-            if let Err(e) = download_and_save_tmdb_image(db, &client, person_id.as_str(), img_url, "Primary").await {
+            if let Err(e) =
+                download_and_save_tmdb_image(db, &client, person_id.as_str(), img_url, "Primary")
+                    .await
+            {
                 tracing::warn!("Failed to download person image for {name}: {e:#}");
             }
         }
@@ -748,9 +856,15 @@ pub async fn fetch_and_apply_tmdb_metadata(
 
     // Fetch additional images (logo, banner, art) from TMDb /images endpoint
     let images_url = if is_tv {
-        format!("https://api.themoviedb.org/3/tv/{}/images?api_key={}", tmdb_id, api_key)
+        format!(
+            "https://api.themoviedb.org/3/tv/{}/images?api_key={}",
+            tmdb_id, api_key
+        )
     } else {
-        format!("https://api.themoviedb.org/3/movie/{}/images?api_key={}", tmdb_id, api_key)
+        format!(
+            "https://api.themoviedb.org/3/movie/{}/images?api_key={}",
+            tmdb_id, api_key
+        )
     };
     if let Ok(resp) = client.get(&images_url).send().await {
         if let Ok(images) = resp.json::<TmdbImagesResponse>().await {
@@ -790,7 +904,10 @@ pub async fn fetch_and_apply_tmdb_metadata(
                     if let Ok(season) = resp.json::<TmdbSeason>().await {
                         if let Some(poster) = season.poster_path {
                             let img_url = format!("https://image.tmdb.org/t/p/w500{}", poster);
-                            let _ = download_and_save_tmdb_image(db, &client, item_id, &img_url, "Primary").await;
+                            let _ = download_and_save_tmdb_image(
+                                db, &client, item_id, &img_url, "Primary",
+                            )
+                            .await;
                         }
                     }
                 }
@@ -817,7 +934,12 @@ async fn download_and_save_tmdb_image(
         .unwrap_or("jpg");
     let dir = std::path::PathBuf::from("data").join("images");
     tokio::fs::create_dir_all(&dir).await.ok();
-    let path = dir.join(format!("{}_{}_tmdb.{}", crate::util::stable_text_id(item_id), image_type.to_ascii_lowercase(), ext));
+    let path = dir.join(format!(
+        "{}_{}_tmdb.{}",
+        crate::util::stable_text_id(item_id),
+        image_type.to_ascii_lowercase(),
+        ext
+    ));
     tokio::fs::write(&path, &bytes).await?;
     let now = crate::util::now_unix();
     let backend = db.get_database_backend();
@@ -865,6 +987,7 @@ struct TmdbImagesResponse {
     #[serde(default)]
     backdrops: Vec<TmdbImageEntry>,
     #[serde(default)]
+    #[allow(dead_code)]
     posters: Vec<TmdbImageEntry>,
 }
 
@@ -873,7 +996,10 @@ struct TmdbImageEntry {
     file_path: String,
 }
 
-async fn get_parent_series_tmdb_id(db: &DatabaseConnection, season_item_id: &str) -> Option<String> {
+async fn get_parent_series_tmdb_id(
+    db: &DatabaseConnection,
+    season_item_id: &str,
+) -> Option<String> {
     let backend = db.get_database_backend();
     // Get the parent_id of the season, then get its TMDb ID
     let row = db
@@ -912,9 +1038,11 @@ pub async fn search_person_tmdb(name: &str, api_key: &str) -> anyhow::Result<Opt
     let resp: TmdbSearchResults = client
         .get(url)
         .query(&[("api_key", api_key), ("query", name)])
-        .send().await?
+        .send()
+        .await?
         .error_for_status()?
-        .json().await?;
+        .json()
+        .await?;
     Ok(resp.results.into_iter().next().map(|p| p.id.to_string()))
 }
 
@@ -934,22 +1062,26 @@ pub async fn fetch_person_tmdb(
     let resp: TmdbPerson = client
         .get(&url)
         .query(&[("api_key", api_key)])
-        .send().await?
+        .send()
+        .await?
         .error_for_status()?
-        .json().await?;
+        .json()
+        .await?;
     let backend = db.get_database_backend();
     if let Some(biography) = resp.biography.filter(|b| !b.is_empty()) {
         db.execute(crate::db::helpers::portable_statement(
             backend,
             "UPDATE people SET overview = ?, tmdb_id = ? WHERE id = ?",
             vec![biography.into(), tmdb_id.into(), person_id.into()],
-        )).await?;
+        ))
+        .await?;
     } else {
         db.execute(crate::db::helpers::portable_statement(
             backend,
             "UPDATE people SET tmdb_id = ? WHERE id = ?",
             vec![tmdb_id.into(), person_id.into()],
-        )).await?;
+        ))
+        .await?;
     }
     // Also try to fetch TMDb image
     let img_url = format!("https://api.themoviedb.org/3/person/{tmdb_id}/images?api_key={api_key}");
@@ -961,11 +1093,17 @@ pub async fn fetch_person_tmdb(
     struct TmdbPersonProfile {
         file_path: String,
     }
-    if let Ok(resp) = client.get(&img_url).send().await.and_then(|r| r.error_for_status()) {
+    if let Ok(resp) = client
+        .get(&img_url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
         if let Ok(images) = resp.json::<TmdbPersonImages>().await {
             if let Some(img) = images.profiles.first() {
                 let img_url = format!("https://image.tmdb.org/t/p/w780{}", img.file_path);
-                let _ = download_and_save_tmdb_image(db, &client, person_id, &img_url, "Primary").await;
+                let _ =
+                    download_and_save_tmdb_image(db, &client, person_id, &img_url, "Primary").await;
             }
         }
     }

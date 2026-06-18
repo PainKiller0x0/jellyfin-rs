@@ -1,13 +1,13 @@
 use std::{collections::HashMap, sync::Arc};
 
+use anyhow::Context;
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use anyhow::Context;
-use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
@@ -163,21 +163,19 @@ async fn set_user_data_flag_json(
                 "UnplayedItemCount": null,
             }))
         }
-        None => {
-            Ok(json!({
-                "ItemId": item_id,
-                "Key": item_id,
-                "IsFavorite": value,
-                "Played": false,
-                "PlaybackPositionTicks": 0,
-                "PlayedPercentage": null,
-                "PlayCount": 0,
-                "LastPlayedDate": null,
-                "Rating": null,
-                "Likes": null,
-                "UnplayedItemCount": null,
-            }))
-        }
+        None => Ok(json!({
+            "ItemId": item_id,
+            "Key": item_id,
+            "IsFavorite": value,
+            "Played": false,
+            "PlaybackPositionTicks": 0,
+            "PlayedPercentage": null,
+            "PlayCount": 0,
+            "LastPlayedDate": null,
+            "Rating": null,
+            "Likes": null,
+            "UnplayedItemCount": null,
+        })),
     }
 }
 
@@ -264,7 +262,9 @@ pub async fn get_user_item_data(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let user_id = request_user_id_or_default(&state, &headers, &query).await;
-    let existing = UserData::find_by_id((user_id, item_id.clone())).one(&state.db).await;
+    let existing = UserData::find_by_id((user_id, item_id.clone()))
+        .one(&state.db)
+        .await;
     match existing {
         Ok(Some(model)) => {
             let data = json!({
@@ -282,21 +282,20 @@ pub async fn get_user_item_data(
             });
             Json(data).into_response()
         }
-        Ok(None) => {
-            Json(json!({
-                "ItemId": item_id,
-                "Key": item_id,
-                "IsFavorite": false,
-                "Played": false,
-                "PlaybackPositionTicks": 0,
-                "PlayedPercentage": null,
-                "PlayCount": 0,
-                "LastPlayedDate": null,
-                "Rating": null,
-                "Likes": null,
-                "UnplayedItemCount": null,
-            })).into_response()
-        }
+        Ok(None) => Json(json!({
+            "ItemId": item_id,
+            "Key": item_id,
+            "IsFavorite": false,
+            "Played": false,
+            "PlaybackPositionTicks": 0,
+            "PlayedPercentage": null,
+            "PlayCount": 0,
+            "LastPlayedDate": null,
+            "Rating": null,
+            "Likes": null,
+            "UnplayedItemCount": null,
+        }))
+        .into_response(),
         Err(error) => internal_error(error.into()),
     }
 }
@@ -312,13 +311,29 @@ pub async fn update_user_item_data(
     let user_id = request_user_id_or_default(&state, &headers, &query).await;
     let now = now_unix();
 
-    let is_favorite = body.get("IsFavorite").and_then(|v| v.as_bool()).unwrap_or(false);
-    let played = body.get("Played").and_then(|v| v.as_bool()).unwrap_or(false);
-    let playback_position_ticks = body.get("PlaybackPositionTicks").and_then(|v| v.as_i64()).unwrap_or(0);
+    let is_favorite = body
+        .get("IsFavorite")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let played = body
+        .get("Played")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let playback_position_ticks = body
+        .get("PlaybackPositionTicks")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     let play_count = body.get("PlayCount").and_then(|v| v.as_i64()).unwrap_or(0);
-    let last_played_at = if body.get("LastPlayedDate").is_some() { Some(now) } else { None };
+    let last_played_at = if body.get("LastPlayedDate").is_some() {
+        Some(now)
+    } else {
+        None
+    };
 
-    match UserData::find_by_id((user_id.clone(), item_id.clone())).one(&state.db).await {
+    match UserData::find_by_id((user_id.clone(), item_id.clone()))
+        .one(&state.db)
+        .await
+    {
         Ok(Some(model)) => {
             let mut active: user_data::ActiveModel = model.into();
             active.is_favorite = Set(if is_favorite { 1 } else { 0 });
@@ -351,7 +366,10 @@ pub async fn update_user_item_data(
     }
 
     // Return updated user data
-    match UserData::find_by_id((user_id, item_id)).one(&state.db).await {
+    match UserData::find_by_id((user_id, item_id))
+        .one(&state.db)
+        .await
+    {
         Ok(Some(model)) => {
             let data = json!({
                 "ItemId": model.item_id,

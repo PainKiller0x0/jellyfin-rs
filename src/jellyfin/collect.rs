@@ -26,7 +26,10 @@ async fn filter_existing_ids(db: &DatabaseConnection, ids: &[String]) -> Vec<Str
     let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!("SELECT id FROM media_items WHERE id IN ({placeholders})");
     let vals: Vec<sea_orm::Value> = ids.iter().map(|id| id.as_str().into()).collect();
-    match db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals)).await {
+    match db
+        .query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
+        .await
+    {
         Ok(rows) => rows.iter().filter_map(|r| r.get_str("id").ok()).collect(),
         Err(_) => Vec::new(),
     }
@@ -170,6 +173,7 @@ pub async fn add_to_collection(
     StatusCode::NO_CONTENT.into_response()
 }
 
+#[allow(dead_code)]
 pub async fn remove_from_collection(
     State(state): State<Arc<AppState>>,
     Path(collection_id): Path<String>,
@@ -555,7 +559,11 @@ pub async fn remove_from_collection_batch(
     let ids: Vec<String> = body
         .get("Ids")
         .and_then(JsonValue::as_array)
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(ToString::to_string)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect()
+        })
         .unwrap_or_default();
 
     if ids.is_empty() {
@@ -564,11 +572,14 @@ pub async fn remove_from_collection_batch(
 
     let backend = state.db.get_database_backend();
     for item_id in &ids {
-        let _ = state.db.execute(crate::db::helpers::portable_statement(
-            backend,
-            "DELETE FROM linked_children WHERE parent_id = ? AND item_id = ?",
-            vec![collection_id.clone().into(), item_id.as_str().into()],
-        )).await;
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "DELETE FROM linked_children WHERE parent_id = ? AND item_id = ?",
+                vec![collection_id.clone().into(), item_id.as_str().into()],
+            ))
+            .await;
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -597,11 +608,14 @@ pub async fn remove_from_collection_delete(
 
     let backend = state.db.get_database_backend();
     for item_id in &ids {
-        let _ = state.db.execute(crate::db::helpers::portable_statement(
-            backend,
-            "DELETE FROM linked_children WHERE parent_id = ? AND item_id = ?",
-            vec![collection_id.clone().into(), item_id.as_str().into()],
-        )).await;
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "DELETE FROM linked_children WHERE parent_id = ? AND item_id = ?",
+                vec![collection_id.clone().into(), item_id.as_str().into()],
+            ))
+            .await;
     }
     StatusCode::NO_CONTENT.into_response()
 }

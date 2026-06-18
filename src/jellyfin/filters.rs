@@ -174,14 +174,22 @@ pub async fn users_prefixes(
     }
 }
 
-async fn list_prefixes(db: &DatabaseConnection, table: &str, column: &str) -> anyhow::Result<Vec<Value>> {
+async fn list_prefixes(
+    db: &DatabaseConnection,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<Vec<Value>> {
     let backend = db.get_database_backend();
     let sql = format!(
         "SELECT DISTINCT UPPER(SUBSTR({}, 1, 1)) AS prefix FROM {} WHERE {} IS NOT NULL AND {} <> '' ORDER BY prefix ASC",
         column, table, column, column
     );
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(backend, &sql, vec![]))
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &sql,
+            vec![],
+        ))
         .await
         .context("failed to list prefixes")?;
     Ok(rows
@@ -371,29 +379,40 @@ async fn list_filter_items_inner(
 
             if has_fav_filter && user_id.is_some() {
                 // Filter persons by user_data.is_favorite
-                let uid = user_id.unwrap();
-                let models = db
-                    .query_all(crate::db::helpers::portable_statement(
-                        db.get_database_backend(),
-                        "SELECT p.id, p.name, ia.etag AS primary_image_tag FROM people p JOIN user_data ud ON ud.item_id = p.id LEFT JOIN image_assets ia ON ia.item_id = p.id AND ia.image_type = 'Primary' WHERE ud.user_id = ? AND ud.is_favorite = 1 ORDER BY p.name ASC",
-                        vec![uid.as_str().into()],
-                    ))
-                    .await
-                    .context("failed to list favorite persons")?;
-                models
-                    .iter()
-                    .filter_map(|r| {
-                        let id = r.get_str("id").ok()?;
-                        let name = r.get_str("name").ok()?;
-                        let image_tag = r.get_opt_str("primary_image_tag").ok().flatten().unwrap_or_default();
-                        let mut item = json!({ "Name": name, "Id": id, "Type": kind.item_type(), "ImageTags": {} });
-                        if !image_tag.is_empty() {
-                            item["PrimaryImageTag"] = json!(image_tag);
-                            item["ImageTags"] = json!({"Primary": image_tag});
-                        }
-                        Some(item)
-                    })
-                    .collect()
+                if let Some(uid) = user_id {
+                    let models = db
+                        .query_all(crate::db::helpers::portable_statement(
+                            db.get_database_backend(),
+                            "SELECT p.id, p.name, ia.etag AS primary_image_tag FROM people p JOIN user_data ud ON ud.item_id = p.id LEFT JOIN image_assets ia ON ia.item_id = p.id AND ia.image_type = 'Primary' WHERE ud.user_id = ? AND ud.is_favorite = 1 ORDER BY p.name ASC",
+                            vec![uid.as_str().into()],
+                        ))
+                        .await
+                        .context("failed to list favorite persons")?;
+                    models
+                        .iter()
+                        .filter_map(|r| {
+                            let id = r.get_str("id").ok()?;
+                            let name = r.get_str("name").ok()?;
+                            let image_tag = r.get_opt_str("primary_image_tag").ok().flatten().unwrap_or_default();
+                            let mut item = json!({ "Name": name, "Id": id, "Type": kind.item_type(), "ImageTags": {} });
+                            if !image_tag.is_empty() {
+                                item["PrimaryImageTag"] = json!(image_tag);
+                                item["ImageTags"] = json!({"Primary": image_tag});
+                            }
+                            Some(item)
+                        })
+                        .collect()
+                } else {
+                    let models = People::find()
+                        .order_by_asc(crate::entities::people::Column::Name)
+                        .all(db)
+                        .await
+                        .context("failed to list persons")?;
+                    models
+                        .into_iter()
+                        .map(|m| json!({ "Name": m.name, "Id": m.id, "Type": kind.item_type(), "ImageTags": {} }))
+                        .collect()
+                }
             } else {
                 let models = People::find()
                     .order_by_asc(crate::entities::people::Column::Name)

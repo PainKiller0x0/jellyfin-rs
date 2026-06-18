@@ -36,7 +36,13 @@ pub async fn remote_search(
         .cloned()
         .unwrap_or_else(|| "jellyfin-rs".to_string());
 
-    if let Some(api_key) = state.tmdb_api_key.read().await.clone().filter(|key| !key.is_empty()) {
+    if let Some(api_key) = state
+        .tmdb_api_key
+        .read()
+        .await
+        .clone()
+        .filter(|key| !key.is_empty())
+    {
         let search_result = if item_type.eq_ignore_ascii_case("Movie") {
             providers::tmdb_movie_search(&state.http_client, &api_key, name, production_year).await
         } else if item_type.eq_ignore_ascii_case("Series") {
@@ -102,7 +108,13 @@ pub async fn apply_remote_search(
 }
 
 async fn enrich_remote_search_result(state: &AppState, body: Value) -> Value {
-    let Some(api_key) = state.tmdb_api_key.read().await.clone().filter(|key| !key.is_empty()) else {
+    let Some(api_key) = state
+        .tmdb_api_key
+        .read()
+        .await
+        .clone()
+        .filter(|key| !key.is_empty())
+    else {
         return body;
     };
     let Some(tmdb_id) = body

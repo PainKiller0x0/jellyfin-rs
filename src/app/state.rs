@@ -23,6 +23,7 @@ pub struct AppState {
     // StrmAssistant integration
     pub sa_config: crate::config::StrmAssistantConfig,
     pub intro_detector: Arc<crate::intro_skip::detector::IntroDetector>,
+    #[allow(dead_code)]
     pub queue_manager: Arc<crate::queue::QueueManager>,
 }
 
@@ -126,8 +127,8 @@ pub fn session_timeout_seconds() -> i64 {
 
 /// Load TMDB API key from database app_settings.
 pub async fn load_tmdb_api_key(db: &sea_orm::DatabaseConnection) -> Option<String> {
-    use sea_orm::ConnectionTrait;
     use crate::db::row_ext::QueryResultExt;
+    use sea_orm::ConnectionTrait;
 
     let backend = db.get_database_backend();
     if let Ok(Some(row)) = db
@@ -158,7 +159,11 @@ impl AppState {
             "INSERT INTO app_settings (key, value, updated_at) VALUES ('tmdb_api_key', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             vec![key.to_string().into(), now.into()],
         )).await?;
-        *self.tmdb_api_key.write().await = if key.is_empty() { None } else { Some(key.to_string()) };
+        *self.tmdb_api_key.write().await = if key.is_empty() {
+            None
+        } else {
+            Some(key.to_string())
+        };
         Ok(())
     }
 }

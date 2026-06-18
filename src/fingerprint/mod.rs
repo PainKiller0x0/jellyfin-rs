@@ -3,6 +3,7 @@ use std::process::Command;
 
 /// Extract audio fingerprint using fpcalc CLI tool.
 /// Returns the fingerprint bytes and duration in seconds.
+#[allow(dead_code)]
 pub fn extract_fingerprint(
     media_path: &Path,
     fpcalc_path: &str,
@@ -46,6 +47,7 @@ pub fn extract_fingerprint(
 
 /// Compare two fingerprints and return a similarity score (0.0 to 1.0).
 /// Uses a simple Hamming-distance-like comparison on the raw integer arrays.
+#[allow(dead_code)]
 pub fn compare_fingerprints(fp1: &[u8], fp2: &[u8]) -> f64 {
     if fp1.is_empty() || fp2.is_empty() {
         return 0.0;
@@ -61,8 +63,18 @@ pub fn compare_fingerprints(fp1: &[u8], fp2: &[u8]) -> f64 {
 
     for i in 0..total {
         let offset = i * 4;
-        let a = i32::from_le_bytes([fp1[offset], fp1[offset + 1], fp1[offset + 2], fp1[offset + 3]]);
-        let b = i32::from_le_bytes([fp2[offset], fp2[offset + 1], fp2[offset + 2], fp2[offset + 3]]);
+        let a = i32::from_le_bytes([
+            fp1[offset],
+            fp1[offset + 1],
+            fp1[offset + 2],
+            fp1[offset + 3],
+        ]);
+        let b = i32::from_le_bytes([
+            fp2[offset],
+            fp2[offset + 1],
+            fp2[offset + 2],
+            fp2[offset + 3],
+        ]);
 
         // Count matching bits
         let xor = (a ^ b) as u32;

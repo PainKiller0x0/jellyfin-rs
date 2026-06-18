@@ -81,9 +81,9 @@ impl IntroDetector {
             let position_delta_secs = position_delta_ticks as f64 / TICKS_PER_SEC as f64;
 
             // Detect fast-forward jumps: |position_delta - wall_elapsed| > 5 seconds
-            let jump_detected =
-                (position_delta_secs.abs() - elapsed_secs).abs() > JUMP_THRESHOLD_SECS
-                    && elapsed_secs > 0.1;
+            let jump_detected = (position_delta_secs.abs() - elapsed_secs).abs()
+                > JUMP_THRESHOLD_SECS
+                && elapsed_secs > 0.1;
 
             if jump_detected
                 && position_ticks <= session.max_intro_duration_ticks
@@ -92,8 +92,7 @@ impl IntroDetector {
                 session.last_jump_position_ticks = Some(position_ticks);
 
                 if session.first_jump_position_ticks.is_none() {
-                    let started_from_beginning =
-                        session.playback_start_ticks < 5 * TICKS_PER_SEC;
+                    let started_from_beginning = session.playback_start_ticks < 5 * TICKS_PER_SEC;
                     let is_forward = position_delta_ticks > 0;
                     let jump_origin = session.previous_position_ticks;
 
@@ -108,18 +107,16 @@ impl IntroDetector {
 
             // Check if we should write intro markers
             let mut intro_action = None;
-            if position_ticks >= session.max_intro_duration_ticks
-                && session.last_jump_position_ticks.is_some()
-                && session.intro_end.is_none()
-            {
-                let intro_end = session.last_jump_position_ticks.unwrap();
-                let intro_start = session
-                    .first_jump_position_ticks
-                    .unwrap_or(0)
-                    .min(intro_end);
+            if position_ticks >= session.max_intro_duration_ticks && session.intro_end.is_none() {
+                if let Some(intro_end) = session.last_jump_position_ticks {
+                    let intro_start = session
+                        .first_jump_position_ticks
+                        .unwrap_or(0)
+                        .min(intro_end);
 
-                if intro_start < intro_end {
-                    intro_action = Some((session.item_id.clone(), intro_start, intro_end));
+                    if intro_start < intro_end {
+                        intro_action = Some((session.item_id.clone(), intro_start, intro_end));
+                    }
                 }
             }
 
@@ -133,7 +130,7 @@ impl IntroDetector {
                     let pause_duration = now.duration_since(pause_time);
                     let pause_ms = pause_duration.as_millis() as u64;
 
-                    if pause_ms >= PAUSE_MIN_DURATION_MS && pause_ms <= PAUSE_MAX_DURATION_MS {
+                    if (PAUSE_MIN_DURATION_MS..=PAUSE_MAX_DURATION_MS).contains(&pause_ms) {
                         let credits_window =
                             session.runtime_ticks - session.max_credits_duration_ticks;
                         if position_ticks > credits_window && session.credits_start.is_none() {
@@ -163,11 +160,7 @@ impl IntroDetector {
     }
 
     /// Called when playback stops.
-    pub fn on_playback_stopped(
-        &self,
-        play_session_id: &str,
-        position_ticks: i64,
-    ) {
+    pub fn on_playback_stopped(&self, play_session_id: &str, position_ticks: i64) {
         if let Some(session) = self.sessions.get(play_session_id) {
             // Credits detection on stop
             let credits_window = session.runtime_ticks - session.max_credits_duration_ticks;
@@ -193,9 +186,7 @@ impl IntroDetector {
         let item_id = item_id.to_string();
         tokio::spawn(async move {
             // TODO: Call chapters::update_intro_for_season when chapters module is ready
-            tracing::info!(
-                "Intro detected for {item_id}: start={intro_start}, end={intro_end}"
-            );
+            tracing::info!("Intro detected for {item_id}: start={intro_start}, end={intro_end}");
         });
     }
 

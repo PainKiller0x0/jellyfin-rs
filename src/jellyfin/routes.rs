@@ -13,11 +13,9 @@ use crate::{
     },
     playback::streaming::{
         stream_audio, stream_audio_container, stream_audio_container_head, stream_audio_head,
-        stream_audio_simple, stream_audio_simple_head,
-        stream_subtitle, stream_subtitle_head,
-        stream_subtitle_with_source, stream_subtitle_with_source_head,
-        stream_subtitle_with_ticks, stream_subtitle_with_ticks_head,
-        stream_video, stream_video_head,
+        stream_audio_simple, stream_audio_simple_head, stream_subtitle, stream_subtitle_head,
+        stream_subtitle_with_source, stream_subtitle_with_source_head, stream_subtitle_with_ticks,
+        stream_subtitle_with_ticks_head, stream_video, stream_video_head,
     },
     ws,
 };
@@ -81,12 +79,21 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(system::parental_ratings),
         )
         .route("/System/ReleaseNotes", get(system::system_release_notes))
-        .route("/System/ReleaseNotes/Versions", get(system::system_release_notes_versions))
+        .route(
+            "/System/ReleaseNotes/Versions",
+            get(system::system_release_notes_versions),
+        )
         .route("/System/Logs/Query", get(system::system_logs_query))
-        .route("/System/WakeOnLanInfo", get(system::system_wake_on_lan_info))
+        .route(
+            "/System/WakeOnLanInfo",
+            get(system::system_wake_on_lan_info),
+        )
         .route("/System/Logs/{name}", get(system::system_log_download))
         .route("/System/Logs/{name}/Lines", get(system::system_log_lines))
-        .route("/System/Configuration/Partial", post(system::update_server_configuration_partial))
+        .route(
+            "/System/Configuration/Partial",
+            post(system::update_server_configuration_partial),
+        )
         .route("/QuickConnect/Enabled", get(system::quick_connect_enabled))
         .route(
             "/QuickConnect/Authorize",
@@ -105,7 +112,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
                 .delete(common::no_content),
         )
         .route("/Playback/BitrateTest", get(system::bitrate_test))
-        .route("/System/Ext/ServerDomains", get(system::system_ext_server_domains))
+        .route(
+            "/System/Ext/ServerDomains",
+            get(system::system_ext_server_domains),
+        )
         .route("/Dlna/ProfileInfos", get(dlna::profile_infos))
         .route("/Dlna/Profiles/Default", get(dlna::default_profile))
         .route("/Dlna/Profiles/{profile_id}", get(dlna::profile_by_id))
@@ -193,7 +203,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/LiveTv/Programs/Recommended", get(common::empty_list))
         .route("/LiveTv/Programs/{program_id}", get(common::empty_object))
         .route("/LiveTv/Recordings", get(common::empty_list))
-        .route("/LiveTv/AvailableRecordingOptions", get(items::available_recording_options))
+        .route(
+            "/LiveTv/AvailableRecordingOptions",
+            get(items::available_recording_options),
+        )
         .route("/LiveTv/Recordings/Series", get(common::empty_list))
         .route("/LiveTv/Recordings/Folders", get(common::empty_array))
         .route("/LiveTv/Recordings/Groups", get(common::empty_list))
@@ -241,7 +254,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/System/Shutdown", post(system::shutdown_handler))
         .route("/System/Restart", post(system::shutdown_handler))
         .route("/Library/MediaFolders", get(library::media_folders))
-        .route("/Library/SelectableMediaFolders", get(library::selectable_media_folders))
+        .route(
+            "/Library/SelectableMediaFolders",
+            get(library::selectable_media_folders),
+        )
         .route("/Libraries/AvailableOptions", get(common::empty_object))
         .route("/Library/PhysicalPaths", get(library::physical_paths))
         .route("/Library/Movies/Added", post(library::library_notify))
@@ -260,8 +276,14 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/Library/VirtualFolders/Delete",
             post(library::delete_virtual_folder),
         )
-        .route("/Library/VirtualFolders/Query", get(library::virtual_folders_query))
-        .route("/Library/VirtualFolders/Name", post(library::rename_virtual_folder))
+        .route(
+            "/Library/VirtualFolders/Query",
+            get(library::virtual_folders_query),
+        )
+        .route(
+            "/Library/VirtualFolders/Name",
+            post(library::rename_virtual_folder),
+        )
         .route(
             "/Library/VirtualFolders/LibraryOptions",
             post(library::update_library_options),
@@ -367,28 +389,75 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(auth::update_user_configuration),
         )
         .route("/Users/{user_id}/Policy", post(auth::update_user_policy))
-        .route("/Users/{user_id}/Authenticate", get(auth::user_authenticate_legacy))
-        .route("/Users/{user_id}/Connect/Link", post(auth::user_connect_link).delete(auth::user_connect_link_delete))
+        .route(
+            "/Users/{user_id}/Authenticate",
+            get(auth::user_authenticate_legacy),
+        )
+        .route(
+            "/Users/{user_id}/Connect/Link",
+            post(auth::user_connect_link).delete(auth::user_connect_link_delete),
+        )
         .route("/Items", get(items::items_root))
         .route("/Items/Filters", get(super::user_extras::items_filters))
         .route("/Items/Filters2", get(super::user_extras::filters2))
-        .route("/Items/Suggestions", get(super::user_extras::items_suggestions))
+        .route(
+            "/Items/Suggestions",
+            get(super::user_extras::items_suggestions),
+        )
         .route(
             "/Items/{item_id}",
-            get(items::item_by_id_public).post(items::update_item).delete(items::delete_single_item),
+            get(items::item_by_id_public)
+                .post(items::update_item)
+                .delete(items::delete_single_item),
         )
-        .route("/Items/{item_id}/Ancestors", get(super::user_extras::item_ancestors))
-        .route("/Items/{item_id}/CriticReviews", get(super::user_extras::item_critic_reviews))
-        .route("/Items/{item_id}/Download", get(super::user_extras::download_item))
-        .route("/Items/{item_id}/File", get(super::user_extras::item_file_info))
-        .route("/Items/{item_id}/ThemeMedia", get(super::user_extras::item_theme_media))
-        .route("/Items/{item_id}/ThemeSongs", get(super::user_extras::item_theme_songs))
-        .route("/Items/{item_id}/ThemeVideos", get(super::user_extras::item_theme_videos))
-        .route("/Items/{item_id}/InstantMix", get(super::user_extras::item_instant_mix))
-        .route("/Items/{item_id}/Intros", get(super::user_extras::item_intros))
-        .route("/Items/{item_id}/LocalTrailers", get(super::user_extras::item_local_trailers))
-        .route("/Items/{item_id}/SpecialFeatures", get(super::user_extras::item_special_features))
-        .route("/Items/{item_id}/ThumbnailSet", get(super::user_extras::thumbnail_set))
+        .route(
+            "/Items/{item_id}/Ancestors",
+            get(super::user_extras::item_ancestors),
+        )
+        .route(
+            "/Items/{item_id}/CriticReviews",
+            get(super::user_extras::item_critic_reviews),
+        )
+        .route(
+            "/Items/{item_id}/Download",
+            get(super::user_extras::download_item),
+        )
+        .route(
+            "/Items/{item_id}/File",
+            get(super::user_extras::item_file_info),
+        )
+        .route(
+            "/Items/{item_id}/ThemeMedia",
+            get(super::user_extras::item_theme_media),
+        )
+        .route(
+            "/Items/{item_id}/ThemeSongs",
+            get(super::user_extras::item_theme_songs),
+        )
+        .route(
+            "/Items/{item_id}/ThemeVideos",
+            get(super::user_extras::item_theme_videos),
+        )
+        .route(
+            "/Items/{item_id}/InstantMix",
+            get(super::user_extras::item_instant_mix),
+        )
+        .route(
+            "/Items/{item_id}/Intros",
+            get(super::user_extras::item_intros),
+        )
+        .route(
+            "/Items/{item_id}/LocalTrailers",
+            get(super::user_extras::item_local_trailers),
+        )
+        .route(
+            "/Items/{item_id}/SpecialFeatures",
+            get(super::user_extras::item_special_features),
+        )
+        .route(
+            "/Items/{item_id}/ThumbnailSet",
+            get(super::user_extras::thumbnail_set),
+        )
         .route("/Items/{item_id}/Images", get(images::item_images))
         .route(
             "/Items/{item_id}/Images/{image_type}",
@@ -426,8 +495,14 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Artists/Prefixes", get(filters::artists_prefixes))
         .route("/Artists/{name}", get(common::empty_object))
         .route("/Artists/{item_id}/InstantMix", get(common::empty_list))
-        .route("/Artists/{name}/Images/{image_type}", get(super::user_extras::artist_image))
-        .route("/Artists/{name}/Images/{image_type}/{index}", get(super::user_extras::artist_image))
+        .route(
+            "/Artists/{name}/Images/{image_type}",
+            get(super::user_extras::artist_image),
+        )
+        .route(
+            "/Artists/{name}/Images/{image_type}/{index}",
+            get(super::user_extras::artist_image),
+        )
         .route("/Movies/Recommendations", get(items::movie_recommendations))
         .route("/Movies/{item_id}/Similar", get(items::similar_items))
         .route("/Shows/{item_id}/Similar", get(items::similar_items))
@@ -442,7 +517,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(images::remote_images_providers),
         )
         .route("/Items/{item_id}/Subtitles", get(items::item_subtitles))
-        .route("/Items/{item_id}/Subtitles/{index}/Delete", post(items::delete_item_subtitle))
+        .route(
+            "/Items/{item_id}/Subtitles/{index}/Delete",
+            post(items::delete_item_subtitle),
+        )
         .route(
             "/Items/{item_id}/RemoteSearch/Subtitles/{param}",
             get(super::user_extras::remote_subtitle_search)
@@ -457,8 +535,14 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Items/Prefixes", get(filters::items_prefixes))
         .route("/Items/{item_id}/Tags/Add", post(items::add_item_tag))
         .route("/Items/{item_id}/Tags/Delete", post(items::delete_item_tag))
-        .route("/Items/{item_id}/MetadataEditor", post(super::system::metadata_editor))
-        .route("/Items/{item_id}/MakePrivate", post(items::make_item_private))
+        .route(
+            "/Items/{item_id}/MetadataEditor",
+            post(super::system::metadata_editor),
+        )
+        .route(
+            "/Items/{item_id}/MakePrivate",
+            post(items::make_item_private),
+        )
         .route("/Items/{item_id}/MakePublic", post(items::make_item_public))
         .route(
             "/Items/RemoteSearch/{item_type}",
@@ -478,23 +562,47 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Search/Hints", get(items::search_hints))
         .route("/Genres", get(filters::genres))
         .route("/Genres/{name}", get(super::user_extras::genre_by_name))
-        .route("/Genres/{name}/Images/{image_type}", get(super::user_extras::genre_image))
-        .route("/Genres/{name}/Images/{image_type}/{index}", get(super::user_extras::genre_image))
+        .route(
+            "/Genres/{name}/Images/{image_type}",
+            get(super::user_extras::genre_image),
+        )
+        .route(
+            "/Genres/{name}/Images/{image_type}/{index}",
+            get(super::user_extras::genre_image),
+        )
         .route("/GameGenres", get(filters::game_genres))
         .route("/GameGenres/{name}", get(super::user_extras::genre_by_name))
-        .route("/GameGenres/{name}/Images/{image_type}", get(super::user_extras::genre_image))
-        .route("/GameGenres/{name}/Images/{image_type}/{index}", get(super::user_extras::genre_image))
+        .route(
+            "/GameGenres/{name}/Images/{image_type}",
+            get(super::user_extras::genre_image),
+        )
+        .route(
+            "/GameGenres/{name}/Images/{image_type}/{index}",
+            get(super::user_extras::genre_image),
+        )
         .route("/MusicGenres/InstantMix", get(common::empty_list))
         .route("/MusicGenres/{name}/InstantMix", get(common::empty_list))
         .route("/Persons", get(filters::persons))
         .route("/Persons/{name}", get(persons::person_by_name))
         .route("/Persons/{name}/Items", get(persons::person_items))
-        .route("/Persons/{name}/Images/{image_type}", get(persons::person_image))
-        .route("/Persons/{name}/Images/{first}/{second}", get(persons::person_image_with_index))
+        .route(
+            "/Persons/{name}/Images/{image_type}",
+            get(persons::person_image),
+        )
+        .route(
+            "/Persons/{name}/Images/{first}/{second}",
+            get(persons::person_image_with_index),
+        )
         .route("/Studios", get(filters::studios))
         .route("/Studios/{name}", get(super::user_extras::studio_by_name))
-        .route("/Studios/{name}/Images/{image_type}", get(super::user_extras::studio_image))
-        .route("/Studios/{name}/Images/{image_type}/{index}", get(super::user_extras::studio_image))
+        .route(
+            "/Studios/{name}/Images/{image_type}",
+            get(super::user_extras::studio_image),
+        )
+        .route(
+            "/Studios/{name}/Images/{image_type}/{index}",
+            get(super::user_extras::studio_image),
+        )
         .route("/Tags", get(filters::tags))
         .route("/Years", get(filters::years))
         .route("/OfficialRatings", get(filters::official_ratings))
@@ -504,12 +612,24 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/AudioCodecs", get(super::user_extras::audio_codecs))
         .route("/AudioLayouts", get(super::user_extras::audio_layouts))
         .route("/SubtitleCodecs", get(super::user_extras::subtitle_codecs))
-        .route("/StreamLanguages", get(super::user_extras::stream_languages))
+        .route(
+            "/StreamLanguages",
+            get(super::user_extras::stream_languages),
+        )
         .route("/ItemTypes", get(super::user_extras::item_types))
-        .route("/Videos/{item_id}/AdditionalParts", get(super::user_extras::video_additional_parts))
+        .route(
+            "/Videos/{item_id}/AdditionalParts",
+            get(super::user_extras::video_additional_parts),
+        )
         .route("/Videos/MergeVersions", post(items::merge_versions))
-        .route("/Videos/ActiveEncodings", get(items::active_encodings).delete(items::stop_encodings))
-        .route("/Videos/{item_id}/AlternateSources", get(items::alternate_sources).delete(items::delete_alternate_source))
+        .route(
+            "/Videos/ActiveEncodings",
+            get(items::active_encodings).delete(items::stop_encodings),
+        )
+        .route(
+            "/Videos/{item_id}/AlternateSources",
+            get(items::alternate_sources).delete(items::delete_alternate_source),
+        )
         .route(
             "/Videos/{item_id}/Trickplay/{width}/tiles.m3u8",
             get(common::empty_object),
@@ -569,8 +689,14 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(common::no_content),
         )
         .route("/Providers/Lyrics/{lyric_id}", get(common::empty_object))
-        .route("/Providers/Subtitles/Subtitles/{param}", get(items::subtitle_provider_info))
-        .route("/MediaSegments/{item_id}", get(super::user_extras::media_segments))
+        .route(
+            "/Providers/Subtitles/Subtitles/{param}",
+            get(items::subtitle_provider_info),
+        )
+        .route(
+            "/MediaSegments/{item_id}",
+            get(super::user_extras::media_segments),
+        )
         .route("/Albums/{item_id}/InstantMix", get(common::empty_list))
         .route("/Playlists/{item_id}/InstantMix", get(common::empty_list))
         .route("/Songs/{item_id}/InstantMix", get(common::empty_list))
@@ -622,7 +748,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/ScheduledTasks/Running/{task_id}",
             post(items::scan_handler).delete(common::no_content),
         )
-        .route("/UserItems/Resume", get(super::user_extras::user_items_resume))
+        .route(
+            "/UserItems/Resume",
+            get(super::user_extras::user_items_resume),
+        )
         .route(
             "/UserItems/{item_id}/UserData",
             get(playback::get_user_item_data).post(playback::update_user_item_data),
@@ -635,10 +764,14 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/PlayingItems/{item_id}",
             post(playback::playing_item_start).delete(playback::playing_item_stop),
         )
-        .route("/PlayingItems/{item_id}/Progress", post(playback::playing_item_progress))
+        .route(
+            "/PlayingItems/{item_id}/Progress",
+            post(playback::playing_item_progress),
+        )
         .route(
             "/UserSettings/{user_id}",
-            get(super::user_extras::get_user_settings).post(super::user_extras::update_user_settings),
+            get(super::user_extras::get_user_settings)
+                .post(super::user_extras::update_user_settings),
         )
         .route(
             "/Users/{user_id}/PlayingItems/{item_id}",
@@ -670,7 +803,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/Collections/{collection_id}/Items",
             post(collect::add_to_collection).delete(collect::remove_from_collection_delete),
         )
-        .route("/Collections/{collection_id}/Items/Delete", post(collect::remove_from_collection_batch))
+        .route(
+            "/Collections/{collection_id}/Items/Delete",
+            post(collect::remove_from_collection_batch),
+        )
         .route("/Playlists", post(collect::create_playlist))
         .route(
             "/Playlists/{playlist_id}",
@@ -711,7 +847,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(common::empty_array).post(common::no_content),
         )
         .route("/Devices/Delete", post(common::no_content))
-        .route("/Devices/Options", get(system::device_options).post(common::no_content))
+        .route(
+            "/Devices/Options",
+            get(system::device_options).post(common::no_content),
+        )
         // ── Environment 补全 ──
         .route("/Environment/NetworkDevices", get(common::empty_array))
         .route("/Environment/NetworkShares", get(common::empty_array))
@@ -757,7 +896,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/swagger", get(common::empty_object))
         .route("/swagger.json", get(common::empty_object))
         // ── Party / SyncPlay ──
-        .route("/Parties", get(common::empty_array).post(common::no_content))
+        .route(
+            "/Parties",
+            get(common::empty_array).post(common::no_content),
+        )
         .route("/Parties/Info", get(common::empty_object))
         .route("/Parties/{id}/Join", post(common::no_content))
         .route("/Parties/Leave", post(common::no_content))
@@ -770,7 +912,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/Sync/JobItems/{id}/AdditionalFiles",
             get(common::empty_array),
         )
-        .route("/Sync/Jobs", get(common::empty_array).post(common::no_content))
+        .route(
+            "/Sync/Jobs",
+            get(common::empty_array).post(common::no_content),
+        )
         .route(
             "/Sync/Jobs/{id}",
             get(common::empty_object).post(common::no_content),
@@ -782,24 +927,15 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Sync/Items/Cancel", post(common::no_content))
         .route("/Sync/OfflineActions", post(common::no_content))
         .route("/Sync/{item_id}/Status", post(common::no_content))
-        .route(
-            "/Sync/{target_id}/Items",
-            delete(common::no_content),
-        )
-        .route(
-            "/Sync/{target_id}/Items/Delete",
-            post(common::no_content),
-        )
+        .route("/Sync/{target_id}/Items", delete(common::no_content))
+        .route("/Sync/{target_id}/Items/Delete", post(common::no_content))
         .route("/Sync/JobItems/{id}/Delete", post(common::no_content))
         .route("/Sync/JobItems/{id}/Enable", post(common::no_content))
         .route(
             "/Sync/JobItems/{id}/MarkForRemoval",
             post(common::no_content),
         )
-        .route(
-            "/Sync/JobItems/{id}/Transferred",
-            post(common::no_content),
-        )
+        .route("/Sync/JobItems/{id}/Transferred", post(common::no_content))
         .route(
             "/Sync/JobItems/{id}/UnmarkForRemoval",
             post(common::no_content),
@@ -815,10 +951,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(common::empty_object).post(common::no_content),
         )
         // ── UserLibrary 补全 ──
-        .route(
-            "/Users/{user_id}/Items/Root",
-            get(items::items_root),
-        )
+        .route("/Users/{user_id}/Items/Root", get(items::items_root))
         .route("/Items/Access", post(common::no_content))
         .route("/Items/Shared/Leave", post(common::no_content))
         // ── Trailers ──
@@ -849,31 +982,16 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/LiveTv/Manage/Channels/{id}/SortIndex",
             post(common::no_content),
         )
-        .route(
-            "/LiveTv/Recordings/{id}/Delete",
-            post(common::no_content),
-        )
-        .route(
-            "/LiveTv/SeriesTimers/{id}/Delete",
-            post(common::no_content),
-        )
-        .route(
-            "/LiveTv/Timers/{id}/Delete",
-            post(common::no_content),
-        )
+        .route("/LiveTv/Recordings/{id}/Delete", post(common::no_content))
+        .route("/LiveTv/SeriesTimers/{id}/Delete", post(common::no_content))
+        .route("/LiveTv/Timers/{id}/Delete", post(common::no_content))
         .route(
             "/LiveTv/TunerHosts/Default/{type}",
             get(common::empty_object),
         )
         // ── DlnaServer ──
-        .route(
-            "/Dlna/{id}/description",
-            get(dlna::device_description),
-        )
-        .route(
-            "/Dlna/{id}/description.xml",
-            get(dlna::device_description),
-        )
+        .route("/Dlna/{id}/description", get(dlna::device_description))
+        .route("/Dlna/{id}/description.xml", get(dlna::device_description))
         .route("/Dlna/{id}/icons/{filename}", get(common::image))
         .route("/Dlna/icons/{filename}", get(common::image))
         .route(

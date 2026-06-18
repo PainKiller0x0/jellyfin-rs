@@ -29,6 +29,7 @@ pub struct ScannedMediaItem {
 }
 
 impl ScannedMediaItem {
+    #[allow(clippy::too_many_arguments)]
     pub fn folder_with_type(
         id: String,
         library_id: String,

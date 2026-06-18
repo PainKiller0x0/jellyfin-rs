@@ -52,7 +52,11 @@ pub async fn tmdb_movie_details(
 ) -> anyhow::Result<Value> {
     let response = client
         .get(format!("https://api.themoviedb.org/3/movie/{tmdb_id}"))
-        .query(&[("api_key", api_key), ("language", "zh-CN"), ("append_to_response", "credits,release_dates")])
+        .query(&[
+            ("api_key", api_key),
+            ("language", "zh-CN"),
+            ("append_to_response", "credits,release_dates"),
+        ])
         .send()
         .await?
         .error_for_status()?
@@ -71,7 +75,8 @@ pub async fn tmdb_movie_details(
         .into_iter()
         .take(20)
         .map(|person| {
-            let mut entry = json!({ "Name": person.name, "Role": person.character, "Type": "Actor" });
+            let mut entry =
+                json!({ "Name": person.name, "Role": person.character, "Type": "Actor" });
             if let Some(ref profile) = person.profile_path {
                 entry["ImageUrl"] = json!(format!("https://image.tmdb.org/t/p/w185{profile}"));
             }
@@ -80,28 +85,29 @@ pub async fn tmdb_movie_details(
         .collect::<Vec<_>>();
 
     // Extract official rating (US certification preferred)
-    let official_rating = response.release_dates
-        .as_ref()
-        .map(|rd| {
-            rd.results.iter()
-                .filter(|r| r.iso_3166_1.as_deref() == Some("US"))
-                .flat_map(|r| &r.release_dates)
-                .find_map(|rd| rd.certification.as_ref().filter(|c| !c.is_empty()).cloned())
-                .or_else(|| {
-                    // Fallback: any non-empty certification
-                    rd.results.iter()
-                        .flat_map(|r| &r.release_dates)
-                        .find_map(|rd| rd.certification.as_ref().filter(|c| !c.is_empty()).cloned())
-                })
-        })
-        .flatten();
+    let official_rating = response.release_dates.as_ref().and_then(|rd| {
+        rd.results
+            .iter()
+            .filter(|r| r.iso_3166_1.as_deref() == Some("US"))
+            .flat_map(|r| &r.release_dates)
+            .find_map(|rd| rd.certification.as_ref().filter(|c| !c.is_empty()).cloned())
+            .or_else(|| {
+                // Fallback: any non-empty certification
+                rd.results
+                    .iter()
+                    .flat_map(|r| &r.release_dates)
+                    .find_map(|rd| rd.certification.as_ref().filter(|c| !c.is_empty()).cloned())
+            })
+    });
 
-    let countries: Vec<String> = response.production_countries
+    let countries: Vec<String> = response
+        .production_countries
         .iter()
         .filter_map(|c| c.name.clone())
         .collect();
 
-    let languages: Vec<String> = response.spoken_languages
+    let languages: Vec<String> = response
+        .spoken_languages
         .iter()
         .filter_map(|l| l.name.clone())
         .collect();
@@ -222,22 +228,22 @@ pub async fn tmdb_tv_details(
         .and_then(|ids| ids.tvdb_id.map(|id| id.to_string()));
 
     // Extract official rating (US content rating preferred)
-    let official_rating = response.content_ratings
-        .as_ref()
-        .map(|cr| {
-            cr.results.iter()
-                .filter(|r| r.iso_3166_1.as_deref() == Some("US"))
-                .find_map(|r| r.rating.as_ref().filter(|c| !c.is_empty()).cloned())
-                .or_else(|| {
-                    cr.results.iter()
-                        .find_map(|r| r.rating.as_ref().filter(|c| !c.is_empty()).cloned())
-                })
-        })
-        .flatten();
+    let official_rating = response.content_ratings.as_ref().and_then(|cr| {
+        cr.results
+            .iter()
+            .filter(|r| r.iso_3166_1.as_deref() == Some("US"))
+            .find_map(|r| r.rating.as_ref().filter(|c| !c.is_empty()).cloned())
+            .or_else(|| {
+                cr.results
+                    .iter()
+                    .find_map(|r| r.rating.as_ref().filter(|c| !c.is_empty()).cloned())
+            })
+    });
 
     let runtime_minutes = response.episode_run_time.first().copied();
     let countries: Vec<String> = response.origin_country.clone();
-    let languages: Vec<String> = response.spoken_languages
+    let languages: Vec<String> = response
+        .spoken_languages
         .iter()
         .filter_map(|l| l.name.clone())
         .collect();
@@ -454,7 +460,9 @@ struct TmdbMovieDetails {
     runtime: Option<i64>,
     status: Option<String>,
     original_language: Option<String>,
+    #[allow(dead_code)]
     budget: Option<i64>,
+    #[allow(dead_code)]
     revenue: Option<i64>,
     #[serde(default)]
     genres: Vec<TmdbNamedItem>,
@@ -525,12 +533,14 @@ struct TmdbExternalIds {
 
 #[derive(Deserialize)]
 struct TmdbCountry {
+    #[allow(dead_code)]
     iso_3166_1: Option<String>,
     name: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct TmdbLanguage {
+    #[allow(dead_code)]
     iso_639_1: Option<String>,
     name: Option<String>,
 }

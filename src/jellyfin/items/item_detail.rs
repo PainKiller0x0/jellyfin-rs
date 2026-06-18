@@ -35,7 +35,8 @@ pub async fn item_by_id(
                 return Json(lib_item).into_response();
             }
             // Check if it's a person
-            if let Ok(Some(person_item)) = find_person_as_item(&state.db, &user_id, &item_id).await {
+            if let Ok(Some(person_item)) = find_person_as_item(&state.db, &user_id, &item_id).await
+            {
                 return Json(person_item).into_response();
             }
             Json(json!({ "Name": item_id, "Id": item_id, "Type": "Folder", "UserData": { "Played": false, "IsFavorite": false } })).into_response()
@@ -60,7 +61,8 @@ pub async fn item_by_id_public(
                 return Json(lib_item).into_response();
             }
             // Check if it's a person
-            if let Ok(Some(person_item)) = find_person_as_item(&state.db, &user_id, &item_id).await {
+            if let Ok(Some(person_item)) = find_person_as_item(&state.db, &user_id, &item_id).await
+            {
                 return Json(person_item).into_response();
             }
             Json(json!({ "Name": item_id, "Id": item_id, "Type": "Folder", "UserData": { "Played": false, "IsFavorite": false } })).into_response()
@@ -238,7 +240,9 @@ async fn item_json_with_provider_ids(
         }
     } else if !item.is_folder {
         // For non-folder items (Episode/Video files), load media streams from DB
-        let streams = crate::jellyfin::playback::media_streams_for_item(db, &item.id).await.unwrap_or_default();
+        let streams = crate::jellyfin::playback::media_streams_for_item(db, &item.id)
+            .await
+            .unwrap_or_default();
         if !streams.is_empty() {
             // Rebuild MediaSources with streams included
             let container = item.container.as_deref().unwrap_or("bin");
@@ -408,6 +412,7 @@ async fn get_episode_parent_info(
     Some((series_title, series_id, season_title, season_id.to_string()))
 }
 
+#[allow(dead_code)]
 async fn relation_values(
     db: &DatabaseConnection,
     table: &str,
@@ -437,7 +442,11 @@ async fn relation_values(
         .collect()
 }
 
-async fn people_values(db: &DatabaseConnection, item_id: &str, user_id: Option<&str>) -> anyhow::Result<Vec<Value>> {
+async fn people_values(
+    db: &DatabaseConnection,
+    item_id: &str,
+    user_id: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
     let backend = db.get_database_backend();
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
@@ -449,25 +458,34 @@ async fn people_values(db: &DatabaseConnection, item_id: &str, user_id: Option<&
         .with_context(|| format!("failed to list people for item: {item_id}"))?;
 
     // Batch load user data for all people
-    let person_ids: Vec<String> = rows.iter()
+    let person_ids: Vec<String> = rows
+        .iter()
         .filter_map(|r| r.get_opt_str("id").ok().flatten())
         .collect();
-    let fav_map = if user_id.is_some() && !person_ids.is_empty() {
-        let uid = user_id.unwrap();
-        let ph = person_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT item_id, is_favorite FROM user_data WHERE user_id = ? AND item_id IN ({})", ph);
-        let mut vals: Vec<sea_orm::Value> = vec![uid.into()];
-        for pid in &person_ids { vals.push(pid.as_str().into()); }
-        let fav_rows = db
-            .query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
-            .await?;
-        let mut m: HashMap<String, bool> = HashMap::new();
-        for r in &fav_rows {
-            if let (Ok(pid), Ok(fav)) = (r.get_str("item_id"), r.get_i64("is_favorite")) {
-                m.insert(pid, fav != 0);
+    let fav_map = if let Some(uid) = user_id {
+        if !person_ids.is_empty() {
+            let ph = person_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT item_id, is_favorite FROM user_data WHERE user_id = ? AND item_id IN ({})",
+                ph
+            );
+            let mut vals: Vec<sea_orm::Value> = vec![uid.into()];
+            for pid in &person_ids {
+                vals.push(pid.as_str().into());
             }
+            let fav_rows = db
+                .query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
+                .await?;
+            let mut m: HashMap<String, bool> = HashMap::new();
+            for r in &fav_rows {
+                if let (Ok(pid), Ok(fav)) = (r.get_str("item_id"), r.get_i64("is_favorite")) {
+                    m.insert(pid, fav != 0);
+                }
+            }
+            m
+        } else {
+            HashMap::new()
         }
-        m
     } else {
         HashMap::new()
     };
@@ -498,7 +516,8 @@ async fn people_values(db: &DatabaseConnection, item_id: &str, user_id: Option<&
 /// Batch-enrich episode items in a list with SeriesId/SeriesName/SeasonId/SeasonName.
 pub async fn enrich_episode_list(db: &DatabaseConnection, items: Vec<MediaItem>) -> Vec<Value> {
     // Collect unique parent_ids (season IDs) for episodes
-    let season_ids: Vec<&str> = items.iter()
+    let season_ids: Vec<&str> = items
+        .iter()
         .filter(|i| i.item_type == "Episode")
         .map(|i| i.parent_id.as_str())
         .collect::<std::collections::HashSet<_>>()
@@ -514,7 +533,12 @@ pub async fn enrich_episode_list(db: &DatabaseConnection, items: Vec<MediaItem>)
             "SELECT s.id AS season_id, s.title AS season_name, s.parent_id AS series_id, ser.title AS series_name FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id WHERE s.id IN ({placeholders})"
         );
         let values: Vec<sea_orm::Value> = season_ids.iter().map(|id| (*id).into()).collect();
-        if let Ok(rows) = db.query_all(crate::db::helpers::portable_statement(backend, &sql, values)).await {
+        if let Ok(rows) = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend, &sql, values,
+            ))
+            .await
+        {
             for row in &rows {
                 if let (Ok(sid), Ok(sname), Ok(serid), Ok(sername)) = (
                     row.get_str("season_id"),
@@ -529,8 +553,12 @@ pub async fn enrich_episode_list(db: &DatabaseConnection, items: Vec<MediaItem>)
     }
 
     // Collect unique series IDs and batch-query their logo/backdrop image tags
-    let series_ids: Vec<String> = season_map.values().map(|(serid, _, _)| serid.clone())
-        .collect::<std::collections::HashSet<_>>().into_iter().collect();
+    let series_ids: Vec<String> = season_map
+        .values()
+        .map(|(serid, _, _)| serid.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
     // series_id -> (logo_etag, backdrop_etag)
     let mut logo_map: HashMap<String, (String, String)> = HashMap::new();
     if !series_ids.is_empty() {
@@ -540,14 +568,21 @@ pub async fn enrich_episode_list(db: &DatabaseConnection, items: Vec<MediaItem>)
             "SELECT item_id, image_type, etag FROM image_assets WHERE item_id IN ({placeholders}) AND image_type IN ('Logo', 'Backdrop')"
         );
         let values: Vec<sea_orm::Value> = series_ids.iter().map(|id| id.as_str().into()).collect();
-        if let Ok(rows) = db.query_all(crate::db::helpers::portable_statement(backend, &sql, values)).await {
+        if let Ok(rows) = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend, &sql, values,
+            ))
+            .await
+        {
             for row in &rows {
                 if let (Ok(item_id), Ok(img_type), Ok(etag)) = (
                     row.get_str("item_id"),
                     row.get_str("image_type"),
                     row.get_str("etag"),
                 ) {
-                    let entry = logo_map.entry(item_id).or_insert((String::new(), String::new()));
+                    let entry = logo_map
+                        .entry(item_id)
+                        .or_insert((String::new(), String::new()));
                     if img_type == "Logo" {
                         entry.0 = etag;
                     } else if img_type == "Backdrop" {
@@ -558,29 +593,33 @@ pub async fn enrich_episode_list(db: &DatabaseConnection, items: Vec<MediaItem>)
         }
     }
 
-    items.into_iter().map(|item| {
-        let mut val = item.to_jellyfin_json();
-        if item.item_type == "Episode" {
-            if let Some((series_id, series_name, season_name)) = season_map.get(&item.parent_id) {
-                val["SeriesId"] = json!(series_id);
-                val["SeriesName"] = json!(series_name);
-                val["SeasonId"] = json!(item.parent_id);
-                val["SeasonName"] = json!(season_name);
-                // Add parent logo/backdrop for playback UI
-                val["ParentLogoItemId"] = json!(series_id);
-                if let Some((logo_etag, _)) = logo_map.get(series_id) {
-                    val["ParentLogoImageTag"] = json!(logo_etag);
-                }
-                val["ParentBackdropItemId"] = json!(series_id);
-                if let Some((_, backdrop_etag)) = logo_map.get(series_id) {
-                    if !backdrop_etag.is_empty() {
-                        val["ParentBackdropImageTags"] = json!([backdrop_etag]);
+    items
+        .into_iter()
+        .map(|item| {
+            let mut val = item.to_jellyfin_json();
+            if item.item_type == "Episode" {
+                if let Some((series_id, series_name, season_name)) = season_map.get(&item.parent_id)
+                {
+                    val["SeriesId"] = json!(series_id);
+                    val["SeriesName"] = json!(series_name);
+                    val["SeasonId"] = json!(item.parent_id);
+                    val["SeasonName"] = json!(season_name);
+                    // Add parent logo/backdrop for playback UI
+                    val["ParentLogoItemId"] = json!(series_id);
+                    if let Some((logo_etag, _)) = logo_map.get(series_id) {
+                        val["ParentLogoImageTag"] = json!(logo_etag);
+                    }
+                    val["ParentBackdropItemId"] = json!(series_id);
+                    if let Some((_, backdrop_etag)) = logo_map.get(series_id) {
+                        if !backdrop_etag.is_empty() {
+                            val["ParentBackdropImageTags"] = json!([backdrop_etag]);
+                        }
                     }
                 }
             }
-        }
-        strip_nulls(val)
-    }).collect()
+            strip_nulls(val)
+        })
+        .collect()
 }
 
 pub async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>) -> Vec<Value> {
@@ -588,7 +627,8 @@ pub async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>)
     let backend = db.get_database_backend();
 
     // Collect parent_ids for Episode items to look up series info
-    let parent_ids: Vec<&str> = items.iter()
+    let parent_ids: Vec<&str> = items
+        .iter()
         .filter(|i| i.item_type == "Episode")
         .map(|i| i.parent_id.as_str())
         .collect();
@@ -603,7 +643,10 @@ pub async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>)
              WHERE s.id IN ({placeholders})",
         );
         let vals: Vec<sea_orm::Value> = parent_ids.iter().map(|p| (*p).into()).collect();
-        if let Ok(rows) = db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals)).await {
+        if let Ok(rows) = db
+            .query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
+            .await
+        {
             for row in &rows {
                 if let (Ok(sid), Ok(st), Ok(srid), Ok(srt)) = (
                     row.get_str("season_id"),
@@ -624,14 +667,18 @@ pub async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>)
         for item in &items {
             if item.is_folder {
                 // Folder items (Movie/Episode) - load child video sources
-                if let Ok(sources) = crate::jellyfin::playback::child_video_sources(db, &item.id).await {
+                if let Ok(sources) =
+                    crate::jellyfin::playback::child_video_sources(db, &item.id).await
+                {
                     if !sources.is_empty() {
                         source_map.insert(item.id.clone(), sources);
                     }
                 }
             } else {
                 // Non-folder items - build MediaSource directly from the item itself
-                let stream_jsons = crate::jellyfin::playback::media_streams_for_item(db, &item.id).await.unwrap_or_default();
+                let stream_jsons = crate::jellyfin::playback::media_streams_for_item(db, &item.id)
+                    .await
+                    .unwrap_or_default();
                 let container = item.container.as_deref().unwrap_or("bin");
                 let source = json!({
                     "Id": item.id,
@@ -655,57 +702,74 @@ pub async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>)
         }
     }
 
-    items.into_iter().map(|item| {
-        let mut value = item.to_jellyfin_json();
+    items
+        .into_iter()
+        .map(|item| {
+            let mut value = item.to_jellyfin_json();
 
-        // Enrich Episode items with series/season info
-        if item.item_type == "Episode" {
-            if let Some((season_title, series_id, series_title)) = season_map.get(&item.parent_id) {
-                value["SeriesName"] = json!(series_title);
-                value["SeriesId"] = json!(series_id);
-                value["SeasonName"] = json!(season_title);
-                value["SeasonId"] = json!(item.parent_id);
+            // Enrich Episode items with series/season info
+            if item.item_type == "Episode" {
+                if let Some((season_title, series_id, series_title)) =
+                    season_map.get(&item.parent_id)
+                {
+                    value["SeriesName"] = json!(series_title);
+                    value["SeriesId"] = json!(series_id);
+                    value["SeasonName"] = json!(season_title);
+                    value["SeasonId"] = json!(item.parent_id);
+                }
+                value["SupportsResume"] = json!(true);
             }
-            value["SupportsResume"] = json!(true);
-        }
 
-        // Add MediaSources if available
-        if let Some(sources) = source_map.get(&item.id) {
-            if !sources.is_empty() {
-                value["MediaSources"] = Value::Array(sources.clone());
-                // Flatten streams to top-level
-                let mut all_streams = Vec::new();
-                for source in sources {
-                    if let Some(streams) = source.get("MediaStreams").and_then(Value::as_array) {
-                        all_streams.extend(streams.clone());
+            // Add MediaSources if available
+            if let Some(sources) = source_map.get(&item.id) {
+                if !sources.is_empty() {
+                    value["MediaSources"] = Value::Array(sources.clone());
+                    // Flatten streams to top-level
+                    let mut all_streams = Vec::new();
+                    for source in sources {
+                        if let Some(streams) = source.get("MediaStreams").and_then(Value::as_array)
+                        {
+                            all_streams.extend(streams.clone());
+                        }
+                    }
+                    value["MediaStreams"] = Value::Array(all_streams);
+
+                    // Get RunTimeTicks from first source if item doesn't have it
+                    if item.runtime_ticks.is_none() {
+                        if let Some(rt) = sources
+                            .first()
+                            .and_then(|s| s.get("RunTimeTicks"))
+                            .and_then(Value::as_i64)
+                            .filter(|v| *v > 0)
+                        {
+                            value["RunTimeTicks"] = json!(rt);
+                        }
                     }
                 }
-                value["MediaStreams"] = Value::Array(all_streams);
+            }
 
-                // Get RunTimeTicks from first source if item doesn't have it
-                if item.runtime_ticks.is_none() {
-                    if let Some(rt) = sources.first().and_then(|s| s.get("RunTimeTicks")).and_then(Value::as_i64).filter(|v| *v > 0) {
-                        value["RunTimeTicks"] = json!(rt);
+            // Ensure RunTimeTicks is set from item if available
+            if item.runtime_ticks.is_some()
+                && value.get("RunTimeTicks").and_then(Value::as_i64).is_none()
+            {
+                value["RunTimeTicks"] = json!(item.runtime_ticks);
+            }
+
+            // Calculate PlayedPercentage if not set
+            if item.played_percentage.is_none() && item.playback_position_ticks > 0 {
+                if let Some(rt) = value
+                    .get("RunTimeTicks")
+                    .and_then(Value::as_i64)
+                    .filter(|v| *v > 0)
+                {
+                    let pct = (item.playback_position_ticks as f64 / rt as f64 * 100.0).min(100.0);
+                    if let Some(ud) = value.get_mut("UserData") {
+                        ud["PlayedPercentage"] = json!(pct);
                     }
                 }
             }
-        }
 
-        // Ensure RunTimeTicks is set from item if available
-        if item.runtime_ticks.is_some() && value.get("RunTimeTicks").and_then(Value::as_i64).is_none() {
-            value["RunTimeTicks"] = json!(item.runtime_ticks);
-        }
-
-        // Calculate PlayedPercentage if not set
-        if item.played_percentage.is_none() && item.playback_position_ticks > 0 {
-            if let Some(rt) = value.get("RunTimeTicks").and_then(Value::as_i64).filter(|v| *v > 0) {
-                let pct = (item.playback_position_ticks as f64 / rt as f64 * 100.0).min(100.0);
-                if let Some(ud) = value.get_mut("UserData") {
-                    ud["PlayedPercentage"] = json!(pct);
-                }
-            }
-        }
-
-        strip_nulls(value)
-    }).collect()
+            strip_nulls(value)
+        })
+        .collect()
 }

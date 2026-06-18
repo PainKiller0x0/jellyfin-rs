@@ -18,9 +18,7 @@ use crate::{
     library::images::upsert_image_asset,
 };
 
-pub async fn remote_images_providers(
-    State(state): State<Arc<AppState>>,
-) -> Response {
+pub async fn remote_images_providers(State(state): State<Arc<AppState>>) -> Response {
     let mut providers = vec![json!({
         "Name": "Local",
         "SupportedImages": ["Primary", "Art", "Backdrop", "Banner", "Logo", "Thumb", "Disc", "Box", "Screenshot", "Menu", "Chapter"]
@@ -73,7 +71,12 @@ pub async fn remote_images(
 
     let mut all_images: Vec<Value> = Vec::new();
 
-    let tmdb_id = if let Some(api_key) = state.tmdb_api_key.read().await.clone().filter(|key| !key.is_empty())
+    let tmdb_id = if let Some(api_key) = state
+        .tmdb_api_key
+        .read()
+        .await
+        .clone()
+        .filter(|key| !key.is_empty())
     {
         let tmdb_id = lookup_tmdb_id(&state.db, &item_id).await.ok().flatten();
         match tmdb_id {

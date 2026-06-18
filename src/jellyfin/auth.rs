@@ -670,7 +670,10 @@ fn request_user_id_from_headers(headers: &HeaderMap) -> Option<String> {
         if let Some(value) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
             for part in value.split(',') {
                 let part = part.trim();
-                if let Some(id) = part.strip_prefix("UserId=\"").and_then(|s| s.find('"').map(|end| &s[..end])) {
+                if let Some(id) = part
+                    .strip_prefix("UserId=\"")
+                    .and_then(|s| s.find('"').map(|end| &s[..end]))
+                {
                     if !id.is_empty() {
                         return Some(id.to_string());
                     }
@@ -746,11 +749,19 @@ pub async fn users_query(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let start_index = query.get("StartIndex").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
-    let limit = query.get("Limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(100);
+    let start_index = query
+        .get("StartIndex")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let limit = query
+        .get("Limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100);
     let search_term = query.get("SearchTerm").map(String::as_str);
     let is_disabled = query.get("IsDisabled").and_then(|v| v.parse::<bool>().ok());
-    let is_admin = query.get("IsAdministrator").and_then(|v| v.parse::<bool>().ok());
+    let is_admin = query
+        .get("IsAdministrator")
+        .and_then(|v| v.parse::<bool>().ok());
 
     match list_users_inner(&state.db).await {
         Ok(mut users) => {
@@ -758,17 +769,27 @@ pub async fn users_query(
             if let Some(term) = search_term {
                 let term_lower = term.to_lowercase();
                 users.retain(|u| {
-                    u.get("Name").and_then(JsonValue::as_str).unwrap_or("").to_lowercase().contains(&term_lower)
+                    u.get("Name")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&term_lower)
                 });
             }
             if let Some(disabled) = is_disabled {
                 users.retain(|u| {
-                    u.get("IsDisabled").and_then(JsonValue::as_bool).unwrap_or(false) == disabled
+                    u.get("IsDisabled")
+                        .and_then(JsonValue::as_bool)
+                        .unwrap_or(false)
+                        == disabled
                 });
             }
             if let Some(admin) = is_admin {
                 users.retain(|u| {
-                    u.get("IsAdministrator").and_then(JsonValue::as_bool).unwrap_or(false) == admin
+                    u.get("IsAdministrator")
+                        .and_then(JsonValue::as_bool)
+                        .unwrap_or(false)
+                        == admin
                 });
             }
 

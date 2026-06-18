@@ -61,9 +61,7 @@ pub fn strip_nulls(value: JsonValue) -> JsonValue {
                 .collect();
             JsonValue::Object(cleaned)
         }
-        JsonValue::Array(arr) => {
-            JsonValue::Array(arr.into_iter().map(strip_nulls).collect())
-        }
+        JsonValue::Array(arr) => JsonValue::Array(arr.into_iter().map(strip_nulls).collect()),
         other => other,
     }
 }

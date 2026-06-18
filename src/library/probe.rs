@@ -32,9 +32,9 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
         .arg("-show_format")
         .arg("-show_streams")
         .arg("-analyzeduration")
-        .arg("5000000")  // 5 seconds max analysis
+        .arg("5000000") // 5 seconds max analysis
         .arg("-probesize")
-        .arg("5000000")  // 5MB max probe size
+        .arg("5000000") // 5MB max probe size
         .arg(path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

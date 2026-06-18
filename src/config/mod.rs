@@ -1,5 +1,5 @@
-use sea_orm::ConnectionTrait;
 use crate::db::row_ext::QueryResultExt;
+use sea_orm::ConnectionTrait;
 
 #[derive(Debug, Clone)]
 pub struct StrmAssistantConfig {
@@ -129,9 +129,7 @@ impl StrmAssistantConfig {
             Err(_) => std::collections::HashMap::new(),
         };
 
-        let get_db = |key: &str| -> Option<String> {
-            db_settings.get(key).cloned()
-        };
+        let get_db = |key: &str| -> Option<String> { db_settings.get(key).cloned() };
 
         // Load each setting: DB first, then env var, then default
         cfg.enabled = get_db("sa.enabled")
@@ -149,11 +147,18 @@ impl StrmAssistantConfig {
 
         cfg.max_concurrent_count = get_db("sa.max_concurrent")
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| env_usize("JELLYFIN_RS_SA_MAX_CONCURRENT", cfg.max_concurrent_count));
+            .unwrap_or_else(|| {
+                env_usize("JELLYFIN_RS_SA_MAX_CONCURRENT", cfg.max_concurrent_count)
+            });
 
         cfg.tier2_max_concurrent_count = get_db("sa.tier2_max_concurrent")
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| env_usize("JELLYFIN_RS_SA_TIER2_MAX_CONCURRENT", cfg.tier2_max_concurrent_count));
+            .unwrap_or_else(|| {
+                env_usize(
+                    "JELLYFIN_RS_SA_TIER2_MAX_CONCURRENT",
+                    cfg.tier2_max_concurrent_count,
+                )
+            });
 
         cfg.cooldown_duration_secs = get_db("sa.cooldown_secs")
             .and_then(|v| v.parse().ok())
@@ -165,26 +170,48 @@ impl StrmAssistantConfig {
 
         cfg.mediainfo_extract_enabled = get_db("sa.mediainfo_enabled")
             .map(|v| parse_bool(&v))
-            .unwrap_or_else(|| env_bool("JELLYFIN_RS_SA_MEDIAINFO_ENABLED", cfg.mediainfo_extract_enabled));
+            .unwrap_or_else(|| {
+                env_bool(
+                    "JELLYFIN_RS_SA_MEDIAINFO_ENABLED",
+                    cfg.mediainfo_extract_enabled,
+                )
+            });
 
         cfg.mediainfo_json_root_folder = get_db("sa.mediainfo_json_root")
             .or_else(|| std::env::var("JELLYFIN_RS_SA_MEDIAINFO_JSON_ROOT").ok());
 
         cfg.intro_skip_enabled = get_db("sa.intro_skip_enabled")
             .map(|v| parse_bool(&v))
-            .unwrap_or_else(|| env_bool("JELLYFIN_RS_SA_INTRO_SKIP_ENABLED", cfg.intro_skip_enabled));
+            .unwrap_or_else(|| {
+                env_bool("JELLYFIN_RS_SA_INTRO_SKIP_ENABLED", cfg.intro_skip_enabled)
+            });
 
         cfg.max_intro_duration_secs = get_db("sa.max_intro_duration")
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| env_i64("JELLYFIN_RS_SA_MAX_INTRO_DURATION", cfg.max_intro_duration_secs));
+            .unwrap_or_else(|| {
+                env_i64(
+                    "JELLYFIN_RS_SA_MAX_INTRO_DURATION",
+                    cfg.max_intro_duration_secs,
+                )
+            });
 
         cfg.max_credits_duration_secs = get_db("sa.max_credits_duration")
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| env_i64("JELLYFIN_RS_SA_MAX_CREDITS_DURATION", cfg.max_credits_duration_secs));
+            .unwrap_or_else(|| {
+                env_i64(
+                    "JELLYFIN_RS_SA_MAX_CREDITS_DURATION",
+                    cfg.max_credits_duration_secs,
+                )
+            });
 
         cfg.min_opening_plot_duration_secs = get_db("sa.min_opening_plot_duration")
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| env_i64("JELLYFIN_RS_SA_MIN_OPENING_PLOT_DURATION", cfg.min_opening_plot_duration_secs));
+            .unwrap_or_else(|| {
+                env_i64(
+                    "JELLYFIN_RS_SA_MIN_OPENING_PLOT_DURATION",
+                    cfg.min_opening_plot_duration_secs,
+                )
+            });
 
         cfg.intro_skip_library_scope = get_db("sa.intro_library_scope")
             .map(|v| split_csv(&v))
@@ -206,19 +233,33 @@ impl StrmAssistantConfig {
             .or_else(|| std::env::var("JELLYFIN_RS_SA_INTRO_PREFERENCE").ok())
         {
             cfg.intro_skip_preference = match val.to_ascii_lowercase().as_str() {
-                "resetandoverwrite" | "reset_and_overwrite" => IntroSkipPreference::ResetAndOverwrite,
-                "nodetectionbutreset" | "no_detection_but_reset" => IntroSkipPreference::NoDetectionButReset,
+                "resetandoverwrite" | "reset_and_overwrite" => {
+                    IntroSkipPreference::ResetAndOverwrite
+                }
+                "nodetectionbutreset" | "no_detection_but_reset" => {
+                    IntroSkipPreference::NoDetectionButReset
+                }
                 _ => IntroSkipPreference::DetectOnly,
             };
         }
 
         cfg.fingerprint_enabled = get_db("sa.fingerprint_enabled")
             .map(|v| parse_bool(&v))
-            .unwrap_or_else(|| env_bool("JELLYFIN_RS_SA_FINGERPRINT_ENABLED", cfg.fingerprint_enabled));
+            .unwrap_or_else(|| {
+                env_bool(
+                    "JELLYFIN_RS_SA_FINGERPRINT_ENABLED",
+                    cfg.fingerprint_enabled,
+                )
+            });
 
         cfg.intro_detection_fingerprint_minutes = get_db("sa.fingerprint_minutes")
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| env_i64("JELLYFIN_RS_SA_FINGERPRINT_MINUTES", cfg.intro_detection_fingerprint_minutes));
+            .unwrap_or_else(|| {
+                env_i64(
+                    "JELLYFIN_RS_SA_FINGERPRINT_MINUTES",
+                    cfg.intro_detection_fingerprint_minutes,
+                )
+            });
 
         cfg.thumbnail_enabled = get_db("sa.thumbnail_enabled")
             .map(|v| parse_bool(&v))
@@ -226,7 +267,12 @@ impl StrmAssistantConfig {
 
         cfg.thumbnail_interval_secs = get_db("sa.thumbnail_interval")
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| env_u64("JELLYFIN_RS_SA_THUMBNAIL_INTERVAL", cfg.thumbnail_interval_secs));
+            .unwrap_or_else(|| {
+                env_u64(
+                    "JELLYFIN_RS_SA_THUMBNAIL_INTERVAL",
+                    cfg.thumbnail_interval_secs,
+                )
+            });
 
         cfg.thumbnail_width = get_db("sa.thumbnail_width")
             .and_then(|v| v.parse().ok())
@@ -234,7 +280,9 @@ impl StrmAssistantConfig {
 
         cfg.tmdb_rate_limit_ms = get_db("sa.tmdb_rate_limit_ms")
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| env_u64("JELLYFIN_RS_SA_TMDB_RATE_LIMIT_MS", cfg.tmdb_rate_limit_ms));
+            .unwrap_or_else(|| {
+                env_u64("JELLYFIN_RS_SA_TMDB_RATE_LIMIT_MS", cfg.tmdb_rate_limit_ms)
+            });
 
         cfg.tmdb_cache_size = get_db("sa.tmdb_cache_size")
             .and_then(|v| v.parse().ok())
@@ -242,15 +290,30 @@ impl StrmAssistantConfig {
 
         cfg.tmdb_original_language_posters = get_db("sa.tmdb_original_posters")
             .map(|v| parse_bool(&v))
-            .unwrap_or_else(|| env_bool("JELLYFIN_RS_SA_TMDB_ORIGINAL_POSTERS", cfg.tmdb_original_language_posters));
+            .unwrap_or_else(|| {
+                env_bool(
+                    "JELLYFIN_RS_SA_TMDB_ORIGINAL_POSTERS",
+                    cfg.tmdb_original_language_posters,
+                )
+            });
 
         cfg.chinese_convert_enabled = get_db("sa.chinese_convert")
             .map(|v| parse_bool(&v))
-            .unwrap_or_else(|| env_bool("JELLYFIN_RS_SA_CHINESE_CONVERT", cfg.chinese_convert_enabled));
+            .unwrap_or_else(|| {
+                env_bool(
+                    "JELLYFIN_RS_SA_CHINESE_CONVERT",
+                    cfg.chinese_convert_enabled,
+                )
+            });
 
         cfg.chinese_search_enhancement = get_db("sa.chinese_search")
             .map(|v| parse_bool(&v))
-            .unwrap_or_else(|| env_bool("JELLYFIN_RS_SA_CHINESE_SEARCH", cfg.chinese_search_enhancement));
+            .unwrap_or_else(|| {
+                env_bool(
+                    "JELLYFIN_RS_SA_CHINESE_SEARCH",
+                    cfg.chinese_search_enhancement,
+                )
+            });
 
         cfg.pinyin_sorting = get_db("sa.pinyin_sorting")
             .map(|v| parse_bool(&v))
@@ -262,12 +325,18 @@ impl StrmAssistantConfig {
 
         cfg.enhanced_subtitle_scan = get_db("sa.enhanced_subtitle_scan")
             .map(|v| parse_bool(&v))
-            .unwrap_or_else(|| env_bool("JELLYFIN_RS_SA_ENHANCED_SUBTITLE_SCAN", cfg.enhanced_subtitle_scan));
+            .unwrap_or_else(|| {
+                env_bool(
+                    "JELLYFIN_RS_SA_ENHANCED_SUBTITLE_SCAN",
+                    cfg.enhanced_subtitle_scan,
+                )
+            });
 
         cfg
     }
 
     /// Load config from env vars only (for startup before DB is ready).
+    #[allow(dead_code)]
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
 
@@ -275,16 +344,34 @@ impl StrmAssistantConfig {
         cfg.ffmpeg_path = env_str("JELLYFIN_RS_SA_FFMPEG_PATH", &cfg.ffmpeg_path);
         cfg.ffprobe_path = env_str("JELLYFIN_RS_SA_FFPROBE_PATH", &cfg.ffprobe_path);
         cfg.fpcalc_path = env_str("JELLYFIN_RS_SA_FPCALC_PATH", &cfg.fpcalc_path);
-        cfg.max_concurrent_count = env_usize("JELLYFIN_RS_SA_MAX_CONCURRENT", cfg.max_concurrent_count);
-        cfg.tier2_max_concurrent_count = env_usize("JELLYFIN_RS_SA_TIER2_MAX_CONCURRENT", cfg.tier2_max_concurrent_count);
-        cfg.cooldown_duration_secs = env_u64("JELLYFIN_RS_SA_COOLDOWN_SECS", cfg.cooldown_duration_secs);
+        cfg.max_concurrent_count =
+            env_usize("JELLYFIN_RS_SA_MAX_CONCURRENT", cfg.max_concurrent_count);
+        cfg.tier2_max_concurrent_count = env_usize(
+            "JELLYFIN_RS_SA_TIER2_MAX_CONCURRENT",
+            cfg.tier2_max_concurrent_count,
+        );
+        cfg.cooldown_duration_secs =
+            env_u64("JELLYFIN_RS_SA_COOLDOWN_SECS", cfg.cooldown_duration_secs);
         cfg.strm_enabled = env_bool("JELLYFIN_RS_SA_STRM_ENABLED", cfg.strm_enabled);
-        cfg.mediainfo_extract_enabled = env_bool("JELLYFIN_RS_SA_MEDIAINFO_ENABLED", cfg.mediainfo_extract_enabled);
+        cfg.mediainfo_extract_enabled = env_bool(
+            "JELLYFIN_RS_SA_MEDIAINFO_ENABLED",
+            cfg.mediainfo_extract_enabled,
+        );
         cfg.mediainfo_json_root_folder = std::env::var("JELLYFIN_RS_SA_MEDIAINFO_JSON_ROOT").ok();
-        cfg.intro_skip_enabled = env_bool("JELLYFIN_RS_SA_INTRO_SKIP_ENABLED", cfg.intro_skip_enabled);
-        cfg.max_intro_duration_secs = env_i64("JELLYFIN_RS_SA_MAX_INTRO_DURATION", cfg.max_intro_duration_secs);
-        cfg.max_credits_duration_secs = env_i64("JELLYFIN_RS_SA_MAX_CREDITS_DURATION", cfg.max_credits_duration_secs);
-        cfg.min_opening_plot_duration_secs = env_i64("JELLYFIN_RS_SA_MIN_OPENING_PLOT_DURATION", cfg.min_opening_plot_duration_secs);
+        cfg.intro_skip_enabled =
+            env_bool("JELLYFIN_RS_SA_INTRO_SKIP_ENABLED", cfg.intro_skip_enabled);
+        cfg.max_intro_duration_secs = env_i64(
+            "JELLYFIN_RS_SA_MAX_INTRO_DURATION",
+            cfg.max_intro_duration_secs,
+        );
+        cfg.max_credits_duration_secs = env_i64(
+            "JELLYFIN_RS_SA_MAX_CREDITS_DURATION",
+            cfg.max_credits_duration_secs,
+        );
+        cfg.min_opening_plot_duration_secs = env_i64(
+            "JELLYFIN_RS_SA_MIN_OPENING_PLOT_DURATION",
+            cfg.min_opening_plot_duration_secs,
+        );
         cfg.intro_skip_library_scope = env_vec("JELLYFIN_RS_SA_INTRO_LIBRARY_SCOPE");
         cfg.intro_skip_user_scope = env_vec("JELLYFIN_RS_SA_INTRO_USER_SCOPE");
         if let Ok(val) = std::env::var("JELLYFIN_RS_SA_INTRO_CLIENT_SCOPE") {
@@ -294,24 +381,50 @@ impl StrmAssistantConfig {
         }
         if let Ok(val) = std::env::var("JELLYFIN_RS_SA_INTRO_PREFERENCE") {
             cfg.intro_skip_preference = match val.to_ascii_lowercase().as_str() {
-                "resetandoverwrite" | "reset_and_overwrite" => IntroSkipPreference::ResetAndOverwrite,
-                "nodetectionbutreset" | "no_detection_but_reset" => IntroSkipPreference::NoDetectionButReset,
+                "resetandoverwrite" | "reset_and_overwrite" => {
+                    IntroSkipPreference::ResetAndOverwrite
+                }
+                "nodetectionbutreset" | "no_detection_but_reset" => {
+                    IntroSkipPreference::NoDetectionButReset
+                }
                 _ => IntroSkipPreference::DetectOnly,
             };
         }
-        cfg.fingerprint_enabled = env_bool("JELLYFIN_RS_SA_FINGERPRINT_ENABLED", cfg.fingerprint_enabled);
-        cfg.intro_detection_fingerprint_minutes = env_i64("JELLYFIN_RS_SA_FINGERPRINT_MINUTES", cfg.intro_detection_fingerprint_minutes);
+        cfg.fingerprint_enabled = env_bool(
+            "JELLYFIN_RS_SA_FINGERPRINT_ENABLED",
+            cfg.fingerprint_enabled,
+        );
+        cfg.intro_detection_fingerprint_minutes = env_i64(
+            "JELLYFIN_RS_SA_FINGERPRINT_MINUTES",
+            cfg.intro_detection_fingerprint_minutes,
+        );
         cfg.thumbnail_enabled = env_bool("JELLYFIN_RS_SA_THUMBNAIL_ENABLED", cfg.thumbnail_enabled);
-        cfg.thumbnail_interval_secs = env_u64("JELLYFIN_RS_SA_THUMBNAIL_INTERVAL", cfg.thumbnail_interval_secs);
+        cfg.thumbnail_interval_secs = env_u64(
+            "JELLYFIN_RS_SA_THUMBNAIL_INTERVAL",
+            cfg.thumbnail_interval_secs,
+        );
         cfg.thumbnail_width = env_u32("JELLYFIN_RS_SA_THUMBNAIL_WIDTH", cfg.thumbnail_width);
-        cfg.tmdb_rate_limit_ms = env_u64("JELLYFIN_RS_SA_TMDB_RATE_LIMIT_MS", cfg.tmdb_rate_limit_ms);
+        cfg.tmdb_rate_limit_ms =
+            env_u64("JELLYFIN_RS_SA_TMDB_RATE_LIMIT_MS", cfg.tmdb_rate_limit_ms);
         cfg.tmdb_cache_size = env_usize("JELLYFIN_RS_SA_TMDB_CACHE_SIZE", cfg.tmdb_cache_size);
-        cfg.tmdb_original_language_posters = env_bool("JELLYFIN_RS_SA_TMDB_ORIGINAL_POSTERS", cfg.tmdb_original_language_posters);
-        cfg.chinese_convert_enabled = env_bool("JELLYFIN_RS_SA_CHINESE_CONVERT", cfg.chinese_convert_enabled);
-        cfg.chinese_search_enhancement = env_bool("JELLYFIN_RS_SA_CHINESE_SEARCH", cfg.chinese_search_enhancement);
+        cfg.tmdb_original_language_posters = env_bool(
+            "JELLYFIN_RS_SA_TMDB_ORIGINAL_POSTERS",
+            cfg.tmdb_original_language_posters,
+        );
+        cfg.chinese_convert_enabled = env_bool(
+            "JELLYFIN_RS_SA_CHINESE_CONVERT",
+            cfg.chinese_convert_enabled,
+        );
+        cfg.chinese_search_enhancement = env_bool(
+            "JELLYFIN_RS_SA_CHINESE_SEARCH",
+            cfg.chinese_search_enhancement,
+        );
         cfg.pinyin_sorting = env_bool("JELLYFIN_RS_SA_PINYIN_SORTING", cfg.pinyin_sorting);
         cfg.merge_enabled = env_bool("JELLYFIN_RS_SA_MERGE_ENABLED", cfg.merge_enabled);
-        cfg.enhanced_subtitle_scan = env_bool("JELLYFIN_RS_SA_ENHANCED_SUBTITLE_SCAN", cfg.enhanced_subtitle_scan);
+        cfg.enhanced_subtitle_scan = env_bool(
+            "JELLYFIN_RS_SA_ENHANCED_SUBTITLE_SCAN",
+            cfg.enhanced_subtitle_scan,
+        );
 
         cfg
     }

@@ -58,6 +58,7 @@ pub fn mediainfo_json_path(media_path: &Path, root_folder: Option<&str>) -> Path
 }
 
 /// Serialize media info from DB to a JSON sidecar file.
+#[allow(dead_code)]
 pub async fn serialize_mediainfo(
     db: &DatabaseConnection,
     item_id: &str,
@@ -84,7 +85,9 @@ pub async fn serialize_mediainfo(
         ))
         .await?;
 
-    let runtime_ticks = item_row.as_ref().and_then(|r| r.get_i64("runtime_ticks").ok());
+    let runtime_ticks = item_row
+        .as_ref()
+        .and_then(|r| r.get_i64("runtime_ticks").ok());
     let container = item_row.as_ref().and_then(|r| r.get_str("container").ok());
     let size_bytes = item_row.as_ref().and_then(|r| r.get_i64("size_bytes").ok());
 
@@ -210,10 +213,7 @@ pub async fn deserialize_mediainfo(
 
     if !updates.is_empty() {
         params.push(item_id.into());
-        let sql = format!(
-            "UPDATE media_items SET {} WHERE id = ?",
-            updates.join(", ")
-        );
+        let sql = format!("UPDATE media_items SET {} WHERE id = ?", updates.join(", "));
         db.execute(portable_statement(backend, &sql, params))
             .await?;
     }
@@ -235,7 +235,10 @@ pub async fn deserialize_mediainfo(
         crate::chapters::save_chapters(db, item_id, &chapters).await?;
     }
 
-    tracing::debug!("deserialized mediainfo for {item_id} from {}", json_path.display());
+    tracing::debug!(
+        "deserialized mediainfo for {item_id} from {}",
+        json_path.display()
+    );
     Ok(true)
 }
 

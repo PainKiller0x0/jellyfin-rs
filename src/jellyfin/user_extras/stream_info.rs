@@ -9,10 +9,7 @@ use axum::{
 use sea_orm::ConnectionTrait;
 use serde_json::{Value, json};
 
-use crate::{
-    app::state::AppState,
-    db::row_ext::QueryResultExt,
-};
+use crate::{app::state::AppState, db::row_ext::QueryResultExt};
 
 /// DELETE /Users/{user_id}/TrackSelections/{track_type} — clear track selections
 pub async fn clear_track_selections(
@@ -24,9 +21,7 @@ pub async fn clear_track_selections(
 }
 
 /// GET /AudioCodecs — list audio codecs from media_streams
-pub async fn audio_codecs(
-    State(state): State<Arc<AppState>>,
-) -> Response {
+pub async fn audio_codecs(State(state): State<Arc<AppState>>) -> Response {
     let backend = state.db.get_database_backend();
     let rows = state.db
         .query_all(crate::db::helpers::portable_statement(
@@ -37,17 +32,21 @@ pub async fn audio_codecs(
         .await
         .unwrap_or_default();
 
-    let codecs: Vec<Value> = rows.iter()
-        .filter_map(|r| r.get_opt_str("codec").ok().flatten().map(|c| json!({"Name": c, "Id": c})))
+    let codecs: Vec<Value> = rows
+        .iter()
+        .filter_map(|r| {
+            r.get_opt_str("codec")
+                .ok()
+                .flatten()
+                .map(|c| json!({"Name": c, "Id": c}))
+        })
         .collect();
 
     Json(json!({ "Items": codecs, "TotalRecordCount": codecs.len() })).into_response()
 }
 
 /// GET /AudioLayouts — list audio channel layouts
-pub async fn audio_layouts(
-    State(state): State<Arc<AppState>>,
-) -> Response {
+pub async fn audio_layouts(State(state): State<Arc<AppState>>) -> Response {
     let backend = state.db.get_database_backend();
     let rows = state.db
         .query_all(crate::db::helpers::portable_statement(
@@ -58,7 +57,8 @@ pub async fn audio_layouts(
         .await
         .unwrap_or_default();
 
-    let layouts: Vec<Value> = rows.iter()
+    let layouts: Vec<Value> = rows
+        .iter()
         .filter_map(|r| {
             r.get_opt_i64("channels").ok().flatten().map(|ch| {
                 let name = match ch {
@@ -77,9 +77,7 @@ pub async fn audio_layouts(
 }
 
 /// GET /SubtitleCodecs — list subtitle codecs
-pub async fn subtitle_codecs(
-    State(state): State<Arc<AppState>>,
-) -> Response {
+pub async fn subtitle_codecs(State(state): State<Arc<AppState>>) -> Response {
     let backend = state.db.get_database_backend();
     let rows = state.db
         .query_all(crate::db::helpers::portable_statement(
@@ -90,17 +88,21 @@ pub async fn subtitle_codecs(
         .await
         .unwrap_or_default();
 
-    let codecs: Vec<Value> = rows.iter()
-        .filter_map(|r| r.get_opt_str("codec").ok().flatten().map(|c| json!({"Name": c, "Id": c})))
+    let codecs: Vec<Value> = rows
+        .iter()
+        .filter_map(|r| {
+            r.get_opt_str("codec")
+                .ok()
+                .flatten()
+                .map(|c| json!({"Name": c, "Id": c}))
+        })
         .collect();
 
     Json(json!({ "Items": codecs, "TotalRecordCount": codecs.len() })).into_response()
 }
 
 /// GET /StreamLanguages — list stream languages
-pub async fn stream_languages(
-    State(state): State<Arc<AppState>>,
-) -> Response {
+pub async fn stream_languages(State(state): State<Arc<AppState>>) -> Response {
     let backend = state.db.get_database_backend();
     let rows = state.db
         .query_all(crate::db::helpers::portable_statement(
@@ -111,8 +113,14 @@ pub async fn stream_languages(
         .await
         .unwrap_or_default();
 
-    let langs: Vec<Value> = rows.iter()
-        .filter_map(|r| r.get_opt_str("language").ok().flatten().map(|l| json!({"Name": l, "Id": l})))
+    let langs: Vec<Value> = rows
+        .iter()
+        .filter_map(|r| {
+            r.get_opt_str("language")
+                .ok()
+                .flatten()
+                .map(|l| json!({"Name": l, "Id": l}))
+        })
         .collect();
 
     Json(json!({ "Items": langs, "TotalRecordCount": langs.len() })).into_response()

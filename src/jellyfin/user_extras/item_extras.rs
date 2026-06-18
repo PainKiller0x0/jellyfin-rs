@@ -7,12 +7,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use sea_orm::ConnectionTrait;
-use serde_json::{Value, json};
+use serde_json::json;
 
-use crate::{
-    app::state::AppState,
-    db::row_ext::QueryResultExt,
-};
+use crate::{app::state::AppState, db::row_ext::QueryResultExt};
 
 /// GET /Items/{item_id}/Intros — get intros (returns empty, not supported)
 pub async fn item_intros() -> Response {
@@ -69,8 +66,7 @@ pub async fn media_segments(
     }
 
     // Get credits marker
-    if let Ok(Some(credits_start)) =
-        crate::chapters::get_credits_marker(&state.db, &item_id).await
+    if let Ok(Some(credits_start)) = crate::chapters::get_credits_marker(&state.db, &item_id).await
     {
         // Get runtime to compute end ticks
         let runtime = state
@@ -114,7 +110,8 @@ pub async fn item_instant_mix(
     // Use similar items logic (same genre-based approach)
     let backend = state.db.get_database_backend();
     let sql = r#"SELECT mg_rel.item_id FROM media_genres mg_src JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id AND mg_src.item_id <> mg_rel.item_id WHERE mg_src.item_id = ? GROUP BY mg_rel.item_id ORDER BY COUNT(*) DESC LIMIT ?"#;
-    let similar_rows = state.db
+    let similar_rows = state
+        .db
         .query_all(crate::db::helpers::portable_statement(
             backend,
             sql,
@@ -123,7 +120,8 @@ pub async fn item_instant_mix(
         .await
         .unwrap_or_default();
 
-    let ids: Vec<String> = similar_rows.iter()
+    let ids: Vec<String> = similar_rows
+        .iter()
         .filter_map(|r| r.get_opt_str("item_id").ok().flatten())
         .collect();
 
@@ -138,10 +136,15 @@ pub async fn item_instant_mix(
         placeholders
     );
     let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
-    for id in &ids { vals.push(id.as_str().into()); }
+    for id in &ids {
+        vals.push(id.as_str().into());
+    }
 
-    let rows = state.db
-        .query_all(crate::db::helpers::portable_statement(backend, &item_sql, vals))
+    let rows = state
+        .db
+        .query_all(crate::db::helpers::portable_statement(
+            backend, &item_sql, vals,
+        ))
         .await
         .unwrap_or_default();
 

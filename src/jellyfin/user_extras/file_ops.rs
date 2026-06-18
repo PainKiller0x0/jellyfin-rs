@@ -9,10 +9,7 @@ use axum::{
 use sea_orm::ConnectionTrait;
 use serde_json::{Value, json};
 
-use crate::{
-    app::state::AppState,
-    db::row_ext::QueryResultExt,
-};
+use crate::{app::state::AppState, db::row_ext::QueryResultExt};
 
 /// GET /Artists/{name}/Images/{image_type} — serve artist image
 pub async fn artist_image(
@@ -22,7 +19,8 @@ pub async fn artist_image(
 ) -> Response {
     // Look up artist by name and serve their image
     let backend = state.db.get_database_backend();
-    let row = state.db
+    let row = state
+        .db
         .query_one(crate::db::helpers::portable_statement(
             backend,
             "SELECT id FROM people WHERE name = ?",
@@ -66,13 +64,8 @@ pub async fn attachment_stream(
             if let Ok(path) = r.get_str("path") {
                 match tokio::fs::read(&path).await {
                     Ok(bytes) => {
-                        let content_type = if path.ends_with(".ttf") || path.ends_with(".otf") {
-                            "application/octet-stream"
-                        } else {
-                            "application/octet-stream"
-                        };
                         return (
-                            [(axum::http::header::CONTENT_TYPE, content_type)],
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
                             bytes,
                         )
                             .into_response();
@@ -92,8 +85,8 @@ pub async fn item_image_head(
     headers: HeaderMap,
     Path((item_id, image_type)): Path<(String, String)>,
 ) -> Response {
+    use crate::entities::image_assets::{Column, Entity as ImageAssets};
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    use crate::entities::image_assets::{Entity as ImageAssets, Column};
 
     let model = ImageAssets::find()
         .filter(Column::ItemId.eq(&item_id))
@@ -147,7 +140,8 @@ pub async fn download_item(
     Path(item_id): Path<String>,
 ) -> Response {
     let backend = state.db.get_database_backend();
-    let row = state.db
+    let row = state
+        .db
         .query_one(crate::db::helpers::portable_statement(
             backend,
             "SELECT path, title, container FROM media_items WHERE id = ?",
@@ -159,17 +153,28 @@ pub async fn download_item(
         Ok(Some(r)) => {
             if let Ok(path) = r.get_str("path") {
                 let title = r.get_opt_str("title").ok().flatten().unwrap_or_default();
-                let container = r.get_opt_str("container").ok().flatten().unwrap_or_default();
+                let container = r
+                    .get_opt_str("container")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
                 match tokio::fs::read(&path).await {
                     Ok(bytes) => {
                         let filename = format!("{}.{}", title, container);
                         return (
                             [
-                                (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
-                                (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename)),
+                                (
+                                    axum::http::header::CONTENT_TYPE,
+                                    "application/octet-stream".to_string(),
+                                ),
+                                (
+                                    axum::http::header::CONTENT_DISPOSITION,
+                                    format!("attachment; filename=\"{}\"", filename),
+                                ),
                             ],
                             bytes,
-                        ).into_response();
+                        )
+                            .into_response();
                     }
                     Err(_) => return StatusCode::NOT_FOUND.into_response(),
                 }
@@ -186,7 +191,8 @@ pub async fn item_file_info(
     Path(item_id): Path<String>,
 ) -> Response {
     let backend = state.db.get_database_backend();
-    let row = state.db
+    let row = state
+        .db
         .query_one(crate::db::helpers::portable_statement(
             backend,
             "SELECT path, title, container, size_bytes FROM media_items WHERE id = ?",
@@ -198,13 +204,18 @@ pub async fn item_file_info(
         Ok(Some(r)) => {
             let path = r.get_opt_str("path").ok().flatten().unwrap_or_default();
             let title = r.get_opt_str("title").ok().flatten().unwrap_or_default();
-            let container = r.get_opt_str("container").ok().flatten().unwrap_or_default();
+            let container = r
+                .get_opt_str("container")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             let size = r.get_opt_i64("size_bytes").ok().flatten();
             Json(json!({
                 "Path": path,
                 "Name": format!("{}.{}", title, container),
                 "Size": size,
-            })).into_response()
+            }))
+            .into_response()
         }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
@@ -217,7 +228,8 @@ pub async fn video_additional_parts(
 ) -> Response {
     // Check if this video has additional parts (same parent folder, same type)
     let backend = state.db.get_database_backend();
-    let row = state.db
+    let row = state
+        .db
         .query_one(crate::db::helpers::portable_statement(
             backend,
             "SELECT parent_id, item_type FROM media_items WHERE id = ?",
@@ -227,8 +239,16 @@ pub async fn video_additional_parts(
 
     match row {
         Ok(Some(r)) => {
-            let parent_id = r.get_opt_str("parent_id").ok().flatten().unwrap_or_default();
-            let item_type = r.get_opt_str("item_type").ok().flatten().unwrap_or_default();
+            let parent_id = r
+                .get_opt_str("parent_id")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let item_type = r
+                .get_opt_str("item_type")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
 
             let rows = state.db
                 .query_all(crate::db::helpers::portable_statement(
@@ -239,20 +259,23 @@ pub async fn video_additional_parts(
                 .await
                 .unwrap_or_default();
 
-            let parts: Vec<Value> = rows.iter().filter_map(|r| {
-                let id = r.get_str("id").ok()?;
-                let title = r.get_str("title").ok()?;
-                let path = r.get_str("path").ok()?;
-                let container = r.get_opt_str("container").ok().flatten()?;
-                let size = r.get_opt_i64("size_bytes").ok().flatten();
-                Some(json!({
-                    "Id": id,
-                    "Name": title,
-                    "Path": path,
-                    "Container": container,
-                    "Size": size,
-                }))
-            }).collect();
+            let parts: Vec<Value> = rows
+                .iter()
+                .filter_map(|r| {
+                    let id = r.get_str("id").ok()?;
+                    let title = r.get_str("title").ok()?;
+                    let path = r.get_str("path").ok()?;
+                    let container = r.get_opt_str("container").ok().flatten()?;
+                    let size = r.get_opt_i64("size_bytes").ok().flatten();
+                    Some(json!({
+                        "Id": id,
+                        "Name": title,
+                        "Path": path,
+                        "Container": container,
+                        "Size": size,
+                    }))
+                })
+                .collect();
 
             Json(json!({ "Items": parts, "TotalRecordCount": parts.len() })).into_response()
         }

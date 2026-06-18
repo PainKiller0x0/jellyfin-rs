@@ -196,7 +196,7 @@ impl Default for CapabilitiesRequest {
 /// POST /Sessions/{session_id}/Users/{user_id} — add user to session (stub)
 pub async fn session_add_user(
     State(state): State<Arc<AppState>>,
-    Path((session_id, user_id)): Path<(String, String)>,
+    Path((session_id, _user_id)): Path<(String, String)>,
 ) -> Response {
     let sessions = state.playback_sessions.read().await;
     if sessions.contains_key(&session_id) {
@@ -209,7 +209,7 @@ pub async fn session_add_user(
 /// DELETE /Sessions/{session_id}/Users/{user_id} — remove user from session (stub)
 pub async fn session_remove_user(
     State(state): State<Arc<AppState>>,
-    Path((session_id, user_id)): Path<(String, String)>,
+    Path((session_id, _user_id)): Path<(String, String)>,
 ) -> Response {
     let sessions = state.playback_sessions.read().await;
     if sessions.contains_key(&session_id) {

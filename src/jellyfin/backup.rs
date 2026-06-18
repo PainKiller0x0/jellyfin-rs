@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::Path, path::PathBuf, sync::Arc};
 
 use axum::{
     Json,
@@ -42,7 +42,7 @@ pub async fn backup_info(State(_state): State<Arc<AppState>>) -> Response {
     let (db_size, db_location) = if is_postgres() {
         let location = database_url()
             .split('@')
-            .last()
+            .next_back()
             .unwrap_or("PostgreSQL")
             .to_string();
         (0u64, location)
@@ -90,7 +90,7 @@ pub async fn create_backup(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-async fn create_sqlite_backup(state: &AppState, backup_dir: &PathBuf) -> Response {
+async fn create_sqlite_backup(state: &AppState, backup_dir: &Path) -> Response {
     let Some(db_path) = sqlite_file_path() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -149,7 +149,7 @@ async fn create_sqlite_backup(state: &AppState, backup_dir: &PathBuf) -> Respons
     }
 }
 
-async fn create_pg_backup(state: &AppState, backup_dir: &PathBuf) -> Response {
+async fn create_pg_backup(state: &AppState, backup_dir: &Path) -> Response {
     let backup_path = backup_dir.join("jellyfin-rs-backup.sql");
 
     // Get all user tables from information_schema
@@ -173,10 +173,11 @@ async fn create_pg_backup(state: &AppState, backup_dir: &PathBuf) -> Response {
     sql_output.push_str("BEGIN;\n\n");
 
     for table_row in &tables {
-        let table_name: String = match crate::db::row_ext::QueryResultExt::get_str(table_row, "table_name") {
-            Ok(name) => name,
-            Err(_) => continue,
-        };
+        let table_name: String =
+            match crate::db::row_ext::QueryResultExt::get_str(table_row, "table_name") {
+                Ok(name) => name,
+                Err(_) => continue,
+            };
 
         // Get column names
         let columns = match state
@@ -202,7 +203,10 @@ async fn create_pg_backup(state: &AppState, backup_dir: &PathBuf) -> Response {
         }
 
         // Get row count
-        let count_sql = format!("SELECT COUNT(*) as cnt FROM \"{}\"", table_name.replace('"', "\"\""));
+        let count_sql = format!(
+            "SELECT COUNT(*) as cnt FROM \"{}\"",
+            table_name.replace('"', "\"\"")
+        );
         let count = match state
             .db
             .query_one(crate::db::helpers::portable_statement(
@@ -257,7 +261,9 @@ async fn create_pg_backup(state: &AppState, backup_dir: &PathBuf) -> Response {
             let mut values = Vec::new();
             for col in &col_names {
                 // Try different types using row_ext helpers
-                let value_str = if let Ok(v) = crate::db::row_ext::QueryResultExt::get_opt_str(row, col) {
+                let value_str = if let Ok(v) =
+                    crate::db::row_ext::QueryResultExt::get_opt_str(row, col)
+                {
                     match v {
                         Some(s) => format!("'{}'", s.replace('\'', "''")),
                         None => "NULL".to_string(),
@@ -312,7 +318,7 @@ pub async fn restore_backup(State(_state): State<Arc<AppState>>) -> Response {
     }
 }
 
-async fn restore_sqlite_backup(backup_dir: &PathBuf) -> Response {
+async fn restore_sqlite_backup(backup_dir: &Path) -> Response {
     let Some(db_path) = sqlite_file_path() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -344,7 +350,7 @@ async fn restore_sqlite_backup(backup_dir: &PathBuf) -> Response {
     }
 }
 
-async fn restore_pg_backup(backup_dir: &PathBuf) -> Response {
+async fn restore_pg_backup(backup_dir: &Path) -> Response {
     let backup_path = backup_dir.join("jellyfin-rs-backup.sql");
     if !backup_path.exists() {
         return (

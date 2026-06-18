@@ -12,10 +12,7 @@ use serde_json::{Value, json};
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
-    jellyfin::{
-        common::internal_error,
-        item_queries,
-    },
+    jellyfin::{common::internal_error, item_queries},
 };
 
 /// GET /Items/Filters2 — return available filter values for a query
@@ -35,7 +32,9 @@ async fn filters2_inner(
 ) -> anyhow::Result<Value> {
     let backend = db.get_database_backend();
     let parent_id = query.get("ParentId").map(String::as_str);
-    let include_types = query.get("IncludeItemTypes").map(|v| v.split(',').map(str::trim).collect::<Vec<_>>());
+    let include_types = query
+        .get("IncludeItemTypes")
+        .map(|v| v.split(',').map(str::trim).collect::<Vec<_>>());
 
     // Build WHERE clause based on ParentId and IncludeItemTypes
     let mut conditions = vec!["1=1".to_string()];
@@ -47,7 +46,11 @@ async fn filters2_inner(
     }
     if let Some(types) = &include_types {
         if !types.is_empty() {
-            let ph = types.iter().map(|_| "media_items.item_type = ?").collect::<Vec<_>>().join(" OR ");
+            let ph = types
+                .iter()
+                .map(|_| "media_items.item_type = ?")
+                .collect::<Vec<_>>()
+                .join(" OR ");
             conditions.push(format!("({})", ph));
             for t in types {
                 values.push((*t).into());
@@ -63,10 +66,19 @@ async fn filters2_inner(
         where_clause
     );
     let genres: Vec<Value> = db
-        .query_all(crate::db::helpers::portable_statement(backend, &genres_sql, values.clone()))
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &genres_sql,
+            values.clone(),
+        ))
         .await?
         .iter()
-        .filter_map(|r| r.get_opt_str("name").ok().flatten().map(|n| json!({"Name": n, "Id": n})))
+        .filter_map(|r| {
+            r.get_opt_str("name")
+                .ok()
+                .flatten()
+                .map(|n| json!({"Name": n, "Id": n}))
+        })
         .collect();
 
     // Get years
@@ -75,10 +87,19 @@ async fn filters2_inner(
         where_clause
     );
     let years: Vec<Value> = db
-        .query_all(crate::db::helpers::portable_statement(backend, &years_sql, values.clone()))
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &years_sql,
+            values.clone(),
+        ))
         .await?
         .iter()
-        .filter_map(|r| r.get_opt_i64("production_year").ok().flatten().map(|y| json!(y)))
+        .filter_map(|r| {
+            r.get_opt_i64("production_year")
+                .ok()
+                .flatten()
+                .map(|y| json!(y))
+        })
         .collect();
 
     // Get tags
@@ -87,10 +108,19 @@ async fn filters2_inner(
         where_clause
     );
     let tags: Vec<Value> = db
-        .query_all(crate::db::helpers::portable_statement(backend, &tags_sql, values.clone()))
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &tags_sql,
+            values.clone(),
+        ))
         .await?
         .iter()
-        .filter_map(|r| r.get_opt_str("name").ok().flatten().map(|n| json!({"Name": n, "Id": n})))
+        .filter_map(|r| {
+            r.get_opt_str("name")
+                .ok()
+                .flatten()
+                .map(|n| json!({"Name": n, "Id": n}))
+        })
         .collect();
 
     // Get studios
@@ -99,10 +129,19 @@ async fn filters2_inner(
         where_clause
     );
     let studios: Vec<Value> = db
-        .query_all(crate::db::helpers::portable_statement(backend, &studios_sql, values.clone()))
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &studios_sql,
+            values.clone(),
+        ))
         .await?
         .iter()
-        .filter_map(|r| r.get_opt_str("name").ok().flatten().map(|n| json!({"Name": n, "Id": n})))
+        .filter_map(|r| {
+            r.get_opt_str("name")
+                .ok()
+                .flatten()
+                .map(|n| json!({"Name": n, "Id": n}))
+        })
         .collect();
 
     // Get official ratings
@@ -111,10 +150,19 @@ async fn filters2_inner(
         where_clause
     );
     let ratings: Vec<Value> = db
-        .query_all(crate::db::helpers::portable_statement(backend, &ratings_sql, values.clone()))
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &ratings_sql,
+            values.clone(),
+        ))
         .await?
         .iter()
-        .filter_map(|r| r.get_opt_str("official_rating").ok().flatten().map(|n| json!(n)))
+        .filter_map(|r| {
+            r.get_opt_str("official_rating")
+                .ok()
+                .flatten()
+                .map(|n| json!(n))
+        })
         .collect();
 
     Ok(json!({
@@ -237,7 +285,8 @@ pub async fn shows_upcoming(
         "{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 ORDER BY media_items.created_at DESC LIMIT ?",
         crate::jellyfin::item_queries::media_item_select_sql("")
     );
-    let rows = state.db
+    let rows = state
+        .db
         .query_all(crate::db::helpers::portable_statement(
             backend,
             &sql,
@@ -257,7 +306,8 @@ pub async fn genre_by_name(
     Path(name): Path<String>,
 ) -> Response {
     let backend = state.db.get_database_backend();
-    let row = state.db
+    let row = state
+        .db
         .query_one(crate::db::helpers::portable_statement(
             backend,
             "SELECT id, name FROM genres WHERE name = ?",
@@ -281,7 +331,8 @@ pub async fn studio_by_name(
     Path(name): Path<String>,
 ) -> Response {
     let backend = state.db.get_database_backend();
-    let row = state.db
+    let row = state
+        .db
         .query_one(crate::db::helpers::portable_statement(
             backend,
             "SELECT id, name FROM studios WHERE name = ?",

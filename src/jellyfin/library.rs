@@ -92,7 +92,11 @@ pub async fn delete_virtual_folder(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let name = query.get("name").map(String::as_str).unwrap_or_default().trim();
+    let name = query
+        .get("name")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
     if name.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -105,7 +109,8 @@ pub async fn delete_virtual_folder(
     let backend = state.db.get_database_backend();
 
     // Get all item IDs belonging to this library
-    let item_rows = match state.db
+    let item_rows = match state
+        .db
         .query_all(crate::db::helpers::portable_statement(
             backend,
             "SELECT id FROM media_items WHERE library_id = ?",
@@ -124,17 +129,24 @@ pub async fn delete_virtual_folder(
 
     if item_ids.is_empty() {
         // No items, just delete library and paths
-        let _ = state.db.execute(crate::db::helpers::portable_statement(
-            backend,
-            "DELETE FROM library_paths WHERE library_id = ?",
-            vec![library_id.clone().into()],
-        )).await;
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "DELETE FROM library_paths WHERE library_id = ?",
+                vec![library_id.clone().into()],
+            ))
+            .await;
 
-        return match state.db.execute(crate::db::helpers::portable_statement(
-            backend,
-            "DELETE FROM libraries WHERE id = ?",
-            vec![library_id.into()],
-        )).await {
+        return match state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "DELETE FROM libraries WHERE id = ?",
+                vec![library_id.into()],
+            ))
+            .await
+        {
             Ok(_) => StatusCode::NO_CONTENT.into_response(),
             Err(error) => internal_error(error.into()),
         };
@@ -147,45 +159,81 @@ pub async fn delete_virtual_folder(
 
     // Delete related data in order (junction tables first, then items)
     let tables = [
-        "media_genres", "media_tags", "media_studios", "media_people",
-        "media_game_genres", "media_streams", "user_data", "image_assets",
-        "provider_ids", "linked_children", "chapters", "trickplay_images",
+        "media_genres",
+        "media_tags",
+        "media_studios",
+        "media_people",
+        "media_game_genres",
+        "media_streams",
+        "user_data",
+        "image_assets",
+        "provider_ids",
+        "linked_children",
+        "chapters",
+        "trickplay_images",
     ];
 
     for table in tables {
         let sql = format!("DELETE FROM {} WHERE item_id IN ({})", table, in_clause);
-        let _ = state.db.execute(crate::db::helpers::portable_statement(
-            backend, &sql, params.clone(),
-        )).await;
+        let _ = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                &sql,
+                params.clone(),
+            ))
+            .await;
     }
 
     // Also delete linked_children where parent_id references items in this library
-    let sql = format!("DELETE FROM linked_children WHERE parent_id IN ({})", in_clause);
-    let _ = state.db.execute(crate::db::helpers::portable_statement(
-        backend, &sql, params.clone(),
-    )).await;
+    let sql = format!(
+        "DELETE FROM linked_children WHERE parent_id IN ({})",
+        in_clause
+    );
+    let _ = state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            &sql,
+            params.clone(),
+        ))
+        .await;
 
     // Delete the media items
     let sql = format!("DELETE FROM media_items WHERE id IN ({})", in_clause);
-    let _ = state.db.execute(crate::db::helpers::portable_statement(
-        backend, &sql, params,
-    )).await;
+    let _ = state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend, &sql, params,
+        ))
+        .await;
 
     // Delete library paths
-    let _ = state.db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "DELETE FROM library_paths WHERE library_id = ?",
-        vec![library_id.clone().into()],
-    )).await;
+    let _ = state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "DELETE FROM library_paths WHERE library_id = ?",
+            vec![library_id.clone().into()],
+        ))
+        .await;
 
     // Delete the library
-    match state.db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "DELETE FROM libraries WHERE id = ?",
-        vec![library_id.into()],
-    )).await {
+    match state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "DELETE FROM libraries WHERE id = ?",
+            vec![library_id.into()],
+        ))
+        .await
+    {
         Ok(_) => {
-            tracing::info!("Deleted library '{}' with {} media items", name, item_ids.len());
+            tracing::info!(
+                "Deleted library '{}' with {} media items",
+                name,
+                item_ids.len()
+            );
             StatusCode::NO_CONTENT.into_response()
         }
         Err(error) => internal_error(error.into()),
@@ -423,8 +471,16 @@ pub async fn rename_virtual_folder(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let name = query.get("name").map(String::as_str).unwrap_or_default().trim();
-    let new_name = query.get("newName").map(String::as_str).unwrap_or_default().trim();
+    let name = query
+        .get("name")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
+    let new_name = query
+        .get("newName")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
 
     if name.is_empty() || new_name.is_empty() {
         return (
@@ -438,7 +494,8 @@ pub async fn rename_virtual_folder(
     let now = now_unix();
     let backend = state.db.get_database_backend();
 
-    match state.db
+    match state
+        .db
         .execute(crate::db::helpers::portable_statement(
             backend,
             "UPDATE libraries SET name = ?, updated_at = ? WHERE id = ?",
@@ -466,9 +523,21 @@ pub async fn update_virtual_folder_path(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let name = query.get("name").map(String::as_str).unwrap_or_default().trim();
-    let path = query.get("path").map(String::as_str).unwrap_or_default().trim();
-    let new_path = query.get("newPath").map(String::as_str).unwrap_or_default().trim();
+    let name = query
+        .get("name")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
+    let path = query
+        .get("path")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
+    let new_path = query
+        .get("newPath")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
 
     if name.is_empty() || path.is_empty() {
         return StatusCode::NO_CONTENT.into_response();
@@ -476,12 +545,13 @@ pub async fn update_virtual_folder_path(
 
     let target_path = if !new_path.is_empty() { new_path } else { path };
     let library_id = library_id_for_name(name);
-    let now = now_unix();
+    let _now = now_unix();
     let backend = state.db.get_database_backend();
 
     // Update the path in library_paths
     let path_id = crate::util::stable_text_id(&format!("library-path:{path}"));
-    let _ = state.db
+    let _ = state
+        .db
         .execute(crate::db::helpers::portable_statement(
             backend,
             "UPDATE library_paths SET path = ?, library_id = ? WHERE id = ?",
@@ -493,9 +563,7 @@ pub async fn update_virtual_folder_path(
 }
 
 /// POST /Library/SelectableMediaFolders — get selectable media folders
-pub async fn selectable_media_folders(
-    State(state): State<Arc<AppState>>,
-) -> Response {
+pub async fn selectable_media_folders(State(state): State<Arc<AppState>>) -> Response {
     // Return the same as virtual_folders but in a different format
     match virtual_folders_inner(&state.db).await {
         Ok(folders) => Json(folders).into_response(),

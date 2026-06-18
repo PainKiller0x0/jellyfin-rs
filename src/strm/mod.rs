@@ -33,6 +33,7 @@ pub fn resolve_strm_path(strm_path: &Path) -> anyhow::Result<PathBuf> {
 
 /// Returns the actual media path for an item, resolving STRM files if needed.
 /// Returns None if the STRM target doesn't exist or can't be read.
+#[allow(dead_code)]
 pub fn resolve_media_path(item_path: &Path) -> Option<PathBuf> {
     if is_strm_path(item_path) {
         resolve_strm_path(item_path).ok().filter(|p| p.exists())

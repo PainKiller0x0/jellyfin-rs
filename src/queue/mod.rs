@@ -1,10 +1,11 @@
 use std::sync::Arc;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 /// Two-tier concurrent processing pipeline.
 /// Master semaphore controls heavy operations (probe, mediainfo extract).
 /// Tier2 semaphore controls lighter operations (TMDb refresh, subtitle scan).
+#[allow(dead_code)]
 pub struct QueueManager {
     pub master_semaphore: Arc<Semaphore>,
     pub tier2_semaphore: Arc<Semaphore>,
@@ -15,6 +16,7 @@ pub struct QueueManager {
     cancel: CancellationToken,
 }
 
+#[allow(dead_code)]
 impl QueueManager {
     pub fn new(master_concurrency: usize, tier2_concurrency: usize) -> Self {
         let (mediainfo_tx, _) = mpsc::unbounded_channel();

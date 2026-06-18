@@ -126,7 +126,13 @@ pub async fn list_media_items(
         let person_ids = query
             .get("PersonIds")
             .or_else(|| query.get("personIds"))
-            .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>())
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         if person_ids.is_empty() {
             return Ok((Vec::new(), 0));
@@ -149,7 +155,9 @@ pub async fn list_media_items(
             placeholders,
         );
         let rows = db
-            .query_all(crate::db::helpers::portable_statement(backend, &sql, values))
+            .query_all(crate::db::helpers::portable_statement(
+                backend, &sql, values,
+            ))
             .await
             .context("failed to list items by person ids")?;
         let mut items = decode_media_items(&rows)?;
@@ -196,7 +204,10 @@ pub async fn list_media_items(
                 vals.push(search_term.as_ref().unwrap().as_str().into());
                 (sql, vals)
             } else {
-                (linked_children_select_sql(), vec![user_id.into(), parent_id.into()])
+                (
+                    linked_children_select_sql(),
+                    vec![user_id.into(), parent_id.into()],
+                )
             };
             db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
                 .await
@@ -204,7 +215,10 @@ pub async fn list_media_items(
             // Global search/filter: no parent_id constraint, use SQL LIKE or just global query
             if has_search {
                 let base = media_item_select_sql("WHERE 1=1");
-                let sql = base.replace("ORDER BY", "AND LOWER(media_items.title) LIKE LOWER(?) ORDER BY");
+                let sql = base.replace(
+                    "ORDER BY",
+                    "AND LOWER(media_items.title) LIKE LOWER(?) ORDER BY",
+                );
                 let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
                 vals.push(search_term.as_ref().unwrap().as_str().into());
                 db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
@@ -221,13 +235,20 @@ pub async fn list_media_items(
                 let base = recursive_media_item_select_sql();
                 let sql = base.replace(
                     "WHERE media_items.id IN",
-                    &format!("WHERE {} AND media_items.id IN", like.trim_start_matches("AND ")),
+                    &format!(
+                        "WHERE {} AND media_items.id IN",
+                        like.trim_start_matches("AND ")
+                    ),
                 );
-                let mut vals: Vec<sea_orm::Value> = vec![parent_id.into(), user_id.into(), parent_id.into()];
+                let mut vals: Vec<sea_orm::Value> =
+                    vec![parent_id.into(), user_id.into(), parent_id.into()];
                 vals.push(search_term.as_ref().unwrap().as_str().into());
                 (sql, vals)
             } else {
-                (recursive_media_item_select_sql(), vec![parent_id.into(), user_id.into(), parent_id.into()])
+                (
+                    recursive_media_item_select_sql(),
+                    vec![parent_id.into(), user_id.into(), parent_id.into()],
+                )
             };
             db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
                 .await
@@ -244,7 +265,10 @@ pub async fn list_media_items(
             db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
                 .await
         } else {
-            let (sql, vals) = (media_item_select_sql("WHERE media_items.parent_id = ?"), vec![user_id.into(), parent_id.into()]);
+            let (sql, vals) = (
+                media_item_select_sql("WHERE media_items.parent_id = ?"),
+                vec![user_id.into(), parent_id.into()],
+            );
             db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
                 .await
         }
@@ -361,9 +385,7 @@ pub async fn latest_media_items(
         let mut all_items = Vec::new();
         for row in &libraries {
             let lib_id: String = row.get_str("id")?;
-            let collection_type = row
-                .get_opt_str("collection_type")?
-                .unwrap_or_default();
+            let collection_type = row.get_opt_str("collection_type")?.unwrap_or_default();
 
             let item_type_filter = match collection_type.as_str() {
                 "movies" => "'Movie'",
@@ -381,7 +403,7 @@ pub async fn latest_media_items(
                     &media_item_select_sql(&where_clause),
                     vec![user_id.into(), lib_id.clone().into()],
                 ))
-                .await?
+                .await?,
             )?;
             all_items.extend(items);
         }
@@ -478,7 +500,7 @@ pub(super) async fn batch_item_image_tags(
     db: &DatabaseConnection,
     item_ids: &[String],
 ) -> anyhow::Result<HashMap<String, serde_json::Value>> {
-    use crate::entities::image_assets::{Entity as ImageAssets, Column};
+    use crate::entities::image_assets::{Column, Entity as ImageAssets};
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
     let mut map = HashMap::new();
     for chunk in item_ids.chunks(100) {
@@ -486,12 +508,16 @@ pub(super) async fn batch_item_image_tags(
             .filter(Column::ItemId.is_in(chunk.iter().map(|s| s.as_str())))
             .order_by_asc(Column::ImageType)
             .order_by_asc(Column::ImageIndex)
-            .all(db).await?;
+            .all(db)
+            .await?;
         for m in &models {
             let etag = m.etag.as_deref().unwrap_or_default();
-            let entry: &mut serde_json::Value = map.entry(m.item_id.clone()).or_insert_with(|| serde_json::Map::new().into());
+            let entry: &mut serde_json::Value = map
+                .entry(m.item_id.clone())
+                .or_insert_with(|| serde_json::Map::new().into());
             if let Some(obj) = entry.as_object_mut() {
-                obj.entry(m.image_type.clone()).or_insert_with(|| json!(etag));
+                obj.entry(m.image_type.clone())
+                    .or_insert_with(|| json!(etag));
             }
         }
     }

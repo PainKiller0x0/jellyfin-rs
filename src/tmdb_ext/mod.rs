@@ -7,6 +7,7 @@ use reqwest::Client;
 use serde::de::DeserializeOwned;
 
 /// Rate-limited TMDB API client with LRU cache.
+#[allow(dead_code)]
 pub struct TmdbClient {
     client: Client,
     api_key: String,
@@ -15,6 +16,7 @@ pub struct TmdbClient {
     cache: Mutex<LruCache<String, String>>,
 }
 
+#[allow(dead_code)]
 impl TmdbClient {
     pub fn new(client: Client, api_key: String, rate_limit_ms: u64, cache_size: usize) -> Self {
         Self {
@@ -22,9 +24,7 @@ impl TmdbClient {
             api_key,
             rate_limit_ms,
             last_request: Mutex::new(Instant::now() - Duration::from_millis(1000)),
-            cache: Mutex::new(LruCache::new(
-                NonZeroUsize::new(cache_size.max(1)).unwrap(),
-            )),
+            cache: Mutex::new(LruCache::new(NonZeroUsize::new(cache_size.max(1)).unwrap())),
         }
     }
 
@@ -77,15 +77,22 @@ impl TmdbClient {
     }
 
     /// Get person details from TMDB.
-    pub async fn get_person(&self, person_id: &str, language: &str) -> anyhow::Result<serde_json::Value> {
+    pub async fn get_person(
+        &self,
+        person_id: &str,
+        language: &str,
+    ) -> anyhow::Result<serde_json::Value> {
         self.get(&format!("person/{person_id}?language={language}"))
             .await
     }
 
     /// Get TV show details from TMDB.
-    pub async fn get_tv_show(&self, show_id: &str, language: &str) -> anyhow::Result<serde_json::Value> {
-        self.get(&format!("tv/{show_id}?language={language}"))
-            .await
+    pub async fn get_tv_show(
+        &self,
+        show_id: &str,
+        language: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.get(&format!("tv/{show_id}?language={language}")).await
     }
 
     /// Get episode details from TMDB.
@@ -103,7 +110,11 @@ impl TmdbClient {
     }
 
     /// Get movie details from TMDB.
-    pub async fn get_movie(&self, movie_id: &str, language: &str) -> anyhow::Result<serde_json::Value> {
+    pub async fn get_movie(
+        &self,
+        movie_id: &str,
+        language: &str,
+    ) -> anyhow::Result<serde_json::Value> {
         self.get(&format!("movie/{movie_id}?language={language}"))
             .await
     }

@@ -31,7 +31,9 @@ pub async fn similar_items(
         Ok(mut items) => {
             if !items.is_empty() {
                 let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-                if let Ok(tags_map) = crate::jellyfin::item_queries::batch_item_image_tags(&state.db, &ids).await {
+                if let Ok(tags_map) =
+                    crate::jellyfin::item_queries::batch_item_image_tags(&state.db, &ids).await
+                {
                     for item in &mut items {
                         if let Some(tags) = tags_map.get(&item.id) {
                             item.image_tags = Some(tags.clone());
@@ -114,8 +116,15 @@ pub async fn search_hints(
 
     let parent_id = query.get("ParentId").map(String::as_str);
 
-    match search_hints_inner(&state.db, &user_id, &search_term, include_types, parent_id, limit)
-        .await
+    match search_hints_inner(
+        &state.db,
+        &user_id,
+        &search_term,
+        include_types,
+        parent_id,
+        limit,
+    )
+    .await
     {
         Ok(hints) => {
             let total = hints.len();
@@ -145,12 +154,19 @@ async fn search_hints_inner(
 
     if let Some(types) = &include_types {
         if !types.is_empty() {
-            let placeholders = types.iter().map(|_| "LOWER(media_items.item_type) = LOWER(?)").collect::<Vec<_>>().join(" OR ");
+            let placeholders = types
+                .iter()
+                .map(|_| "LOWER(media_items.item_type) = LOWER(?)")
+                .collect::<Vec<_>>()
+                .join(" OR ");
             where_parts.push(format!("({})", placeholders));
         }
     }
 
-    let where_clause = format!("WHERE {} ORDER BY media_items.title ASC", where_parts.join(" AND "));
+    let where_clause = format!(
+        "WHERE {} ORDER BY media_items.title ASC",
+        where_parts.join(" AND ")
+    );
     let sql = item_queries::media_item_select_sql(&where_clause);
 
     let mut values: Vec<sea_orm::Value> = Vec::new();
@@ -168,9 +184,7 @@ async fn search_hints_inner(
 
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
-            backend,
-            &sql,
-            values,
+            backend, &sql, values,
         ))
         .await
         .context("failed to fetch search hints")?;
@@ -245,7 +259,8 @@ pub async fn shows_next_up(
     match next_up_inner(&state.db, &user_id, series_id.as_deref(), limit).await {
         Ok(items) => {
             let json_items = crate::jellyfin::items::enrich_episode_list(&state.db, items).await;
-            Json(json!({ "Items": json_items, "TotalRecordCount": json_items.len() })).into_response()
+            Json(json!({ "Items": json_items, "TotalRecordCount": json_items.len() }))
+                .into_response()
         }
         Err(error) => internal_error(error),
     }

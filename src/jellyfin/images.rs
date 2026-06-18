@@ -238,7 +238,10 @@ async fn serve_item_image(
 
         if let Ok(cached_bytes) = tokio::fs::read(&cache_path).await {
             let mut response_headers = HeaderMap::new();
-            response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(options.format.content_type()));
+            response_headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(options.format.content_type()),
+            );
             response_headers.insert(
                 header::CONTENT_LENGTH,
                 HeaderValue::from_str(&cached_bytes.len().to_string())
@@ -251,7 +254,7 @@ async fn serve_item_image(
         }
 
         // Cache miss — read, process, save to cache
-        let mut bytes = match tokio::fs::read(&path).await {
+        let bytes = match tokio::fs::read(&path).await {
             Ok(bytes) => bytes,
             Err(error) => {
                 return (
@@ -267,7 +270,10 @@ async fn serve_item_image(
                 let _ = tokio::fs::create_dir_all("data/image_cache").await;
                 let _ = tokio::fs::write(&cache_path, &processed).await;
                 let mut response_headers = HeaderMap::new();
-                response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(options.format.content_type()));
+                response_headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static(options.format.content_type()),
+                );
                 response_headers.insert(
                     header::CONTENT_LENGTH,
                     HeaderValue::from_str(&processed.len().to_string())
@@ -283,7 +289,7 @@ async fn serve_item_image(
     }
 
     // No processing needed — serve original file directly
-    let mut bytes = match tokio::fs::read(&path).await {
+    let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(error) => {
             return (
@@ -698,6 +704,7 @@ fn parse_image_url_body(body: &[u8]) -> Option<String> {
         .map(ToString::to_string)
 }
 
+#[allow(dead_code)]
 pub async fn item_image_tags(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<JsonValue> {
     let models = ImageAssets::find()
         .filter(image_assets::Column::ItemId.eq(item_id))

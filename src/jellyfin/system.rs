@@ -41,7 +41,10 @@ const MAX_CLIENT_LOG_BYTES: usize = 1024 * 1024;
 const MAX_CAMERA_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 const MAX_USER_USAGE_BACKUP_BYTES: usize = 20 * 1024 * 1024;
 const MAX_LOG_LINE_LIMIT: usize = 10_000;
+const MAX_DEVICE_ID_LEN: usize = 256;
+const MAX_DEVICE_IDS_PER_REQUEST: usize = 128;
 const MAX_DEVICE_CUSTOM_NAME_LEN: usize = 128;
+const MAX_CAMERA_UPLOAD_FIELD_LEN: usize = 256;
 const MAX_PLUGIN_REPOSITORIES: usize = 32;
 const MAX_PLUGIN_REPOSITORY_NAME_LEN: usize = 128;
 const MAX_PLUGIN_REPOSITORY_URL_LEN: usize = 2048;
@@ -368,26 +371,14 @@ pub async fn delete_devices(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DeviceIdQuery>,
 ) -> Response {
-    let Some(id) = query
-        .id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let ids = match normalize_device_ids(query.id.as_deref()) {
+        Ok(ids) => ids,
+        Err(error) => return validation_error_response(error),
     };
-    let ids = id
-        .split(',')
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .collect::<Vec<_>>();
-    if ids.is_empty() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
 
     let now = now_unix();
     for id in ids {
-        if let Err(error) = revoke_device(&state, id, now).await {
+        if let Err(error) = revoke_device(&state, &id, now).await {
             return internal_error(error);
         }
     }
@@ -398,11 +389,19 @@ pub async fn camera_uploads(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(device_id) = query_value(&query, "DeviceId")
-        .or_else(|| query_value(&query, "deviceId"))
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let device_id = match normalize_device_id(
+        query_value(&query, "DeviceId")
+            .or_else(|| query_value(&query, "deviceId"))
+            .as_deref(),
+    ) {
+        Ok(device_id) => device_id,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "Error": error.to_string() })),
+            )
+                .into_response();
+        }
     };
     match camera_upload_history_value(&state.db, &device_id).await {
         Ok(value) => Json(value).into_response(),
@@ -421,6 +420,12 @@ pub async fn upload_camera(
         Err(error) if error.to_string().contains("required") => {
             StatusCode::BAD_REQUEST.into_response()
         }
+        Err(error)
+            if error.to_string().contains("unsupported")
+                || error.to_string().contains("too long") =>
+        {
+            StatusCode::BAD_REQUEST.into_response()
+        }
         Err(error) if error.to_string().contains("too large") => {
             StatusCode::PAYLOAD_TOO_LARGE.into_response()
         }
@@ -432,13 +437,9 @@ pub async fn device_info(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DeviceIdQuery>,
 ) -> Response {
-    let Some(id) = query
-        .id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    else {
-        return device_not_found();
+    let id = match normalize_device_id(query.id.as_deref()) {
+        Ok(id) => id,
+        Err(_) => return device_not_found(),
     };
     let Some(record) = device_records(&state, None)
         .await
@@ -455,13 +456,9 @@ pub async fn device_options(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DeviceIdQuery>,
 ) -> Response {
-    let Some(id) = query
-        .id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    else {
-        return device_not_found();
+    let id = match normalize_device_id(query.id.as_deref()) {
+        Ok(id) => id,
+        Err(_) => return device_not_found(),
     };
     let exists = device_records(&state, None)
         .await
@@ -469,8 +466,8 @@ pub async fn device_options(
         .any(|record| record.id == id);
     if exists {
         Json(device_options_result(
-            id,
-            device_custom_name(&state.db, id).await,
+            &id,
+            device_custom_name(&state.db, &id).await,
         ))
         .into_response()
     } else {
@@ -483,13 +480,9 @@ pub async fn update_device_options(
     Query(query): Query<DeviceIdQuery>,
     Json(request): Json<DeviceOptionsRequest>,
 ) -> Response {
-    let Some(id) = query
-        .id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    else {
-        return device_not_found();
+    let id = match normalize_device_id(query.id.as_deref()) {
+        Ok(id) => id,
+        Err(_) => return device_not_found(),
     };
     let exists = device_records(&state, None)
         .await
@@ -510,7 +503,7 @@ pub async fn update_device_options(
     };
     match set_app_setting(
         &state.db,
-        &device_options_key(id),
+        &device_options_key(&id),
         custom_name.as_deref().unwrap_or_default(),
     )
     .await
@@ -2845,7 +2838,7 @@ async fn save_camera_upload_to(
     if body.len() > MAX_CAMERA_UPLOAD_BYTES {
         anyhow::bail!("camera upload is too large");
     }
-    let device_id = required_upload_part(query.device_id, "DeviceId")?;
+    let device_id = normalize_device_id(query.device_id.as_deref())?;
     let album = required_upload_part(query.album, "Album")?;
     let name = required_upload_part(query.name, "Name")?;
     let id = required_upload_part(query.id, "Id")?;
@@ -2906,10 +2899,20 @@ fn camera_upload_history_key(device_id: &str) -> String {
 }
 
 fn required_upload_part(value: Option<String>, name: &str) -> anyhow::Result<String> {
-    value
-        .map(|value| value.trim().to_string())
+    let Some(value) = value
+        .as_deref()
+        .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{name} is required"))
+    else {
+        anyhow::bail!("{name} is required");
+    };
+    if value.chars().count() > MAX_CAMERA_UPLOAD_FIELD_LEN {
+        anyhow::bail!("{name} is too long");
+    }
+    if value.contains('\0') || value.chars().any(char::is_control) {
+        anyhow::bail!("{name} contains unsupported characters");
+    }
+    Ok(value.to_string())
 }
 
 fn sanitize_file_part(value: &str) -> String {
@@ -2936,6 +2939,44 @@ async fn device_custom_name(db: &DatabaseConnection, device_id: &str) -> Option<
 
 fn device_options_key(device_id: &str) -> String {
     format!("device_options:{device_id}:custom_name")
+}
+
+fn normalize_device_ids(value: Option<&str>) -> Result<Vec<String>, (StatusCode, &'static str)> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err((StatusCode::BAD_REQUEST, "DeviceId is required"));
+    };
+    let mut ids = Vec::new();
+    for id in value.split(',') {
+        if id.trim().is_empty() {
+            continue;
+        }
+        let id = normalize_device_id(Some(id))
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid DeviceId"))?;
+        if ids.iter().any(|existing| existing == &id) {
+            continue;
+        }
+        ids.push(id);
+        if ids.len() > MAX_DEVICE_IDS_PER_REQUEST {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "Too many device ids"));
+        }
+    }
+    if ids.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "DeviceId is required"));
+    }
+    Ok(ids)
+}
+
+fn normalize_device_id(value: Option<&str>) -> anyhow::Result<String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        anyhow::bail!("DeviceId is required");
+    };
+    if value.len() > MAX_DEVICE_ID_LEN
+        || value.contains('\0')
+        || value.chars().any(char::is_control)
+    {
+        anyhow::bail!("Invalid DeviceId");
+    }
+    Ok(value.to_string())
 }
 
 fn normalize_device_custom_name(value: Option<&str>) -> anyhow::Result<Option<String>> {
@@ -4500,10 +4541,11 @@ mod tests {
         live_tv_default_tuner_host, live_tv_default_tuner_host_value, live_tv_guide_info,
         live_tv_info, live_tv_timer_defaults, live_tv_timer_defaults_value, live_tv_unavailable,
         log_file_entry, normalize_branding_options, normalize_device_custom_name,
-        normalize_notification_ids, normalize_notification_level, normalize_notification_text,
-        normalize_plugin_repositories, normalize_scheduled_task_triggers, notification_items,
-        notification_services_test, notification_services_value, package_install_unavailable,
-        package_list, package_update_list, party_unavailable, play_activity_rows, plugin_list,
+        normalize_device_id, normalize_device_ids, normalize_notification_ids,
+        normalize_notification_level, normalize_notification_text, normalize_plugin_repositories,
+        normalize_scheduled_task_triggers, notification_items, notification_services_test,
+        notification_services_value, package_install_unavailable, package_list,
+        package_update_list, party_unavailable, play_activity_rows, plugin_list,
         report_activity_headers_for_query, report_csv, report_item_headers_for_query,
         reports_activity_result, reports_items_result, required_upload_part,
         run_user_usage_custom_query, safe_log_path, safe_user_usage_backup_file,
@@ -4742,6 +4784,26 @@ mod tests {
     }
 
     #[test]
+    fn device_ids_are_normalized_and_limited() {
+        assert_eq!(
+            normalize_device_id(Some("  device-1  ")).unwrap(),
+            "device-1"
+        );
+        assert!(normalize_device_id(None).is_err());
+        assert!(normalize_device_id(Some("bad\ndevice")).is_err());
+        assert!(normalize_device_id(Some(&"x".repeat(super::MAX_DEVICE_ID_LEN + 1))).is_err());
+
+        let ids = normalize_device_ids(Some(" d1, d2,,d1 ")).unwrap();
+        assert_eq!(ids, vec!["d1".to_string(), "d2".to_string()]);
+        assert!(normalize_device_ids(Some("bad\nid")).is_err());
+        let too_many = (0..super::MAX_DEVICE_IDS_PER_REQUEST + 1)
+            .map(|index| format!("d{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(normalize_device_ids(Some(&too_many)).is_err());
+    }
+
+    #[test]
     fn device_record_json_keeps_custom_name() {
         let token = access_tokens::Model {
             id: "t1".to_string(),
@@ -4851,6 +4913,14 @@ mod tests {
         assert_eq!(history["FilesUploaded"][0]["MimeType"], "image/jpeg");
         assert_eq!(sanitize_file_part("../photo.jpg"), "photo.jpg");
         assert!(required_upload_part(None, "DeviceId").is_err());
+        assert!(required_upload_part(Some("bad\nalbum".to_string()), "Album").is_err());
+        assert!(
+            required_upload_part(
+                Some("x".repeat(super::MAX_CAMERA_UPLOAD_FIELD_LEN + 1)),
+                "Name"
+            )
+            .is_err()
+        );
         let _ = std::fs::remove_dir_all(upload_root);
     }
 

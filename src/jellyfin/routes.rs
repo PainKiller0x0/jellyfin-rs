@@ -1286,7 +1286,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
                 .post(super::user_extras::update_typed_setting),
         )
         // ── UserLibrary 补全 ──
-        .route("/Users/{user_id}/Items/Root", get(items::items_root))
+        .route("/Users/{user_id}/Items/Root", get(items::user_items_root))
         .route("/Items/Access", post(system::items_access))
         .route("/Items/Shared/Leave", post(system::items_shared_leave))
         // ── Trailers ──

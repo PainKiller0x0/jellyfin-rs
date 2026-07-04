@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, Query, State},
     response::{IntoResponse, Response},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
     app::state::AppState,
@@ -16,6 +16,7 @@ use crate::{
         },
     },
     library::models::MediaItem,
+    util::stable_text_id,
 };
 
 pub async fn views(State(state): State<Arc<AppState>>) -> Response {
@@ -100,13 +101,15 @@ pub async fn items_root(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let user_id = query
-        .get("UserId")
+        .get("userId")
+        .or_else(|| query.get("UserId"))
         .cloned()
         .unwrap_or_else(|| state.user_id.to_string());
-    match list_media_items(&state.db, &user_id, &query).await {
-        Ok((items, total)) => media_list_response_with_total(items, total),
-        Err(error) => internal_error(error),
-    }
+    Json(root_folder_value(&user_id)).into_response()
+}
+
+pub async fn user_items_root(Path(user_id): Path<String>) -> Response {
+    Json(root_folder_value(&user_id)).into_response()
 }
 
 pub async fn trailers(
@@ -131,4 +134,62 @@ pub fn media_list_response(items: Vec<MediaItem>) -> Response {
 
 pub fn media_list_response_with_total(items: Vec<MediaItem>, total: usize) -> Response {
     Json(json!({ "Items": items.into_iter().map(|item| strip_nulls(item.to_jellyfin_json())).collect::<Vec<_>>(), "TotalRecordCount": total })).into_response()
+}
+
+fn root_folder_value(user_id: &str) -> Value {
+    let id = stable_text_id(&format!("user-root:{user_id}"));
+    json!({
+        "Name": "Root",
+        "Id": id,
+        "Type": "UserRootFolder",
+        "UserId": user_id,
+        "IsFolder": true,
+        "ParentId": null,
+        "Path": null,
+        "ServerId": "jellyfin-rs",
+        "CollectionType": null,
+        "LocationType": "Virtual",
+        "PlayAccess": "Full",
+        "CanDelete": false,
+        "CanDownload": false,
+        "ProviderIds": {},
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "Genres": [],
+        "Tags": [],
+        "Studios": [],
+        "People": [],
+        "UserData": {
+            "ItemId": id,
+            "Key": id,
+            "Played": false,
+            "IsFavorite": false,
+            "PlayCount": 0,
+            "PlaybackPositionTicks": 0,
+            "PlayedPercentage": null,
+            "Rating": null,
+            "LastPlayedDate": null,
+            "Likes": null,
+            "UnplayedItemCount": null,
+        },
+        "LockedFields": [],
+        "LockData": false,
+        "ExternalUrls": [],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::root_folder_value;
+
+    #[test]
+    fn root_folder_is_single_base_item_dto() {
+        let value = root_folder_value("u1");
+        assert_eq!(value["Name"], "Root");
+        assert_eq!(value["Type"], "UserRootFolder");
+        assert_eq!(value["UserId"], "u1");
+        assert_eq!(value["IsFolder"], true);
+        assert!(value.get("Items").is_none());
+        assert_eq!(value["UserData"]["ItemId"], value["Id"]);
+    }
 }

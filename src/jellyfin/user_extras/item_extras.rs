@@ -715,13 +715,14 @@ fn instant_mix_response(items: Vec<MediaItem>) -> Response {
     let total = items.len();
     Json(json!({
         "Items": items.into_iter().map(|item| strip_nulls(item.to_jellyfin_json())).collect::<Vec<_>>(),
-        "TotalRecordCount": total
+        "TotalRecordCount": total,
+        "StartIndex": 0
     }))
     .into_response()
 }
 
 fn empty_instant_mix_response() -> Response {
-    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+    Json(json!({ "Items": [], "TotalRecordCount": 0, "StartIndex": 0 })).into_response()
 }
 
 /// GET /Items/{id}/CriticReviews — critic reviews
@@ -908,9 +909,11 @@ pub async fn user_item_special_features(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExtraKind, include_item_types, item_extras, item_intros_value, media_segments_value,
-        parse_trickplay_index, query_limit, trickplay_info,
+        ExtraKind, empty_instant_mix_response, include_item_types, instant_mix_response,
+        item_extras, item_intros_value, media_segments_value, parse_trickplay_index, query_limit,
+        trickplay_info,
     };
+    use axum::{body::to_bytes, response::IntoResponse};
     use sea_orm::{ConnectionTrait, Database};
     use serde_json::json;
     use std::collections::HashMap;
@@ -966,6 +969,22 @@ mod tests {
         query.insert("limit".to_string(), "500".to_string());
         assert_eq!(include_item_types(&query), vec!["Audio", "MusicAlbum"]);
         assert_eq!(query_limit(&query), 200);
+    }
+
+    #[tokio::test]
+    async fn instant_mix_responses_include_start_index() {
+        let response =
+            instant_mix_response(vec![item("Song", "Music/song.mp3", "Audio")]).into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["TotalRecordCount"], 1);
+        assert_eq!(value["StartIndex"], 0);
+
+        let response = empty_instant_mix_response().into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["TotalRecordCount"], 0);
+        assert_eq!(value["StartIndex"], 0);
     }
 
     #[test]

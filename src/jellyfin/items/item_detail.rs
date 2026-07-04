@@ -22,6 +22,12 @@ use crate::{
     library::models::{MediaItem, media_source_json_with_streams},
 };
 
+fn visible_media_item_sql(alias: &str) -> String {
+    format!(
+        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
+    )
+}
+
 pub async fn item_by_id(
     State(state): State<Arc<AppState>>,
     Path((user_id, item_id)): Path<(String, String)>,
@@ -292,10 +298,11 @@ async fn item_json_with_provider_ids(
 
     // Enrich Season items with series info
     if item.item_type == "Season" {
+        let parent_visible = visible_media_item_sql("media_items");
         if let Ok(Some(row)) = db
             .query_one(crate::db::helpers::portable_statement(
                 db.get_database_backend(),
-                "SELECT id, title FROM media_items WHERE id = ? AND is_public = 1",
+                &format!("SELECT id, title FROM media_items WHERE id = ? AND {parent_visible}"),
                 vec![item.parent_id.clone().into()],
             ))
             .await
@@ -306,10 +313,11 @@ async fn item_json_with_provider_ids(
             }
         }
         // RecursiveItemCount for Season = episode count
+        let episode_visible = visible_media_item_sql("media_items");
         if let Ok(Some(row)) = db
             .query_one(crate::db::helpers::portable_statement(
                 db.get_database_backend(),
-                "SELECT COUNT(*) AS cnt FROM media_items WHERE parent_id = ? AND item_type = 'Episode' AND is_public = 1",
+                &format!("SELECT COUNT(*) AS cnt FROM media_items WHERE parent_id = ? AND item_type = 'Episode' AND {episode_visible}"),
                 vec![item.id.clone().into()],
             ))
             .await
@@ -320,7 +328,7 @@ async fn item_json_with_provider_ids(
             if let Ok(Some(ud_row)) = db
                 .query_one(crate::db::helpers::portable_statement(
                     db.get_database_backend(),
-                    "SELECT COUNT(*) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id = ? AND mi.item_type = 'Episode' AND mi.is_public = 1 AND ud.user_id = ? AND ud.played = 1",
+                    &format!("SELECT COUNT(*) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id = ? AND mi.item_type = 'Episode' AND {} AND ud.user_id = ? AND ud.played = 1", visible_media_item_sql("mi")),
                     vec![item.id.clone().into(), user_id.into()],
                 ))
                 .await
@@ -334,10 +342,11 @@ async fn item_json_with_provider_ids(
     // Enrich Series items with child counts
     if item.item_type == "Series" {
         // ChildCount = number of seasons
+        let season_visible = visible_media_item_sql("media_items");
         if let Ok(Some(row)) = db
             .query_one(crate::db::helpers::portable_statement(
                 db.get_database_backend(),
-                "SELECT COUNT(*) AS cnt FROM media_items WHERE parent_id = ? AND item_type = 'Season' AND is_public = 1",
+                &format!("SELECT COUNT(*) AS cnt FROM media_items WHERE parent_id = ? AND item_type = 'Season' AND {season_visible}"),
                 vec![item.id.clone().into()],
             ))
             .await
@@ -347,10 +356,12 @@ async fn item_json_with_provider_ids(
             value["SeasonCount"] = json!(season_cnt);
         }
         // RecursiveItemCount = total episodes under all seasons of this series
+        let episode_visible = visible_media_item_sql("media_items");
+        let season_visible = visible_media_item_sql("s");
         if let Ok(Some(row)) = db
             .query_one(crate::db::helpers::portable_statement(
                 db.get_database_backend(),
-                "SELECT COUNT(*) AS cnt FROM media_items WHERE item_type = 'Episode' AND is_public = 1 AND parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season' AND is_public = 1)",
+                &format!("SELECT COUNT(*) AS cnt FROM media_items WHERE item_type = 'Episode' AND {episode_visible} AND parent_id IN (SELECT s.id FROM media_items s WHERE s.parent_id = ? AND s.item_type = 'Season' AND {season_visible})"),
                 vec![item.id.clone().into()],
             ))
             .await
@@ -362,7 +373,7 @@ async fn item_json_with_provider_ids(
             if let Ok(Some(ud_row)) = db
                 .query_one(crate::db::helpers::portable_statement(
                     db.get_database_backend(),
-                    "SELECT COUNT(*) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.item_type = 'Episode' AND mi.is_public = 1 AND mi.parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season' AND is_public = 1) AND ud.user_id = ? AND ud.played = 1",
+                    &format!("SELECT COUNT(*) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.item_type = 'Episode' AND {} AND mi.parent_id IN (SELECT s.id FROM media_items s WHERE s.parent_id = ? AND s.item_type = 'Season' AND {}) AND ud.user_id = ? AND ud.played = 1", visible_media_item_sql("mi"), visible_media_item_sql("s")),
                     vec![item.id.clone().into(), user_id.into()],
                 ))
                 .await
@@ -405,7 +416,7 @@ async fn get_episode_parent_info(
     let row = db
         .query_one(crate::db::helpers::portable_statement(
             backend,
-            "SELECT s.title AS season_title, s.parent_id AS series_id, ser.title AS series_title FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id AND ser.is_public = 1 WHERE s.id = ? AND s.is_public = 1",
+            &format!("SELECT s.title AS season_title, s.parent_id AS series_id, ser.title AS series_title FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id AND {} WHERE s.id = ? AND {}", visible_media_item_sql("ser"), visible_media_item_sql("s")),
             vec![season_id.into()],
         ))
         .await
@@ -533,8 +544,10 @@ pub async fn enrich_episode_list(db: &DatabaseConnection, items: Vec<MediaItem>)
     if !season_ids.is_empty() {
         let backend = db.get_database_backend();
         let placeholders = season_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let season_visible = visible_media_item_sql("s");
+        let series_visible = visible_media_item_sql("ser");
         let sql = format!(
-            "SELECT s.id AS season_id, s.title AS season_name, s.parent_id AS series_id, ser.title AS series_name FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id AND ser.is_public = 1 WHERE s.id IN ({placeholders}) AND s.is_public = 1"
+            "SELECT s.id AS season_id, s.title AS season_name, s.parent_id AS series_id, ser.title AS series_name FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id AND {series_visible} WHERE s.id IN ({placeholders}) AND {season_visible}"
         );
         let values: Vec<sea_orm::Value> = season_ids.iter().map(|id| (*id).into()).collect();
         if let Ok(rows) = db
@@ -641,10 +654,12 @@ pub async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>)
     let mut season_map: HashMap<String, (String, String, String)> = HashMap::new();
     if !parent_ids.is_empty() {
         let placeholders = parent_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let season_visible = visible_media_item_sql("s");
+        let series_visible = visible_media_item_sql("ser");
         let sql = format!(
             "SELECT s.id AS season_id, s.title AS season_title, ser.id AS series_id, ser.title AS series_title \
-             FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id AND ser.is_public = 1 \
-             WHERE s.id IN ({placeholders}) AND s.is_public = 1",
+             FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id AND {series_visible} \
+             WHERE s.id IN ({placeholders}) AND {season_visible}",
         );
         let vals: Vec<sea_orm::Value> = parent_ids.iter().map(|p| (*p).into()).collect();
         if let Ok(rows) = db
@@ -776,4 +791,144 @@ pub async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>)
             strip_nulls(value)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{enrich_episode_list, get_episode_parent_info, item_json_with_provider_ids};
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+
+    #[tokio::test]
+    async fn item_detail_counts_hide_private_parent_children() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
+            vec!["tv".into(), "TV".into(), "tvshows".into()],
+        ))
+        .await
+        .unwrap();
+        insert_item(&db, "series", "Series", "tv", "Series", 1, 1, None, None).await;
+        insert_item(
+            &db,
+            "season-public",
+            "S1",
+            "series",
+            "Season",
+            1,
+            1,
+            None,
+            None,
+        )
+        .await;
+        insert_item(
+            &db,
+            "season-private",
+            "S2",
+            "series",
+            "Season",
+            1,
+            0,
+            None,
+            None,
+        )
+        .await;
+        insert_item(
+            &db,
+            "episode-public",
+            "E1",
+            "season-public",
+            "Episode",
+            0,
+            1,
+            Some(1),
+            Some(1),
+        )
+        .await;
+        insert_item(
+            &db,
+            "episode-under-private-season",
+            "E2",
+            "season-private",
+            "Episode",
+            0,
+            1,
+            Some(2),
+            Some(1),
+        )
+        .await;
+
+        let series = crate::jellyfin::item_queries::find_media_item_for_admin(&db, "u1", "series")
+            .await
+            .unwrap()
+            .unwrap();
+        let series_json = item_json_with_provider_ids(&db, "u1", series, true)
+            .await
+            .unwrap();
+        assert_eq!(series_json["SeasonCount"], 1);
+        assert_eq!(series_json["RecursiveItemCount"], 1);
+
+        let season =
+            crate::jellyfin::item_queries::find_media_item_for_admin(&db, "u1", "season-public")
+                .await
+                .unwrap()
+                .unwrap();
+        let season_json = item_json_with_provider_ids(&db, "u1", season, true)
+            .await
+            .unwrap();
+        assert_eq!(season_json["SeriesId"], "series");
+        assert_eq!(season_json["RecursiveItemCount"], 1);
+
+        let hidden_episode = crate::jellyfin::item_queries::find_media_item_for_admin(
+            &db,
+            "u1",
+            "episode-under-private-season",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let hidden_json = item_json_with_provider_ids(&db, "u1", hidden_episode.clone(), true)
+            .await
+            .unwrap();
+        assert!(hidden_json.get("SeriesId").is_none());
+        assert!(
+            get_episode_parent_info(&db, "season-private")
+                .await
+                .is_none()
+        );
+
+        let enriched = enrich_episode_list(&db, vec![hidden_episode]).await;
+        assert!(enriched[0].get("SeriesId").is_none());
+    }
+
+    async fn insert_item(
+        db: &DatabaseConnection,
+        id: &str,
+        title: &str,
+        parent_id: &str,
+        item_type: &str,
+        is_folder: i64,
+        is_public: i64,
+        season_number: Option<i64>,
+        episode_number: Option<i64>,
+    ) {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, season_number, episode_number, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'tv', ?, ?, ?, ?, ?, ?, 1, 1, 1)",
+            vec![
+                id.into(),
+                title.into(),
+                id.into(),
+                parent_id.into(),
+                item_type.into(),
+                is_folder.into(),
+                is_public.into(),
+                season_number.into(),
+                episode_number.into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    }
 }

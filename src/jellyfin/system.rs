@@ -29,7 +29,7 @@ use crate::{
         common::{image as placeholder_image, internal_error},
     },
     library::path_utils,
-    util::{now_unix, stable_text_id, unix_to_jellyfin_date},
+    util::{now_unix, stable_text_id, system_time_to_unix, unix_to_jellyfin_date},
 };
 
 const BRANDING_SPLASHSCREEN_PATH: &str = "data/images/branding-splashscreen";
@@ -40,6 +40,7 @@ const MAX_CAMERA_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 const MAX_USER_USAGE_BACKUP_BYTES: usize = 20 * 1024 * 1024;
 const CAMERA_UPLOADS_PATH: &str = "data/camera_uploads";
 const USER_USAGE_BACKUP_PATH: &str = "data/user_usage_stats";
+const FALLBACK_FONTS_PATH: &str = "data/fonts";
 
 mod configuration;
 mod localization;
@@ -3060,11 +3061,101 @@ fn query_value(query: &HashMap<String, String>, key: &str) -> Option<String> {
 }
 
 pub async fn fallback_fonts() -> Response {
-    Json(Vec::<JsonValue>::new()).into_response()
+    Json(fallback_font_entries()).into_response()
 }
 
-pub async fn fallback_font_file() -> Response {
-    StatusCode::NOT_FOUND.into_response()
+pub async fn fallback_font_file(Path(name): Path<String>) -> Response {
+    let Some(path) = fallback_font_path(&name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(fallback_font_mime_type(&name)),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    (headers, bytes).into_response()
+}
+
+fn fallback_font_entries() -> Vec<JsonValue> {
+    let mut entries = Vec::new();
+    if let Ok(fonts) = std::fs::read_dir(FALLBACK_FONTS_PATH) {
+        for entry in fonts.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !is_safe_fallback_font_name(name) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            entries.push(json!({
+                "Name": name,
+                "Size": metadata.len(),
+                "DateCreated": metadata.created().ok().map(|time| unix_to_jellyfin_date(system_time_to_unix(time))).unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
+                "DateModified": metadata.modified().ok().map(|time| unix_to_jellyfin_date(system_time_to_unix(time))).unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
+            }));
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.get("Name")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .cmp(
+                &right
+                    .get("Name")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+            )
+    });
+    entries
+}
+
+fn fallback_font_path(name: &str) -> Option<std::path::PathBuf> {
+    is_safe_fallback_font_name(name)
+        .then(|| std::path::PathBuf::from(FALLBACK_FONTS_PATH).join(name))
+}
+
+fn is_safe_fallback_font_name(name: &str) -> bool {
+    let path = std::path::Path::new(name);
+    path.file_name().and_then(|part| part.to_str()) == Some(name)
+        && matches!(
+            path.extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref(),
+            Some("ttf" | "otf" | "woff" | "woff2")
+        )
+}
+
+fn fallback_font_mime_type(name: &str) -> &'static str {
+    match std::path::Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
 }
 
 pub async fn news_product() -> Response {
@@ -3846,18 +3937,20 @@ pub async fn encoding_video_codec_information() -> Response {
 mod tests {
     use super::channel_features_value;
     use super::{
-        CameraUploadQuery, CustomQueryRequest, DeviceRecord, TmdbApiKeyRequest,
-        activity_log_entry_json, activity_log_query, camera_upload_history_value,
-        connect_unavailable, default_branding_options, default_plugin_repositories,
-        default_scan_library_triggers, device_options_result, empty_query_result,
-        game_system_display_name, image_by_name_info, is_known_scheduled_task, is_safe_log_name,
-        items_access_value, last_task_result, live_tv_channel_mapping_options,
-        live_tv_channel_mapping_options_value, live_tv_default_listing_provider,
-        live_tv_default_listing_provider_value, live_tv_default_tuner_host,
-        live_tv_default_tuner_host_value, live_tv_guide_info, live_tv_info, live_tv_timer_defaults,
-        live_tv_timer_defaults_value, live_tv_unavailable, log_file_entry, notification_items,
-        notification_services_test, notification_services_value, package_install_unavailable,
-        package_list, package_update_list, party_unavailable, play_activity_rows, plugin_list,
+        CameraUploadQuery, CustomQueryRequest, DeviceRecord, FALLBACK_FONTS_PATH,
+        TmdbApiKeyRequest, activity_log_entry_json, activity_log_query,
+        camera_upload_history_value, connect_unavailable, default_branding_options,
+        default_plugin_repositories, default_scan_library_triggers, device_options_result,
+        empty_query_result, fallback_font_entries, fallback_font_mime_type, fallback_font_path,
+        game_system_display_name, image_by_name_info, is_known_scheduled_task,
+        is_safe_fallback_font_name, is_safe_log_name, items_access_value, last_task_result,
+        live_tv_channel_mapping_options, live_tv_channel_mapping_options_value,
+        live_tv_default_listing_provider, live_tv_default_listing_provider_value,
+        live_tv_default_tuner_host, live_tv_default_tuner_host_value, live_tv_guide_info,
+        live_tv_info, live_tv_timer_defaults, live_tv_timer_defaults_value, live_tv_unavailable,
+        log_file_entry, notification_items, notification_services_test,
+        notification_services_value, package_install_unavailable, package_list,
+        package_update_list, party_unavailable, play_activity_rows, plugin_list,
         report_activity_headers_for_query, report_csv, report_item_headers_for_query,
         reports_activity_result, reports_items_result, required_upload_part,
         run_user_usage_custom_query, safe_log_path, safe_user_usage_backup_file,
@@ -4856,6 +4949,38 @@ mod tests {
     #[test]
     fn log_file_entry_rejects_non_logs() {
         assert!(log_file_entry(std::path::Path::new("notes.txt")).is_none());
+    }
+
+    #[test]
+    fn fallback_fonts_list_only_safe_font_files() {
+        let root = std::path::PathBuf::from(FALLBACK_FONTS_PATH);
+        let existed = root.exists();
+        std::fs::create_dir_all(&root).unwrap();
+        let font = root.join("TestFont.ttf");
+        let ignored = root.join("notes.txt");
+        std::fs::write(&font, b"font").unwrap();
+        std::fs::write(&ignored, b"no").unwrap();
+
+        let entries = fallback_font_entries();
+        assert!(entries.iter().any(|entry| entry["Name"] == "TestFont.ttf"));
+        assert!(!entries.iter().any(|entry| entry["Name"] == "notes.txt"));
+        assert!(is_safe_fallback_font_name("TestFont.ttf"));
+        assert!(!is_safe_fallback_font_name("../TestFont.ttf"));
+        assert!(fallback_font_path("../TestFont.ttf").is_none());
+        assert_eq!(fallback_font_mime_type("TestFont.ttf"), "font/ttf");
+        assert_eq!(
+            fallback_font_path("TestFont.ttf")
+                .unwrap()
+                .file_name()
+                .and_then(|value| value.to_str()),
+            Some("TestFont.ttf")
+        );
+
+        std::fs::remove_file(font).unwrap();
+        std::fs::remove_file(ignored).unwrap();
+        if !existed {
+            let _ = std::fs::remove_dir(root);
+        }
     }
 
     #[tokio::test]

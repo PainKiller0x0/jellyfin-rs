@@ -11,6 +11,12 @@ use serde_json::{Value, json};
 
 use crate::{app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error};
 
+const MAX_USER_SETTING_KEY_LEN: usize = 128;
+const MAX_USER_SETTING_VALUE_BYTES: usize = 64 * 1024;
+const MAX_USER_SETTINGS_PER_REQUEST: usize = 128;
+const MAX_TYPED_SETTING_KEY_LEN: usize = 128;
+const MAX_TYPED_SETTING_VALUE_BYTES: usize = 64 * 1024;
+
 /// GET /UserSettings/{user_id} — get user settings
 pub async fn get_user_settings(
     State(state): State<Arc<AppState>>,
@@ -53,10 +59,21 @@ pub async fn update_user_settings(
     let Some(obj) = body.as_object() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if obj.len() > MAX_USER_SETTINGS_PER_REQUEST {
+        return validation_error_response(StatusCode::PAYLOAD_TOO_LARGE, "Too many settings");
+    }
 
     for (key, value) in obj {
+        if !setting_key_allowed(key, MAX_USER_SETTING_KEY_LEN) {
+            return validation_error_response(StatusCode::BAD_REQUEST, "Invalid setting key");
+        }
+        let Ok(value_str) = user_setting_value(value) else {
+            return validation_error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Setting is too large",
+            );
+        };
         let full_key = format!("user_settings:{}:{}", user_id, key);
-        let value_str = user_setting_value(value);
         let now = crate::util::now_unix();
         if let Err(error) = state
             .db
@@ -77,6 +94,9 @@ pub async fn get_typed_setting(
     State(state): State<Arc<AppState>>,
     Path((user_id, key)): Path<(String, String)>,
 ) -> Response {
+    if !setting_key_allowed(&key, MAX_TYPED_SETTING_KEY_LEN) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let backend = state.db.get_database_backend();
     match state
         .db
@@ -105,6 +125,12 @@ pub async fn update_typed_setting(
     Path((user_id, key)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Response {
+    if !setting_key_allowed(&key, MAX_TYPED_SETTING_KEY_LEN) {
+        return validation_error_response(StatusCode::BAD_REQUEST, "Invalid setting key");
+    }
+    let Ok(value) = serialize_json_value(&body, MAX_TYPED_SETTING_VALUE_BYTES) else {
+        return validation_error_response(StatusCode::PAYLOAD_TOO_LARGE, "Setting is too large");
+    };
     let backend = state.db.get_database_backend();
     let now = crate::util::now_unix();
     match state
@@ -114,7 +140,7 @@ pub async fn update_typed_setting(
             "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             vec![
                 typed_setting_key(&user_id, &key).into(),
-                body.to_string().into(),
+                value.into(),
                 now.into(),
             ],
         ))
@@ -129,11 +155,39 @@ fn typed_setting_key(user_id: &str, key: &str) -> String {
     format!("typed_user_settings:{}:{}:{}", user_id.len(), user_id, key)
 }
 
-fn user_setting_value(value: &Value) -> String {
-    value
+fn user_setting_value(value: &Value) -> Result<String, ()> {
+    let value = value
         .as_str()
         .map(str::to_string)
-        .unwrap_or_else(|| value.to_string())
+        .unwrap_or_else(|| value.to_string());
+    if value.len() > MAX_USER_SETTING_VALUE_BYTES
+        || value.contains('\0')
+        || value.chars().any(|c| c.is_control() && c != '\t')
+    {
+        return Err(());
+    }
+    Ok(value)
+}
+
+fn serialize_json_value(value: &Value, max_bytes: usize) -> Result<String, ()> {
+    let value = value.to_string();
+    if value.len() > max_bytes {
+        return Err(());
+    }
+    Ok(value)
+}
+
+fn setting_key_allowed(key: &str, max_len: usize) -> bool {
+    let key = key.trim();
+    !key.is_empty()
+        && key.len() <= max_len
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn validation_error_response(status: StatusCode, message: &'static str) -> Response {
+    (status, Json(json!({ "Error": message }))).into_response()
 }
 
 /// GET /Sessions/PlayQueue — get current play queue
@@ -236,16 +290,41 @@ mod tests {
 
     #[test]
     fn user_setting_value_preserves_strings_and_json_values() {
-        assert_eq!(user_setting_value(&json!("dark")), "dark");
+        assert_eq!(user_setting_value(&json!("dark")).unwrap(), "dark");
         assert_eq!(
-            user_setting_value(&json!({"enabled": true})),
+            user_setting_value(&json!({"enabled": true})).unwrap(),
             "{\"enabled\":true}"
         );
+        assert!(user_setting_value(&json!("bad\nvalue")).is_err());
     }
 
     #[test]
     fn typed_setting_key_separates_user_and_key() {
         assert_ne!(typed_setting_key("ab", "c"), typed_setting_key("a", "bc"));
+    }
+
+    #[test]
+    fn user_setting_keys_are_limited() {
+        assert!(setting_key_allowed(
+            "home.layout-1",
+            MAX_USER_SETTING_KEY_LEN
+        ));
+        assert!(!setting_key_allowed("", MAX_USER_SETTING_KEY_LEN));
+        assert!(!setting_key_allowed("../secret", MAX_USER_SETTING_KEY_LEN));
+        assert!(!setting_key_allowed(
+            &"x".repeat(MAX_USER_SETTING_KEY_LEN + 1),
+            MAX_USER_SETTING_KEY_LEN
+        ));
+        assert!(
+            serialize_json_value(&json!({"theme": "dark"}), MAX_TYPED_SETTING_VALUE_BYTES).is_ok()
+        );
+        assert!(
+            serialize_json_value(
+                &json!({"value": "x".repeat(MAX_TYPED_SETTING_VALUE_BYTES)}),
+                MAX_TYPED_SETTING_VALUE_BYTES
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

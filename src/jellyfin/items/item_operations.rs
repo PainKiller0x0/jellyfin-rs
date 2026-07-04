@@ -19,6 +19,17 @@ use crate::{
     util::{now_unix, stable_text_id},
 };
 
+const MAX_ITEM_METADATA_NAME_LEN: usize = 512;
+const MAX_ITEM_METADATA_OVERVIEW_LEN: usize = 64 * 1024;
+const MAX_ITEM_PROVIDER_IDS: usize = 64;
+const MAX_ITEM_PROVIDER_KEY_LEN: usize = 64;
+const MAX_ITEM_PROVIDER_VALUE_LEN: usize = 512;
+const MAX_ITEM_RELATION_NAMES: usize = 256;
+const MAX_ITEM_RELATION_NAME_LEN: usize = 256;
+const MAX_ITEM_PEOPLE: usize = 512;
+const MAX_ITEM_PERSON_ROLE_LEN: usize = 256;
+const MAX_ITEM_PERSON_TYPE_LEN: usize = 64;
+
 pub async fn delete_info(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
@@ -69,6 +80,10 @@ pub async fn update_item(
     Path(item_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
+    let body = match normalize_item_update_body(body) {
+        Ok(body) => body,
+        Err(error) => return validation_error_response(error),
+    };
     match update_item_inner(&state.db, &item_id, body).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
@@ -201,6 +216,7 @@ pub(crate) async fn update_item_inner(
     item_id: &str,
     body: Value,
 ) -> anyhow::Result<bool> {
+    let body = normalize_item_update_body(body).map_err(|(_, message)| anyhow::anyhow!(message))?;
     let now = now_unix();
     let backend = db.get_database_backend();
     let existing = db
@@ -281,6 +297,211 @@ pub(crate) async fn update_item_inner(
     update_people(db, item_id, &body).await?;
 
     Ok(true)
+}
+
+pub(crate) fn normalize_item_update_body(body: Value) -> Result<Value, (StatusCode, &'static str)> {
+    let Some(input) = body.as_object() else {
+        return Err((StatusCode::BAD_REQUEST, "Item metadata must be an object"));
+    };
+    let mut normalized = serde_json::Map::new();
+
+    if input.contains_key("Name") {
+        normalized.insert(
+            "Name".to_string(),
+            Value::String(metadata_string_field(
+                input.get("Name"),
+                MAX_ITEM_METADATA_NAME_LEN,
+                true,
+                "Invalid item name",
+            )?),
+        );
+    }
+    if input.contains_key("Overview") {
+        let overview = metadata_string_field(
+            input.get("Overview"),
+            MAX_ITEM_METADATA_OVERVIEW_LEN,
+            false,
+            "Invalid item overview",
+        )?;
+        normalized.insert("Overview".to_string(), Value::String(overview));
+    }
+    if let Some(value) = input.get("ProductionYear") {
+        if !value.is_null() {
+            let year = value
+                .as_i64()
+                .ok_or((StatusCode::BAD_REQUEST, "Invalid production year"))?;
+            if !(0..=9999).contains(&year) {
+                return Err((StatusCode::BAD_REQUEST, "Invalid production year"));
+            }
+            normalized.insert("ProductionYear".to_string(), Value::from(year));
+        }
+    }
+    if let Some(provider_ids) = input.get("ProviderIds") {
+        normalized.insert(
+            "ProviderIds".to_string(),
+            Value::Object(normalize_provider_ids(provider_ids)?),
+        );
+    }
+    for key in ["Genres", "Tags", "Studios"] {
+        if let Some(value) = input.get(key) {
+            normalized.insert(
+                key.to_string(),
+                Value::Array(normalize_name_array(value, key)?),
+            );
+        }
+    }
+    if let Some(value) = input.get("People") {
+        normalized.insert("People".to_string(), Value::Array(normalize_people(value)?));
+    }
+
+    Ok(Value::Object(normalized))
+}
+
+fn metadata_string_field(
+    value: Option<&Value>,
+    max_len: usize,
+    required: bool,
+    error: &'static str,
+) -> Result<String, (StatusCode, &'static str)> {
+    let value = value
+        .and_then(Value::as_str)
+        .ok_or((StatusCode::BAD_REQUEST, error))?
+        .trim();
+    if required && value.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, error));
+    }
+    if value.chars().count() > max_len {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, error));
+    }
+    if value.contains('\0')
+        || value
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err((StatusCode::BAD_REQUEST, error));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_provider_ids(
+    value: &Value,
+) -> Result<serde_json::Map<String, Value>, (StatusCode, &'static str)> {
+    let Some(provider_ids) = value.as_object() else {
+        return Err((StatusCode::BAD_REQUEST, "ProviderIds must be an object"));
+    };
+    if provider_ids.len() > MAX_ITEM_PROVIDER_IDS {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Too many provider ids"));
+    }
+    let mut normalized = serde_json::Map::new();
+    for (provider, provider_item_id) in provider_ids {
+        validate_metadata_name(provider, MAX_ITEM_PROVIDER_KEY_LEN, "Invalid provider")?;
+        let Some(provider_item_id) = provider_item_id.as_str() else {
+            return Err((StatusCode::BAD_REQUEST, "Invalid provider id"));
+        };
+        let provider_item_id = provider_item_id.trim();
+        if provider_item_id.is_empty() {
+            continue;
+        }
+        validate_metadata_name(
+            provider_item_id,
+            MAX_ITEM_PROVIDER_VALUE_LEN,
+            "Invalid provider id",
+        )?;
+        normalized.insert(
+            provider.trim().to_string(),
+            Value::String(provider_item_id.to_string()),
+        );
+    }
+    Ok(normalized)
+}
+
+fn normalize_name_array(
+    value: &Value,
+    field: &'static str,
+) -> Result<Vec<Value>, (StatusCode, &'static str)> {
+    let Some(values) = value.as_array() else {
+        return Err((StatusCode::BAD_REQUEST, field));
+    };
+    if values.len() > MAX_ITEM_RELATION_NAMES {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, field));
+    }
+    let mut normalized = Vec::new();
+    for value in values {
+        let Some(name) = value.as_str() else {
+            return Err((StatusCode::BAD_REQUEST, field));
+        };
+        let name = name.trim();
+        if name.is_empty()
+            || normalized
+                .iter()
+                .any(|existing: &Value| existing.as_str() == Some(name))
+        {
+            continue;
+        }
+        validate_metadata_name(name, MAX_ITEM_RELATION_NAME_LEN, field)?;
+        normalized.push(Value::String(name.to_string()));
+    }
+    Ok(normalized)
+}
+
+fn normalize_people(value: &Value) -> Result<Vec<Value>, (StatusCode, &'static str)> {
+    let Some(people) = value.as_array() else {
+        return Err((StatusCode::BAD_REQUEST, "People must be an array"));
+    };
+    if people.len() > MAX_ITEM_PEOPLE {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Too many people"));
+    }
+    let mut normalized = Vec::new();
+    for person in people {
+        let Some(person) = person.as_object() else {
+            return Err((StatusCode::BAD_REQUEST, "People entries must be objects"));
+        };
+        let Some(name) = person.get("Name").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        validate_metadata_name(name, MAX_ITEM_RELATION_NAME_LEN, "Invalid person name")?;
+        let mut object = serde_json::Map::new();
+        object.insert("Name".to_string(), Value::String(name.to_string()));
+        if let Some(role) = person.get("Role").and_then(Value::as_str).map(str::trim) {
+            if !role.is_empty() {
+                validate_metadata_name(role, MAX_ITEM_PERSON_ROLE_LEN, "Invalid person role")?;
+                object.insert("Role".to_string(), Value::String(role.to_string()));
+            }
+        }
+        if let Some(person_type) = person.get("Type").and_then(Value::as_str).map(str::trim) {
+            if !person_type.is_empty() {
+                validate_metadata_name(
+                    person_type,
+                    MAX_ITEM_PERSON_TYPE_LEN,
+                    "Invalid person type",
+                )?;
+                object.insert("Type".to_string(), Value::String(person_type.to_string()));
+            }
+        }
+        normalized.push(Value::Object(object));
+    }
+    Ok(normalized)
+}
+
+fn validate_metadata_name(
+    value: &str,
+    max_len: usize,
+    error: &'static str,
+) -> Result<(), (StatusCode, &'static str)> {
+    if value.chars().count() > max_len {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, error));
+    }
+    if value.contains('\0') || value.chars().any(char::is_control) {
+        return Err((StatusCode::BAD_REQUEST, error));
+    }
+    Ok(())
+}
+
+fn validation_error_response(error: (StatusCode, &'static str)) -> Response {
+    (error.0, Json(json!({ "Error": error.1 }))).into_response()
 }
 
 async fn update_item_content_type_inner(
@@ -600,8 +821,9 @@ pub async fn make_item_public(
 #[cfg(test)]
 mod tests {
     use super::{
-        delete_item_records_for_ids, media_item_exists, update_item_content_type_inner,
-        update_item_inner,
+        MAX_ITEM_METADATA_NAME_LEN, MAX_ITEM_PEOPLE, MAX_ITEM_PROVIDER_IDS,
+        MAX_ITEM_RELATION_NAMES, delete_item_records_for_ids, media_item_exists,
+        normalize_item_update_body, update_item_content_type_inner, update_item_inner,
     };
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
     use serde_json::json;
@@ -620,6 +842,60 @@ mod tests {
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn item_update_body_is_normalized_and_limited() {
+        let body = normalize_item_update_body(json!({
+            "Name": " Movie ",
+            "Overview": "Line one\nLine two",
+            "ProductionYear": 2024,
+            "ProviderIds": { "Tmdb": " 123 ", "Empty": "" },
+            "Genres": ["Drama", "Drama", " "],
+            "Tags": ["Favorite"],
+            "Studios": ["Studio"],
+            "People": [
+                { "Name": " Actor ", "Role": " Lead ", "Type": "Actor", "Ignored": true },
+                { "Name": "" }
+            ],
+            "Ignored": "field"
+        }))
+        .unwrap();
+        assert_eq!(body["Name"], "Movie");
+        assert_eq!(body["ProviderIds"]["Tmdb"], "123");
+        assert!(body["ProviderIds"]["Empty"].is_null());
+        assert_eq!(body["Genres"], json!(["Drama"]));
+        assert_eq!(body["People"][0]["Name"], "Actor");
+        assert!(body["Ignored"].is_null());
+
+        assert!(normalize_item_update_body(json!([])).is_err());
+        assert!(
+            normalize_item_update_body(
+                json!({ "Name": "x".repeat(MAX_ITEM_METADATA_NAME_LEN + 1) })
+            )
+            .is_err()
+        );
+        assert!(normalize_item_update_body(json!({ "ProductionYear": 10000 })).is_err());
+        assert!(
+            normalize_item_update_body(json!({
+                "ProviderIds": (0..=MAX_ITEM_PROVIDER_IDS)
+                    .map(|index| (format!("P{index}"), json!("id")))
+                    .collect::<serde_json::Map<_, _>>()
+            }))
+            .is_err()
+        );
+        assert!(
+            normalize_item_update_body(json!({
+                "Genres": vec!["x"; MAX_ITEM_RELATION_NAMES + 1]
+            }))
+            .is_err()
+        );
+        assert!(
+            normalize_item_update_body(json!({
+                "People": vec![json!({"Name": "Actor"}); MAX_ITEM_PEOPLE + 1]
+            }))
+            .is_err()
         );
     }
 

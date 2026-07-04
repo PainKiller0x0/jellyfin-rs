@@ -2679,7 +2679,10 @@ pub async fn metadata_editor(
     Path(item_id): Path<String>,
     Json(body): Json<JsonValue>,
 ) -> Response {
-    // Delegate to update_item_inner
+    let body = match crate::jellyfin::items::normalize_item_update_body(body) {
+        Ok(body) => body,
+        Err(error) => return validation_error_response(error),
+    };
     match crate::jellyfin::items::update_item_inner(&state.db, &item_id, body).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),

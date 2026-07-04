@@ -400,7 +400,9 @@ fn split_media_streams_and_attachments(
             .and_then(JsonValue::as_str)
             .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Attachment"))
         {
-            attachments.push(media_attachment_json(item_id, &stream));
+            if let Some(attachment) = media_attachment_json(item_id, &stream) {
+                attachments.push(attachment);
+            }
         } else {
             media_streams.push(stream);
         }
@@ -408,14 +410,18 @@ fn split_media_streams_and_attachments(
     (media_streams, attachments)
 }
 
-fn media_attachment_json(item_id: &str, stream: &JsonValue) -> JsonValue {
+fn media_attachment_json(item_id: &str, stream: &JsonValue) -> Option<JsonValue> {
+    stream
+        .get("Path")
+        .and_then(JsonValue::as_str)
+        .filter(|path| !path.trim().is_empty())?;
     let index = stream
         .get("Index")
         .and_then(JsonValue::as_i64)
         .unwrap_or_default();
     let codec = stream.get("Codec").cloned().unwrap_or(JsonValue::Null);
     let mime_type = attachment_mime_type(codec.as_str().unwrap_or_default());
-    json!({
+    Some(json!({
         "Codec": codec,
         "CodecTag": stream.get("CodecTag").cloned().unwrap_or(JsonValue::Null),
         "Comment": stream.get("Comment").cloned().unwrap_or(JsonValue::Null),
@@ -423,7 +429,7 @@ fn media_attachment_json(item_id: &str, stream: &JsonValue) -> JsonValue {
         "FileName": stream.get("Title").cloned().unwrap_or(JsonValue::Null),
         "MimeType": mime_type,
         "DeliveryUrl": format!("/Videos/{item_id}/{item_id}/Attachments/{index}")
-    })
+    }))
 }
 
 fn attachment_mime_type(codec: &str) -> &'static str {
@@ -490,7 +496,7 @@ impl MediaStreamRow {
         map.insert("DisplayTitle".into(), JsonValue::String(display_title));
         map.insert(
             "Path".into(),
-            if self.is_external {
+            if self.is_external || self.stream_type.eq_ignore_ascii_case("Attachment") {
                 opt_str(&self.path)
             } else {
                 JsonValue::Null
@@ -766,7 +772,14 @@ mod tests {
                 "Type": "Attachment",
                 "Codec": "ttf",
                 "Title": "Font.ttf",
-                "Comment": "subtitle font"
+                "Comment": "subtitle font",
+                "Path": "D:/Movies/Font.ttf"
+            }),
+            json!({
+                "Index": 6,
+                "Type": "Attachment",
+                "Codec": "otf",
+                "Title": "Embedded.otf"
             }),
         ]
     }

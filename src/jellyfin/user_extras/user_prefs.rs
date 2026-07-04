@@ -71,6 +71,7 @@ pub async fn update_user_settings(
     }
 
     for (key, value) in obj {
+        let key = key.trim();
         if !setting_key_allowed(key, MAX_USER_SETTING_KEY_LEN) {
             return validation_error_response(StatusCode::BAD_REQUEST, "Invalid setting key");
         }
@@ -310,7 +311,11 @@ pub async fn add_to_playlist_info(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{ConnectionTrait, Database};
+    use crate::app::state::PlaybackSession;
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::{RwLock, broadcast};
+    use uuid::Uuid;
 
     #[test]
     fn user_setting_value_preserves_strings_and_json_values() {
@@ -349,6 +354,34 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn user_settings_trim_keys_before_saving() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let state = Arc::new(test_state(db));
+
+        let response = update_user_settings(
+            State(state.clone()),
+            Path("u1".to_string()),
+            Json(json!({ " theme ": "dark" })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let row = state
+            .db
+            .query_one(crate::db::helpers::portable_statement(
+                state.db.get_database_backend(),
+                "SELECT value FROM app_settings WHERE key = 'user_settings:u1:theme'",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get_str("value").unwrap(), "dark");
     }
 
     #[tokio::test]
@@ -404,5 +437,23 @@ mod tests {
             .filter_map(|row| row.get_str("item_id").ok())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["c", "a", "b"]);
+    }
+
+    fn test_state(db: DatabaseConnection) -> AppState {
+        let (ws_event_tx, _) = broadcast::channel(4);
+        AppState {
+            user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, b"user-prefs-test"),
+            access_token: "test-token".to_string(),
+            db,
+            media_dirs: Vec::new(),
+            http_client: reqwest::Client::new(),
+            tmdb_api_key: RwLock::new(None),
+            playback_sessions: RwLock::new(HashMap::<String, PlaybackSession>::new()),
+            session_capabilities: RwLock::new(HashMap::new()),
+            ws_event_tx,
+            sa_config: crate::config::StrmAssistantConfig::default(),
+            intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),
+            queue_manager: Arc::new(crate::queue::QueueManager::default()),
+        }
     }
 }

@@ -12,6 +12,12 @@ use serde_json::{Value, json};
 
 use crate::{app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error};
 
+fn visible_media_item_sql(alias: &str) -> String {
+    format!(
+        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
+    )
+}
+
 pub async fn genres(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
@@ -109,10 +115,14 @@ async fn list_extended_video_types_inner(
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
     let backend = db.get_database_backend();
+    let visible = visible_media_item_sql("mi");
+    let sql = format!(
+        "SELECT mi.extended_video_type FROM media_items mi WHERE {visible} AND mi.extended_video_type IS NOT NULL AND mi.extended_video_type <> ''"
+    );
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            "SELECT extended_video_type FROM media_items WHERE is_public = 1 AND extended_video_type IS NOT NULL AND extended_video_type <> ''",
+            &sql,
             vec![],
         ))
         .await
@@ -213,10 +223,14 @@ async fn list_years_inner(
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
     let backend = db.get_database_backend();
+    let visible = visible_media_item_sql("mi");
+    let sql = format!(
+        "SELECT DISTINCT mi.production_year FROM media_items mi WHERE {visible} AND mi.production_year IS NOT NULL AND mi.production_year > 0 ORDER BY mi.production_year DESC"
+    );
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            "SELECT DISTINCT production_year FROM media_items WHERE is_public = 1 AND production_year IS NOT NULL AND production_year > 0 ORDER BY production_year DESC",
+            &sql,
             vec![],
         ))
         .await
@@ -240,10 +254,14 @@ async fn list_years_inner(
 }
 
 async fn year_exists(db: &DatabaseConnection, year: i64) -> anyhow::Result<bool> {
+    let visible = visible_media_item_sql("mi");
+    let sql = format!(
+        "SELECT COUNT(*) AS cnt FROM media_items mi WHERE {visible} AND mi.production_year = ?"
+    );
     let row = db
         .query_one(crate::db::helpers::portable_statement(
             db.get_database_backend(),
-            "SELECT COUNT(*) AS cnt FROM media_items WHERE is_public = 1 AND production_year = ?",
+            &sql,
             vec![year.into()],
         ))
         .await
@@ -294,8 +312,10 @@ async fn list_distinct_values_inner(
     column: &str,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
+    debug_assert_eq!(table, "media_items");
+    let visible = visible_media_item_sql("mi");
     let sql = format!(
-        "SELECT DISTINCT {column} FROM {table} WHERE is_public = 1 AND {column} IS NOT NULL AND {column} <> '' ORDER BY {column} ASC"
+        "SELECT DISTINCT mi.{column} FROM {table} mi WHERE {visible} AND mi.{column} IS NOT NULL AND mi.{column} <> '' ORDER BY mi.{column} ASC"
     );
     let backend = db.get_database_backend();
     let rows = db
@@ -339,8 +359,9 @@ async fn list_media_stream_values_inner(
     column: &str,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
+    let visible = visible_media_item_sql("mi");
     let sql = format!(
-        "SELECT DISTINCT media_streams.{column} FROM media_streams JOIN media_items ON media_items.id = media_streams.item_id WHERE media_items.is_public = 1 AND media_streams.{column} IS NOT NULL AND media_streams.{column} <> '' ORDER BY media_streams.{column} ASC"
+        "SELECT DISTINCT media_streams.{column} FROM media_streams JOIN media_items mi ON mi.id = media_streams.item_id WHERE {visible} AND media_streams.{column} IS NOT NULL AND media_streams.{column} <> '' ORDER BY media_streams.{column} ASC"
     );
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
@@ -468,10 +489,14 @@ async fn list_filter_items_inner(
             if has_fav_filter && user_id.is_some() {
                 // Filter persons by user_data.is_favorite
                 if let Some(uid) = user_id {
+                    let visible = visible_media_item_sql("mi");
+                    let sql = format!(
+                        "SELECT DISTINCT p.id, p.name, ia.etag AS primary_image_tag FROM people p JOIN user_data ud ON ud.item_id = p.id JOIN media_people mp ON mp.person_id = p.id JOIN media_items mi ON mi.id = mp.item_id LEFT JOIN image_assets ia ON ia.item_id = p.id AND ia.image_type = 'Primary' WHERE {visible} AND ud.user_id = ? AND ud.is_favorite = 1 ORDER BY p.name ASC"
+                    );
                     let models = db
                         .query_all(crate::db::helpers::portable_statement(
                             db.get_database_backend(),
-                            "SELECT DISTINCT p.id, p.name, ia.etag AS primary_image_tag FROM people p JOIN user_data ud ON ud.item_id = p.id JOIN media_people mp ON mp.person_id = p.id JOIN media_items mi ON mi.id = mp.item_id LEFT JOIN image_assets ia ON ia.item_id = p.id AND ia.image_type = 'Primary' WHERE mi.is_public = 1 AND ud.user_id = ? AND ud.is_favorite = 1 ORDER BY p.name ASC",
+                            &sql,
                             vec![uid.as_str().into()],
                         ))
                         .await
@@ -560,8 +585,9 @@ async fn list_public_related_items(
     item_type: &str,
     context: Option<&'static str>,
 ) -> anyhow::Result<Vec<Value>> {
+    let visible = visible_media_item_sql("mi");
     let sql = format!(
-        "SELECT DISTINCT named.id, named.name FROM {table} named JOIN {relation_table} rel ON rel.{relation_column} = named.id JOIN media_items mi ON mi.id = rel.item_id WHERE mi.is_public = 1 ORDER BY named.name ASC"
+        "SELECT DISTINCT named.id, named.name FROM {table} named JOIN {relation_table} rel ON rel.{relation_column} = named.id JOIN media_items mi ON mi.id = rel.item_id WHERE {visible} ORDER BY named.name ASC"
     );
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
@@ -583,21 +609,19 @@ async fn list_public_related_items(
 }
 
 async fn list_media_item_prefixes(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>> {
-    list_prefixes_sql(
-        db,
-        "SELECT DISTINCT UPPER(SUBSTR(title, 1, 1)) AS prefix FROM media_items WHERE is_public = 1 AND title IS NOT NULL AND title <> '' ORDER BY prefix ASC",
-        Vec::<DbValue>::new(),
-    )
-    .await
+    let visible = visible_media_item_sql("mi");
+    let sql = format!(
+        "SELECT DISTINCT UPPER(SUBSTR(mi.title, 1, 1)) AS prefix FROM media_items mi WHERE {visible} AND mi.title IS NOT NULL AND mi.title <> '' ORDER BY prefix ASC"
+    );
+    list_prefixes_sql(db, &sql, Vec::<DbValue>::new()).await
 }
 
 async fn list_artist_prefixes(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>> {
-    list_prefixes_sql(
-        db,
-        "SELECT DISTINCT UPPER(SUBSTR(p.name, 1, 1)) AS prefix FROM people p JOIN media_people mp ON mp.person_id = p.id JOIN media_items mi ON mi.id = mp.item_id WHERE mi.is_public = 1 AND p.name IS NOT NULL AND p.name <> '' ORDER BY prefix ASC",
-        Vec::<DbValue>::new(),
-    )
-    .await
+    let visible = visible_media_item_sql("mi");
+    let sql = format!(
+        "SELECT DISTINCT UPPER(SUBSTR(p.name, 1, 1)) AS prefix FROM people p JOIN media_people mp ON mp.person_id = p.id JOIN media_items mi ON mi.id = mp.item_id WHERE {visible} AND p.name IS NOT NULL AND p.name <> '' ORDER BY prefix ASC"
+    );
+    list_prefixes_sql(db, &sql, Vec::<DbValue>::new()).await
 }
 
 async fn list_prefixes_sql(
@@ -690,6 +714,7 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
 
+        insert_user(&db, "u1").await;
         insert_media_item(&db, "public", "Alpha Public", 1, 2001, "PG", "mkv", "Dvd").await;
         insert_media_item(
             &db,
@@ -702,27 +727,67 @@ mod tests {
             "BluRay",
         )
         .await;
+        insert_media_item(
+            &db,
+            "private-parent",
+            "Hidden Parent",
+            0,
+            1999,
+            "NC-17",
+            "mp4",
+            "Hdr10",
+        )
+        .await;
+        insert_media_item_with_parent(
+            &db,
+            "hidden-child",
+            "Beta Hidden Child",
+            "private-parent",
+            1,
+            2003,
+            "G",
+            "mov",
+            "DolbyVision",
+        )
+        .await;
         insert_stream(&db, "public", "h264").await;
         insert_stream(&db, "private", "hevc").await;
+        insert_stream(&db, "hidden-child", "vp9").await;
 
         insert_named(&db, "genres", "g_public", "PublicGenre").await;
         insert_named(&db, "genres", "g_private", "PrivateGenre").await;
+        insert_named(&db, "genres", "g_hidden", "HiddenGenre").await;
         insert_named(&db, "tags", "t_public", "PublicTag").await;
         insert_named(&db, "tags", "t_private", "PrivateTag").await;
+        insert_named(&db, "tags", "t_hidden", "HiddenTag").await;
         insert_named(&db, "studios", "s_public", "PublicStudio").await;
         insert_named(&db, "studios", "s_private", "PrivateStudio").await;
+        insert_named(&db, "studios", "s_hidden", "HiddenStudio").await;
         insert_named(&db, "people", "p_public", "PublicPerson").await;
         insert_named(&db, "people", "p_private", "PrivatePerson").await;
+        insert_named(&db, "people", "p_hidden", "HiddenPerson").await;
         insert_named(&db, "game_genres", "gg_public", "PublicGameGenre").await;
         insert_named(&db, "game_genres", "gg_private", "PrivateGameGenre").await;
+        insert_named(&db, "game_genres", "gg_hidden", "HiddenGameGenre").await;
         link_named(&db, "media_genres", "genre_id", "public", "g_public").await;
         link_named(&db, "media_genres", "genre_id", "private", "g_private").await;
+        link_named(&db, "media_genres", "genre_id", "hidden-child", "g_hidden").await;
         link_named(&db, "media_tags", "tag_id", "public", "t_public").await;
         link_named(&db, "media_tags", "tag_id", "private", "t_private").await;
+        link_named(&db, "media_tags", "tag_id", "hidden-child", "t_hidden").await;
         link_named(&db, "media_studios", "studio_id", "public", "s_public").await;
         link_named(&db, "media_studios", "studio_id", "private", "s_private").await;
+        link_named(
+            &db,
+            "media_studios",
+            "studio_id",
+            "hidden-child",
+            "s_hidden",
+        )
+        .await;
         link_named(&db, "media_people", "person_id", "public", "p_public").await;
         link_named(&db, "media_people", "person_id", "private", "p_private").await;
+        link_named(&db, "media_people", "person_id", "hidden-child", "p_hidden").await;
         link_named(
             &db,
             "media_game_genres",
@@ -739,6 +804,16 @@ mod tests {
             "gg_private",
         )
         .await;
+        link_named(
+            &db,
+            "media_game_genres",
+            "game_genre_id",
+            "hidden-child",
+            "gg_hidden",
+        )
+        .await;
+        favorite_item(&db, "u1", "p_public").await;
+        favorite_item(&db, "u1", "p_hidden").await;
 
         let query = Default::default();
         assert_names(
@@ -805,6 +880,17 @@ mod tests {
             list_artist_prefixes(&db).await.unwrap(),
             vec![Value::from("P")]
         );
+
+        let favorite_query = HashMap::from([
+            ("Filters".to_string(), "IsFavorite".to_string()),
+            ("UserId".to_string(), "u1".to_string()),
+        ]);
+        assert_names(
+            list_filter_items_inner(&db, FilterKind::Person, &favorite_query)
+                .await
+                .unwrap(),
+            &["PublicPerson"],
+        );
     }
 
     fn assert_names(items: Vec<Value>, expected: &[&str]) {
@@ -825,19 +911,65 @@ mod tests {
         container: &str,
         extended_video_type: &str,
     ) {
+        insert_media_item_with_parent(
+            db,
+            id,
+            title,
+            "",
+            is_public,
+            year,
+            rating,
+            container,
+            extended_video_type,
+        )
+        .await;
+    }
+
+    async fn insert_media_item_with_parent(
+        db: &sea_orm::DatabaseConnection,
+        id: &str,
+        title: &str,
+        parent_id: &str,
+        is_public: i64,
+        year: i64,
+        rating: &str,
+        container: &str,
+        extended_video_type: &str,
+    ) {
         db.execute(crate::db::helpers::portable_statement(
             db.get_database_backend(),
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, production_year, official_rating, container, extended_video_type, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, ?, ?, ?, ?, ?, 1, 1, 1)",
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, production_year, official_rating, container, extended_video_type, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', 0, ?, ?, ?, ?, ?, 1, 1, 1)",
             vec![
                 id.into(),
                 title.into(),
                 id.into(),
+                parent_id.into(),
                 is_public.into(),
                 year.into(),
                 rating.into(),
                 container.into(),
                 extended_video_type.into(),
             ],
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn insert_user(db: &sea_orm::DatabaseConnection, user_id: &str) {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, ?, ?, 0, 0, 1, 1)",
+            vec![user_id.into(), user_id.into(), user_id.into()],
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn favorite_item(db: &sea_orm::DatabaseConnection, user_id: &str, item_id: &str) {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO user_data (user_id, item_id, is_favorite, played, playback_position_ticks, play_count, updated_at) VALUES (?, ?, 1, 0, 0, 0, 1)",
+            vec![user_id.into(), item_id.into()],
         ))
         .await
         .unwrap();

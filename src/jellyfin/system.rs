@@ -10,7 +10,7 @@ use axum::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement,
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -693,33 +693,49 @@ pub async fn activity_log(
         .or_else(|| query.get("HasUserId"))
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
 
-    let mut select = ActivityLog::find()
+    let select = activity_log_query(has_user_id);
+    let total = match select.clone().count(&state.db).await {
+        Ok(total) => total,
+        Err(error) => return internal_error(error.into()),
+    };
+
+    match select
         .order_by_desc(activity_log::Column::CreatedAt)
         .limit(limit)
-        .offset(start_index);
-
-    if has_user_id {
-        select = select.filter(activity_log::Column::UserId.is_not_null());
-    }
-
-    match select.all(&state.db).await {
+        .offset(start_index)
+        .all(&state.db)
+        .await
+    {
         Ok(models) => {
-            let items: Vec<JsonValue> = models
-                .iter()
-                .map(|m| {
-                    json!({
-                        "Name": m.name,
-                        "Type": m.log_type,
-                        "Date": crate::util::unix_to_jellyfin_date(m.created_at),
-                        "UserId": m.user_id.as_deref().unwrap_or_default(),
-                        "Severity": "Info",
-                    })
-                })
-                .collect();
-            Json(json!({ "Items": items, "TotalRecordCount": items.len() })).into_response()
+            let items: Vec<JsonValue> = models.iter().map(activity_log_entry_json).collect();
+            Json(json!({
+                "Items": items,
+                "TotalRecordCount": total,
+                "StartIndex": start_index
+            }))
+            .into_response()
         }
         Err(error) => internal_error(error.into()),
     }
+}
+
+fn activity_log_query(has_user_id: bool) -> Select<activity_log::Entity> {
+    let select = ActivityLog::find();
+    if has_user_id {
+        select.filter(activity_log::Column::UserId.is_not_null())
+    } else {
+        select
+    }
+}
+
+fn activity_log_entry_json(model: &activity_log::Model) -> JsonValue {
+    json!({
+        "Name": model.name,
+        "Type": model.log_type,
+        "Date": crate::util::unix_to_jellyfin_date(model.created_at),
+        "UserId": model.user_id.as_deref().unwrap_or_default(),
+        "Severity": model.severity,
+    })
 }
 
 pub async fn users_item_access(
@@ -3825,10 +3841,11 @@ mod tests {
     use super::channel_features_value;
     use super::{
         CameraUploadQuery, CustomQueryRequest, DeviceRecord, TmdbApiKeyRequest,
-        camera_upload_history_value, connect_unavailable, default_branding_options,
-        default_plugin_repositories, default_scan_library_triggers, device_options_result,
-        empty_query_result, game_system_display_name, image_by_name_info, is_known_scheduled_task,
-        is_safe_log_name, items_access_value, last_task_result, live_tv_channel_mapping_options,
+        activity_log_entry_json, activity_log_query, camera_upload_history_value,
+        connect_unavailable, default_branding_options, default_plugin_repositories,
+        default_scan_library_triggers, device_options_result, empty_query_result,
+        game_system_display_name, image_by_name_info, is_known_scheduled_task, is_safe_log_name,
+        items_access_value, last_task_result, live_tv_channel_mapping_options,
         live_tv_channel_mapping_options_value, live_tv_default_listing_provider,
         live_tv_default_listing_provider_value, live_tv_default_tuner_host,
         live_tv_default_tuner_host_value, live_tv_guide_info, live_tv_info, live_tv_timer_defaults,
@@ -3855,7 +3872,9 @@ mod tests {
         extract::{Path, Query, State},
         response::IntoResponse,
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, EntityTrait, Set};
+    use sea_orm::{
+        ConnectionTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait, Set,
+    };
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
     use uuid::Uuid;
@@ -3880,6 +3899,45 @@ mod tests {
         assert_eq!(value["TotalRecordCount"], 0);
         assert_eq!(value["StartIndex"], 0);
         assert!(value["Items"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn activity_log_entry_uses_model_severity() {
+        let entry = activity_log::Model {
+            id: "a1".to_string(),
+            name: "Scanned".to_string(),
+            log_type: "Task".to_string(),
+            user_id: Some("u1".to_string()),
+            item_id: None,
+            severity: "Warning".to_string(),
+            created_at: 1,
+        };
+        let value = activity_log_entry_json(&entry);
+        assert_eq!(value["Severity"], "Warning");
+        assert_eq!(value["UserId"], "u1");
+    }
+
+    #[tokio::test]
+    async fn activity_log_query_count_uses_user_filter() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        for (id, user_id) in [("global", None), ("user", Some("u1"))] {
+            activity_log::Entity::insert(activity_log::ActiveModel {
+                id: Set(id.to_string()),
+                name: Set(id.to_string()),
+                log_type: Set("Task".to_string()),
+                user_id: Set(user_id.map(ToString::to_string)),
+                item_id: Set(None),
+                severity: Set("Info".to_string()),
+                created_at: Set(1),
+            })
+            .exec(&db)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(activity_log_query(false).count(&db).await.unwrap(), 2);
+        assert_eq!(activity_log_query(true).count(&db).await.unwrap(), 1);
     }
 
     #[tokio::test]

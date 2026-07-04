@@ -120,8 +120,61 @@ fn collection_playlist_name(value: Option<&str>) -> Result<String, (StatusCode, 
     Ok(value.to_string())
 }
 
+fn query_value(query: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| {
+            query
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+        })
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn playlist_users_from_value(
+    value: Option<&JsonValue>,
+) -> Result<HashMap<String, bool>, (StatusCode, &'static str)> {
+    let Some(value) = value else {
+        return Ok(HashMap::new());
+    };
+    let Some(items) = value.as_array() else {
+        return Err((StatusCode::BAD_REQUEST, "Users must be an array"));
+    };
+    let mut users = HashMap::new();
+    for item in items {
+        let Some(user_id) = item.get("UserId").and_then(JsonValue::as_str) else {
+            return Err((StatusCode::BAD_REQUEST, "UserId is required"));
+        };
+        let user_id = user_id.trim();
+        if user_id.is_empty()
+            || user_id.len() > MAX_COLLECTION_PLAYLIST_ID_LEN
+            || user_id.contains('\0')
+            || user_id.chars().any(char::is_control)
+        {
+            return Err((StatusCode::BAD_REQUEST, "Invalid UserId"));
+        }
+        let can_edit = item
+            .get("CanEdit")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        users.insert(user_id.to_string(), can_edit);
+        if users.len() > MAX_COLLECTION_PLAYLIST_IDS {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "Too many users"));
+        }
+    }
+    Ok(users)
+}
+
 fn validation_error_response(error: (StatusCode, &'static str)) -> Response {
     (error.0, Json(json!({ "Error": error.1 }))).into_response()
+}
+
+fn playlist_forbidden_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "Error": "Playlist access is denied" })),
+    )
+        .into_response()
 }
 
 pub async fn create_collection(
@@ -397,26 +450,67 @@ pub async fn remove_from_collection(
 
 pub async fn create_playlist(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     Json(body): Json<JsonValue>,
 ) -> Response {
     if !body.is_object() {
         return validation_error_response((StatusCode::BAD_REQUEST, "Playlist must be an object"));
     }
-    let name = match collection_playlist_name(body.get("Name").and_then(JsonValue::as_str)) {
+    let (request_user_id, is_admin) =
+        request_user_id_and_admin_or_default(&state, &headers, &query).await;
+    let owner_user_id = query_value(&query, &["userId", "UserId"])
+        .or_else(|| {
+            body.get("UserId")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| request_user_id.clone());
+    if owner_user_id != request_user_id && !is_admin {
+        return playlist_forbidden_response();
+    }
+
+    let name = match collection_playlist_name(
+        query_value(&query, &["name", "Name"])
+            .as_deref()
+            .or_else(|| body.get("Name").and_then(JsonValue::as_str)),
+    ) {
         Ok(name) => name,
         Err(error) => return validation_error_response(error),
     };
-    let ids = match item_ids_from_value(body.get("Ids").or_else(|| body.get("ids"))) {
+    let ids = match ids_query(&query, &["ids", "Ids"]).and_then(|query_ids| {
+        if query_ids.is_empty() {
+            item_ids_from_value(body.get("Ids").or_else(|| body.get("ids")))
+        } else {
+            Ok(query_ids)
+        }
+    }) {
         Ok(ids) => ids,
         Err(error) => return validation_error_response(error),
     };
 
-    let media_type = body
-        .get("MediaType")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("Video");
+    let media_type = query_value(&query, &["mediaType", "MediaType"])
+        .or_else(|| {
+            body.get("MediaType")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "Video".to_string());
+    let playlist_users = match playlist_users_from_value(body.get("Users")) {
+        Ok(users) => users,
+        Err(error) => return validation_error_response(error),
+    };
 
-    match create_playlist_inner(&state.db, &name, &ids, media_type).await {
+    match create_playlist_inner(
+        &state.db,
+        &name,
+        &ids,
+        &media_type,
+        &owner_user_id,
+        playlist_users,
+    )
+    .await
+    {
         Ok(id) => Json(json!({ "Id": id })).into_response(),
         Err(error) => internal_error(error),
     }
@@ -427,6 +521,8 @@ async fn create_playlist_inner(
     name: &str,
     ids: &[String],
     _media_type: &str,
+    owner_user_id: &str,
+    mut users: HashMap<String, bool>,
 ) -> anyhow::Result<String> {
     let now = now_unix();
     let id = stable_text_id(&format!("playlist:{}:{}", name.to_ascii_lowercase(), now));
@@ -461,6 +557,13 @@ async fn create_playlist_inner(
         .await;
     }
 
+    if !owner_user_id.trim().is_empty() {
+        users.insert(owner_user_id.to_string(), true);
+    }
+    if !users.is_empty() {
+        save_playlist_permissions(db, &id, &users).await?;
+    }
+
     Ok(id)
 }
 
@@ -484,8 +587,22 @@ pub async fn get_playlist(
 
 pub async fn get_playlist_users(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(playlist_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    match playlist_write_access_from_request(&state, &headers, &query, &playlist_id).await {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => return playlist_forbidden_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "Error": "Playlist not found" })),
+            )
+                .into_response();
+        }
+        Err(error) => return internal_error(error),
+    }
     match playlist_users_inner(&state.db, &playlist_id).await {
         Ok(Some(users)) => Json(users).into_response(),
         Ok(None) => (
@@ -499,8 +616,22 @@ pub async fn get_playlist_users(
 
 pub async fn get_playlist_user(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((playlist_id, user_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    match playlist_write_access_from_request(&state, &headers, &query, &playlist_id).await {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => return playlist_forbidden_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "Error": "Playlist not found" })),
+            )
+                .into_response();
+        }
+        Err(error) => return internal_error(error),
+    }
     match playlist_user_inner(&state.db, &playlist_id, &user_id).await {
         Ok(Some(user)) => Json(user).into_response(),
         Ok(None) => (
@@ -514,11 +645,25 @@ pub async fn get_playlist_user(
 
 pub async fn update_playlist_user(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((playlist_id, user_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
     Json(body): Json<JsonValue>,
 ) -> Response {
     if !body.is_object() {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    match playlist_write_access_from_request(&state, &headers, &query, &playlist_id).await {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => return playlist_forbidden_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "Error": "Playlist not found" })),
+            )
+                .into_response();
+        }
+        Err(error) => return internal_error(error),
     }
     match set_playlist_user_permission(&state.db, &playlist_id, &user_id, &body).await {
         Ok(Some(user)) => Json(user).into_response(),
@@ -533,8 +678,22 @@ pub async fn update_playlist_user(
 
 pub async fn remove_playlist_user(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((playlist_id, user_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    match playlist_write_access_from_request(&state, &headers, &query, &playlist_id).await {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => return playlist_forbidden_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "Error": "Playlist not found" })),
+            )
+                .into_response();
+        }
+        Err(error) => return internal_error(error),
+    }
     match remove_playlist_user_permission(&state.db, &playlist_id, &user_id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
@@ -548,11 +707,25 @@ pub async fn remove_playlist_user(
 
 pub async fn update_playlist(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(playlist_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
     Json(body): Json<JsonValue>,
 ) -> Response {
     if !body.is_object() {
         return validation_error_response((StatusCode::BAD_REQUEST, "Playlist must be an object"));
+    }
+    match playlist_write_access_from_request(&state, &headers, &query, &playlist_id).await {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => return playlist_forbidden_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "Error": "Playlist not found" })),
+            )
+                .into_response();
+        }
+        Err(error) => return internal_error(error),
     }
     let name = if body.get("Name").is_some() {
         match collection_playlist_name(body.get("Name").and_then(JsonValue::as_str)) {
@@ -570,7 +743,23 @@ pub async fn update_playlist(
     } else {
         None
     };
-    match update_playlist_inner(&state.db, &playlist_id, name.as_deref(), ids.as_deref()).await {
+    let users = if body.get("Users").is_some() {
+        match playlist_users_from_value(body.get("Users")) {
+            Ok(users) => Some(users),
+            Err(error) => return validation_error_response(error),
+        }
+    } else {
+        None
+    };
+    match update_playlist_inner(
+        &state.db,
+        &playlist_id,
+        name.as_deref(),
+        ids.as_deref(),
+        users,
+    )
+    .await
+    {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -586,6 +775,7 @@ async fn update_playlist_inner(
     playlist_id: &str,
     name: Option<&str>,
     ids: Option<&[String]>,
+    users: Option<HashMap<String, bool>>,
 ) -> anyhow::Result<bool> {
     if !playlist_exists(db, playlist_id).await? {
         return Ok(false);
@@ -624,6 +814,11 @@ async fn update_playlist_inner(
             .await
             .context("failed to insert playlist item")?;
         }
+        touch_media_item(db, playlist_id).await?;
+    }
+
+    if let Some(users) = users {
+        save_playlist_permissions(db, playlist_id, &users).await?;
         touch_media_item(db, playlist_id).await?;
     }
 
@@ -668,11 +863,17 @@ async fn get_playlist_inner(
         .filter_map(|row| row.get_str("item_id").ok())
         .collect();
 
+    let permissions = playlist_permissions(db, playlist_id).await;
+    let shares = permissions
+        .iter()
+        .map(|(user_id, can_edit)| playlist_user_permissions_json(user_id, *can_edit))
+        .collect::<Vec<_>>();
+
     Ok(Some(json!({
         "Name": title,
         "Id": playlist_id,
         "OpenAccess": false,
-        "Shares": [],
+        "Shares": shares,
         "ItemIds": item_ids,
     })))
 }
@@ -702,7 +903,7 @@ async fn playlist_users_inner(
                 let id = row.get_str("id").ok()?;
                 Some(playlist_user_permissions_json(
                     &id,
-                    permissions.get(&id).copied().unwrap_or(true),
+                    permissions.get(&id).copied().unwrap_or(false),
                 ))
             })
             .collect(),
@@ -730,7 +931,7 @@ async fn playlist_user_inner(
 
     let permissions = playlist_permissions(db, playlist_id).await;
     Ok(row.map(|_| {
-        playlist_user_permissions_json(user_id, permissions.get(user_id).copied().unwrap_or(true))
+        playlist_user_permissions_json(user_id, permissions.get(user_id).copied().unwrap_or(false))
     }))
 }
 
@@ -747,6 +948,37 @@ async fn playlist_exists(db: &DatabaseConnection, playlist_id: &str) -> anyhow::
         .is_some())
 }
 
+pub(crate) async fn playlist_write_access(
+    db: &DatabaseConnection,
+    playlist_id: &str,
+    user_id: &str,
+    is_admin: bool,
+) -> anyhow::Result<Option<bool>> {
+    if !playlist_exists(db, playlist_id).await? {
+        return Ok(None);
+    }
+    if is_admin {
+        return Ok(Some(true));
+    }
+    Ok(Some(
+        playlist_permissions(db, playlist_id)
+            .await
+            .get(user_id)
+            .copied()
+            .unwrap_or(false),
+    ))
+}
+
+async fn playlist_write_access_from_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+    playlist_id: &str,
+) -> anyhow::Result<Option<bool>> {
+    let (user_id, is_admin) = request_user_id_and_admin_or_default(state, headers, query).await;
+    playlist_write_access(&state.db, playlist_id, &user_id, is_admin).await
+}
+
 async fn set_playlist_user_permission(
     db: &DatabaseConnection,
     playlist_id: &str,
@@ -760,7 +992,7 @@ async fn set_playlist_user_permission(
     let can_edit = body
         .get("CanEdit")
         .and_then(JsonValue::as_bool)
-        .unwrap_or_else(|| permissions.get(user_id).copied().unwrap_or(true));
+        .unwrap_or_else(|| permissions.get(user_id).copied().unwrap_or(false));
     permissions.insert(user_id.to_string(), can_edit);
     save_playlist_permissions(db, playlist_id, &permissions).await?;
     Ok(Some(playlist_user_permissions_json(user_id, can_edit)))
@@ -847,9 +1079,22 @@ pub async fn get_playlist_items(
 
 pub async fn add_to_playlist(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(playlist_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    match playlist_write_access_from_request(&state, &headers, &query, &playlist_id).await {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => return playlist_forbidden_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "Error": "Playlist not found" })),
+            )
+                .into_response();
+        }
+        Err(error) => return internal_error(error),
+    }
     let ids = match ids_query(&query, &["ids", "Ids"]) {
         Ok(ids) => ids,
         Err(error) => return validation_error_response(error),
@@ -867,9 +1112,22 @@ pub async fn add_to_playlist(
 
 pub async fn remove_from_playlist(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(playlist_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    match playlist_write_access_from_request(&state, &headers, &query, &playlist_id).await {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => return playlist_forbidden_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "Error": "Playlist not found" })),
+            )
+                .into_response();
+        }
+        Err(error) => return internal_error(error),
+    }
     let ids = match ids_query(&query, &["ids", "Ids", "entryIds", "EntryIds"]) {
         Ok(ids) => ids,
         Err(error) => return validation_error_response(error),
@@ -1003,13 +1261,15 @@ pub async fn remove_from_collection_delete(
 mod tests {
     use super::{
         MAX_COLLECTION_PLAYLIST_IDS, MAX_COLLECTION_PLAYLIST_NAME_LEN, add_children,
-        collection_item_json, collection_playlist_name, get_playlist_inner,
+        collection_item_json, collection_playlist_name, create_playlist_inner, get_playlist_inner,
         item_collections_result, item_ids_from_value, normalize_item_ids, playlist_items_inner,
-        playlist_user_inner, playlist_user_permissions_json, remove_children,
-        set_playlist_user_permission,
+        playlist_user_inner, playlist_user_permissions_json, playlist_users_from_value,
+        playlist_write_access, remove_children, set_playlist_user_permission,
+        update_playlist_inner,
     };
     use sea_orm::{ConnectionTrait, Database};
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn collection_item_shape_is_boxset() {
@@ -1036,6 +1296,20 @@ mod tests {
         let user = playlist_user_permissions_json("u1", false);
         assert_eq!(user["UserId"], "u1");
         assert_eq!(user["CanEdit"], false);
+    }
+
+    #[test]
+    fn playlist_user_inputs_are_normalized_and_limited() {
+        let users = playlist_users_from_value(Some(&json!([
+            { "UserId": " u1 ", "CanEdit": true },
+            { "UserId": "u2" }
+        ])))
+        .unwrap();
+        assert_eq!(users.get("u1"), Some(&true));
+        assert_eq!(users.get("u2"), Some(&false));
+        assert!(playlist_users_from_value(Some(&json!({"UserId": "u1"}))).is_err());
+        assert!(playlist_users_from_value(Some(&json!([{ "CanEdit": true }]))).is_err());
+        assert!(playlist_users_from_value(Some(&json!([{ "UserId": "bad\nid" }]))).is_err());
     }
 
     #[test]
@@ -1086,6 +1360,98 @@ mod tests {
 
         let loaded = playlist_user_inner(&db, "p1", "u1").await.unwrap().unwrap();
         assert_eq!(loaded["CanEdit"], false);
+
+        insert_user(&db, "u2").await;
+        let inherited = playlist_user_inner(&db, "p1", "u2").await.unwrap().unwrap();
+        assert_eq!(inherited["CanEdit"], false);
+    }
+
+    #[tokio::test]
+    async fn playlist_creation_grants_owner_edit_access() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        insert_user(&db, "owner").await;
+        insert_user(&db, "viewer").await;
+        insert_media_item(&db, "m1", "Movie", "Movie").await;
+
+        let mut users = HashMap::new();
+        users.insert("viewer".to_string(), false);
+        let playlist_id = create_playlist_inner(
+            &db,
+            "Road Trip",
+            &["m1".to_string()],
+            "Video",
+            "owner",
+            users,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            playlist_write_access(&db, &playlist_id, "owner", false)
+                .await
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            playlist_write_access(&db, &playlist_id, "viewer", false)
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            playlist_write_access(&db, &playlist_id, "admin", true)
+                .await
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            playlist_write_access(&db, "missing", "owner", false)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let playlist = get_playlist_inner(&db, &playlist_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(playlist["ItemIds"], json!(["m1"]));
+        assert!(
+            playlist["Shares"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|user| user["UserId"] == "owner" && user["CanEdit"] == true)
+        );
+    }
+
+    #[tokio::test]
+    async fn playlist_update_replaces_share_permissions() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+        insert_media_item(&db, "p1", "Playlist", "Playlist").await;
+
+        let users = playlist_users_from_value(Some(&json!([
+            { "UserId": "u1", "CanEdit": true },
+            { "UserId": "u2", "CanEdit": false }
+        ])))
+        .unwrap();
+        assert!(
+            update_playlist_inner(&db, "p1", None, None, Some(users))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            playlist_write_access(&db, "p1", "u1", false).await.unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            playlist_write_access(&db, "p1", "u2", false).await.unwrap(),
+            Some(false)
+        );
     }
 
     #[tokio::test]

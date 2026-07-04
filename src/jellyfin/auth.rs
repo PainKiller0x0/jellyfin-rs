@@ -1778,8 +1778,7 @@ fn sessions_read_requires_admin(
     if method != Method::GET || path != "/Sessions" {
         return false;
     }
-    query_value(query, "ControllableByUserId")
-        .is_none_or(|target| target != user_id)
+    query_value(query, "ControllableByUserId").is_none_or(|target| target != user_id)
 }
 
 fn session_user_management_write(path: &str) -> bool {
@@ -1848,10 +1847,9 @@ async fn session_control_allowed(
     user_id: &str,
 ) -> Option<bool> {
     let sessions = state.playback_sessions.read().await;
-    sessions.get(session_id).map(|session| {
-        session.supports_remote_control
-            && session_user_matches(session, user_id)
-    })
+    sessions
+        .get(session_id)
+        .map(|session| session.supports_remote_control && session_user_matches(session, user_id))
 }
 
 async fn session_read_allowed(state: &AppState, session_id: &str, user_id: &str) -> Option<bool> {

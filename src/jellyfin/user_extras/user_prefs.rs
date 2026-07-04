@@ -3,13 +3,20 @@ use std::{collections::HashMap, sync::Arc};
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use sea_orm::ConnectionTrait;
 use serde_json::{Value, json};
 
-use crate::{app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error};
+use crate::{
+    app::state::AppState,
+    db::row_ext::QueryResultExt,
+    jellyfin::{
+        auth::request_user_id_and_admin_or_default, collect::playlist_write_access,
+        common::internal_error,
+    },
+};
 
 const MAX_USER_SETTING_KEY_LEN: usize = 128;
 const MAX_USER_SETTING_VALUE_BYTES: usize = 64 * 1024;
@@ -218,13 +225,30 @@ pub async fn play_queue(
 /// POST /Playlists/{playlist_id}/Items/{item_id}/Move/{new_index} — reorder playlist
 pub async fn playlist_move_item(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((playlist_id, item_id, new_index)): Path<(String, String, usize)>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    let (user_id, is_admin) = request_user_id_and_admin_or_default(&state, &headers, &query).await;
+    match playlist_write_access(&state.db, &playlist_id, &user_id, is_admin).await {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => return playlist_forbidden_response(),
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return internal_error(error),
+    }
     match move_playlist_item_inner(&state.db, &playlist_id, &item_id, new_index).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => internal_error(error),
     }
+}
+
+fn playlist_forbidden_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "Error": "Playlist access is denied" })),
+    )
+        .into_response()
 }
 
 async fn move_playlist_item_inner(

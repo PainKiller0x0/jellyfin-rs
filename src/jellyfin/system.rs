@@ -47,6 +47,10 @@ const MAX_PLUGIN_REPOSITORY_NAME_LEN: usize = 128;
 const MAX_PLUGIN_REPOSITORY_URL_LEN: usize = 2048;
 const MAX_SCHEDULED_TASK_TRIGGERS: usize = 32;
 const MAX_SCHEDULED_TASK_TRIGGERS_JSON_BYTES: usize = 32 * 1024;
+const MAX_NOTIFICATION_NAME_LEN: usize = 256;
+const MAX_NOTIFICATION_DESCRIPTION_LEN: usize = 4096;
+const MAX_NOTIFICATION_IDS: usize = 512;
+const MAX_NOTIFICATION_ID_LEN: usize = 128;
 const CAMERA_UPLOADS_PATH: &str = "data/camera_uploads";
 const USER_USAGE_BACKUP_PATH: &str = "data/user_usage_stats";
 const FALLBACK_FONTS_PATH: &str = "data/fonts";
@@ -3240,11 +3244,30 @@ pub async fn send_admin_notification(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(name) = query_value(&query, "Name").filter(|value| !value.is_empty()) else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let name = match normalize_notification_text(
+        query_value(&query, "Name").as_deref(),
+        MAX_NOTIFICATION_NAME_LEN,
+        true,
+        "Name is required",
+    ) {
+        Ok(name) => name,
+        Err(error) => return validation_error_response(error),
     };
-    let description = query_value(&query, "Description").unwrap_or_default();
-    let level = query_value(&query, "Level").unwrap_or_else(|| "Normal".to_string());
+    let description = match normalize_notification_text(
+        query_value(&query, "Description").as_deref(),
+        MAX_NOTIFICATION_DESCRIPTION_LEN,
+        false,
+        "Description is invalid",
+    ) {
+        Ok(description) => description,
+        Err(error) => return validation_error_response(error),
+    };
+    let level = match normalize_notification_level(
+        query_value(&query, "Level").as_deref().unwrap_or("Normal"),
+    ) {
+        Ok(level) => level,
+        Err(error) => return validation_error_response(error),
+    };
     match insert_notification(&state, None, &name, &description, &level).await {
         Ok(()) => Json(json!({ "Notifications": [], "TotalRecordCount": 0 })).into_response(),
         Err(error) => internal_error(error),
@@ -3329,6 +3352,22 @@ async fn insert_notification(
     description: &str,
     level: &str,
 ) -> anyhow::Result<()> {
+    let name = normalize_notification_text(
+        Some(name),
+        MAX_NOTIFICATION_NAME_LEN,
+        true,
+        "Name is required",
+    )
+    .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    let description = normalize_notification_text(
+        Some(description),
+        MAX_NOTIFICATION_DESCRIPTION_LEN,
+        false,
+        "Description is invalid",
+    )
+    .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    let level =
+        normalize_notification_level(level).map_err(|(_, message)| anyhow::anyhow!(message))?;
     let now = now_unix();
     let id = stable_text_id(&format!(
         "notification:{now}:{}:{name}:{description}:{level}",
@@ -3394,18 +3433,22 @@ async fn update_notification_read_state(
     query: &HashMap<String, String>,
     read: bool,
 ) -> Response {
-    let ids = query
-        .get("Ids")
-        .or_else(|| query.get("ids"))
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let ids = match normalize_notification_ids(
+        query
+            .get("Ids")
+            .or_else(|| query.get("ids"))
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    ) {
+        Ok(ids) => ids,
+        Err(error) => return validation_error_response(error),
+    };
     if ids.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -3475,6 +3518,59 @@ async fn notification_read_ids(db: &DatabaseConnection, user_id: &str) -> Vec<St
 
 fn notification_read_key(user_id: &str) -> String {
     format!("notifications_read:{user_id}")
+}
+
+fn normalize_notification_text(
+    value: Option<&str>,
+    max_len: usize,
+    required: bool,
+    required_error: &'static str,
+) -> Result<String, (StatusCode, &'static str)> {
+    let value = value.unwrap_or_default().trim();
+    if required && value.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, required_error));
+    }
+    if value.chars().count() > max_len {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, required_error));
+    }
+    if value.contains('\0')
+        || value
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err((StatusCode::BAD_REQUEST, required_error));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_notification_level(level: &str) -> Result<String, (StatusCode, &'static str)> {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "" | "normal" | "info" | "information" => Ok("Normal".to_string()),
+        "warning" | "warn" => Ok("Warning".to_string()),
+        "error" | "err" => Ok("Error".to_string()),
+        _ => Err((StatusCode::BAD_REQUEST, "Invalid notification level")),
+    }
+}
+
+fn normalize_notification_ids(ids: Vec<String>) -> Result<Vec<String>, (StatusCode, &'static str)> {
+    if ids.len() > MAX_NOTIFICATION_IDS {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Too many notification ids"));
+    }
+    let mut normalized = Vec::new();
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() || normalized.iter().any(|existing| existing == id) {
+            continue;
+        }
+        if id.len() > MAX_NOTIFICATION_ID_LEN
+            || id.contains('\0')
+            || id.chars().any(char::is_control)
+        {
+            return Err((StatusCode::BAD_REQUEST, "Invalid notification id"));
+        }
+        normalized.push(id.to_string());
+    }
+    Ok(normalized)
 }
 
 fn notification_level(level: &str) -> &str {
@@ -4401,6 +4497,7 @@ mod tests {
         live_tv_default_tuner_host, live_tv_default_tuner_host_value, live_tv_guide_info,
         live_tv_info, live_tv_timer_defaults, live_tv_timer_defaults_value, live_tv_unavailable,
         log_file_entry, normalize_branding_options, normalize_device_custom_name,
+        normalize_notification_ids, normalize_notification_level, normalize_notification_text,
         normalize_plugin_repositories, normalize_scheduled_task_triggers, notification_items,
         notification_services_test, notification_services_value, package_install_unavailable,
         package_list, package_update_list, party_unavailable, play_activity_rows, plugin_list,
@@ -5544,6 +5641,59 @@ mod tests {
                 .await
                 .status(),
             axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn notification_inputs_are_normalized_and_limited() {
+        assert_eq!(
+            normalize_notification_text(
+                Some("  Hello\t"),
+                super::MAX_NOTIFICATION_NAME_LEN,
+                true,
+                "Name is required"
+            )
+            .unwrap(),
+            "Hello"
+        );
+        assert!(
+            normalize_notification_text(
+                Some("bad\0name"),
+                super::MAX_NOTIFICATION_NAME_LEN,
+                true,
+                "Name is required"
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_notification_text(
+                Some(&"x".repeat(super::MAX_NOTIFICATION_NAME_LEN + 1)),
+                super::MAX_NOTIFICATION_NAME_LEN,
+                true,
+                "Name is required"
+            )
+            .is_err()
+        );
+        assert_eq!(normalize_notification_level("warn").unwrap(), "Warning");
+        assert_eq!(
+            normalize_notification_level("information").unwrap(),
+            "Normal"
+        );
+        assert!(normalize_notification_level("critical").is_err());
+        assert_eq!(
+            normalize_notification_ids(vec![
+                " n1 ".to_string(),
+                "n1".to_string(),
+                "".to_string(),
+                "n2".to_string()
+            ])
+            .unwrap(),
+            vec!["n1".to_string(), "n2".to_string()]
+        );
+        assert!(normalize_notification_ids(vec!["bad\nid".to_string()]).is_err());
+        assert!(
+            normalize_notification_ids(vec!["x".to_string(); super::MAX_NOTIFICATION_IDS + 1])
+                .is_err()
         );
     }
 

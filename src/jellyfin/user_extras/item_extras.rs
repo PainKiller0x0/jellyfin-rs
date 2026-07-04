@@ -17,7 +17,7 @@ use crate::{
         common::{internal_error, strip_nulls},
         item_queries,
     },
-    library::models::MediaItem,
+    library::{models::MediaItem, path_utils},
 };
 
 /// GET /Items/{item_id}/Intros — get intros (returns empty, not supported)
@@ -834,6 +834,9 @@ pub async fn trickplay_playlist(
 ) -> Response {
     match trickplay_info(&state.db, &item_id, width).await {
         Ok(Some(info)) => {
+            if !info.has_allowed_path(&state.db).await {
+                return StatusCode::NOT_FOUND.into_response();
+            }
             if tokio::fs::metadata(&info.path).await.is_err() {
                 return StatusCode::NOT_FOUND.into_response();
             }
@@ -860,19 +863,24 @@ pub async fn trickplay_tile(
         return StatusCode::NOT_FOUND.into_response();
     };
     match trickplay_info(&state.db, &item_id, width).await {
-        Ok(Some(info)) if index == 0 => match tokio::fs::read(&info.path).await {
-            Ok(bytes) => {
-                let mut headers = HeaderMap::new();
-                headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
-                headers.insert(
-                    header::CONTENT_LENGTH,
-                    HeaderValue::from_str(&bytes.len().to_string())
-                        .unwrap_or_else(|_| HeaderValue::from_static("0")),
-                );
-                (headers, bytes).into_response()
+        Ok(Some(info)) if index == 0 => {
+            if !info.has_allowed_path(&state.db).await {
+                return StatusCode::NOT_FOUND.into_response();
             }
-            Err(_) => StatusCode::NOT_FOUND.into_response(),
-        },
+            match tokio::fs::read(&info.path).await {
+                Ok(bytes) => {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
+                    headers.insert(
+                        header::CONTENT_LENGTH,
+                        HeaderValue::from_str(&bytes.len().to_string())
+                            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+                    );
+                    (headers, bytes).into_response()
+                }
+                Err(_) => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => internal_error(error),
     }
@@ -883,6 +891,26 @@ struct TrickplayInfo {
     tile_count: i64,
     interval_ticks: i64,
     path: String,
+}
+
+impl TrickplayInfo {
+    async fn has_allowed_path(&self, db: &DatabaseConnection) -> bool {
+        let mut roots = vec![
+            std::path::PathBuf::from("data")
+                .join("trickplay")
+                .to_string_lossy()
+                .to_string(),
+            std::path::PathBuf::from("data")
+                .join("images")
+                .to_string_lossy()
+                .to_string(),
+        ];
+        match library_roots(db).await {
+            Ok(library_roots) => roots.extend(library_roots),
+            Err(error) => tracing::warn!("failed to read library roots for trickplay: {error:#}"),
+        }
+        path_utils::path_within_roots(&self.path, &roots)
+    }
 }
 
 async fn trickplay_info(
@@ -907,6 +935,19 @@ async fn trickplay_info(
 
 fn parse_trickplay_index(value: &str) -> Option<i64> {
     value.trim_end_matches(".jpg").parse().ok()
+}
+
+async fn library_roots(db: &DatabaseConnection) -> anyhow::Result<Vec<String>> {
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "SELECT path FROM library_paths",
+            vec![],
+        ))
+        .await?;
+    rows.iter()
+        .map(|row| row.get_str("path").map_err(Into::into))
+        .collect()
 }
 
 /// GET /Items/{item_id}/RemoteSearch/Subtitles/{language} — search remote subtitles
@@ -1005,11 +1046,11 @@ async fn public_item_exists(db: &DatabaseConnection, item_id: &str) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::{
-        ExtraKind, empty_instant_mix_response, include_item_types, instant_mix_from_seed_ids,
-        instant_mix_response, item_critic_reviews, item_extras, item_intros_value,
-        media_segments_value, parse_trickplay_index, public_item_exists, query_limit,
-        remote_subtitle_search, seed_ids_for_artist, seed_ids_for_item, seed_ids_for_music_genre,
-        studio_image_with_index, trickplay_info,
+        ExtraKind, TrickplayInfo, empty_instant_mix_response, include_item_types,
+        instant_mix_from_seed_ids, instant_mix_response, item_critic_reviews, item_extras,
+        item_intros_value, media_segments_value, parse_trickplay_index, public_item_exists,
+        query_limit, remote_subtitle_search, seed_ids_for_artist, seed_ids_for_item,
+        seed_ids_for_music_genre, studio_image_with_index, trickplay_info,
     };
     use axum::{
         body::to_bytes, extract::Path, extract::Query, extract::State, response::IntoResponse,
@@ -1451,6 +1492,60 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn trickplay_paths_must_stay_inside_library_or_data_roots() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let temp =
+            std::env::temp_dir().join(format!("jellyfin-rs-trickplay-{}", uuid::Uuid::new_v4()));
+        let library = temp.join("library");
+        let outside = temp.join("outside");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let allowed_tile = library.join("tiles.jpg");
+        let rejected_tile = outside.join("secret.jpg");
+        std::fs::write(&allowed_tile, b"tile").unwrap();
+        std::fs::write(&rejected_tile, b"secret").unwrap();
+
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES ('lib', 'Library', 'movies', 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO library_paths (id, library_id, path, created_at) VALUES ('path1', 'lib', ?, 1)",
+            vec![library.to_string_lossy().to_string().into()],
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            (TrickplayInfo {
+                width: 320,
+                tile_count: 1,
+                interval_ticks: 5_000_000,
+                path: allowed_tile.to_string_lossy().to_string(),
+            })
+            .has_allowed_path(&db)
+            .await
+        );
+        assert!(
+            !(TrickplayInfo {
+                width: 320,
+                tile_count: 1,
+                interval_ticks: 5_000_000,
+                path: rejected_tile.to_string_lossy().to_string(),
+            })
+            .has_allowed_path(&db)
+            .await
+        );
+
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[tokio::test]

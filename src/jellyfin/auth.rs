@@ -120,6 +120,8 @@ const ADMIN_CONTAINS: &[&str] = &[
 const QUICK_CONNECT_PREFIX: &str = "quick_connect:";
 const QUICK_CONNECT_CODE_PREFIX: &str = "quick_connect_code:";
 const QUICK_CONNECT_TTL_SECONDS: i64 = 10 * 60;
+const MAX_API_KEY_APP_LEN: usize = 128;
+const MAX_API_KEY_TOKEN_LEN: usize = 256;
 const MAX_USER_NAME_LEN: usize = 128;
 const MAX_USER_PASSWORD_LEN: usize = 1024;
 const MAX_USER_SETTING_STRING_LEN: usize = 512;
@@ -171,6 +173,7 @@ pub struct UpdatePasswordRequest {
 
 #[derive(Deserialize)]
 pub struct CreateApiKeyQuery {
+    #[serde(rename = "app", alias = "App")]
     app: Option<String>,
 }
 
@@ -512,7 +515,7 @@ pub async fn create_api_key(
 ) -> Response {
     match create_api_key_inner(&state, query).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) if error.to_string().contains("required") => (
+        Err(error) if api_key_validation_error(&error) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "Error": error.to_string() })),
         )
@@ -527,6 +530,11 @@ pub async fn delete_api_key(
 ) -> Response {
     match delete_api_key_inner(&state.db, &key).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) if api_key_validation_error(&error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": error.to_string() })),
+        )
+            .into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -1097,12 +1105,7 @@ async fn api_keys_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<JsonValue
 }
 
 async fn create_api_key_inner(state: &AppState, query: CreateApiKeyQuery) -> anyhow::Result<()> {
-    let app = query
-        .app
-        .as_deref()
-        .map(str::trim)
-        .filter(|app| !app.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("app is required"))?;
+    let app = validate_api_key_app(query.app.as_deref())?;
     let now = now_unix();
     let token = Uuid::new_v4().simple().to_string();
     let key_id = Uuid::new_v4().to_string();
@@ -1110,7 +1113,7 @@ async fn create_api_key_inner(state: &AppState, query: CreateApiKeyQuery) -> any
     let key_active = api_keys::ActiveModel {
         id: Set(key_id),
         access_token: Set(token.clone()),
-        name: Set(app.to_string()),
+        name: Set(app.clone()),
         user_id: Set(state.user_id.to_string()),
         created_at: Set(now),
         ..Default::default()
@@ -1124,7 +1127,7 @@ async fn create_api_key_inner(state: &AppState, query: CreateApiKeyQuery) -> any
         id: Set(Uuid::new_v4().to_string()),
         user_id: Set(state.user_id.to_string()),
         token_hash: Set(stable_text_id(&token)),
-        name: Set(Some(app.to_string())),
+        name: Set(Some(app)),
         created_at: Set(now),
         ..Default::default()
     };
@@ -1137,7 +1140,8 @@ async fn create_api_key_inner(state: &AppState, query: CreateApiKeyQuery) -> any
 }
 
 async fn delete_api_key_inner(db: &DatabaseConnection, key: &str) -> anyhow::Result<()> {
-    let token_hash = stable_text_id(key);
+    let key = validate_api_key_token(key)?;
+    let token_hash = stable_text_id(&key);
 
     ApiKeys::delete_many()
         .filter(api_keys::Column::AccessToken.eq(key))
@@ -1152,6 +1156,40 @@ async fn delete_api_key_inner(db: &DatabaseConnection, key: &str) -> anyhow::Res
         .context("failed to delete api key access token")?;
 
     Ok(())
+}
+
+fn api_key_validation_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.to_string().as_str(),
+        "app is required" | "Invalid app name" | "Invalid api key"
+    )
+}
+
+fn validate_api_key_app(value: Option<&str>) -> anyhow::Result<String> {
+    let value = value.unwrap_or_default().trim();
+    if value.is_empty() {
+        bail!("app is required");
+    }
+    if value.chars().count() > MAX_API_KEY_APP_LEN
+        || value.contains('\0')
+        || value.chars().any(char::is_control)
+    {
+        bail!("Invalid app name");
+    }
+    Ok(value.to_string())
+}
+
+fn validate_api_key_token(value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > MAX_API_KEY_TOKEN_LEN
+        || !value
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
+    {
+        bail!("Invalid api key");
+    }
+    Ok(value.to_string())
 }
 
 async fn list_users_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<JsonValue>> {
@@ -2848,6 +2886,67 @@ mod tests {
         assert_eq!(result["TotalRecordCount"], 1);
         assert_eq!(result["StartIndex"], 0);
         assert_eq!(result["Items"][0]["AppName"], "Web");
+    }
+
+    #[test]
+    fn api_key_inputs_are_normalized_and_limited() {
+        assert_eq!(
+            validate_api_key_app(Some("  Dashboard  ")).unwrap(),
+            "Dashboard"
+        );
+        assert!(validate_api_key_app(None).is_err());
+        assert!(validate_api_key_app(Some("bad\napp")).is_err());
+        assert!(validate_api_key_app(Some(&"x".repeat(MAX_API_KEY_APP_LEN + 1))).is_err());
+
+        assert_eq!(
+            validate_api_key_token(" abc-DEF_123.456 ").unwrap(),
+            "abc-DEF_123.456"
+        );
+        assert!(validate_api_key_token("").is_err());
+        assert!(validate_api_key_token("bad/key").is_err());
+        assert!(validate_api_key_token(&"x".repeat(MAX_API_KEY_TOKEN_LEN + 1)).is_err());
+
+        let query: CreateApiKeyQuery = serde_json::from_value(json!({ "App": "Emby" })).unwrap();
+        assert_eq!(query.app.as_deref(), Some("Emby"));
+    }
+
+    #[tokio::test]
+    async fn api_key_create_and_delete_manage_tokens() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let state = test_state(db);
+        let statement = crate::db::helpers::portable_statement(
+            state.db.get_database_backend(),
+            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, 'admin', 'admin', 1, 0, 1, 1)",
+            vec![state.user_id.to_string().into()],
+        );
+        state.db.execute(statement).await.unwrap();
+
+        create_api_key_inner(
+            &state,
+            CreateApiKeyQuery {
+                app: Some("  Dashboard  ".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let keys = api_keys_inner(&state.db).await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["AppName"], "Dashboard");
+        let token = keys[0]["AccessToken"].as_str().unwrap().to_string();
+        assert_eq!(AccessTokens::find().all(&state.db).await.unwrap().len(), 1);
+
+        delete_api_key_inner(&state.db, &token).await.unwrap();
+        assert!(api_keys_inner(&state.db).await.unwrap().is_empty());
+        assert!(
+            AccessTokens::find()
+                .all(&state.db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(delete_api_key_inner(&state.db, "../bad").await.is_err());
     }
 
     #[test]

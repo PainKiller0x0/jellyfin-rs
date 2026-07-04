@@ -458,3 +458,126 @@ pub async fn playing_item_progress(
 
     StatusCode::NO_CONTENT.into_response()
 }
+
+pub async fn current_user_playing_item_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Path(item_id): Path<String>,
+    body: Option<Json<JsonValue>>,
+) -> Response {
+    let user_id = request_user_id_or_default(&state, &headers, &query).await;
+    playing_item_start(
+        State(state),
+        Path((user_id, item_id)),
+        headers,
+        Query(query),
+        body,
+    )
+    .await
+}
+
+pub async fn current_user_playing_item_stop(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    let user_id = request_user_id_or_default(&state, &headers, &query).await;
+    playing_item_stop(State(state), Path((user_id, item_id)), Query(query)).await
+}
+
+pub async fn current_user_playing_item_progress(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Path(item_id): Path<String>,
+    body: Option<Json<JsonValue>>,
+) -> Response {
+    let user_id = request_user_id_or_default(&state, &headers, &query).await;
+    playing_item_progress(State(state), Path((user_id, item_id)), Query(query), body).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::current_user_playing_item_start;
+    use crate::app::state::{AppState, PlaybackSession};
+    use crate::db::row_ext::QueryResultExt;
+    use axum::{
+        Json,
+        extract::{Path, Query, State},
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+    };
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::{RwLock, broadcast};
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn current_user_playing_item_start_uses_single_path_item_id() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let state = Arc::new(test_state(db));
+        seed_user_and_item(&state.db, &state.user_id.to_string(), "m1").await;
+
+        let response = current_user_playing_item_start(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(HashMap::new()),
+            Path("m1".to_string()),
+            Some(Json(serde_json::json!({ "PositionTicks": 42 }))),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let row = state
+            .db
+            .query_one(crate::db::helpers::portable_statement(
+                state.db.get_database_backend(),
+                "SELECT playback_position_ticks FROM user_data WHERE user_id = ? AND item_id = ?",
+                vec![state.user_id.to_string().into(), "m1".into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get_i64("playback_position_ticks").unwrap(), 42);
+    }
+
+    async fn seed_user_and_item(db: &DatabaseConnection, user_id: &str, item_id: &str) {
+        let backend = db.get_database_backend();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, 'test', 'Test', 0, 0, 1, 1)",
+            vec![user_id.into()],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, 'Movie', 'D:/movie.mkv', '', '', 'Movie', 0, 1, 1, 1, 1)",
+            vec![item_id.into()],
+        ))
+        .await
+        .unwrap();
+    }
+
+    fn test_state(db: DatabaseConnection) -> AppState {
+        let (ws_event_tx, _) = broadcast::channel(4);
+        AppState {
+            user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, b"playback-test"),
+            access_token: "test-token".to_string(),
+            db,
+            media_dirs: Vec::new(),
+            http_client: reqwest::Client::new(),
+            tmdb_api_key: RwLock::new(None),
+            playback_sessions: RwLock::new(HashMap::<String, PlaybackSession>::new()),
+            session_capabilities: RwLock::new(HashMap::new()),
+            ws_event_tx,
+            sa_config: crate::config::StrmAssistantConfig::default(),
+            intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),
+            queue_manager: Arc::new(crate::queue::QueueManager::default()),
+        }
+    }
+}

@@ -1002,11 +1002,12 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/PlayingItems/{item_id}",
-            post(playback::playing_item_start).delete(playback::playing_item_stop),
+            post(playback::current_user_playing_item_start)
+                .delete(playback::current_user_playing_item_stop),
         )
         .route(
             "/PlayingItems/{item_id}/Progress",
-            post(playback::playing_item_progress),
+            post(playback::current_user_playing_item_progress),
         )
         .route(
             "/UserSettings/{user_id}",

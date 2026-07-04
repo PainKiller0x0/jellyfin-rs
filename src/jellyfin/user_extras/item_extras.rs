@@ -20,8 +20,15 @@ use crate::{
 };
 
 /// GET /Items/{item_id}/Intros — get intros (returns empty, not supported)
-pub async fn item_intros() -> Response {
-    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+pub async fn item_intros(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    match item_intros_value(&state.db, &request_user_id(&state, &query), &item_id).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => internal_error(error),
+    }
 }
 
 /// GET /Items/{item_id}/LocalTrailers — get local trailers
@@ -198,6 +205,23 @@ fn theme_result(items: Vec<MediaItem>, owner_id: &str) -> serde_json::Value {
         "StartIndex": 0,
         "OwnerId": owner_id,
     })
+}
+
+async fn item_intros_value(
+    db: &DatabaseConnection,
+    user_id: &str,
+    item_id: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let mut items = item_extras(db, user_id, item_id, ExtraKind::Trailer).await?;
+    items.extend(item_extras(db, user_id, item_id, ExtraKind::SpecialFeature).await?);
+    items.sort_by(|left, right| left.title.cmp(&right.title).then(left.id.cmp(&right.id)));
+    items.dedup_by(|left, right| left.id == right.id);
+    let total = items.len();
+    Ok(json!({
+        "Items": media_items_json(items),
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    }))
 }
 
 fn request_user_id(state: &AppState, query: &HashMap<String, String>) -> String {
@@ -849,8 +873,14 @@ pub async fn studio_image(
 }
 
 /// GET /Users/{id}/Items/{id}/Intros — per-user intros
-pub async fn user_item_intros() -> Response {
-    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+pub async fn user_item_intros(
+    State(state): State<Arc<AppState>>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Response {
+    match item_intros_value(&state.db, &user_id, &item_id).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => internal_error(error),
+    }
 }
 
 /// GET /Users/{id}/Items/{id}/LocalTrailers — per-user local trailers
@@ -878,8 +908,8 @@ pub async fn user_item_special_features(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExtraKind, include_item_types, item_extras, media_segments_value, parse_trickplay_index,
-        query_limit, trickplay_info,
+        ExtraKind, include_item_types, item_extras, item_intros_value, media_segments_value,
+        parse_trickplay_index, query_limit, trickplay_info,
     };
     use sea_orm::{ConnectionTrait, Database};
     use serde_json::json;
@@ -983,6 +1013,14 @@ mod tests {
                 "Video",
                 0_i64,
             ),
+            (
+                "trailer1",
+                "Trailer",
+                "D:/Movie/trailers/Trailer.mp4",
+                "movie1",
+                "Video",
+                0_i64,
+            ),
         ] {
             db.execute(crate::db::helpers::portable_statement(
                 backend,
@@ -1006,6 +1044,18 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "extra1");
 
+        let intros = item_intros_value(&db, "u1", "video1").await.unwrap();
+        assert_eq!(intros["TotalRecordCount"], 2);
+        assert_eq!(intros["StartIndex"], 0);
+        let ids: Vec<_> = intros["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["Id"].as_str())
+            .collect();
+        assert!(ids.contains(&"extra1"));
+        assert!(ids.contains(&"trailer1"));
+
         db.execute(crate::db::helpers::portable_statement(
             backend,
             "UPDATE media_items SET is_public = 0 WHERE id = ?",
@@ -1018,6 +1068,10 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+        assert_eq!(
+            item_intros_value(&db, "u1", "video1").await.unwrap()["TotalRecordCount"],
+            0
         );
     }
 

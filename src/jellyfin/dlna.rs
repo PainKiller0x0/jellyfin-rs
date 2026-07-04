@@ -16,6 +16,8 @@ use crate::{
 };
 
 const DEFAULT_PROFILE_ID: &str = "00000000-0000-0000-0000-000000000000";
+const MAX_DLNA_PROFILE_ID_LEN: usize = 128;
+const MAX_DLNA_PROFILE_JSON_BYTES: usize = 256 * 1024;
 
 pub async fn profile_infos(State(state): State<Arc<AppState>>) -> Response {
     match profile_infos_inner(&state.db).await {
@@ -270,6 +272,9 @@ async fn profile_by_id_inner(
     if profile_id.eq_ignore_ascii_case("default") || profile_id == DEFAULT_PROFILE_ID {
         return Ok(Some(default_device_profile()));
     }
+    let Some(profile_id) = custom_profile_id(profile_id) else {
+        return Ok(None);
+    };
     let key = profile_key(profile_id);
     Ok(crate::jellyfin::system::app_setting(db, &key, "")
         .await
@@ -282,21 +287,25 @@ async fn save_profile_inner(
     db: &sea_orm::DatabaseConnection,
     mut profile: Value,
 ) -> anyhow::Result<bool> {
-    let Some(profile_id) = profile
-        .get("Id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-    else {
-        return Ok(false);
+    let profile_id = {
+        let Some(object) = profile.as_object_mut() else {
+            return Ok(false);
+        };
+        let Some(profile_id) = object
+            .get("Id")
+            .and_then(Value::as_str)
+            .and_then(custom_profile_id)
+        else {
+            return Ok(false);
+        };
+        object.insert("Id".to_string(), Value::String(profile_id.clone()));
+        profile_id
     };
-    if profile_id.eq_ignore_ascii_case("default") || profile_id == DEFAULT_PROFILE_ID {
+    let profile_json = profile.to_string();
+    if profile_json.len() > MAX_DLNA_PROFILE_JSON_BYTES {
         return Ok(false);
     }
-    profile["Id"] = Value::String(profile_id.clone());
-    crate::jellyfin::system::set_app_setting(db, &profile_key(&profile_id), &profile.to_string())
-        .await?;
+    crate::jellyfin::system::set_app_setting(db, &profile_key(&profile_id), &profile_json).await?;
     Ok(true)
 }
 
@@ -307,6 +316,9 @@ async fn delete_profile_inner(
     if profile_id.eq_ignore_ascii_case("default") || profile_id == DEFAULT_PROFILE_ID {
         return Ok(false);
     }
+    let Some(profile_id) = custom_profile_id(profile_id) else {
+        return Ok(false);
+    };
     let result = db
         .execute(crate::db::helpers::portable_statement(
             db.get_database_backend(),
@@ -317,8 +329,23 @@ async fn delete_profile_inner(
     Ok(result.rows_affected() > 0)
 }
 
-fn profile_key(profile_id: &str) -> String {
+fn profile_key(profile_id: impl AsRef<str>) -> String {
+    let profile_id = profile_id.as_ref();
     format!("dlna_profile:{profile_id}")
+}
+
+fn custom_profile_id(profile_id: &str) -> Option<String> {
+    let profile_id = profile_id.trim();
+    if profile_id.eq_ignore_ascii_case("default") || profile_id == DEFAULT_PROFILE_ID {
+        return None;
+    }
+    if profile_id.is_empty() || profile_id.len() > MAX_DLNA_PROFILE_ID_LEN {
+        return None;
+    }
+    profile_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        .then(|| profile_id.to_string())
 }
 
 fn profile_info(profile: &Value, profile_type: &str) -> Value {
@@ -616,9 +643,10 @@ fn soap_xml(status: StatusCode, xml: String) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_PROFILE_ID, connection_manager_control, connection_manager_description,
-        content_directory_control, content_directory_description, delete_profile_inner,
-        profile_by_id_inner, profile_infos_inner, save_profile_inner,
+        DEFAULT_PROFILE_ID, MAX_DLNA_PROFILE_ID_LEN, MAX_DLNA_PROFILE_JSON_BYTES,
+        connection_manager_control, connection_manager_description, content_directory_control,
+        content_directory_description, delete_profile_inner, profile_by_id_inner,
+        profile_infos_inner, save_profile_inner,
     };
     use axum::body::Bytes;
     use axum::http::{HeaderMap, HeaderValue};
@@ -725,6 +753,48 @@ mod tests {
                 .unwrap()
                 .unwrap()["Name"],
             "Default"
+        );
+    }
+
+    #[tokio::test]
+    async fn dlna_profile_writes_are_limited() {
+        let db = test_db().await;
+        assert!(!save_profile_inner(&db, json!(["bad"])).await.unwrap());
+        assert!(
+            !save_profile_inner(&db, json!({ "Id": "../bad", "Name": "Bad" }))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !save_profile_inner(
+                &db,
+                json!({ "Id": "x".repeat(MAX_DLNA_PROFILE_ID_LEN + 1), "Name": "Bad" })
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !save_profile_inner(
+                &db,
+                json!({ "Id": "big", "Name": "x".repeat(MAX_DLNA_PROFILE_JSON_BYTES) })
+            )
+            .await
+            .unwrap()
+        );
+
+        assert!(
+            save_profile_inner(&db, json!({ "Id": " ok-id_1.2 ", "Name": "Trimmed" }))
+                .await
+                .unwrap()
+        );
+        assert!(profile_by_id_inner(&db, "../bad").await.unwrap().is_none());
+        assert!(!delete_profile_inner(&db, "../bad").await.unwrap());
+        assert_eq!(
+            profile_by_id_inner(&db, "ok-id_1.2")
+                .await
+                .unwrap()
+                .unwrap()["Id"],
+            "ok-id_1.2"
         );
     }
 

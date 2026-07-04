@@ -1971,6 +1971,8 @@ fn query_scoped_user_path(path: &str) -> bool {
             | "/Search/Hints"
             | "/Shows/NextUp"
             | "/Shows/Upcoming"
+            | "/Sync/Options"
+            | "/Sync/Targets"
             | "/Trailers"
             | "/UserItems/Resume"
             | "/UserViews"
@@ -2900,6 +2902,11 @@ mod tests {
         let query = query_map("UserId=u3");
         assert_eq!(request_user_target("/Users/ItemAccess", &query), Some("u3"));
         assert_eq!(request_user_target("/Items/Access", &query), Some("u3"));
+        assert_eq!(request_user_target("/Sync/Targets", &query), Some("u3"));
+        assert_eq!(
+            request_user_target("/emby/Sync/Options", &query),
+            Some("u3")
+        );
     }
 
     #[test]

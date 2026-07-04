@@ -677,7 +677,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Items/RemoteSearch/Game", post(items::remote_search))
         .route(
             "/Items/RemoteSearch/Image",
-            get(common::empty_array).post(items::remote_search),
+            get(images::image_by_name_remote).post(items::remote_search),
         )
         .route("/Items/RemoteSearch/Movie", post(items::remote_search))
         .route("/Items/RemoteSearch/MusicAlbum", post(items::remote_search))

@@ -11,6 +11,12 @@ use serde_json::{Value, json};
 
 use crate::{app::state::AppState, db::row_ext::QueryResultExt};
 
+fn visible_media_item_sql(alias: &str) -> String {
+    format!(
+        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
+    )
+}
+
 /// DELETE /Users/{user_id}/TrackSelections/{track_type} — clear track selections
 pub async fn clear_track_selections(
     State(_state): State<Arc<AppState>>,
@@ -124,8 +130,9 @@ async fn public_stream_rows(
     filter: &str,
     order_by: &str,
 ) -> Vec<sea_orm::QueryResult> {
+    let visible = visible_media_item_sql("media_items");
     let sql = format!(
-        "SELECT DISTINCT {select_expr} FROM media_streams JOIN media_items ON media_items.id = media_streams.item_id WHERE media_items.is_public = 1 AND {filter} ORDER BY {order_by}"
+        "SELECT DISTINCT {select_expr} FROM media_streams JOIN media_items ON media_items.id = media_streams.item_id WHERE {visible} AND {filter} ORDER BY {order_by}"
     );
     db.query_all(crate::db::helpers::portable_statement(
         db.get_database_backend(),
@@ -160,14 +167,42 @@ mod tests {
     async fn stream_filters_hide_private_media_values() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        for (id, public, codec, lang, channels) in [
-            ("public", 1, "aac", "eng", 2_i64),
-            ("private", 0, "dts", "jpn", 8_i64),
+        for (id, parent_id, item_type, is_folder, public, codec, lang, channels) in [
+            ("public", "", "Movie", 0_i64, 1_i64, "aac", "eng", 2_i64),
+            ("private", "", "Movie", 0_i64, 0_i64, "dts", "jpn", 8_i64),
+            (
+                "private-parent",
+                "",
+                "Series",
+                1_i64,
+                0_i64,
+                "flac",
+                "fra",
+                6_i64,
+            ),
+            (
+                "hidden-child",
+                "private-parent",
+                "Episode",
+                0_i64,
+                1_i64,
+                "opus",
+                "spa",
+                1_i64,
+            ),
         ] {
             db.execute(crate::db::helpers::portable_statement(
                 db.get_database_backend(),
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, ?, 1, 1, 1)",
-                vec![id.into(), id.into(), id.into(), public.into()],
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?, ?, ?, 1, 1, 1)",
+                vec![
+                    id.into(),
+                    id.into(),
+                    id.into(),
+                    parent_id.into(),
+                    item_type.into(),
+                    is_folder.into(),
+                    public.into(),
+                ],
             ))
             .await
             .unwrap();

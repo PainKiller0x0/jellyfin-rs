@@ -71,12 +71,15 @@ pub fn verify_password(password: &str, password_hash: &str) -> bool {
 }
 
 pub fn http_client() -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .no_proxy();
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
     let proxy_url = std::env::var("JELLYFIN_RS_PROXY").unwrap_or_default();
     if !proxy_url.is_empty() {
-        builder = builder.proxy(reqwest::Proxy::all(&proxy_url)?);
+        builder = builder.no_proxy().proxy(reqwest::Proxy::all(&proxy_url)?);
+    } else if std::env::var("JELLYFIN_RS_NO_PROXY")
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+    {
+        builder = builder.no_proxy();
     }
     Ok(builder.build()?)
 }

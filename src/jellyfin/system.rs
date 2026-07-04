@@ -38,6 +38,7 @@ const MAX_BRANDING_SPLASHSCREEN_BYTES: usize = 10 * 1024 * 1024;
 const MAX_CLIENT_LOG_BYTES: usize = 1024 * 1024;
 const MAX_CAMERA_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 const MAX_USER_USAGE_BACKUP_BYTES: usize = 20 * 1024 * 1024;
+const MAX_LOG_LINE_LIMIT: usize = 10_000;
 const CAMERA_UPLOADS_PATH: &str = "data/camera_uploads";
 const USER_USAGE_BACKUP_PATH: &str = "data/user_usage_stats";
 const FALLBACK_FONTS_PATH: &str = "data/fonts";
@@ -2189,18 +2190,22 @@ pub async fn system_release_notes_versions() -> Response {
 pub async fn system_logs_query(Query(query): Query<HashMap<String, String>>) -> Response {
     let start_index = query
         .get("StartIndex")
+        .or_else(|| query.get("startIndex"))
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
     let limit = query
         .get("Limit")
+        .or_else(|| query.get("limit"))
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(50);
+        .unwrap_or(50)
+        .min(MAX_LOG_LINE_LIMIT);
 
     let files = log_files();
 
     let total = files.len();
     let items: Vec<_> = files.into_iter().skip(start_index).take(limit).collect();
-    Json(json!({ "Items": items, "TotalRecordCount": total })).into_response()
+    Json(json!({ "Items": items, "TotalRecordCount": total, "StartIndex": start_index }))
+        .into_response()
 }
 
 fn log_files() -> Vec<JsonValue> {
@@ -2227,7 +2232,7 @@ fn log_file_entry(path: &std::path::Path) -> Option<JsonValue> {
     Some(json!({
         "Name": name,
         "Size": meta.len(),
-        "DateModified": meta.modified().ok().and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0),
+        "DateModified": meta.modified().ok().map(|time| unix_to_jellyfin_date(system_time_to_unix(time))).unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
     }))
 }
 
@@ -2257,8 +2262,10 @@ pub async fn system_log_lines(
 ) -> Response {
     let limit = query
         .get("Limit")
+        .or_else(|| query.get("limit"))
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1000);
+        .unwrap_or(1000)
+        .min(MAX_LOG_LINE_LIMIT);
 
     match safe_log_path(&name).and_then(|path| std::fs::read_to_string(path).ok()) {
         Some(data) => {
@@ -3957,8 +3964,8 @@ mod tests {
         sanitize_file_part, save_camera_upload_to, scan_library_task, smtp_notification_test,
         stop_scheduled_task, sync_data, sync_data_result, sync_empty_query_result,
         sync_empty_response, sync_options_result, sync_play_unavailable, sync_unavailable,
-        system_log_file, tmdb_client_configuration_value, ui_command,
-        update_notification_read_state, usage_stats_breakdown_items,
+        system_log_file, system_log_lines, system_logs_query, tmdb_client_configuration_value,
+        ui_command, update_notification_read_state, usage_stats_breakdown_items,
         usage_stats_duration_histogram_items, usage_stats_hourly_items, usage_stats_session_entry,
         usage_user_entry, user_usage_stats_load_backup_from, user_usage_stats_save_backup_to,
         user_usage_stats_user_manage, user_view_grouping_options_value, web_strings_value,
@@ -4949,6 +4956,45 @@ mod tests {
     #[test]
     fn log_file_entry_rejects_non_logs() {
         assert!(log_file_entry(std::path::Path::new("notes.txt")).is_none());
+    }
+
+    #[tokio::test]
+    async fn log_query_reports_start_index_and_limits_lines() {
+        let root = std::path::PathBuf::from("logs");
+        let existed = root.exists();
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("system-test.log");
+        let second_log = root.join("system-test-2.log");
+        std::fs::write(&log, b"one\ntwo\nthree").unwrap();
+        std::fs::write(&second_log, b"other").unwrap();
+
+        let mut query = HashMap::new();
+        query.insert("StartIndex".to_string(), "1".to_string());
+        query.insert("Limit".to_string(), "1".to_string());
+        let response = system_logs_query(Query(query)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["StartIndex"], 1);
+        assert!(value["TotalRecordCount"].as_u64().unwrap_or_default() >= 1);
+        assert_eq!(value["Items"].as_array().unwrap().len(), 1);
+
+        let mut query = HashMap::new();
+        query.insert("Limit".to_string(), "2".to_string());
+        let response = system_log_lines(Path("system-test.log".to_string()), Query(query))
+            .await
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "two\nthree");
+
+        std::fs::remove_file(log).unwrap();
+        std::fs::remove_file(second_log).unwrap();
+        if !existed {
+            let _ = std::fs::remove_dir(root);
+        }
     }
 
     #[test]

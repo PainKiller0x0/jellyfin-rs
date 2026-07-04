@@ -57,10 +57,9 @@ pub async fn item_subtitles(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
 ) -> Response {
-    match subtitle_list_inner(&state.db, &item_id).await {
-        Ok(items) => {
-            Json(json!({ "Items": items, "TotalRecordCount": items.len() })).into_response()
-        }
+    match subtitle_list_result_inner(&state.db, &item_id).await {
+        Ok(Some(value)) => Json(value).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -636,6 +635,29 @@ async fn subtitle_list_inner(
             }))
         })
         .collect()
+}
+
+async fn subtitle_list_result_inner(
+    db: &sea_orm::DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<Option<Value>> {
+    let exists = db
+        .query_one(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "SELECT 1 AS found FROM media_items WHERE id = ? AND is_public = 1",
+            vec![item_id.into()],
+        ))
+        .await?
+        .is_some();
+    if !exists {
+        return Ok(None);
+    }
+    let items = subtitle_list_inner(db, item_id).await?;
+    Ok(Some(json!({
+        "Items": items,
+        "TotalRecordCount": items.len(),
+        "StartIndex": 0,
+    })))
 }
 
 pub async fn metadata_reset(
@@ -1217,8 +1239,8 @@ mod tests {
         audiobooks_next_up_inner, available_recording_options, available_recording_options_value,
         delete_alternate_sources_inner, delete_lyrics_inner, item_counts_inner, item_lyrics_inner,
         lyrics_value_from_text, metadata_editor_info_inner, parse_lrc_timestamp, stop_encodings,
-        subtitle_format, subtitle_list_inner, subtitle_provider_info, subtitle_suffix,
-        upload_lyrics_inner, upload_subtitle_inner,
+        subtitle_format, subtitle_list_inner, subtitle_list_result_inner, subtitle_provider_info,
+        subtitle_suffix, upload_lyrics_inner, upload_subtitle_inner,
     };
     use axum::body::{Bytes, to_bytes};
     use axum::extract::{Extension, Query, State};
@@ -1500,6 +1522,40 @@ mod tests {
         .unwrap();
 
         assert!(subtitle_list_inner(&db, "song").await.unwrap().is_empty());
+        assert!(
+            subtitle_list_result_inner(&db, "song")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn subtitle_list_result_reports_empty_public_items() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        insert_audio_item(
+            &db,
+            "song",
+            "Song",
+            &std::env::temp_dir().join("public-song.mp3"),
+            true,
+        )
+        .await;
+
+        let value = subtitle_list_result_inner(&db, "song")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value["TotalRecordCount"], 0);
+        assert_eq!(value["StartIndex"], 0);
+        assert!(value["Items"].as_array().unwrap().is_empty());
+        assert!(
+            subtitle_list_result_inner(&db, "missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

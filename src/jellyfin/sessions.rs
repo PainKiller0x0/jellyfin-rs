@@ -571,6 +571,16 @@ pub async fn session_add_user(
     State(state): State<Arc<AppState>>,
     Path((session_id, user_id)): Path<(String, String)>,
 ) -> Response {
+    let (session_id, user_id) = match session_user_params(&session_id, &user_id) {
+        Ok(params) => params,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "Error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
     let Some(user) = session_user_info(&state, &user_id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -578,15 +588,32 @@ pub async fn session_add_user(
     let Some(session) = sessions.get_mut(&session_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if session.additional_users.len() >= MAX_SESSION_ARRAY_ITEMS
+        && !session
+            .additional_users
+            .iter()
+            .any(|existing| existing.user_id == user.user_id)
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "Error": "Too many session users" })),
+        )
+            .into_response();
+    }
+    let mut changed = false;
     if !session
         .additional_users
         .iter()
         .any(|existing| existing.user_id == user.user_id)
     {
         session.additional_users.push(user);
+        touch_session_time(session, now_unix());
+        changed = true;
     }
     drop(sessions);
-    let _ = state.ws_event_tx.send(crate::ws::WsEvent::SessionsChanged);
+    if changed {
+        let _ = state.ws_event_tx.send(crate::ws::WsEvent::SessionsChanged);
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -595,16 +622,54 @@ pub async fn session_remove_user(
     State(state): State<Arc<AppState>>,
     Path((session_id, user_id)): Path<(String, String)>,
 ) -> Response {
+    let (session_id, user_id) = match session_user_params(&session_id, &user_id) {
+        Ok(params) => params,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "Error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
     let mut sessions = state.playback_sessions.write().await;
     let Some(session) = sessions.get_mut(&session_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let before = session.additional_users.len();
     session
         .additional_users
         .retain(|user| user.user_id != user_id);
+    let changed = session.additional_users.len() != before;
+    if changed {
+        touch_session_time(session, now_unix());
+    }
     drop(sessions);
-    let _ = state.ws_event_tx.send(crate::ws::WsEvent::SessionsChanged);
+    if changed {
+        let _ = state.ws_event_tx.send(crate::ws::WsEvent::SessionsChanged);
+    }
     StatusCode::NO_CONTENT.into_response()
+}
+
+fn session_user_params(session_id: &str, user_id: &str) -> anyhow::Result<(String, String)> {
+    Ok((
+        validate_session_path_id(session_id, "SessionId")?,
+        validate_session_path_id(user_id, "UserId")?,
+    ))
+}
+
+fn validate_session_path_id(value: &str, label: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("{label} is required");
+    }
+    if value.len() > MAX_SESSION_ID_LEN
+        || value.contains('\0')
+        || value.chars().any(char::is_control)
+    {
+        anyhow::bail!("Invalid {label}");
+    }
+    Ok(value.to_string())
 }
 
 async fn session_user_info(state: &AppState, user_id: &str) -> Option<SessionUserInfo> {
@@ -625,13 +690,22 @@ mod tests {
     use super::{
         MAX_SESSION_ARRAY_ITEMS, MAX_SESSION_ARRAY_VALUE_LEN, MAX_SESSION_ID_LEN,
         MAX_SESSION_TEXT_LEN, SessionsQuery, apply_playstate_command, auth_value,
-        device_info_from_headers, filter_sessions, normalize_string_array, query_text, session_key,
-        touch_session_time,
+        device_info_from_headers, filter_sessions, normalize_string_array, query_text,
+        session_add_user, session_key, session_remove_user, touch_session_time,
+        validate_session_path_id,
     };
-    use crate::app::state::{PlaybackSession, PlaybackState, SessionCapabilities, SessionUserInfo};
-    use axum::http::{HeaderMap, HeaderValue};
+    use crate::app::state::{
+        AppState, PlaybackSession, PlaybackState, SessionCapabilities, SessionUserInfo,
+    };
+    use axum::{
+        extract::State,
+        http::{HeaderMap, HeaderValue, StatusCode},
+    };
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::{RwLock, broadcast};
+    use uuid::Uuid;
 
     #[test]
     fn auth_value_reads_comma_separated_emby_header() {
@@ -803,6 +877,129 @@ mod tests {
         assert_eq!(sessions[0].id, "s1");
     }
 
+    #[test]
+    fn session_path_ids_are_validated() {
+        assert_eq!(
+            validate_session_path_id("  s1  ", "SessionId").unwrap(),
+            "s1"
+        );
+        assert!(validate_session_path_id("", "SessionId").is_err());
+        assert!(validate_session_path_id("bad\nid", "SessionId").is_err());
+        assert!(
+            validate_session_path_id(&"x".repeat(MAX_SESSION_ID_LEN + 1), "SessionId").is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_user_routes_add_dedupe_and_remove_users() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u2', 'guest', 'guest', 0, 0, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        let state = Arc::new(test_state(db));
+        let mut session = test_session();
+        session.additional_users.clear();
+        session.last_activity_unix = 1;
+        state
+            .playback_sessions
+            .write()
+            .await
+            .insert("s1".to_string(), session);
+
+        let response = session_add_user(
+            State(state.clone()),
+            axum::extract::Path(("s1".to_string(), "u2".to_string())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let sessions = state.playback_sessions.read().await;
+        let session = sessions.get("s1").unwrap();
+        assert_eq!(session.additional_users.len(), 1);
+        assert_eq!(session.additional_users[0].user_name, "guest");
+        assert!(session.last_activity_unix >= 1);
+        drop(sessions);
+
+        let response = session_add_user(
+            State(state.clone()),
+            axum::extract::Path(("s1".to_string(), "u2".to_string())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            state
+                .playback_sessions
+                .read()
+                .await
+                .get("s1")
+                .unwrap()
+                .additional_users
+                .len(),
+            1
+        );
+
+        let response = session_remove_user(
+            State(state.clone()),
+            axum::extract::Path(("s1".to_string(), "u2".to_string())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state
+                .playback_sessions
+                .read()
+                .await
+                .get("s1")
+                .unwrap()
+                .additional_users
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_user_routes_validate_and_limit_inputs() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('new-user', 'new-user', 'new-user', 0, 0, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        let state = Arc::new(test_state(db));
+        let mut session = test_session();
+        session.additional_users = (0..MAX_SESSION_ARRAY_ITEMS)
+            .map(|index| SessionUserInfo {
+                user_id: format!("u{index}"),
+                user_name: format!("User {index}"),
+            })
+            .collect();
+        state
+            .playback_sessions
+            .write()
+            .await
+            .insert("s1".to_string(), session);
+
+        let response = session_add_user(
+            State(state.clone()),
+            axum::extract::Path(("s1".to_string(), "new-user".to_string())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let response = session_add_user(
+            State(state),
+            axum::extract::Path(("bad\nsession".to_string(), "new-user".to_string())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     fn test_session() -> PlaybackSession {
         PlaybackSession {
             id: "s1".to_string(),
@@ -845,6 +1042,24 @@ mod tests {
                 supports_media_control: true,
                 supports_persistent_identifier: true,
             },
+        }
+    }
+
+    fn test_state(db: DatabaseConnection) -> AppState {
+        let (ws_event_tx, _) = broadcast::channel(4);
+        AppState {
+            user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, b"test"),
+            access_token: "test-token".to_string(),
+            db,
+            media_dirs: Vec::new(),
+            http_client: reqwest::Client::new(),
+            tmdb_api_key: RwLock::new(None),
+            playback_sessions: RwLock::new(HashMap::<String, PlaybackSession>::new()),
+            session_capabilities: RwLock::new(HashMap::new()),
+            ws_event_tx,
+            sa_config: crate::config::StrmAssistantConfig::default(),
+            intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),
+            queue_manager: Arc::new(crate::queue::QueueManager::default()),
         }
     }
 }

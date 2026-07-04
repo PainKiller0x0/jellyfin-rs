@@ -500,7 +500,7 @@ pub async fn find_media_item(
         db,
         user_id,
         id,
-        "WHERE media_items.id = ? AND media_items.is_public = 1",
+        "WHERE media_items.id = ? AND media_items.is_public = 1 AND (media_items.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = media_items.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = media_items.parent_id AND parent.is_public = 1))",
     )
     .await
 }
@@ -986,6 +986,38 @@ mod tests {
         );
         assert!(
             find_media_item_for_admin(&db, "u1", "private")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        for (id, parent_id, is_folder, is_public) in [
+            ("private-parent", "", 1_i64, 0_i64),
+            ("public-child", "private-parent", 0_i64, 1_i64),
+        ] {
+            db.execute(crate::db::helpers::portable_statement(
+                db.get_database_backend(),
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', ?, ?, 1, 1, 1)",
+                vec![
+                    id.into(),
+                    id.into(),
+                    format!("/tmp/{id}").into(),
+                    parent_id.into(),
+                    is_folder.into(),
+                    is_public.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+        assert!(
+            find_media_item(&db, "u1", "public-child")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find_media_item_for_admin(&db, "u1", "public-child")
                 .await
                 .unwrap()
                 .is_some()

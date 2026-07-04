@@ -187,20 +187,14 @@ pub async fn virtual_folders(State(state): State<Arc<AppState>>) -> Response {
 
 pub async fn virtual_folders_query(State(state): State<Arc<AppState>>) -> Response {
     match virtual_folders_inner(&state.db).await {
-        Ok(folders) => {
-            let total = folders.len();
-            Json(json!({ "Items": folders, "TotalRecordCount": total })).into_response()
-        }
+        Ok(folders) => Json(query_result(folders)).into_response(),
         Err(error) => internal_error(error),
     }
 }
 
 pub async fn media_folders(State(state): State<Arc<AppState>>) -> Response {
     match virtual_folders_inner(&state.db).await {
-        Ok(folders) => {
-            let total = folders.len();
-            Json(json!({ "Items": folders, "TotalRecordCount": total })).into_response()
-        }
+        Ok(folders) => Json(query_result(folders)).into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -815,12 +809,20 @@ fn option_info(name: &str, default_enabled: bool) -> Value {
     json!({ "Name": name, "DefaultEnabled": default_enabled })
 }
 
+fn query_result(items: Vec<Value>) -> Value {
+    json!({
+        "Items": items,
+        "TotalRecordCount": items.len(),
+        "StartIndex": 0
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         VirtualFolderQuery, delete_virtual_folder_inner, delete_virtual_folder_path_inner,
-        library_options_result, library_path_request, query_string, rename_virtual_folder_inner,
-        rename_virtual_folder_request, update_library_options_inner,
+        library_options_result, library_path_request, query_result, query_string,
+        rename_virtual_folder_inner, rename_virtual_folder_request, update_library_options_inner,
         update_virtual_folder_path_inner, update_virtual_folder_path_request,
         virtual_folder_request,
     };
@@ -842,6 +844,14 @@ mod tests {
                 && v.iter().any(|item| item["Type"] == "Series")
                 && v.iter().any(|item| item["Type"] == "Audio")
         }));
+    }
+
+    #[test]
+    fn library_query_results_include_start_index() {
+        let result = query_result(vec![serde_json::json!({ "Name": "Movies" })]);
+        assert_eq!(result["TotalRecordCount"], 1);
+        assert_eq!(result["StartIndex"], 0);
+        assert_eq!(result["Items"][0]["Name"], "Movies");
     }
 
     #[test]

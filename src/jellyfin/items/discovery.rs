@@ -53,16 +53,11 @@ async fn similar_items_inner(
     limit: usize,
 ) -> anyhow::Result<Vec<MediaItem>> {
     let backend = db.get_database_backend();
-    let seed_visible = db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT id FROM media_items WHERE id = ? AND is_public = 1",
-            vec![item_id.into()],
-        ))
+    if item_queries::find_media_item(db, "", item_id)
         .await
         .context("failed to check similar item seed")?
-        .is_some();
-    if !seed_visible {
+        .is_none()
+    {
         return Ok(Vec::new());
     }
 
@@ -73,7 +68,9 @@ async fn similar_items_inner(
                FROM media_genres mg_src
                JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id AND mg_src.item_id <> mg_rel.item_id
                JOIN media_items mi_rel ON mi_rel.id = mg_rel.item_id
-               WHERE mi_rel.is_public = 1 AND (mg_src.item_id = ? OR mg_src.item_id = (SELECT parent_id FROM media_items WHERE id = ?))
+               WHERE mi_rel.is_public = 1
+                    AND (mi_rel.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = mi_rel.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = mi_rel.parent_id AND parent.is_public = 1))
+                    AND (mg_src.item_id = ? OR mg_src.item_id = (SELECT parent_id FROM media_items WHERE id = ?))
                GROUP BY mg_rel.item_id ORDER BY COUNT(*) DESC LIMIT ?"#,
             vec![item_id.into(), item_id.into(), i64::try_from(limit).unwrap_or(i64::MAX).into()],
         ))
@@ -397,8 +394,35 @@ mod tests {
         insert_media_item(&db, "public", "Public", 1).await;
         insert_media_item(&db, "private", "Private", 0).await;
         insert_media_item(&db, "private_seed", "Private Seed", 0).await;
+        insert_media_item_typed(
+            &db,
+            "private-parent",
+            "Private Parent",
+            "",
+            "Movie",
+            1,
+            None,
+        )
+        .await;
+        update_item_visibility(&db, "private-parent", 0).await;
+        insert_media_item_typed(
+            &db,
+            "public-child-seed",
+            "Public Child Seed",
+            "private-parent",
+            "Movie",
+            0,
+            None,
+        )
+        .await;
         insert_genre(&db, "g1", "Drama").await;
-        for item_id in ["seed", "public", "private", "private_seed"] {
+        for item_id in [
+            "seed",
+            "public",
+            "private",
+            "private_seed",
+            "public-child-seed",
+        ] {
             link_genre(&db, item_id, "g1").await;
         }
 
@@ -407,6 +431,11 @@ mod tests {
         assert_eq!(items[0].id, "public");
 
         let items = similar_items_inner(&db, "private_seed", 10).await.unwrap();
+        assert!(items.is_empty());
+
+        let items = similar_items_inner(&db, "public-child-seed", 10)
+            .await
+            .unwrap();
         assert!(items.is_empty());
     }
 

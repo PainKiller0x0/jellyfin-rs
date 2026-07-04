@@ -23,6 +23,11 @@ use crate::{
     util::{now_unix, stable_text_id, unix_to_jellyfin_date},
 };
 
+const MAX_SESSION_TEXT_LEN: usize = 256;
+const MAX_SESSION_ID_LEN: usize = 256;
+const MAX_SESSION_ARRAY_ITEMS: usize = 64;
+const MAX_SESSION_ARRAY_VALUE_LEN: usize = 64;
+
 #[derive(Deserialize)]
 pub struct CapabilitiesRequest {
     #[serde(rename = "PlayableMediaTypes", default)]
@@ -136,11 +141,19 @@ pub async fn capabilities(
         device_id: device.device_id.clone(),
         application_version: device.version,
         playable_media_types: default_if_empty(
-            capabilities.playable_media_types,
+            normalize_string_array(
+                capabilities.playable_media_types,
+                MAX_SESSION_ARRAY_ITEMS,
+                MAX_SESSION_ARRAY_VALUE_LEN,
+            ),
             ["Audio", "Video"].map(ToString::to_string).to_vec(),
         ),
         supported_commands: default_if_empty(
-            capabilities.supported_commands,
+            normalize_string_array(
+                capabilities.supported_commands,
+                MAX_SESSION_ARRAY_ITEMS,
+                MAX_SESSION_ARRAY_VALUE_LEN,
+            ),
             ["Play", "Pause", "Stop", "Seek", "SetVolume", "ToggleMute"]
                 .map(ToString::to_string)
                 .to_vec(),
@@ -167,12 +180,16 @@ pub async fn capabilities_full(
         playable_media_types: body
             .get("PlayableMediaTypes")
             .and_then(Value::as_array)
-            .map(|values| string_array(values))
+            .map(|values| {
+                string_array(values, MAX_SESSION_ARRAY_ITEMS, MAX_SESSION_ARRAY_VALUE_LEN)
+            })
             .unwrap_or_default(),
         supported_commands: body
             .get("SupportedCommands")
             .and_then(Value::as_array)
-            .map(|values| string_array(values))
+            .map(|values| {
+                string_array(values, MAX_SESSION_ARRAY_ITEMS, MAX_SESSION_ARRAY_VALUE_LEN)
+            })
             .unwrap_or_default(),
         supports_media_control: body
             .get("SupportsMediaControl")
@@ -256,12 +273,7 @@ pub async fn report_viewing(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(item_id) = query
-        .get("itemId")
-        .or_else(|| query.get("ItemId"))
-        .map(String::as_str)
-        .filter(|value| !value.trim().is_empty())
-    else {
+    let Some(item_id) = query_text(&query, &["itemId", "ItemId"], MAX_SESSION_ID_LEN) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let user_id = request_user_id_or_default(&state, &headers, &query).await;
@@ -269,8 +281,7 @@ pub async fn report_viewing(
     let session_id = query
         .get("sessionId")
         .or_else(|| query.get("SessionId"))
-        .filter(|value| !value.trim().is_empty())
-        .cloned()
+        .and_then(|value| normalize_session_text(value, MAX_SESSION_ID_LEN))
         .unwrap_or_else(|| session_key(&headers, &query, &device.device_id));
     let session_info = session_info(&state, &headers, &query).await;
     let now = now_unix();
@@ -288,12 +299,8 @@ pub async fn report_viewing(
         id: session_id.clone(),
         user_id: user_id.clone(),
         play_session_id: session_id.clone(),
-        item_id: item_id.to_string(),
-        item_name: query
-            .get("itemName")
-            .or_else(|| query.get("ItemName"))
-            .filter(|value| !value.trim().is_empty())
-            .cloned(),
+        item_id,
+        item_name: query_text(&query, &["itemName", "ItemName"], MAX_SESSION_TEXT_LEN),
         now_playing_queue: Vec::new(),
         additional_users: Vec::new(),
         client: client.clone(),
@@ -441,7 +448,13 @@ pub async fn session_info(
 }
 
 fn session_key(headers: &HeaderMap, query: &HashMap<String, String>, device_id: &str) -> String {
-    request_token(headers, query).unwrap_or_else(|| format!("device:{device_id}"))
+    request_token(headers, query)
+        .and_then(|token| normalize_session_text(&token, MAX_SESSION_ID_LEN))
+        .unwrap_or_else(|| {
+            normalize_session_text(device_id, MAX_SESSION_ID_LEN)
+                .map(|device_id| format!("device:{device_id}"))
+                .unwrap_or_else(|| "device:unknown".to_string())
+        })
 }
 
 fn device_info_from_headers(headers: &HeaderMap) -> DeviceInfo {
@@ -451,11 +464,18 @@ fn device_info_from_headers(headers: &HeaderMap) -> DeviceInfo {
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     DeviceInfo {
-        client: auth_value(authorization, "Client").unwrap_or_else(|| "jellyfin-rs".to_string()),
+        client: auth_value(authorization, "Client")
+            .and_then(|value| normalize_session_text(&value, MAX_SESSION_TEXT_LEN))
+            .unwrap_or_else(|| "jellyfin-rs".to_string()),
         device_name: auth_value(authorization, "Device")
+            .and_then(|value| normalize_session_text(&value, MAX_SESSION_TEXT_LEN))
             .unwrap_or_else(|| "Unknown Device".to_string()),
-        device_id: auth_value(authorization, "DeviceId").unwrap_or_default(),
-        version: auth_value(authorization, "Version").unwrap_or_else(|| "0.1.0".to_string()),
+        device_id: auth_value(authorization, "DeviceId")
+            .and_then(|value| normalize_session_text(&value, MAX_SESSION_ID_LEN))
+            .unwrap_or_default(),
+        version: auth_value(authorization, "Version")
+            .and_then(|value| normalize_session_text(&value, MAX_SESSION_TEXT_LEN))
+            .unwrap_or_else(|| "0.1.0".to_string()),
     }
 }
 
@@ -476,12 +496,56 @@ fn default_if_empty(values: Vec<String>, default: Vec<String>) -> Vec<String> {
     if values.is_empty() { default } else { values }
 }
 
-fn string_array(values: &[Value]) -> Vec<String> {
-    values
-        .iter()
-        .filter_map(Value::as_str)
-        .map(ToString::to_string)
-        .collect()
+fn string_array(values: &[Value], max_items: usize, max_len: usize) -> Vec<String> {
+    normalize_string_array(
+        values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string),
+        max_items,
+        max_len,
+    )
+}
+
+fn normalize_string_array<I>(values: I, max_items: usize, max_len: usize) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut normalized = Vec::new();
+    for value in values {
+        let Some(value) = normalize_session_text(&value, max_len) else {
+            continue;
+        };
+        if normalized.iter().any(|existing| existing == &value) {
+            continue;
+        }
+        normalized.push(value);
+        if normalized.len() >= max_items {
+            break;
+        }
+    }
+    normalized
+}
+
+fn query_text(query: &HashMap<String, String>, keys: &[&str], max_len: usize) -> Option<String> {
+    keys.iter()
+        .find_map(|key| query.get(*key))
+        .and_then(|value| normalize_session_text(value, max_len))
+}
+
+fn normalize_session_text(value: &str, max_len: usize) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let text = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(max_len)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 struct DeviceInfo {
@@ -559,8 +623,10 @@ async fn session_user_info(state: &AppState, user_id: &str) -> Option<SessionUse
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionsQuery, apply_playstate_command, auth_value, device_info_from_headers,
-        filter_sessions, session_key, touch_session_time,
+        MAX_SESSION_ARRAY_ITEMS, MAX_SESSION_ARRAY_VALUE_LEN, MAX_SESSION_ID_LEN,
+        MAX_SESSION_TEXT_LEN, SessionsQuery, apply_playstate_command, auth_value,
+        device_info_from_headers, filter_sessions, normalize_string_array, query_text, session_key,
+        touch_session_time,
     };
     use crate::app::state::{PlaybackSession, PlaybackState, SessionCapabilities, SessionUserInfo};
     use axum::http::{HeaderMap, HeaderValue};
@@ -599,6 +665,57 @@ mod tests {
         assert_eq!(device.device_name, "Browser");
         assert_eq!(device.device_id, "dev1");
         assert_eq!(device.version, "1.0");
+    }
+
+    #[test]
+    fn session_inputs_are_normalized_and_limited() {
+        let mut headers = HeaderMap::new();
+        let long_device_id = "d".repeat(MAX_SESSION_ID_LEN + 20);
+        headers.insert(
+            "X-Emby-Authorization",
+            HeaderValue::from_str(&format!(
+                r#"MediaBrowser Client=" Web ", Device="{}", DeviceId="{long_device_id}", Version="1.0""#,
+                "B".repeat(MAX_SESSION_TEXT_LEN + 20)
+            ))
+            .unwrap(),
+        );
+        let device = device_info_from_headers(&headers);
+        assert_eq!(device.client, "Web");
+        assert_eq!(device.device_name.len(), MAX_SESSION_TEXT_LEN);
+        assert_eq!(device.device_id.len(), MAX_SESSION_ID_LEN);
+        assert_eq!(device.version, "1.0");
+
+        let values = normalize_string_array(
+            (0..MAX_SESSION_ARRAY_ITEMS + 10).map(|index| {
+                if index % 2 == 0 {
+                    "Play".to_string()
+                } else {
+                    format!("{}{}", "x".repeat(MAX_SESSION_ARRAY_VALUE_LEN + 5), index)
+                }
+            }),
+            MAX_SESSION_ARRAY_ITEMS,
+            MAX_SESSION_ARRAY_VALUE_LEN,
+        );
+        assert!(values.len() <= MAX_SESSION_ARRAY_ITEMS);
+        assert!(
+            values
+                .iter()
+                .all(|value| value.len() <= MAX_SESSION_ARRAY_VALUE_LEN)
+        );
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| value.as_str() == "Play")
+                .count(),
+            1
+        );
+
+        let mut query = HashMap::new();
+        query.insert("ItemName".to_string(), " Movie\nName ".to_string());
+        assert_eq!(
+            query_text(&query, &["ItemName"], MAX_SESSION_TEXT_LEN).as_deref(),
+            Some("MovieName")
+        );
     }
 
     #[test]

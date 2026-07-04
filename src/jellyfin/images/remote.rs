@@ -1,10 +1,11 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use axum::{
     Json,
+    body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection};
@@ -173,6 +174,44 @@ pub async fn download_remote_image(
 
     match download_and_cache_image(&state, &item_id, image_type, image_url).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) if is_rejected_remote_image_url(&error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": error.to_string() })),
+        )
+            .into_response(),
+        Err(error) if super::is_image_too_large(&error) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "Error": "Image is too large" })),
+        )
+            .into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn image_by_name_remote(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(image_url) = image_url_query(&query) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "ImageUrl is required" })),
+        )
+            .into_response();
+    };
+
+    match fetch_remote_image(&state, image_url).await {
+        Ok((bytes, content_type)) => remote_image_response(bytes, content_type),
+        Err(error) if is_rejected_remote_image_url(&error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": error.to_string() })),
+        )
+            .into_response(),
+        Err(error) if super::is_image_too_large(&error) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "Error": "Image is too large" })),
+        )
+            .into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -183,9 +222,10 @@ pub(super) async fn download_and_cache_image(
     image_type: &str,
     image_url: &str,
 ) -> anyhow::Result<()> {
+    let image_url = validate_remote_image_url(image_url)?;
     let response = state
         .http_client
-        .get(image_url)
+        .get(image_url.clone())
         .send()
         .await?
         .error_for_status()?;
@@ -194,11 +234,20 @@ pub(super) async fn download_and_cache_image(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string);
+    if response
+        .content_length()
+        .is_some_and(|length| length > super::MAX_IMAGE_BYTES as u64)
+    {
+        bail!("image is too large");
+    }
     let bytes = response.bytes().await?;
+    if bytes.len() > super::MAX_IMAGE_BYTES {
+        bail!("image is too large");
+    }
     let extension = content_type
         .as_deref()
         .and_then(super::extension_from_content_type)
-        .or_else(|| super::extension_from_url(image_url))
+        .or_else(|| super::extension_from_url(image_url.as_str()))
         .unwrap_or("bin");
 
     let directory = PathBuf::from("data").join("images");
@@ -223,6 +272,86 @@ pub(super) async fn download_and_cache_image(
         i64::try_from(bytes.len()).ok(),
     )
     .await
+}
+
+async fn fetch_remote_image(
+    state: &AppState,
+    image_url: &str,
+) -> anyhow::Result<(Bytes, &'static str)> {
+    let image_url = validate_remote_image_url(image_url)?;
+    let response = state
+        .http_client
+        .get(image_url)
+        .send()
+        .await?
+        .error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > super::MAX_IMAGE_BYTES as u64)
+    {
+        bail!("image is too large");
+    }
+    let content_type = remote_image_content_type(response.headers());
+    let bytes = response.bytes().await?;
+    if bytes.len() > super::MAX_IMAGE_BYTES {
+        bail!("image is too large");
+    }
+    Ok((bytes, content_type))
+}
+
+fn remote_image_response(bytes: Bytes, content_type: &'static str) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    (headers, Body::from(bytes)).into_response()
+}
+
+fn remote_image_content_type(headers: &HeaderMap) -> &'static str {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match content_type.as_str() {
+        "image/jpeg" => "image/jpeg",
+        "image/png" => "image/png",
+        "image/webp" => "image/webp",
+        "image/gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
+
+fn validate_remote_image_url(image_url: &str) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(image_url.trim()).context("invalid remote image url")?;
+    let allowed = url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("image.tmdb.org"))
+        && url.path().starts_with("/t/");
+    if !allowed {
+        bail!("remote image url is not allowed");
+    }
+    Ok(url)
+}
+
+pub(super) fn is_rejected_remote_image_url(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("remote image url is not allowed")
+        || message.contains("invalid remote image url")
+}
+
+fn image_url_query(query: &HashMap<String, String>) -> Option<&str> {
+    query
+        .get("ImageUrl")
+        .or_else(|| query.get("imageUrl"))
+        .filter(|value| !value.trim().is_empty())
+        .map(String::as_str)
 }
 
 async fn lookup_tmdb_id(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Option<String>> {
@@ -387,4 +516,59 @@ struct TmdbTvImage {
     vote_average: Option<f64>,
     vote_count: Option<i64>,
     iso_639_1: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{image_url_query, remote_image_content_type, validate_remote_image_url};
+    use axum::http::{HeaderMap, HeaderValue, header};
+    use std::collections::HashMap;
+
+    #[test]
+    fn remote_image_url_allows_tmdb_cdn() {
+        assert!(validate_remote_image_url("https://image.tmdb.org/t/p/w500/poster.jpg").is_ok());
+    }
+
+    #[test]
+    fn remote_image_url_rejects_private_or_unexpected_hosts() {
+        assert!(validate_remote_image_url("http://127.0.0.1/admin.png").is_err());
+        assert!(validate_remote_image_url("https://example.com/poster.jpg").is_err());
+        assert!(validate_remote_image_url("https://image.tmdb.org/metadata").is_err());
+    }
+
+    #[test]
+    fn remote_image_query_accepts_jellyfin_and_emby_casing() {
+        let mut query = HashMap::new();
+        query.insert(
+            "imageUrl".to_string(),
+            " https://image.tmdb.org/t/p/w500/a.jpg ".to_string(),
+        );
+        assert_eq!(
+            image_url_query(&query),
+            Some(" https://image.tmdb.org/t/p/w500/a.jpg ")
+        );
+
+        query.clear();
+        query.insert("ImageUrl".to_string(), "".to_string());
+        assert_eq!(image_url_query(&query), None);
+    }
+
+    #[test]
+    fn remote_image_content_type_is_image_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("image/webp; charset=binary"),
+        );
+        assert_eq!(remote_image_content_type(&headers), "image/webp");
+
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        assert_eq!(
+            remote_image_content_type(&headers),
+            "application/octet-stream"
+        );
+    }
 }

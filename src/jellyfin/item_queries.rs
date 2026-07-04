@@ -266,8 +266,15 @@ pub async fn list_media_items(
                 .await
         } else {
             let (sql, vals) = (
-                media_item_select_sql("WHERE media_items.parent_id = ?"),
-                vec![user_id.into(), parent_id.into()],
+                media_item_select_sql(
+                    "WHERE media_items.parent_id = ? AND media_items.is_public = 1 AND (EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = ?) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = ? AND parent.is_public = 1))",
+                ),
+                vec![
+                    user_id.into(),
+                    parent_id.into(),
+                    parent_id.into(),
+                    parent_id.into(),
+                ],
             );
             db.query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
                 .await
@@ -296,11 +303,38 @@ pub async fn list_media_items(
     Ok(items)
 }
 
+pub async fn list_trailers(
+    db: &DatabaseConnection,
+    user_id: &str,
+    query: &HashMap<String, String>,
+) -> anyhow::Result<(Vec<MediaItem>, usize)> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &media_item_select_sql(
+                "WHERE media_items.item_type = 'Trailer' ORDER BY media_items.title ASC",
+            ),
+            vec![user_id.into()],
+        ))
+        .await
+        .context("failed to list trailers")?;
+
+    let mut items = decode_media_items(&rows)?;
+    apply_item_filters(&mut items, query);
+    apply_relation_filters(db, &mut items, query).await?;
+    sort_media_items(&mut items, query);
+    let total = items.len();
+    let offset = query_u32_any(query, &["StartIndex", "startIndex"], 0) as usize;
+    let limit = query_u32_any(query, &["Limit", "limit"], 50).min(200) as usize;
+    Ok((items.into_iter().skip(offset).take(limit).collect(), total))
+}
+
 /// SQL SELECT for querying items joined through media_people.
 /// Includes the media_items columns + user_data join.
 fn media_item_select_sql_from_person(where_clause: &str) -> String {
     format!(
-        r#"SELECT mi.id, mi.title, mi.path, mi.library_id, libraries.collection_type, mi.parent_id, mi.item_type, mi.is_folder, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.season_number, mi.episode_number, mi.community_rating, mi.critic_rating, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? LEFT JOIN libraries ON libraries.id = mi.library_id {where_clause}"#
+        r#"SELECT mi.id, mi.title, mi.path, mi.library_id, libraries.collection_type, mi.parent_id, mi.item_type, mi.is_folder, mi.is_public, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.season_number, mi.episode_number, mi.community_rating, mi.critic_rating, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? LEFT JOIN libraries ON libraries.id = mi.library_id {where_clause}"#
     )
 }
 
@@ -318,7 +352,7 @@ async fn is_collection_or_playlist(db: &DatabaseConnection, item_id: &str) -> an
 }
 
 fn linked_children_select_sql() -> String {
-    r#"SELECT mi.id, mi.title, mi.path, mi.library_id, libraries.collection_type, mi.parent_id, mi.item_type, mi.is_folder, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.season_number, mi.episode_number, mi.community_rating, mi.critic_rating, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? LEFT JOIN libraries ON libraries.id = mi.library_id WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC"#.to_string()
+    r#"SELECT mi.id, mi.title, mi.path, mi.library_id, libraries.collection_type, mi.parent_id, mi.item_type, mi.is_folder, mi.is_public, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.season_number, mi.episode_number, mi.community_rating, mi.critic_rating, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? LEFT JOIN libraries ON libraries.id = mi.library_id WHERE lc.parent_id = ? AND mi.is_public = 1 ORDER BY lc.sort_order ASC"#.to_string()
 }
 
 pub async fn latest_media_items(
@@ -462,11 +496,34 @@ pub async fn find_media_item(
     user_id: &str,
     id: &str,
 ) -> anyhow::Result<Option<MediaItem>> {
+    find_media_item_with_clause(
+        db,
+        user_id,
+        id,
+        "WHERE media_items.id = ? AND media_items.is_public = 1",
+    )
+    .await
+}
+
+pub async fn find_media_item_for_admin(
+    db: &DatabaseConnection,
+    user_id: &str,
+    id: &str,
+) -> anyhow::Result<Option<MediaItem>> {
+    find_media_item_with_clause(db, user_id, id, "WHERE media_items.id = ?").await
+}
+
+async fn find_media_item_with_clause(
+    db: &DatabaseConnection,
+    user_id: &str,
+    id: &str,
+    where_clause: &str,
+) -> anyhow::Result<Option<MediaItem>> {
     let backend = db.get_database_backend();
     let row = db
         .query_one(crate::db::helpers::portable_statement(
             backend,
-            &media_item_select_sql("WHERE media_items.id = ?"),
+            &media_item_select_sql(where_clause),
             vec![user_id.into(), id.into()],
         ))
         .await
@@ -478,18 +535,31 @@ pub async fn find_media_item(
 
 pub fn media_item_select_sql(where_clause: &str) -> String {
     format!(
-        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.runtime_ticks, media_items.size_bytes, media_items.season_number, media_items.episode_number, media_items.community_rating, media_items.critic_rating, media_items.created_at, media_items.modified_at, COALESCE(user_data.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(user_data.played, CAST(0 AS bigint)) AS played, COALESCE(user_data.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, user_data.played_percentage AS played_percentage, COALESCE(user_data.play_count, CAST(0 AS bigint)) AS play_count, user_data.last_played_at AS last_played_at FROM media_items LEFT JOIN user_data ON user_data.item_id = media_items.id AND user_data.user_id = ? LEFT JOIN libraries ON libraries.id = media_items.library_id {where_clause}"#
+        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.is_public, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.runtime_ticks, media_items.size_bytes, media_items.season_number, media_items.episode_number, media_items.community_rating, media_items.critic_rating, media_items.created_at, media_items.modified_at, COALESCE(user_data.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(user_data.played, CAST(0 AS bigint)) AS played, COALESCE(user_data.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, user_data.played_percentage AS played_percentage, COALESCE(user_data.play_count, CAST(0 AS bigint)) AS play_count, user_data.last_played_at AS last_played_at FROM media_items LEFT JOIN user_data ON user_data.item_id = media_items.id AND user_data.user_id = ? LEFT JOIN libraries ON libraries.id = media_items.library_id {where_clause}"#
     )
 }
 
 fn recursive_media_item_select_sql() -> String {
     format!(
-        r#"WITH RECURSIVE tree(id) AS (SELECT ? UNION ALL SELECT media_items.id FROM media_items JOIN tree ON media_items.parent_id = tree.id) {} WHERE media_items.id IN (SELECT id FROM tree WHERE id <> ?)"#,
+        r#"WITH RECURSIVE tree(id) AS (SELECT id FROM media_items WHERE id = ? AND is_public = 1 UNION ALL SELECT media_items.id FROM media_items JOIN tree ON media_items.parent_id = tree.id WHERE media_items.is_public = 1) {} WHERE media_items.id IN (SELECT id FROM tree WHERE id <> ?) AND media_items.is_public = 1"#,
         media_item_select_sql("").trim()
     )
 }
 
 pub fn decode_media_items(rows: &[sea_orm::QueryResult]) -> anyhow::Result<Vec<MediaItem>> {
+    Ok(rows
+        .iter()
+        .map(MediaItem::from_query_result)
+        .collect::<Result<Vec<_>, _>>()
+        .context("failed to decode media items")?
+        .into_iter()
+        .filter(|item| item.is_public)
+        .collect())
+}
+
+pub fn decode_media_items_for_admin(
+    rows: &[sea_orm::QueryResult],
+) -> anyhow::Result<Vec<MediaItem>> {
     rows.iter()
         .map(MediaItem::from_query_result)
         .collect::<Result<Vec<_>, _>>()
@@ -525,8 +595,14 @@ pub(super) async fn batch_item_image_tags(
 }
 
 fn query_u32(query: &HashMap<String, String>, key: &str, default: u32) -> u32 {
+    query_u32_any(query, &[key], default)
+}
+
+fn query_u32_any(query: &HashMap<String, String>, keys: &[&str], default: u32) -> u32 {
     query
-        .get(key)
+        .iter()
+        .find(|(key, _)| keys.iter().any(|wanted| key.eq_ignore_ascii_case(wanted)))
+        .map(|(_, value)| value)
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(default)
 }
@@ -539,7 +615,11 @@ fn query_bool(query: &HashMap<String, String>, key: &str, default: bool) -> bool
 }
 
 fn apply_item_filters(items: &mut Vec<MediaItem>, query: &HashMap<String, String>) {
-    if let Some(search_term) = query.get("SearchTerm").filter(|value| !value.is_empty()) {
+    if let Some(search_term) = query
+        .get("SearchTerm")
+        .or_else(|| query.get("searchTerm"))
+        .filter(|value| !value.is_empty())
+    {
         let search_term = search_term.to_ascii_lowercase();
         items.retain(|item| item.title.to_ascii_lowercase().contains(&search_term));
     }
@@ -872,5 +952,126 @@ fn sort_media_items(items: &mut [MediaItem], query: &HashMap<String, String>) {
         .is_some_and(|value| value.eq_ignore_ascii_case("Descending"))
     {
         items.reverse();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_media_item, find_media_item_for_admin, query_u32_any};
+    use sea_orm::{ConnectionTrait, Database};
+    use std::collections::HashMap;
+
+    #[test]
+    fn query_u32_any_reads_jellyfin_casing() {
+        let mut query = HashMap::new();
+        query.insert("startIndex".to_string(), "7".to_string());
+        assert_eq!(query_u32_any(&query, &["StartIndex", "startIndex"], 0), 7);
+    }
+
+    #[tokio::test]
+    async fn find_media_item_hides_private_items_without_admin_bypass() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, ?, 1, 1, 1)",
+            vec![
+                "private".into(),
+                "Private".into(),
+                "/tmp/private.mkv".into(),
+                0_i64.into(),
+            ],
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            find_media_item(&db, "u1", "private")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find_media_item_for_admin(&db, "u1", "private")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_media_items_hides_private_items() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
+            vec!["movies".into(), "Movies".into(), "movies".into()],
+        ))
+        .await
+        .unwrap();
+        for (id, is_public) in [("public", 1_i64), ("private", 0_i64)] {
+            db.execute(crate::db::helpers::portable_statement(
+                db.get_database_backend(),
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', 'movies', 'Movie', 0, ?, 1, 1, 1)",
+                vec![
+                    id.into(),
+                    id.into(),
+                    format!("/tmp/{id}.mkv").into(),
+                    is_public.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let mut query = HashMap::new();
+        query.insert("ParentId".to_string(), "movies".to_string());
+        let (items, total) = super::list_media_items(&db, "u1", &query).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, "public");
+    }
+
+    #[tokio::test]
+    async fn list_media_items_requires_visible_media_parent() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
+            vec!["movies".into(), "Movies".into(), "movies".into()],
+        ))
+        .await
+        .unwrap();
+        for (id, parent_id, is_folder, is_public) in [
+            ("private-parent", "movies", 1_i64, 0_i64),
+            ("public-child", "private-parent", 0_i64, 1_i64),
+        ] {
+            db.execute(crate::db::helpers::portable_statement(
+                db.get_database_backend(),
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', ?, 'Movie', ?, ?, 1, 1, 1)",
+                vec![
+                    id.into(),
+                    id.into(),
+                    format!("/tmp/{id}").into(),
+                    parent_id.into(),
+                    is_folder.into(),
+                    is_public.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let mut query = HashMap::new();
+        query.insert("ParentId".to_string(), "private-parent".to_string());
+        let (items, total) = super::list_media_items(&db, "u1", &query).await.unwrap();
+        assert_eq!(total, 0);
+        assert!(items.is_empty());
+
+        query.insert("Recursive".to_string(), "true".to_string());
+        let (items, total) = super::list_media_items(&db, "u1", &query).await.unwrap();
+        assert_eq!(total, 0);
+        assert!(items.is_empty());
     }
 }

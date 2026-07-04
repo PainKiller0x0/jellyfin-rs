@@ -11,7 +11,9 @@ use crate::{
     app::state::AppState,
     jellyfin::{
         common::{internal_error, strip_nulls},
-        item_queries::{latest_media_items, library_views, list_media_items, resume_media_items},
+        item_queries::{
+            latest_media_items, library_views, list_media_items, list_trailers, resume_media_items,
+        },
     },
     library::models::MediaItem,
 };
@@ -58,6 +60,27 @@ pub async fn latest_items(
     }
 }
 
+pub async fn latest_items_root(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let user_id = query
+        .get("UserId")
+        .cloned()
+        .unwrap_or_else(|| state.user_id.to_string());
+    let parent_id = query.get("ParentId").map(String::as_str);
+    match latest_media_items(&state.db, &user_id, parent_id).await {
+        Ok(items) => Json(
+            items
+                .into_iter()
+                .map(|item| strip_nulls(item.to_jellyfin_json()))
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
 pub async fn resume_items(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<String>,
@@ -81,6 +104,21 @@ pub async fn items_root(
         .cloned()
         .unwrap_or_else(|| state.user_id.to_string());
     match list_media_items(&state.db, &user_id, &query).await {
+        Ok((items, total)) => media_list_response_with_total(items, total),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn trailers(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let user_id = query
+        .get("UserId")
+        .or_else(|| query.get("userId"))
+        .cloned()
+        .unwrap_or_else(|| state.user_id.to_string());
+    match list_trailers(&state.db, &user_id, &query).await {
         Ok((items, total)) => media_list_response_with_total(items, total),
         Err(error) => internal_error(error),
     }

@@ -6,8 +6,8 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sea_orm::ConnectionTrait;
-use serde_json::json;
+use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
+use serde_json::{Value as JsonValue, json};
 
 use crate::{app::state::AppState, jellyfin::common::internal_error};
 
@@ -76,7 +76,48 @@ pub async fn backup_info(State(_state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
-/// POST /BackupRestore/Restore — create a backup
+/// GET /Backup - list available backups.
+pub async fn list_backups() -> Response {
+    Json(list_backup_files()).into_response()
+}
+
+pub async fn backup_manifest() -> Response {
+    Json(json!({
+        "Name": "jellyfin-rs",
+        "ServerVersion": env!("CARGO_PKG_VERSION"),
+        "DatabaseType": if is_postgres() { "PostgreSQL" } else { "SQLite" },
+        "Files": list_backup_files()
+    }))
+    .into_response()
+}
+
+fn list_backup_files() -> Vec<serde_json::Value> {
+    std::fs::read_dir(backup_dir())
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if !name.ends_with(".db") && !name.ends_with(".sql") {
+                return None;
+            }
+            let meta = entry.metadata().ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let date_created = meta
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                .map(|d| crate::util::unix_to_jellyfin_date(d.as_secs() as i64));
+            Some(json!({
+                "Name": name,
+                "Path": path.to_string_lossy(),
+                "Size": size,
+                "DateCreated": date_created,
+            }))
+        })
+        .collect()
+}
+
 pub async fn create_backup(State(state): State<Arc<AppState>>) -> Response {
     let backup_dir = backup_dir();
     if let Err(error) = tokio::fs::create_dir_all(&backup_dir).await {
@@ -308,17 +349,36 @@ async fn create_pg_backup(state: &AppState, backup_dir: &Path) -> Response {
 }
 
 /// POST /BackupRestore/RestoreData — restore from backup
-pub async fn restore_backup(State(_state): State<Arc<AppState>>) -> Response {
+pub async fn restore_backup(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<JsonValue>>,
+) -> Response {
     let backup_dir = backup_dir();
+    let backup_name = body
+        .as_ref()
+        .and_then(|Json(body)| requested_backup_name(body));
+    let backup_file = match safe_backup_file_name(
+        backup_name.as_deref(),
+        if is_postgres() {
+            "jellyfin-rs-backup.sql"
+        } else {
+            "jellyfin-rs-backup.db"
+        },
+    ) {
+        Ok(name) => name,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "Error": message }))).into_response();
+        }
+    };
 
     if is_postgres() {
-        restore_pg_backup(&backup_dir).await
+        restore_pg_backup(&state, &backup_dir, &backup_file).await
     } else {
-        restore_sqlite_backup(&backup_dir).await
+        restore_sqlite_backup(&backup_dir, &backup_file).await
     }
 }
 
-async fn restore_sqlite_backup(backup_dir: &Path) -> Response {
+async fn restore_sqlite_backup(backup_dir: &Path, backup_file: &str) -> Response {
     let Some(db_path) = sqlite_file_path() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -327,7 +387,7 @@ async fn restore_sqlite_backup(backup_dir: &Path) -> Response {
             .into_response();
     };
 
-    let backup_path = backup_dir.join("jellyfin-rs-backup.db");
+    let backup_path = backup_dir.join(backup_file);
     if !backup_path.exists() {
         return (
             StatusCode::NOT_FOUND,
@@ -350,8 +410,8 @@ async fn restore_sqlite_backup(backup_dir: &Path) -> Response {
     }
 }
 
-async fn restore_pg_backup(backup_dir: &Path) -> Response {
-    let backup_path = backup_dir.join("jellyfin-rs-backup.sql");
+async fn restore_pg_backup(state: &AppState, backup_dir: &Path, backup_file: &str) -> Response {
+    let backup_path = backup_dir.join(backup_file);
     if !backup_path.exists() {
         return (
             StatusCode::NOT_FOUND,
@@ -360,14 +420,305 @@ async fn restore_pg_backup(backup_dir: &Path) -> Response {
             .into_response();
     }
 
-    // Note: SQL restore requires manual execution via psql or similar tool
-    // We return the path and instructions
-    Json(json!({
-        "Success": true,
-        "Method": "sql_file",
-        "BackupPath": backup_path.to_string_lossy(),
-        "Message": "SQL backup file ready. To restore, execute the SQL file against your PostgreSQL database using psql or a database client.",
-        "RestoreCommand": format!("psql -h <host> -U <user> -d <database> -f {}", backup_path.to_string_lossy()),
-    }))
-    .into_response()
+    let sql = match tokio::fs::read_to_string(&backup_path).await {
+        Ok(sql) => sql,
+        Err(error) => return internal_error(error.into()),
+    };
+    let statements = match pg_restore_statements(&sql) {
+        Ok(statements) if !statements.is_empty() => statements,
+        Ok(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "Error": "Backup contains no restorable statements" })),
+            )
+                .into_response();
+        }
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "Error": message }))).into_response();
+        }
+    };
+
+    match apply_pg_restore(&state.db, &statements).await {
+        Ok(tables) => Json(json!({
+            "Success": true,
+            "Method": "sql_restore",
+            "BackupPath": backup_path.to_string_lossy(),
+            "RestoredTables": tables,
+            "RestoredStatements": statements.len(),
+            "RequiresRestart": false,
+        }))
+        .into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+async fn apply_pg_restore(
+    db: &sea_orm::DatabaseConnection,
+    statements: &[PgRestoreStatement],
+) -> anyhow::Result<Vec<String>> {
+    let backend = db.get_database_backend();
+    let txn = db.begin().await?;
+    let mut tables = Vec::new();
+    for statement in statements {
+        if !tables.contains(&statement.table) {
+            tables.push(statement.table.clone());
+        }
+    }
+    if !tables.is_empty() {
+        let table_list = tables
+            .iter()
+            .map(|table| format!("\"{}\"", table.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        txn.execute(Statement::from_string(
+            backend,
+            format!("TRUNCATE TABLE {table_list} RESTART IDENTITY CASCADE"),
+        ))
+        .await?;
+    }
+    for statement in sorted_pg_restore_statements(statements) {
+        txn.execute(Statement::from_string(backend, statement.sql.clone()))
+            .await?;
+    }
+    txn.commit().await?;
+    Ok(tables)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PgRestoreStatement {
+    table: String,
+    sql: String,
+}
+
+fn pg_restore_statements(sql: &str) -> Result<Vec<PgRestoreStatement>, String> {
+    split_sql_statements(sql)?
+        .into_iter()
+        .filter_map(|statement| {
+            let upper = statement.to_ascii_uppercase();
+            if upper == "BEGIN" || upper == "COMMIT" {
+                None
+            } else {
+                Some(statement)
+            }
+        })
+        .map(|statement| {
+            let Some(table) = insert_table_name(&statement) else {
+                return Err("Backup contains unsupported SQL".to_string());
+            };
+            Ok(PgRestoreStatement {
+                table,
+                sql: statement,
+            })
+        })
+        .collect()
+}
+
+fn sorted_pg_restore_statements(statements: &[PgRestoreStatement]) -> Vec<&PgRestoreStatement> {
+    let mut sorted = statements.iter().collect::<Vec<_>>();
+    sorted.sort_by_key(|statement| restore_table_rank(&statement.table));
+    sorted
+}
+
+fn restore_table_rank(table: &str) -> usize {
+    [
+        "users",
+        "libraries",
+        "media_items",
+        "people",
+        "genres",
+        "tags",
+        "studios",
+        "game_genres",
+        "access_tokens",
+        "api_keys",
+        "library_paths",
+        "media_streams",
+        "user_data",
+        "media_people",
+        "media_genres",
+        "media_tags",
+        "media_studios",
+        "provider_ids",
+        "image_assets",
+        "activity_log",
+        "task_results",
+        "app_settings",
+        "display_preferences",
+        "linked_children",
+        "chapters",
+        "audio_fingerprints",
+        "trickplay_images",
+        "merge_groups",
+        "media_game_genres",
+    ]
+    .iter()
+    .position(|known| *known == table)
+    .unwrap_or(usize::MAX)
+}
+
+fn split_sql_statements(sql: &str) -> Result<Vec<String>, String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut in_quote = false;
+
+    while let Some(ch) = chars.next() {
+        if !in_quote && ch == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next == '\n' {
+                    current.push('\n');
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '\'' {
+            current.push(ch);
+            if in_quote && chars.peek() == Some(&'\'') {
+                current.push(chars.next().unwrap());
+            } else {
+                in_quote = !in_quote;
+            }
+            continue;
+        }
+        if !in_quote && ch == ';' {
+            let statement = current.trim();
+            if !statement.is_empty() {
+                statements.push(statement.to_string());
+            }
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+
+    if in_quote {
+        return Err("Backup SQL has an unterminated string".to_string());
+    }
+    if !current.trim().is_empty() {
+        return Err("Backup SQL has an unterminated statement".to_string());
+    }
+    Ok(statements)
+}
+
+fn insert_table_name(statement: &str) -> Option<String> {
+    let rest = statement.strip_prefix("INSERT INTO ")?;
+    let (name, rest) = parse_quoted_identifier(rest.trim_start())?;
+    rest.trim_start().starts_with('(').then_some(name)
+}
+
+fn parse_quoted_identifier(input: &str) -> Option<(String, &str)> {
+    let mut chars = input.char_indices();
+    if chars.next()? != (0, '"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut end = None;
+    while let Some((index, ch)) = chars.next() {
+        if ch == '"' {
+            if let Some((_, '"')) = chars.clone().next() {
+                chars.next();
+                out.push('"');
+            } else {
+                end = Some(index + ch.len_utf8());
+                break;
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    let end = end?;
+    Some((out, &input[end..]))
+}
+
+fn requested_backup_name(body: &JsonValue) -> Option<String> {
+    ["ArchiveFileName", "BackupName", "Name"]
+        .iter()
+        .find_map(|key| body.get(*key).and_then(JsonValue::as_str))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+}
+
+fn safe_backup_file_name(
+    requested: Option<&str>,
+    default_name: &str,
+) -> Result<String, &'static str> {
+    let name = requested.unwrap_or(default_name).trim();
+    if name.is_empty() {
+        return Err("Backup file name is required");
+    }
+    let path = Path::new(name);
+    if path.components().count() != 1
+        || path.file_name().and_then(|value| value.to_str()) != Some(name)
+    {
+        return Err("Backup file name must not contain a path");
+    }
+    if !name.ends_with(".db") && !name.ends_with(".sql") {
+        return Err("Backup file must end with .db or .sql");
+    }
+    Ok(name.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        pg_restore_statements, requested_backup_name, safe_backup_file_name,
+        sorted_pg_restore_statements,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn backup_file_name_rejects_paths() {
+        assert_eq!(
+            safe_backup_file_name(None, "jellyfin-rs-backup.db").unwrap(),
+            "jellyfin-rs-backup.db"
+        );
+        assert!(safe_backup_file_name(Some("../backup.db"), "x.db").is_err());
+        assert!(safe_backup_file_name(Some(r"dir\backup.db"), "x.db").is_err());
+        assert!(safe_backup_file_name(Some("backup.txt"), "x.db").is_err());
+    }
+
+    #[test]
+    fn restore_request_accepts_backup_name_aliases() {
+        assert_eq!(
+            requested_backup_name(&json!({ "ArchiveFileName": "a.db" })).as_deref(),
+            Some("a.db")
+        );
+        assert_eq!(
+            requested_backup_name(&json!({ "BackupName": "b.db" })).as_deref(),
+            Some("b.db")
+        );
+        assert_eq!(
+            requested_backup_name(&json!({ "Name": "c.db" })).as_deref(),
+            Some("c.db")
+        );
+    }
+
+    #[test]
+    fn pg_restore_accepts_only_generated_insert_statements() {
+        let sql = r#"
+            -- jellyfin-rs database backup
+            BEGIN;
+            INSERT INTO "access_tokens" ("id", "user_id") VALUES ('t1', 'u1');
+            INSERT INTO "users" ("id", "username") VALUES ('u1', 'ali''ce;ok');
+            COMMIT;
+        "#;
+        let statements = pg_restore_statements(sql).unwrap();
+        assert_eq!(statements.len(), 2);
+        assert_eq!(statements[0].table, "access_tokens");
+        assert_eq!(statements[1].table, "users");
+
+        let sorted = sorted_pg_restore_statements(&statements);
+        assert_eq!(sorted[0].table, "users");
+        assert_eq!(sorted[1].table, "access_tokens");
+    }
+
+    #[test]
+    fn pg_restore_rejects_unsupported_sql() {
+        assert!(pg_restore_statements("DROP TABLE users;").is_err());
+        assert!(pg_restore_statements("INSERT INTO users VALUES ('u1');").is_err());
+        assert!(pg_restore_statements("INSERT INTO \"users\" (\"id\") VALUES ('u1')").is_err());
+    }
 }

@@ -3,7 +3,8 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Context;
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
+    http::HeaderMap,
     response::{IntoResponse, Response},
 };
 use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter};
@@ -14,6 +15,7 @@ use crate::{
     db::row_ext::QueryResultExt,
     entities::people::Entity as People,
     jellyfin::{
+        auth::request_user_id_and_admin_or_default,
         common::{internal_error, strip_nulls},
         item_queries::find_library_as_item,
     },
@@ -25,7 +27,8 @@ pub async fn item_by_id(
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Response {
     match super::find_media_item(&state.db, &user_id, &item_id).await {
-        Ok(Some(item)) => match item_json_with_provider_ids(&state.db, &user_id, item).await {
+        Ok(Some(item)) => match item_json_with_provider_ids(&state.db, &user_id, item, false).await
+        {
             Ok(item) => Json(strip_nulls(item)).into_response(),
             Err(error) => internal_error(error),
         },
@@ -47,14 +50,23 @@ pub async fn item_by_id(
 
 pub async fn item_by_id_public(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = state.user_id.to_string();
-    match super::find_media_item(&state.db, &user_id, &item_id).await {
-        Ok(Some(item)) => match item_json_with_provider_ids(&state.db, &user_id, item).await {
-            Ok(item) => Json(strip_nulls(item)).into_response(),
-            Err(error) => internal_error(error),
-        },
+    let (user_id, is_admin) = request_user_id_and_admin_or_default(&state, &headers, &query).await;
+    let item_result = if is_admin {
+        super::find_media_item_for_admin(&state.db, &user_id, &item_id).await
+    } else {
+        super::find_media_item(&state.db, &user_id, &item_id).await
+    };
+    match item_result {
+        Ok(Some(item)) => {
+            match item_json_with_provider_ids(&state.db, &user_id, item, is_admin).await {
+                Ok(item) => Json(strip_nulls(item)).into_response(),
+                Err(error) => internal_error(error),
+            }
+        }
         Ok(None) => {
             // Check if it's a library
             if let Ok(Some(lib_item)) = find_library_as_item(&state.db, &item_id).await {
@@ -147,6 +159,7 @@ async fn item_json_with_provider_ids(
     db: &DatabaseConnection,
     user_id: &str,
     item: MediaItem,
+    include_private_sources: bool,
 ) -> anyhow::Result<Value> {
     let mut value = item.to_jellyfin_json();
     let backend = db.get_database_backend();
@@ -225,7 +238,10 @@ async fn item_json_with_provider_ids(
 
     // For Movie/Episode folders, load child video media sources (multi-version support)
     if (item.item_type == "Movie" || item.item_type == "Episode") && item.is_folder {
-        if let Ok(sources) = crate::jellyfin::playback::child_video_sources(db, &item.id).await {
+        if let Ok(sources) =
+            crate::jellyfin::playback::child_video_sources(db, &item.id, include_private_sources)
+                .await
+        {
             if !sources.is_empty() {
                 value["MediaSources"] = Value::Array(sources.clone());
                 // Also flatten streams to top-level MediaStreams for clients that expect it
@@ -291,7 +307,7 @@ async fn item_json_with_provider_ids(
         if let Ok(Some(row)) = db
             .query_one(crate::db::helpers::portable_statement(
                 db.get_database_backend(),
-                "SELECT id, title FROM media_items WHERE id = ?",
+                "SELECT id, title FROM media_items WHERE id = ? AND is_public = 1",
                 vec![item.parent_id.clone().into()],
             ))
             .await
@@ -305,7 +321,7 @@ async fn item_json_with_provider_ids(
         if let Ok(Some(row)) = db
             .query_one(crate::db::helpers::portable_statement(
                 db.get_database_backend(),
-                "SELECT COUNT(*) AS cnt FROM media_items WHERE parent_id = ? AND item_type = 'Episode'",
+                "SELECT COUNT(*) AS cnt FROM media_items WHERE parent_id = ? AND item_type = 'Episode' AND is_public = 1",
                 vec![item.id.clone().into()],
             ))
             .await
@@ -316,7 +332,7 @@ async fn item_json_with_provider_ids(
             if let Ok(Some(ud_row)) = db
                 .query_one(crate::db::helpers::portable_statement(
                     db.get_database_backend(),
-                    "SELECT COUNT(*) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id = ? AND mi.item_type = 'Episode' AND ud.user_id = ? AND ud.played = 1",
+                    "SELECT COUNT(*) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id = ? AND mi.item_type = 'Episode' AND mi.is_public = 1 AND ud.user_id = ? AND ud.played = 1",
                     vec![item.id.clone().into(), user_id.into()],
                 ))
                 .await
@@ -333,7 +349,7 @@ async fn item_json_with_provider_ids(
         if let Ok(Some(row)) = db
             .query_one(crate::db::helpers::portable_statement(
                 db.get_database_backend(),
-                "SELECT COUNT(*) AS cnt FROM media_items WHERE parent_id = ? AND item_type = 'Season'",
+                "SELECT COUNT(*) AS cnt FROM media_items WHERE parent_id = ? AND item_type = 'Season' AND is_public = 1",
                 vec![item.id.clone().into()],
             ))
             .await
@@ -346,7 +362,7 @@ async fn item_json_with_provider_ids(
         if let Ok(Some(row)) = db
             .query_one(crate::db::helpers::portable_statement(
                 db.get_database_backend(),
-                "SELECT COUNT(*) AS cnt FROM media_items WHERE item_type = 'Episode' AND parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season')",
+                "SELECT COUNT(*) AS cnt FROM media_items WHERE item_type = 'Episode' AND is_public = 1 AND parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season' AND is_public = 1)",
                 vec![item.id.clone().into()],
             ))
             .await
@@ -358,7 +374,7 @@ async fn item_json_with_provider_ids(
             if let Ok(Some(ud_row)) = db
                 .query_one(crate::db::helpers::portable_statement(
                     db.get_database_backend(),
-                    "SELECT COUNT(*) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.item_type = 'Episode' AND mi.parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season') AND ud.user_id = ? AND ud.played = 1",
+                    "SELECT COUNT(*) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.item_type = 'Episode' AND mi.is_public = 1 AND mi.parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season' AND is_public = 1) AND ud.user_id = ? AND ud.played = 1",
                     vec![item.id.clone().into(), user_id.into()],
                 ))
                 .await
@@ -401,7 +417,7 @@ async fn get_episode_parent_info(
     let row = db
         .query_one(crate::db::helpers::portable_statement(
             backend,
-            "SELECT s.title AS season_title, s.parent_id AS series_id, ser.title AS series_title FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id WHERE s.id = ?",
+            "SELECT s.title AS season_title, s.parent_id AS series_id, ser.title AS series_title FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id AND ser.is_public = 1 WHERE s.id = ? AND s.is_public = 1",
             vec![season_id.into()],
         ))
         .await
@@ -530,7 +546,7 @@ pub async fn enrich_episode_list(db: &DatabaseConnection, items: Vec<MediaItem>)
         let backend = db.get_database_backend();
         let placeholders = season_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT s.id AS season_id, s.title AS season_name, s.parent_id AS series_id, ser.title AS series_name FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id WHERE s.id IN ({placeholders})"
+            "SELECT s.id AS season_id, s.title AS season_name, s.parent_id AS series_id, ser.title AS series_name FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id AND ser.is_public = 1 WHERE s.id IN ({placeholders}) AND s.is_public = 1"
         );
         let values: Vec<sea_orm::Value> = season_ids.iter().map(|id| (*id).into()).collect();
         if let Ok(rows) = db
@@ -639,8 +655,8 @@ pub async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>)
         let placeholders = parent_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
             "SELECT s.id AS season_id, s.title AS season_title, ser.id AS series_id, ser.title AS series_title \
-             FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id \
-             WHERE s.id IN ({placeholders})",
+             FROM media_items s LEFT JOIN media_items ser ON ser.id = s.parent_id AND ser.is_public = 1 \
+             WHERE s.id IN ({placeholders}) AND s.is_public = 1",
         );
         let vals: Vec<sea_orm::Value> = parent_ids.iter().map(|p| (*p).into()).collect();
         if let Ok(rows) = db
@@ -668,7 +684,7 @@ pub async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>)
             if item.is_folder {
                 // Folder items (Movie/Episode) - load child video sources
                 if let Ok(sources) =
-                    crate::jellyfin::playback::child_video_sources(db, &item.id).await
+                    crate::jellyfin::playback::child_video_sources(db, &item.id, false).await
                 {
                     if !sources.is_empty() {
                         source_map.insert(item.id.clone(), sources);

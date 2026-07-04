@@ -45,12 +45,21 @@ pub(crate) async fn media_streams_for_item(
 pub(crate) async fn child_video_sources(
     db: &sea_orm::DatabaseConnection,
     parent_id: &str,
+    include_private: bool,
 ) -> anyhow::Result<Vec<JsonValue>> {
     let backend = db.get_database_backend();
+    let visibility = if include_private {
+        ""
+    } else {
+        " AND media_items.is_public = 1"
+    };
+    let sql = format!(
+        "SELECT media_items.id, media_items.title, media_items.path, media_items.container, media_items.runtime_ticks, media_items.size_bytes FROM media_items WHERE media_items.parent_id = ? AND media_items.item_type = 'Video'{visibility} ORDER BY media_items.title ASC"
+    );
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            "SELECT media_items.id, media_items.title, media_items.path, media_items.container, media_items.runtime_ticks, media_items.size_bytes FROM media_items WHERE media_items.parent_id = ? AND media_items.item_type = 'Video' ORDER BY media_items.title ASC",
+            &sql,
             vec![parent_id.into()],
         ))
         .await
@@ -101,4 +110,43 @@ pub async fn subtitle_stream_path(
         .await
         .with_context(|| format!("failed to find subtitle stream: {item_id}:{stream_index}"))?;
     Ok(model.and_then(|m| m.path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::child_video_sources;
+    use sea_orm::{ConnectionTrait, Database};
+
+    #[tokio::test]
+    async fn child_video_sources_hide_private_versions_unless_requested() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        for (id, is_public) in [("public", 1_i64), ("private", 0_i64)] {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', 'movie', 'Video', 0, ?, 'mkv', 1, 1, 1)",
+                vec![
+                    id.into(),
+                    id.into(),
+                    format!("/tmp/{id}.mkv").into(),
+                    is_public.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            child_video_sources(&db, "movie", false)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            child_video_sources(&db, "movie", true).await.unwrap().len(),
+            2
+        );
+    }
 }

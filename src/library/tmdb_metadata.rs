@@ -927,11 +927,7 @@ async fn download_and_save_tmdb_image(
 ) -> anyhow::Result<()> {
     let response = client.get(url).send().await?.error_for_status()?;
     let bytes = response.bytes().await?;
-    let ext = url
-        .rsplit('.')
-        .next()
-        .and_then(|e| if e.len() <= 5 { Some(e) } else { None })
-        .unwrap_or("jpg");
+    let ext = tmdb_image_extension(url);
     let dir = std::path::PathBuf::from("data").join("images");
     tokio::fs::create_dir_all(&dir).await.ok();
     let path = dir.join(format!(
@@ -960,6 +956,22 @@ async fn download_and_save_tmdb_image(
         ))
         .await;
     Ok(())
+}
+
+fn tmdb_image_extension(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "jpg",
+        "png" => "png",
+        "webp" => "webp",
+        _ => "jpg",
+    }
 }
 
 fn extract_season_number(path: &Path) -> Option<i64> {
@@ -1153,4 +1165,45 @@ pub async fn batch_fetch_person_tmdb(
         count += 1;
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clean_title_with_year, tmdb_image_extension};
+
+    #[test]
+    fn tmdb_image_extension_allows_known_image_types() {
+        assert_eq!(
+            tmdb_image_extension("https://image.tmdb.org/t/p/w500/poster.jpeg?x=1"),
+            "jpg"
+        );
+        assert_eq!(
+            tmdb_image_extension("https://image.tmdb.org/t/p/w500/logo.PNG"),
+            "png"
+        );
+        assert_eq!(
+            tmdb_image_extension("https://image.tmdb.org/t/p/w500/still.webp#tag"),
+            "webp"
+        );
+    }
+
+    #[test]
+    fn tmdb_image_extension_rejects_non_image_suffixes() {
+        assert_eq!(
+            tmdb_image_extension("https://image.tmdb.org/t/p/w500/poster.php"),
+            "jpg"
+        );
+        assert_eq!(
+            tmdb_image_extension("https://image.tmdb.org/t/p/w500/poster"),
+            "jpg"
+        );
+    }
+
+    #[test]
+    fn clean_title_with_year_keeps_title_and_year() {
+        assert_eq!(
+            clean_title_with_year("Movie Name (2024) {tmdb-123}"),
+            ("Movie Name".to_string(), Some(2024))
+        );
+    }
 }

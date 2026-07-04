@@ -43,7 +43,7 @@ pub fn migrations() -> Vec<Migration> {
             "failed to create library paths library index",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS media_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, path TEXT NOT NULL UNIQUE, library_id TEXT NOT NULL, parent_id TEXT NOT NULL, item_type TEXT NOT NULL, is_folder BIGINT NOT NULL DEFAULT 0, container TEXT, overview TEXT, official_rating TEXT, extended_video_type TEXT, production_year BIGINT, runtime_ticks BIGINT, size_bytes BIGINT, season_number BIGINT, episode_number BIGINT, modified_at BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL DEFAULT 0)"#,
+            r#"CREATE TABLE IF NOT EXISTS media_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, path TEXT NOT NULL UNIQUE, library_id TEXT NOT NULL, parent_id TEXT NOT NULL, item_type TEXT NOT NULL, is_folder BIGINT NOT NULL DEFAULT 0, is_public BIGINT NOT NULL DEFAULT 1, container TEXT, overview TEXT, official_rating TEXT, extended_video_type TEXT, production_year BIGINT, runtime_ticks BIGINT, size_bytes BIGINT, season_number BIGINT, episode_number BIGINT, modified_at BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL DEFAULT 0)"#,
             "failed to migrate media_items",
         ),
         (
@@ -138,6 +138,10 @@ pub fn optional_migrations() -> Vec<Migration> {
         (
             "ALTER TABLE media_items ADD COLUMN is_folder BIGINT NOT NULL DEFAULT 0",
             "add media_items.is_folder",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN is_public BIGINT NOT NULL DEFAULT 1",
+            "add media_items.is_public",
         ),
         (
             "ALTER TABLE media_items ADD COLUMN overview TEXT",

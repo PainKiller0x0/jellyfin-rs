@@ -53,10 +53,28 @@ async fn similar_items_inner(
     limit: usize,
 ) -> anyhow::Result<Vec<MediaItem>> {
     let backend = db.get_database_backend();
+    let seed_visible = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT id FROM media_items WHERE id = ? AND is_public = 1",
+            vec![item_id.into()],
+        ))
+        .await
+        .context("failed to check similar item seed")?
+        .is_some();
+    if !seed_visible {
+        return Ok(Vec::new());
+    }
+
     let similar_ids = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            r#"SELECT mg_rel.item_id FROM media_genres mg_src JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id AND mg_src.item_id <> mg_rel.item_id WHERE (mg_src.item_id = ? OR mg_src.item_id = (SELECT parent_id FROM media_items WHERE id = ?)) GROUP BY mg_rel.item_id ORDER BY COUNT(*) DESC LIMIT ?"#,
+            r#"SELECT mg_rel.item_id
+               FROM media_genres mg_src
+               JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id AND mg_src.item_id <> mg_rel.item_id
+               JOIN media_items mi_rel ON mi_rel.id = mg_rel.item_id
+               WHERE mi_rel.is_public = 1 AND (mg_src.item_id = ? OR mg_src.item_id = (SELECT parent_id FROM media_items WHERE id = ?))
+               GROUP BY mg_rel.item_id ORDER BY COUNT(*) DESC LIMIT ?"#,
             vec![item_id.into(), item_id.into(), i64::try_from(limit).unwrap_or(i64::MAX).into()],
         ))
         .await
@@ -77,7 +95,7 @@ async fn similar_items_inner(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.runtime_ticks, media_items.size_bytes, media_items.season_number, media_items.episode_number, media_items.community_rating, media_items.critic_rating, media_items.created_at, media_items.modified_at, CAST(0 AS bigint) AS is_favorite, CAST(0 AS bigint) AS played, CAST(0 AS bigint) AS playback_position_ticks, NULL AS played_percentage, CAST(0 AS bigint) AS play_count, NULL AS last_played_at FROM media_items LEFT JOIN libraries ON libraries.id = media_items.library_id WHERE media_items.id IN ({placeholders})"#
+        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.is_public, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.runtime_ticks, media_items.size_bytes, media_items.season_number, media_items.episode_number, media_items.community_rating, media_items.critic_rating, media_items.created_at, media_items.modified_at, CAST(0 AS bigint) AS is_favorite, CAST(0 AS bigint) AS played, CAST(0 AS bigint) AS playback_position_ticks, NULL AS played_percentage, CAST(0 AS bigint) AS play_count, NULL AS last_played_at FROM media_items LEFT JOIN libraries ON libraries.id = media_items.library_id WHERE media_items.id IN ({placeholders})"#
     );
 
     let mut values: Vec<SeaValue> = Vec::new();
@@ -278,7 +296,8 @@ async fn next_up_inner(
         (
             format!(
                 r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0
-                    AND media_items.parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season')
+                    AND media_items.is_public = 1
+                    AND media_items.parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season' AND is_public = 1)
                     AND COALESCE(user_data.played, 0) = 0
                     AND COALESCE(user_data.playback_position_ticks, 0) = 0
                     ORDER BY media_items.parent_id ASC, media_items.episode_number ASC
@@ -296,13 +315,14 @@ async fn next_up_inner(
         (
             format!(
                 r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0
+                    AND media_items.is_public = 1
                     AND COALESCE(user_data.played, 0) = 0
                     AND COALESCE(user_data.playback_position_ticks, 0) = 0
                     AND media_items.episode_number = (
                         SELECT MIN(mi3.episode_number) FROM media_items mi3
                         LEFT JOIN user_data ud3 ON ud3.item_id = mi3.id AND ud3.user_id = ?
                         WHERE mi3.parent_id = media_items.parent_id
-                            AND mi3.item_type = 'Episode' AND mi3.is_folder = 0
+                            AND mi3.item_type = 'Episode' AND mi3.is_folder = 0 AND mi3.is_public = 1
                             AND COALESCE(ud3.played, 0) = 0
                             AND COALESCE(ud3.playback_position_ticks, 0) = 0
                     )
@@ -330,4 +350,66 @@ async fn next_up_inner(
 
 pub async fn shows_missing() -> Response {
     Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::similar_items_inner;
+    use sea_orm::{ConnectionTrait, Database};
+
+    #[tokio::test]
+    async fn similar_items_require_public_seed_and_hide_private_results() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        insert_media_item(&db, "seed", "Seed", 1).await;
+        insert_media_item(&db, "public", "Public", 1).await;
+        insert_media_item(&db, "private", "Private", 0).await;
+        insert_media_item(&db, "private_seed", "Private Seed", 0).await;
+        insert_genre(&db, "g1", "Drama").await;
+        for item_id in ["seed", "public", "private", "private_seed"] {
+            link_genre(&db, item_id, "g1").await;
+        }
+
+        let items = similar_items_inner(&db, "seed", 10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "public");
+
+        let items = similar_items_inner(&db, "private_seed", 10).await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    async fn insert_media_item(
+        db: &sea_orm::DatabaseConnection,
+        id: &str,
+        title: &str,
+        is_public: i64,
+    ) {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, ?, 1, 1, 1)",
+            vec![id.into(), title.into(), id.into(), is_public.into()],
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn insert_genre(db: &sea_orm::DatabaseConnection, id: &str, name: &str) {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO genres (id, name, created_at) VALUES (?, ?, 1)",
+            vec![id.into(), name.into()],
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn link_genre(db: &sea_orm::DatabaseConnection, item_id: &str, genre_id: &str) {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_genres (item_id, genre_id) VALUES (?, ?)",
+            vec![item_id.into(), genre_id.into()],
+        ))
+        .await
+        .unwrap();
+    }
 }

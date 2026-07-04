@@ -7,6 +7,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use sea_orm::ConnectionTrait;
 use serde_json::json;
 use tokio::{
     fs::File,
@@ -16,11 +17,12 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     app::state::AppState,
+    db::row_ext::QueryResultExt,
     jellyfin::{
-        auth::request_user_id_or_default,
-        routes::{find_media_item, internal_error, not_found},
+        auth::{request_user_id_and_admin_or_default, request_user_id_or_default},
+        routes::{find_media_item, find_media_item_for_admin, internal_error, not_found},
     },
-    library::models::MediaItem,
+    library::{models::MediaItem, path_utils},
 };
 
 pub async fn stream_video(
@@ -36,6 +38,24 @@ pub async fn stream_video_head(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((item_id, _container)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    stream_media_item(state, item_id, headers, query, Method::HEAD).await
+}
+
+pub async fn stream_video_simple(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    stream_media_item(state, item_id, headers, query, Method::GET).await
+}
+
+pub async fn stream_video_simple_head(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     stream_media_item(state, item_id, headers, query, Method::HEAD).await
@@ -61,37 +81,46 @@ pub async fn stream_audio_head(
 
 pub async fn stream_subtitle(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((item_id, index, _format)): Path<(String, i64, String)>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(state, item_id, index, Method::GET).await
+    stream_subtitle_item(state, item_id, index, headers, query, Method::GET).await
 }
 
 pub async fn stream_subtitle_head(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((item_id, index, _format)): Path<(String, i64, String)>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(state, item_id, index, Method::HEAD).await
+    stream_subtitle_item(state, item_id, index, headers, query, Method::HEAD).await
 }
 
 /// Subtitle streaming with mediaSourceId path segment for Emby client compatibility.
 pub async fn stream_subtitle_with_source(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((item_id, _media_source_id, index, _format)): Path<(String, String, i64, String)>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     // media_source_id is ignored; route to the same handler
-    stream_subtitle_item(state, item_id, index, Method::GET).await
+    stream_subtitle_item(state, item_id, index, headers, query, Method::GET).await
 }
 
 pub async fn stream_subtitle_with_source_head(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((item_id, _media_source_id, index, _format)): Path<(String, String, i64, String)>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(state, item_id, index, Method::HEAD).await
+    stream_subtitle_item(state, item_id, index, headers, query, Method::HEAD).await
 }
 
 /// Subtitle streaming with mediaSourceId and start position ticks (Emby compatibility).
 pub async fn stream_subtitle_with_ticks(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((item_id, _media_source_id, index, _start_ticks, _format)): Path<(
         String,
         String,
@@ -99,12 +128,14 @@ pub async fn stream_subtitle_with_ticks(
         i64,
         String,
     )>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(state, item_id, index, Method::GET).await
+    stream_subtitle_item(state, item_id, index, headers, query, Method::GET).await
 }
 
 pub async fn stream_subtitle_with_ticks_head(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((item_id, _media_source_id, index, _start_ticks, _format)): Path<(
         String,
         String,
@@ -112,22 +143,41 @@ pub async fn stream_subtitle_with_ticks_head(
         i64,
         String,
     )>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(state, item_id, index, Method::HEAD).await
+    stream_subtitle_item(state, item_id, index, headers, query, Method::HEAD).await
 }
 
 async fn stream_subtitle_item(
     state: Arc<AppState>,
     item_id: String,
     index: i64,
+    request_headers: HeaderMap,
+    query: HashMap<String, String>,
     method: Method,
 ) -> Response {
+    let (user_id, is_admin) =
+        request_user_id_and_admin_or_default(&state, &request_headers, &query).await;
+    let item = if is_admin {
+        find_media_item_for_admin(&state.db, &user_id, &item_id).await
+    } else {
+        find_media_item(&state.db, &user_id, &item_id).await
+    };
+    match item {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return internal_error(error),
+    }
+
     let path = match crate::jellyfin::routes::subtitle_stream_path(&state.db, &item_id, index).await
     {
         Ok(Some(path)) => path,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return internal_error(error),
     };
+    if !readable_media_path(&state.db, &path).await {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -169,6 +219,9 @@ async fn stream_media_item(
         Err(error) => return internal_error(error),
     };
     if item.is_folder {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !readable_media_path(&state.db, &item.path).await {
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -294,6 +347,30 @@ fn media_content_type(item: &MediaItem) -> &'static str {
         "wav" => "audio/wav",
         _ => "application/octet-stream",
     }
+}
+
+pub(crate) async fn readable_media_path(db: &sea_orm::DatabaseConnection, path: &str) -> bool {
+    match library_roots(db).await {
+        Ok(roots) => path_utils::path_within_roots(path, &roots),
+        Err(error) => {
+            tracing::warn!("failed to check media path roots: {error:#}");
+            false
+        }
+    }
+}
+
+async fn library_roots(db: &sea_orm::DatabaseConnection) -> anyhow::Result<Vec<String>> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT path FROM library_paths",
+            vec![],
+        ))
+        .await?;
+    rows.iter()
+        .map(|row| row.get_str("path").map_err(Into::into))
+        .collect()
 }
 
 /// GET /Audio/{id}/stream — alias for stream_audio

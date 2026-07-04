@@ -147,12 +147,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Then: fetch episode details in loop
+            // Then: fetch episode details once after startup scan has had time to populate rows.
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 match library::tmdb_metadata::batch_fetch_episode_tmdb(&ep_state.db, &api_key).await
                 {
-                    Ok(0) => {} // no episodes ready yet, keep trying
+                    Ok(0) => break,
                     Ok(n) => {
                         tracing::info!("episode TMDb batch fetched {n} titles");
                         break;
@@ -166,9 +166,12 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let api_routes = jellyfin::routes::api_routes().route_layer(
+        axum::middleware::from_fn_with_state(state.clone(), jellyfin::auth::require_auth),
+    );
     let app = Router::new()
-        .nest("/emby", jellyfin::routes::api_routes())
-        .merge(jellyfin::routes::api_routes())
+        .nest("/emby", api_routes.clone())
+        .merge(api_routes)
         .fallback(jellyfin::routes::not_found)
         .with_state(state)
         .layer(CorsLayer::permissive())

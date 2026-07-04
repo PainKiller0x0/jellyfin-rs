@@ -4,12 +4,13 @@ use crate::util::stable_item_id;
 
 pub fn classify_media_path(path: &Path, collection_type: &str) -> Option<String> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    // STRM files are classified based on their content (handled in scanner.rs)
+    // STRM files are classified from their resolved content by the scanner.
     if extension == "strm" {
         return Some(
             match collection_type {
                 "tvshows" | "tv" => "Episode",
                 "music" => "Audio",
+                "trailers" => "Trailer",
                 "movies" => "Video",
                 _ => "Movie",
             }
@@ -24,6 +25,7 @@ pub fn classify_media_path(path: &Path, collection_type: &str) -> Option<String>
             match collection_type {
                 "tvshows" | "tv" => "Episode",
                 "music" => "Audio",
+                "trailers" => "Trailer",
                 // In movie libraries, files are "Video" — the folder itself is the "Movie"
                 "movies" => "Video",
                 _ => "Movie",
@@ -84,4 +86,18 @@ fn is_season_folder_name(name: &str) -> bool {
     name.starts_with("season ")
         || name.starts_with("season_")
         || name.starts_with('s') && name[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_media_path;
+    use std::path::Path;
+
+    #[test]
+    fn trailers_library_video_files_are_trailers() {
+        assert_eq!(
+            classify_media_path(Path::new("sample.mp4"), "trailers").as_deref(),
+            Some("Trailer")
+        );
+    }
 }

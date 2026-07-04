@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Context;
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -38,18 +39,70 @@ pub async fn unfavorite_item(
     }
 }
 
+pub async fn current_user_favorite_item(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    let user_id = request_user_id_or_default(&state, &headers, &query).await;
+    match set_user_data_flag_json(&state.db, &user_id, &item_id, "is_favorite", true).await {
+        Ok(data) => Json(data).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn current_user_unfavorite_item(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    let user_id = request_user_id_or_default(&state, &headers, &query).await;
+    match set_user_data_flag_json(&state.db, &user_id, &item_id, "is_favorite", false).await {
+        Ok(data) => Json(data).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
 pub async fn mark_played(
     State(state): State<Arc<AppState>>,
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Response {
-    set_user_data_flag(&state.db, &user_id, &item_id, "played", true).await
+    match set_user_data_flag_json(&state.db, &user_id, &item_id, "played", true).await {
+        Ok(data) => Json(data).into_response(),
+        Err(error) => internal_error(error),
+    }
 }
 
 pub async fn mark_unplayed(
     State(state): State<Arc<AppState>>,
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Response {
-    set_user_data_flag(&state.db, &user_id, &item_id, "played", false).await
+    match set_user_data_flag_json(&state.db, &user_id, &item_id, "played", false).await {
+        Ok(data) => Json(data).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn current_user_mark_played(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    let user_id = request_user_id_or_default(&state, &headers, &query).await;
+    mark_played(State(state), Path((user_id, item_id))).await
+}
+
+pub async fn current_user_mark_unplayed(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    let user_id = request_user_id_or_default(&state, &headers, &query).await;
+    mark_unplayed(State(state), Path((user_id, item_id))).await
 }
 
 pub async fn hide_from_resume(
@@ -78,20 +131,29 @@ pub async fn hide_from_resume(
 pub async fn set_rating(
     State(state): State<Arc<AppState>>,
     Path((user_id, item_id)): Path<(String, String)>,
-    Json(body): Json<JsonValue>,
+    Query(query): Query<HashMap<String, String>>,
+    body: Bytes,
 ) -> Response {
-    let rating = body
-        .get("Likes")
-        .and_then(JsonValue::as_bool)
-        .map(|likes| if likes { 1.0 } else { -1.0 })
-        .or_else(|| body.get("Rating").and_then(JsonValue::as_f64))
-        .unwrap_or(0.0);
+    let body_json = if body.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice::<JsonValue>(&body) {
+            Ok(value) => Some(value),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        }
+    };
+    let Some(rating) = rating_from_request(&query, body_json.as_ref()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
     match upsert_user_data_simple(&state.db, &user_id, &item_id, |active| {
         active.rating = Set(Some(rating));
     })
     .await
     {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => match user_data_json(&state.db, &user_id, &item_id).await {
+            Ok(data) => Json(data).into_response(),
+            Err(error) => internal_error(error),
+        },
         Err(error) => internal_error(error),
     }
 }
@@ -105,22 +167,33 @@ pub async fn delete_rating(
     })
     .await
     {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => match user_data_json(&state.db, &user_id, &item_id).await {
+            Ok(data) => Json(data).into_response(),
+            Err(error) => internal_error(error),
+        },
         Err(error) => internal_error(error),
     }
 }
 
-async fn set_user_data_flag(
-    db: &sea_orm::DatabaseConnection,
-    user_id: &str,
-    item_id: &str,
-    field: &str,
-    value: bool,
+pub async fn current_user_set_rating(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Path(item_id): Path<String>,
+    body: Bytes,
 ) -> Response {
-    match upsert_user_data_flag(db, user_id, item_id, field, value).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error),
-    }
+    let user_id = request_user_id_or_default(&state, &headers, &query).await;
+    set_rating(State(state), Path((user_id, item_id)), Query(query), body).await
+}
+
+pub async fn current_user_delete_rating(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Path(item_id): Path<String>,
+) -> Response {
+    let user_id = request_user_id_or_default(&state, &headers, &query).await;
+    delete_rating(State(state), Path((user_id, item_id))).await
 }
 
 async fn set_user_data_flag_json(
@@ -131,12 +204,19 @@ async fn set_user_data_flag_json(
     value: bool,
 ) -> anyhow::Result<JsonValue> {
     upsert_user_data_flag(db, user_id, item_id, field, value).await?;
-    // Fetch the updated user data and return it
+    user_data_json(db, user_id, item_id).await
+}
+
+async fn user_data_json(
+    db: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    item_id: &str,
+) -> anyhow::Result<JsonValue> {
     let backend = db.get_database_backend();
     let row = db
         .query_one(crate::db::helpers::portable_statement(
             backend,
-            "SELECT is_favorite, played, playback_position_ticks, played_percentage, play_count, last_played_at FROM user_data WHERE user_id = ? AND item_id = ?",
+            "SELECT is_favorite, played, playback_position_ticks, played_percentage, play_count, last_played_at, rating FROM user_data WHERE user_id = ? AND item_id = ?",
             vec![user_id.into(), item_id.into()],
         ))
         .await?;
@@ -149,6 +229,7 @@ async fn set_user_data_flag_json(
             let played_percentage = row.get_f64("played_percentage")?;
             let play_count = row.get_i64("play_count")?;
             let last_played_at = row.get_opt_i64("last_played_at")?;
+            let rating = row.get_f64("rating")?;
             Ok(json!({
                 "ItemId": item_id,
                 "Key": item_id,
@@ -158,7 +239,7 @@ async fn set_user_data_flag_json(
                 "PlayedPercentage": played_percentage,
                 "PlayCount": play_count,
                 "LastPlayedDate": last_played_at.map(unix_to_jellyfin_date),
-                "Rating": null,
+                "Rating": rating,
                 "Likes": null,
                 "UnplayedItemCount": null,
             }))
@@ -166,7 +247,7 @@ async fn set_user_data_flag_json(
         None => Ok(json!({
             "ItemId": item_id,
             "Key": item_id,
-            "IsFavorite": value,
+            "IsFavorite": false,
             "Played": false,
             "PlaybackPositionTicks": 0,
             "PlayedPercentage": null,
@@ -176,6 +257,90 @@ async fn set_user_data_flag_json(
             "Likes": null,
             "UnplayedItemCount": null,
         })),
+    }
+}
+
+fn rating_from_request(query: &HashMap<String, String>, body: Option<&JsonValue>) -> Option<f64> {
+    query_bool_any(query, &["likes", "Likes"])
+        .map(|likes| if likes { 1.0 } else { -1.0 })
+        .or_else(|| {
+            query
+                .get("rating")
+                .or_else(|| query.get("Rating"))
+                .and_then(|value| value.parse::<f64>().ok())
+        })
+        .or_else(|| {
+            body.and_then(|body| {
+                body.get("Likes")
+                    .and_then(JsonValue::as_bool)
+                    .map(|likes| if likes { 1.0 } else { -1.0 })
+                    .or_else(|| body.get("Rating").and_then(JsonValue::as_f64))
+            })
+        })
+}
+
+fn query_bool_any(query: &HashMap<String, String>, keys: &[&str]) -> Option<bool> {
+    let value = query
+        .iter()
+        .find(|(key, _)| keys.iter().any(|wanted| key.eq_ignore_ascii_case(wanted)))
+        .map(|(_, value)| value.trim().to_ascii_lowercase())?;
+    match value.as_str() {
+        "1" | "true" | "yes" => Some(true),
+        "0" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn optional_f64(body: &JsonValue, key: &str) -> Option<Option<f64>> {
+    match body.get(key)? {
+        JsonValue::Null => Some(None),
+        value => value.as_f64().map(Some),
+    }
+}
+
+fn optional_jellyfin_date(body: &JsonValue, key: &str) -> Option<Option<i64>> {
+    match body.get(key)? {
+        JsonValue::Null => Some(None),
+        JsonValue::String(value) => chrono::DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|date| Some(date.timestamp())),
+        _ => None,
+    }
+}
+
+fn apply_user_item_data_update(active: &mut user_data::ActiveModel, body: &JsonValue, now: i64) {
+    if let Some(value) = body.get("IsFavorite").and_then(JsonValue::as_bool) {
+        active.is_favorite = Set(if value { 1 } else { 0 });
+    }
+    if let Some(value) = body.get("Played").and_then(JsonValue::as_bool) {
+        active.played = Set(if value { 1 } else { 0 });
+        if value && !body.get("LastPlayedDate").is_some_and(JsonValue::is_null) {
+            active.last_played_at = Set(Some(now));
+        } else if !value {
+            active.last_played_at = Set(None);
+        }
+    }
+    if let Some(value) = body
+        .get("PlaybackPositionTicks")
+        .and_then(JsonValue::as_i64)
+    {
+        active.playback_position_ticks = Set(value.max(0));
+    }
+    if let Some(value) = optional_f64(body, "PlayedPercentage") {
+        active.played_percentage = Set(value);
+    }
+    if let Some(value) = body.get("PlayCount").and_then(JsonValue::as_i64) {
+        active.play_count = Set(value.max(0));
+    }
+    if let Some(value) = optional_jellyfin_date(body, "LastPlayedDate") {
+        active.last_played_at = Set(value);
+    }
+    if let Some(value) = optional_f64(body, "Rating").or_else(|| {
+        body.get("Likes")
+            .and_then(JsonValue::as_bool)
+            .map(|likes| Some(if likes { 1.0 } else { -1.0 }))
+    }) {
+        active.rating = Set(value);
     }
 }
 
@@ -195,28 +360,55 @@ async fn upsert_user_data_flag(
             })
             .await
         }
-        "played" => {
-            let now = now_unix();
-            let backend = db.get_database_backend();
-            db.execute(crate::db::helpers::portable_statement(
-                backend,
-                r#"INSERT INTO user_data (user_id, item_id, played, playback_position_ticks, played_percentage, play_count, last_played_at, updated_at) VALUES (?, ?, ?, 0, NULL, COALESCE((SELECT play_count FROM user_data WHERE user_id = ? AND item_id = ?), 0) + 1, ?, ?) ON CONFLICT(user_id, item_id) DO UPDATE SET played = excluded.played, playback_position_ticks = excluded.playback_position_ticks, played_percentage = excluded.played_percentage, play_count = COALESCE(user_data.play_count, 0) + 1, last_played_at = excluded.last_played_at, updated_at = excluded.updated_at"#,
-                vec![
-                    user_id.into(),
-                    item_id.into(),
-                    value_int.into(),
-                    user_id.into(),
-                    item_id.into(),
-                    now.into(),
-                    now.into(),
-                ],
-            ))
+        "played" => upsert_played_flag(db, user_id, item_id, value)
             .await
-            .with_context(|| format!("failed to update user data flag for item: {item_id}"))?;
-            Ok(())
-        }
+            .with_context(|| format!("failed to update user data flag for item: {item_id}")),
         _ => anyhow::bail!("unsupported user data flag: {field}"),
     }
+}
+
+async fn upsert_played_flag(
+    db: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    item_id: &str,
+    played: bool,
+) -> anyhow::Result<()> {
+    let now = now_unix();
+    match UserData::find_by_id((user_id.to_string(), item_id.to_string()))
+        .one(db)
+        .await?
+    {
+        Some(model) => {
+            let play_count = if played {
+                model.play_count.saturating_add(1)
+            } else {
+                0
+            };
+            let mut active: user_data::ActiveModel = model.into();
+            active.played = Set(if played { 1 } else { 0 });
+            active.playback_position_ticks = Set(0);
+            active.played_percentage = Set(None);
+            active.play_count = Set(play_count);
+            active.last_played_at = Set(played.then_some(now));
+            active.updated_at = Set(now);
+            active.update(db).await?;
+        }
+        None => {
+            let active = user_data::ActiveModel {
+                user_id: Set(user_id.to_string()),
+                item_id: Set(item_id.to_string()),
+                played: Set(if played { 1 } else { 0 }),
+                playback_position_ticks: Set(0),
+                played_percentage: Set(None),
+                play_count: Set(if played { 1 } else { 0 }),
+                last_played_at: Set(played.then_some(now)),
+                updated_at: Set(now),
+                ..Default::default()
+            };
+            UserData::insert(active).exec(db).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn upsert_user_data_simple(
@@ -311,82 +503,142 @@ pub async fn update_user_item_data(
     let user_id = request_user_id_or_default(&state, &headers, &query).await;
     let now = now_unix();
 
-    let is_favorite = body
-        .get("IsFavorite")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let played = body
-        .get("Played")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let playback_position_ticks = body
-        .get("PlaybackPositionTicks")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let play_count = body.get("PlayCount").and_then(|v| v.as_i64()).unwrap_or(0);
-    let last_played_at = if body.get("LastPlayedDate").is_some() {
-        Some(now)
-    } else {
-        None
-    };
-
-    match UserData::find_by_id((user_id.clone(), item_id.clone()))
-        .one(&state.db)
-        .await
+    if let Err(error) = upsert_user_data_simple(&state.db, &user_id, &item_id, |active| {
+        apply_user_item_data_update(active, &body, now);
+    })
+    .await
     {
-        Ok(Some(model)) => {
-            let mut active: user_data::ActiveModel = model.into();
-            active.is_favorite = Set(if is_favorite { 1 } else { 0 });
-            active.played = Set(if played { 1 } else { 0 });
-            active.playback_position_ticks = Set(playback_position_ticks);
-            active.play_count = Set(play_count);
-            active.last_played_at = Set(last_played_at);
-            active.updated_at = Set(now);
-            if let Err(e) = active.update(&state.db).await {
-                return internal_error(e.into());
-            }
-        }
-        Ok(None) => {
-            let active = user_data::ActiveModel {
-                user_id: Set(user_id.clone()),
-                item_id: Set(item_id.clone()),
-                is_favorite: Set(if is_favorite { 1 } else { 0 }),
-                played: Set(if played { 1 } else { 0 }),
-                playback_position_ticks: Set(playback_position_ticks),
-                play_count: Set(play_count),
-                last_played_at: Set(last_played_at),
-                updated_at: Set(now),
-                ..Default::default()
-            };
-            if let Err(e) = UserData::insert(active).exec(&state.db).await {
-                return internal_error(e.into());
-            }
-        }
-        Err(error) => return internal_error(error.into()),
+        return internal_error(error);
     }
 
-    // Return updated user data
-    match UserData::find_by_id((user_id, item_id))
-        .one(&state.db)
+    match user_data_json(&state.db, &user_id, &item_id).await {
+        Ok(data) => Json(data).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_user_item_data_update, rating_from_request, set_user_data_flag_json,
+        upsert_user_data_simple, user_data_json,
+    };
+    use crate::db::row_ext::QueryResultExt;
+    use sea_orm::Set;
+    use sea_orm::{ConnectionTrait, Database};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn marking_unplayed_does_not_increment_play_count() {
+        let db = seeded_db().await;
+        let backend = db.get_database_backend();
+
+        let played = set_user_data_flag_json(&db, "u1", "i1", "played", true)
+            .await
+            .unwrap();
+        assert_eq!(played["Played"], true);
+        assert_eq!(played["PlayCount"], 1);
+        assert!(played["LastPlayedDate"].is_string());
+
+        let unplayed = set_user_data_flag_json(&db, "u1", "i1", "played", false)
+            .await
+            .unwrap();
+        assert_eq!(unplayed["Played"], false);
+        assert_eq!(unplayed["PlayCount"], 0);
+        assert_eq!(unplayed["PlaybackPositionTicks"], 0);
+        assert!(unplayed["LastPlayedDate"].is_null());
+
+        let row = db
+            .query_one(crate::db::helpers::portable_statement(
+                backend,
+                "SELECT played, play_count, last_played_at FROM user_data WHERE user_id = 'u1' AND item_id = 'i1'",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get_i64("played").unwrap(), 0);
+        assert_eq!(row.get_i64("play_count").unwrap(), 0);
+        assert_eq!(row.get_opt_i64("last_played_at").unwrap(), None);
+    }
+
+    #[test]
+    fn rating_request_accepts_query_and_body_shapes() {
+        let mut query = HashMap::new();
+        query.insert("Likes".to_string(), "false".to_string());
+        assert_eq!(rating_from_request(&query, None), Some(-1.0));
+
+        query.clear();
+        query.insert("rating".to_string(), "4.5".to_string());
+        assert_eq!(rating_from_request(&query, None), Some(4.5));
+
+        assert_eq!(
+            rating_from_request(&HashMap::new(), Some(&json!({ "Likes": true }))),
+            Some(1.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn user_data_json_includes_rating() {
+        let db = seeded_db().await;
+        upsert_user_data_simple(&db, "u1", "i1", |active| {
+            active.rating = Set(Some(4.5));
+        })
         .await
-    {
-        Ok(Some(model)) => {
-            let data = json!({
-                "ItemId": model.item_id,
-                "Key": model.item_id,
-                "IsFavorite": model.is_favorite != 0,
-                "Played": model.played != 0,
-                "PlaybackPositionTicks": model.playback_position_ticks,
-                "PlayedPercentage": model.played_percentage,
-                "PlayCount": model.play_count,
-                "LastPlayedDate": model.last_played_at.map(unix_to_jellyfin_date),
-                "Rating": model.rating,
-                "Likes": null,
-                "UnplayedItemCount": null,
-            });
-            Json(data).into_response()
-        }
-        Ok(None) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error.into()),
+        .unwrap();
+
+        let data = user_data_json(&db, "u1", "i1").await.unwrap();
+        assert_eq!(data["Rating"], 4.5);
+    }
+
+    #[tokio::test]
+    async fn user_data_update_preserves_omitted_fields() {
+        let db = seeded_db().await;
+        upsert_user_data_simple(&db, "u1", "i1", |active| {
+            active.is_favorite = Set(1);
+            active.played = Set(1);
+            active.playback_position_ticks = Set(10);
+            active.play_count = Set(3);
+            active.last_played_at = Set(Some(100));
+            active.rating = Set(Some(4.5));
+        })
+        .await
+        .unwrap();
+
+        upsert_user_data_simple(&db, "u1", "i1", |active| {
+            apply_user_item_data_update(active, &json!({ "PlaybackPositionTicks": 250 }), 200);
+        })
+        .await
+        .unwrap();
+
+        let data = user_data_json(&db, "u1", "i1").await.unwrap();
+        assert_eq!(data["IsFavorite"], true);
+        assert_eq!(data["Played"], true);
+        assert_eq!(data["PlaybackPositionTicks"], 250);
+        assert_eq!(data["PlayCount"], 3);
+        assert_eq!(data["Rating"], 4.5);
+        assert_eq!(data["LastPlayedDate"], "1970-01-01T00:01:40Z");
+    }
+
+    async fn seeded_db() -> sea_orm::DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'u1', 'u1', 0, 0, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES ('i1', 'Movie', '/tmp/i1.mkv', '', '', 'Movie', 0, 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db
     }
 }

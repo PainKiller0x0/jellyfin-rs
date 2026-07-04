@@ -378,15 +378,7 @@ async fn build_activity_data(state: &AppState) -> Value {
 }
 
 async fn build_tasks_data(state: &AppState) -> Value {
-    let scan_result = crate::jellyfin::system::last_task_result(&state.db, "scan-library").await;
-    let task = serde_json::json!({
-        "Name": "Scan media library",
-        "State": "Idle",
-        "Id": "scan-library",
-        "Description": "Scans configured media library paths for new and updated media files.",
-        "Category": "Library",
-        "IsHidden": false,
-        "LastExecutionResult": scan_result,
-    });
-    Value::Array(vec![task])
+    Value::Array(vec![
+        crate::jellyfin::system::scan_library_task(&state.db).await,
+    ])
 }

@@ -1,21 +1,28 @@
 use anyhow::Context;
-use sea_orm::sqlx::{Sqlite, migrate::MigrateDatabase};
+use sea_orm::sqlx::{Postgres, Sqlite, migrate::MigrateDatabase};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 
 use crate::db::schema::{migrations, optional_migrations};
 
 pub async fn ensure_database_exists(database_url: &str) -> anyhow::Result<()> {
-    if !database_url.starts_with("sqlite:") {
-        return Ok(());
-    }
-
-    if !Sqlite::database_exists(database_url)
-        .await
-        .unwrap_or_default()
-    {
-        Sqlite::create_database(database_url)
+    if database_url.starts_with("sqlite:") {
+        if !Sqlite::database_exists(database_url)
             .await
-            .with_context(|| format!("failed to create SQLite database: {database_url}"))?;
+            .unwrap_or_default()
+        {
+            Sqlite::create_database(database_url)
+                .await
+                .with_context(|| format!("failed to create SQLite database: {database_url}"))?;
+        }
+    } else if database_url.starts_with("postgres:") || database_url.starts_with("postgresql:") {
+        if !Postgres::database_exists(database_url)
+            .await
+            .unwrap_or_default()
+        {
+            Postgres::create_database(database_url)
+                .await
+                .with_context(|| format!("failed to create PostgreSQL database: {database_url}"))?;
+        }
     }
 
     Ok(())
@@ -45,7 +52,7 @@ async fn execute_migration(
     sql: &str,
     context: &'static str,
 ) -> anyhow::Result<()> {
-    db.execute(Statement::from_string(backend, sql.to_string()))
+    db.execute(Statement::from_string(backend, migration_sql(backend, sql)))
         .await
         .context(context)?;
     Ok(())
@@ -58,12 +65,23 @@ async fn execute_optional_migration(
     context: &'static str,
 ) {
     if let Err(error) = db
-        .execute(Statement::from_string(backend, sql.to_string()))
+        .execute(Statement::from_string(backend, migration_sql(backend, sql)))
         .await
     {
         let message = error.to_string().to_ascii_lowercase();
-        if !message.contains("duplicate") && !message.contains("exists") {
+        if !message.contains("duplicate")
+            && !message.contains("exists")
+            && !message.contains("已经存在")
+        {
             tracing::warn!("optional migration failed ({context}): {error}");
         }
+    }
+}
+
+fn migration_sql(backend: DbBackend, sql: &str) -> String {
+    if backend == DbBackend::Postgres {
+        sql.replace(" BLOB ", " BYTEA ")
+    } else {
+        sql.to_string()
     }
 }

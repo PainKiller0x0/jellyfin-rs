@@ -50,22 +50,90 @@ pub async fn update_user_settings(
     Json(body): Json<Value>,
 ) -> Response {
     let backend = state.db.get_database_backend();
-    if let Some(obj) = body.as_object() {
-        for (key, value) in obj {
-            let full_key = format!("user_settings:{}:{}", user_id, key);
-            let value_str = match value.as_str() {
-                Some(s) => s.to_string(),
-                None => value.to_string(),
-            };
-            let now = crate::util::now_unix();
-            let _ = state.db.execute(crate::db::helpers::portable_statement(
+    let Some(obj) = body.as_object() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    for (key, value) in obj {
+        let full_key = format!("user_settings:{}:{}", user_id, key);
+        let value_str = user_setting_value(value);
+        let now = crate::util::now_unix();
+        if let Err(error) = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
                 backend,
                 "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 vec![full_key.into(), value_str.as_str().into(), now.into()],
-            )).await;
+            ))
+            .await
+        {
+            return internal_error(error.into());
         }
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+pub async fn get_typed_setting(
+    State(state): State<Arc<AppState>>,
+    Path((user_id, key)): Path<(String, String)>,
+) -> Response {
+    let backend = state.db.get_database_backend();
+    match state
+        .db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT value FROM app_settings WHERE key = ?",
+            vec![typed_setting_key(&user_id, &key).into()],
+        ))
+        .await
+    {
+        Ok(Some(row)) => {
+            let value = row
+                .get_str("value")
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or(Value::Null);
+            Json(value).into_response()
+        }
+        Ok(None) => Json(json!({})).into_response(),
+        Err(error) => internal_error(error.into()),
+    }
+}
+
+pub async fn update_typed_setting(
+    State(state): State<Arc<AppState>>,
+    Path((user_id, key)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let backend = state.db.get_database_backend();
+    let now = crate::util::now_unix();
+    match state
+        .db
+        .execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            vec![
+                typed_setting_key(&user_id, &key).into(),
+                body.to_string().into(),
+                now.into(),
+            ],
+        ))
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error.into()),
+    }
+}
+
+fn typed_setting_key(user_id: &str, key: &str) -> String {
+    format!("typed_user_settings:{}:{}:{}", user_id.len(), user_id, key)
+}
+
+fn user_setting_value(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
 }
 
 /// GET /Sessions/PlayQueue — get current play queue
@@ -122,4 +190,23 @@ pub async fn add_to_playlist_info(
         "Items": ids.iter().map(|id| json!({"Id": id})).collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_setting_value_preserves_strings_and_json_values() {
+        assert_eq!(user_setting_value(&json!("dark")), "dark");
+        assert_eq!(
+            user_setting_value(&json!({"enabled": true})),
+            "{\"enabled\":true}"
+        );
+    }
+
+    #[test]
+    fn typed_setting_key_separates_user_and_key() {
+        assert_ne!(typed_setting_key("ab", "c"), typed_setting_key("a", "bc"));
+    }
 }

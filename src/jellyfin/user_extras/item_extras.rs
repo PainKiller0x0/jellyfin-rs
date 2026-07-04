@@ -3,13 +3,21 @@ use std::{collections::HashMap, sync::Arc};
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use sea_orm::ConnectionTrait;
+use sea_orm::{ConnectionTrait, DatabaseConnection, Value as SeaValue};
 use serde_json::json;
 
-use crate::{app::state::AppState, db::row_ext::QueryResultExt};
+use crate::{
+    app::state::AppState,
+    db::row_ext::QueryResultExt,
+    jellyfin::{
+        common::{internal_error, strip_nulls},
+        item_queries,
+    },
+    library::models::MediaItem,
+};
 
 /// GET /Items/{item_id}/Intros — get intros (returns empty, not supported)
 pub async fn item_intros() -> Response {
@@ -18,78 +26,284 @@ pub async fn item_intros() -> Response {
 
 /// GET /Items/{item_id}/LocalTrailers — get local trailers
 pub async fn item_local_trailers(
-    State(_state): State<Arc<AppState>>,
-    Path(_item_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    Json(json!([])).into_response()
+    item_extra_array(&state, &item_id, &query, ExtraKind::Trailer).await
 }
 
 /// GET /Items/{item_id}/SpecialFeatures — get special features
 pub async fn item_special_features(
-    State(_state): State<Arc<AppState>>,
-    Path(_item_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    Json(json!([])).into_response()
+    item_extra_array(&state, &item_id, &query, ExtraKind::SpecialFeature).await
 }
 
 /// GET /Items/{item_id}/ThemeSongs — theme songs (empty for video server)
-pub async fn item_theme_songs() -> Response {
-    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+pub async fn item_theme_songs(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    item_theme_result(&state, &item_id, &query, ExtraKind::ThemeSong).await
 }
 
 /// GET /Items/{item_id}/ThemeVideos — theme videos (empty)
-pub async fn item_theme_videos() -> Response {
-    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+pub async fn item_theme_videos(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    item_theme_result(&state, &item_id, &query, ExtraKind::ThemeVideo).await
 }
 
 /// GET /Items/{item_id}/ThemeMedia — theme media (empty)
-pub async fn item_theme_media() -> Response {
-    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+pub async fn item_theme_media(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let songs = item_theme_result_value(&state, &item_id, &query, ExtraKind::ThemeSong).await;
+    let videos = item_theme_result_value(&state, &item_id, &query, ExtraKind::ThemeVideo).await;
+    match (songs, videos) {
+        (Ok(theme_songs), Ok(theme_videos)) => Json(json!({
+            "ThemeVideosResult": theme_videos,
+            "ThemeSongsResult": theme_songs,
+            "SoundtrackSongsResult": theme_result(Vec::new(), &item_id),
+        }))
+        .into_response(),
+        (Err(error), _) | (_, Err(error)) => internal_error(error),
+    }
 }
 
 /// GET /MediaSegments/{item_id} — chapter markers (intro/credits segments)
+async fn item_extra_array(
+    state: &AppState,
+    item_id: &str,
+    query: &HashMap<String, String>,
+    kind: ExtraKind,
+) -> Response {
+    match item_extras(&state.db, &request_user_id(state, query), item_id, kind).await {
+        Ok(items) => Json(media_items_json(items)).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+async fn item_theme_result(
+    state: &AppState,
+    item_id: &str,
+    query: &HashMap<String, String>,
+    kind: ExtraKind,
+) -> Response {
+    match item_theme_result_value(state, item_id, query, kind).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+async fn item_theme_result_value(
+    state: &AppState,
+    item_id: &str,
+    query: &HashMap<String, String>,
+    kind: ExtraKind,
+) -> anyhow::Result<serde_json::Value> {
+    item_extras(&state.db, &request_user_id(state, query), item_id, kind)
+        .await
+        .map(|items| theme_result(items, item_id))
+}
+
+async fn item_extras(
+    db: &DatabaseConnection,
+    user_id: &str,
+    item_id: &str,
+    kind: ExtraKind,
+) -> anyhow::Result<Vec<MediaItem>> {
+    let sql = item_queries::media_item_select_sql(
+        "WHERE media_items.id IN (WITH RECURSIVE target(id, root_id) AS (SELECT id, CASE WHEN is_folder = 0 AND parent_id <> '' THEN parent_id ELSE id END FROM media_items WHERE id = ? AND is_public = 1), tree(id) AS (SELECT root_id FROM target UNION ALL SELECT child.id FROM media_items child JOIN tree ON child.parent_id = tree.id AND child.is_public = 1) SELECT id FROM tree WHERE id <> (SELECT id FROM target)) AND media_items.is_folder = 0 AND media_items.is_public = 1 ORDER BY media_items.title ASC",
+    );
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            &sql,
+            vec![user_id.into(), item_id.into()],
+        ))
+        .await?;
+    let mut items = item_queries::decode_media_items(&rows)?
+        .into_iter()
+        .filter(|item| kind.matches(item))
+        .collect::<Vec<_>>();
+    attach_image_tags(db, &mut items).await;
+    Ok(items)
+}
+
+#[derive(Clone, Copy)]
+enum ExtraKind {
+    Trailer,
+    SpecialFeature,
+    ThemeSong,
+    ThemeVideo,
+}
+
+impl ExtraKind {
+    fn matches(self, item: &MediaItem) -> bool {
+        let haystack = format!(
+            "{} {} {}",
+            item.title.to_ascii_lowercase(),
+            item.path.replace('\\', "/").to_ascii_lowercase(),
+            item.extended_video_type
+                .clone()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        );
+        match self {
+            Self::Trailer => item.item_type == "Trailer" || contains_any(&haystack, &["trailer"]),
+            Self::SpecialFeature => contains_any(
+                &haystack,
+                &[
+                    "/extras/",
+                    "/specials/",
+                    "special feature",
+                    "behind the scenes",
+                    "deleted scene",
+                ],
+            ),
+            Self::ThemeSong => item.item_type == "Audio" && contains_any(&haystack, &["theme"]),
+            Self::ThemeVideo => {
+                matches!(item.item_type.as_str(), "Video" | "Movie" | "Trailer")
+                    && contains_any(&haystack, &["theme"])
+            }
+        }
+    }
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+fn media_items_json(items: Vec<MediaItem>) -> Vec<serde_json::Value> {
+    items
+        .into_iter()
+        .map(|item| strip_nulls(item.to_jellyfin_json()))
+        .collect()
+}
+
+fn theme_result(items: Vec<MediaItem>, owner_id: &str) -> serde_json::Value {
+    let items = media_items_json(items);
+    json!({
+        "Items": items,
+        "TotalRecordCount": items.len(),
+        "StartIndex": 0,
+        "OwnerId": owner_id,
+    })
+}
+
+fn request_user_id(state: &AppState, query: &HashMap<String, String>) -> String {
+    query
+        .get("UserId")
+        .or_else(|| query.get("userId"))
+        .cloned()
+        .unwrap_or_else(|| state.user_id.to_string())
+}
+
 pub async fn media_segments(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    match media_segments_value(&state.db, &item_id, &query).await {
+        Ok(Some(value)) => Json(value).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+async fn media_segments_value(
+    db: &DatabaseConnection,
+    item_id: &str,
+    query: &HashMap<String, String>,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let include_types = query_param(query, &["includeSegmentTypes", "IncludeSegmentTypes"])
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let Some(runtime) = public_item_runtime_ticks(db, item_id).await? else {
+        return Ok(None);
+    };
+    let chapters = crate::chapters::get_chapters(db, item_id).await?;
     let mut segments = Vec::new();
-
-    // Get intro markers
-    if let Ok(Some((intro_start, intro_end))) =
-        crate::chapters::get_intro_markers(&state.db, &item_id).await
-    {
+    for window in chapters.windows(2) {
+        let start = &window[0];
+        let end = &window[1];
+        let segment_type = match start.marker_type.as_deref() {
+            Some("IntroStart") if end.marker_type.as_deref() == Some("IntroEnd") => "Intro",
+            _ => continue,
+        };
+        if !include_types.is_empty()
+            && !include_types
+                .iter()
+                .any(|value| value == &segment_type.to_ascii_lowercase())
+        {
+            continue;
+        }
         segments.push(json!({
-            "Type": "Intro",
-            "StartTicks": intro_start,
-            "EndTicks": intro_end
+            "Id": start.id,
+            "ItemId": item_id,
+            "Type": segment_type,
+            "StartTicks": start.start_position_ticks,
+            "EndTicks": end.start_position_ticks,
         }));
     }
-
-    // Get credits marker
-    if let Ok(Some(credits_start)) = crate::chapters::get_credits_marker(&state.db, &item_id).await
+    if let Some(credits) = chapters
+        .iter()
+        .find(|chapter| chapter.marker_type.as_deref() == Some("CreditsStart"))
     {
-        // Get runtime to compute end ticks
-        let runtime = state
-            .db
-            .query_one(crate::db::helpers::portable_statement(
-                state.db.get_database_backend(),
-                "SELECT runtime_ticks FROM media_items WHERE id = ?",
-                vec![item_id.clone().into()],
-            ))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|r| r.get_i64("runtime_ticks").ok())
-            .unwrap_or(0);
-
-        segments.push(json!({
-            "Type": "Credits",
-            "StartTicks": credits_start,
-            "EndTicks": runtime
-        }));
+        if runtime > credits.start_position_ticks
+            && (include_types.is_empty() || include_types.iter().any(|value| value == "outro"))
+        {
+            segments.push(json!({
+                "Id": credits.id,
+                "ItemId": item_id,
+                "Type": "Outro",
+                "StartTicks": credits.start_position_ticks,
+                "EndTicks": runtime,
+            }));
+        }
     }
+    segments.sort_by_key(|segment| {
+        segment
+            .get("StartTicks")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    });
+    let total = segments.len();
+    Ok(Some(json!({
+        "Items": segments,
+        "TotalRecordCount": total,
+        "StartIndex": 0,
+    })))
+}
 
-    Json(json!({ "Segments": segments })).into_response()
+async fn public_item_runtime_ticks(
+    db: &DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<Option<i64>> {
+    Ok(db
+        .query_one(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "SELECT runtime_ticks FROM media_items WHERE id = ? AND is_public = 1",
+            vec![item_id.into()],
+        ))
+        .await?
+        .map(|row| row.get_i64("runtime_ticks").unwrap_or(0)))
 }
 
 /// GET /Items/{item_id}/InstantMix — instant mix from item
@@ -100,57 +314,390 @@ pub async fn item_instant_mix(
 ) -> Response {
     let user_id = query
         .get("UserId")
+        .or_else(|| query.get("userId"))
         .cloned()
         .unwrap_or_else(|| state.user_id.to_string());
-    let limit = query
-        .get("Limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16);
 
-    // Use similar items logic (same genre-based approach)
-    let backend = state.db.get_database_backend();
-    let sql = r#"SELECT mg_rel.item_id FROM media_genres mg_src JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id AND mg_src.item_id <> mg_rel.item_id WHERE mg_src.item_id = ? GROUP BY mg_rel.item_id ORDER BY COUNT(*) DESC LIMIT ?"#;
-    let similar_rows = state
-        .db
-        .query_all(crate::db::helpers::portable_statement(
+    match async {
+        let seed_ids = seed_ids_for_item(&state.db, &item_id).await?;
+        instant_mix_from_seed_ids(&state.db, &user_id, &seed_ids, &query, true).await
+    }
+    .await
+    {
+        Ok(items) => instant_mix_response(items),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn artist_instant_mix(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(id) = query_param(&query, &["Id", "id", "ItemId", "itemId"]) else {
+        return empty_instant_mix_response();
+    };
+    artist_instant_mix_for_value(&state, id, &query).await
+}
+
+pub async fn artist_instant_mix_by_id(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    artist_instant_mix_for_value(&state, &item_id, &query).await
+}
+
+async fn artist_instant_mix_for_value(
+    state: &AppState,
+    id_or_name: &str,
+    query: &HashMap<String, String>,
+) -> Response {
+    let user_id = query
+        .get("UserId")
+        .or_else(|| query.get("userId"))
+        .cloned()
+        .unwrap_or_else(|| state.user_id.to_string());
+
+    match async {
+        let seed_ids = seed_ids_for_artist(&state.db, id_or_name).await?;
+        instant_mix_from_seed_ids(&state.db, &user_id, &seed_ids, query, true).await
+    }
+    .await
+    {
+        Ok(items) => instant_mix_response(items),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn music_genre_instant_mix(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(id) = query_param(&query, &["Id", "id", "Name", "name"]) else {
+        return empty_instant_mix_response();
+    };
+    music_genre_instant_mix_for_value(&state, id, &query).await
+}
+
+pub async fn music_genre_instant_mix_by_name(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    music_genre_instant_mix_for_value(&state, &name, &query).await
+}
+
+async fn music_genre_instant_mix_for_value(
+    state: &AppState,
+    id_or_name: &str,
+    query: &HashMap<String, String>,
+) -> Response {
+    let user_id = query
+        .get("UserId")
+        .or_else(|| query.get("userId"))
+        .cloned()
+        .unwrap_or_else(|| state.user_id.to_string());
+
+    match async {
+        let seed_ids = seed_ids_for_music_genre(&state.db, id_or_name, query_limit(query)).await?;
+        instant_mix_from_seed_ids(&state.db, &user_id, &seed_ids, query, true).await
+    }
+    .await
+    {
+        Ok(items) => instant_mix_response(items),
+        Err(error) => internal_error(error),
+    }
+}
+
+async fn seed_ids_for_item(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Vec<String>> {
+    let backend = db.get_database_backend();
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
             backend,
-            sql,
-            vec![item_id.into(), (limit as i64).into()],
+            "SELECT item_type, is_folder FROM media_items WHERE id = ? AND is_public = 1",
+            vec![item_id.into()],
         ))
-        .await
-        .unwrap_or_default();
+        .await?;
 
-    let ids: Vec<String> = similar_rows
-        .iter()
-        .filter_map(|r| r.get_opt_str("item_id").ok().flatten())
-        .collect();
+    let Some(row) = row else {
+        return Ok(Vec::new());
+    };
+    let item_type = row.get_str("item_type").unwrap_or_default();
+    let is_folder = row.get_i64("is_folder").unwrap_or_default() != 0;
 
-    if ids.is_empty() {
-        return Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response();
+    if matches!(item_type.as_str(), "Playlist" | "BoxSet") {
+        return query_string_column(
+            db,
+            r#"SELECT DISTINCT audio.id
+               FROM linked_children lc
+               JOIN media_items source ON source.id = lc.item_id
+               JOIN media_items audio ON (audio.id = source.id OR audio.parent_id = source.id)
+               WHERE lc.parent_id = ? AND source.is_public = 1 AND audio.is_public = 1 AND audio.item_type = 'Audio' AND audio.is_folder = 0
+               GROUP BY audio.id
+               ORDER BY MIN(audio.title) ASC"#,
+            vec![item_id.into()],
+            "id",
+        )
+        .await;
     }
 
-    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let item_sql = format!(
-        "{} WHERE media_items.id IN ({})",
-        crate::jellyfin::item_queries::media_item_select_sql(""),
-        placeholders
+    if is_folder || item_type == "MusicAlbum" {
+        let children = query_string_column(
+            db,
+            "SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Audio' AND is_folder = 0 AND is_public = 1 ORDER BY title ASC",
+            vec![item_id.into()],
+            "id",
+        )
+        .await?;
+        if !children.is_empty() {
+            return Ok(children);
+        }
+    }
+
+    Ok(vec![item_id.to_string()])
+}
+
+async fn seed_ids_for_artist(
+    db: &DatabaseConnection,
+    id_or_name: &str,
+) -> anyhow::Result<Vec<String>> {
+    let Some(person_id) = resolve_named_id(db, "people", id_or_name).await? else {
+        return Ok(Vec::new());
+    };
+    query_string_column(
+        db,
+        r#"SELECT DISTINCT audio.id
+           FROM media_people mp
+           JOIN media_items source ON source.id = mp.item_id
+           JOIN media_items audio ON (audio.id = source.id OR audio.parent_id = source.id)
+           WHERE mp.person_id = ?
+             AND source.is_public = 1
+             AND audio.is_public = 1
+             AND LOWER(COALESCE(mp.person_type, '')) IN ('artist', 'musicartist', 'albumartist', 'audioalbumartist')
+             AND audio.item_type = 'Audio'
+             AND audio.is_folder = 0
+           GROUP BY audio.id
+           ORDER BY MIN(audio.title) ASC"#,
+        vec![person_id.into()],
+        "id",
+    )
+    .await
+}
+
+async fn seed_ids_for_music_genre(
+    db: &DatabaseConnection,
+    id_or_name: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<String>> {
+    let Some(genre_id) = resolve_named_id(db, "genres", id_or_name).await? else {
+        return Ok(Vec::new());
+    };
+    query_string_column(
+        db,
+        r#"SELECT DISTINCT audio.id
+           FROM media_genres mg
+           JOIN media_items source ON source.id = mg.item_id
+           JOIN media_items audio ON (audio.id = source.id OR audio.parent_id = source.id)
+           WHERE mg.genre_id = ?
+             AND source.is_public = 1
+             AND audio.is_public = 1
+             AND audio.item_type = 'Audio'
+             AND audio.is_folder = 0
+           GROUP BY audio.id
+           ORDER BY MIN(audio.title) ASC
+           LIMIT ?"#,
+        vec![genre_id.into(), limit.into()],
+        "id",
+    )
+    .await
+}
+
+async fn instant_mix_from_seed_ids(
+    db: &DatabaseConnection,
+    user_id: &str,
+    seed_ids: &[String],
+    query: &HashMap<String, String>,
+    fallback_to_seeds: bool,
+) -> anyhow::Result<Vec<MediaItem>> {
+    if seed_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let limit = query_limit(query);
+    let item_types = include_item_types(query);
+    let seed_placeholders = placeholders(seed_ids.len());
+    let type_placeholders = placeholders(item_types.len());
+    let sql = format!(
+        r#"SELECT mg_rel.item_id
+           FROM media_genres mg_src
+           JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id
+           JOIN media_items mi ON mi.id = mg_rel.item_id
+           WHERE mg_src.item_id IN ({seed_placeholders})
+             AND mg_rel.item_id NOT IN ({seed_placeholders})
+             AND mi.is_public = 1
+             AND mi.is_folder = 0
+             AND mi.item_type IN ({type_placeholders})
+           GROUP BY mg_rel.item_id
+           ORDER BY COUNT(*) DESC, MAX(mi.modified_at) DESC
+           LIMIT ?"#,
     );
-    let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
-    for id in &ids {
-        vals.push(id.as_str().into());
+    let mut values = Vec::new();
+    push_values(&mut values, seed_ids);
+    push_values(&mut values, seed_ids);
+    push_values(&mut values, &item_types);
+    values.push(limit.into());
+
+    let related_ids = query_string_column(db, &sql, values, "item_id").await?;
+    if !related_ids.is_empty() {
+        return fetch_items_by_ids(db, user_id, &related_ids, &item_types, limit).await;
     }
 
-    let rows = state
-        .db
-        .query_all(crate::db::helpers::portable_statement(
-            backend, &item_sql, vals,
-        ))
-        .await
-        .unwrap_or_default();
+    if fallback_to_seeds {
+        return fetch_items_by_ids(db, user_id, seed_ids, &item_types, limit).await;
+    }
+    Ok(Vec::new())
+}
 
-    let items = crate::jellyfin::item_queries::decode_media_items(&rows).unwrap_or_default();
+async fn fetch_items_by_ids(
+    db: &DatabaseConnection,
+    user_id: &str,
+    ids: &[String],
+    item_types: &[String],
+    limit: i64,
+) -> anyhow::Result<Vec<MediaItem>> {
+    let ids = ids
+        .iter()
+        .take(usize::try_from(limit).unwrap_or(16))
+        .cloned()
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let id_placeholders = placeholders(ids.len());
+    let type_placeholders = placeholders(item_types.len());
+    let sql = item_queries::media_item_select_sql(&format!(
+        "WHERE media_items.id IN ({id_placeholders}) AND media_items.is_folder = 0 AND media_items.is_public = 1 AND media_items.item_type IN ({type_placeholders})"
+    ));
+    let mut values: Vec<SeaValue> = vec![user_id.into()];
+    push_values(&mut values, &ids);
+    push_values(&mut values, item_types);
+
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            &sql,
+            values,
+        ))
+        .await?;
+    let mut items = item_queries::decode_media_items(&rows)?;
+    items.sort_by_key(|item| {
+        ids.iter()
+            .position(|id| id == &item.id)
+            .unwrap_or(usize::MAX)
+    });
+    attach_image_tags(db, &mut items).await;
+    Ok(items)
+}
+
+async fn attach_image_tags(db: &DatabaseConnection, items: &mut [MediaItem]) {
+    if items.is_empty() {
+        return;
+    }
+    let ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+    if let Ok(tags_map) = item_queries::batch_item_image_tags(db, &ids).await {
+        for item in items {
+            if let Some(tags) = tags_map.get(&item.id) {
+                item.image_tags = Some(tags.clone());
+            }
+        }
+    }
+}
+
+async fn resolve_named_id(
+    db: &DatabaseConnection,
+    table: &str,
+    id_or_name: &str,
+) -> anyhow::Result<Option<String>> {
+    let sql = format!("SELECT id FROM {table} WHERE id = ? OR name = ? LIMIT 1");
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            &sql,
+            vec![id_or_name.into(), id_or_name.into()],
+        ))
+        .await?;
+    Ok(row.and_then(|row| row.get_opt_str("id").ok().flatten()))
+}
+
+async fn query_string_column(
+    db: &DatabaseConnection,
+    sql: &str,
+    values: Vec<SeaValue>,
+    column: &str,
+) -> anyhow::Result<Vec<String>> {
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            sql,
+            values,
+        ))
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| row.get_opt_str(column).ok().flatten())
+        .collect())
+}
+
+fn placeholders(len: usize) -> String {
+    (0..len).map(|_| "?").collect::<Vec<_>>().join(",")
+}
+
+fn push_values(values: &mut Vec<SeaValue>, strings: &[String]) {
+    values.extend(strings.iter().map(|value| value.as_str().into()));
+}
+
+fn query_param<'a>(query: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| query.get(*key).map(String::as_str))
+}
+
+fn query_limit(query: &HashMap<String, String>) -> i64 {
+    query_param(query, &["Limit", "limit"])
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(16)
+        .clamp(1, 200)
+}
+
+fn include_item_types(query: &HashMap<String, String>) -> Vec<String> {
+    let types = query_param(query, &["IncludeItemTypes", "includeItemTypes"])
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if types.is_empty() {
+        vec!["Audio".to_string()]
+    } else {
+        types
+    }
+}
+
+fn instant_mix_response(items: Vec<MediaItem>) -> Response {
     let total = items.len();
-    Json(json!({ "Items": items.into_iter().map(|i| crate::jellyfin::common::strip_nulls(i.to_jellyfin_json())).collect::<Vec<_>>(), "TotalRecordCount": total })).into_response()
+    Json(json!({
+        "Items": items.into_iter().map(|item| strip_nulls(item.to_jellyfin_json())).collect::<Vec<_>>(),
+        "TotalRecordCount": total
+    }))
+    .into_response()
+}
+
+fn empty_instant_mix_response() -> Response {
+    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
 }
 
 /// GET /Items/{id}/CriticReviews — critic reviews
@@ -160,11 +707,108 @@ pub async fn item_critic_reviews() -> Response {
 
 /// GET /Items/{id}/ThumbnailSet — trickplay thumbnail set
 pub async fn thumbnail_set(
-    State(_state): State<Arc<AppState>>,
-    Path(_item_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    // Not implemented - would need trickplay image generation
-    StatusCode::NOT_FOUND.into_response()
+    let width = query
+        .get("Width")
+        .or_else(|| query.get("width"))
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(320);
+    match trickplay_info(&state.db, &item_id, width).await {
+        Ok(Some(info)) => Json(json!({
+            "AspectRatio": 16.0 / 9.0,
+            "Thumbnails": (0..info.tile_count).map(|index| json!({
+                "PositionTicks": index * info.interval_ticks,
+                "ImageTag": format!("{}-{}-{}", item_id, info.width, index),
+            })).collect::<Vec<_>>()
+        }))
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn trickplay_playlist(
+    State(state): State<Arc<AppState>>,
+    Path((item_id, width)): Path<(String, i64)>,
+) -> Response {
+    match trickplay_info(&state.db, &item_id, width).await {
+        Ok(Some(info)) => {
+            if tokio::fs::metadata(&info.path).await.is_err() {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            let interval_seconds = (info.interval_ticks as f64 / 10_000_000.0).max(0.001)
+                * info.tile_count.max(1) as f64;
+            let mut body = "#EXTM3U\n#EXT-X-VERSION:3\n".to_string();
+            body.push_str(&format!(
+                "#EXTINF:{interval_seconds:.3},\n/Videos/{}/Trickplay/{}/0.jpg\n",
+                item_id, info.width
+            ));
+            body.push_str("#EXT-X-ENDLIST\n");
+            ([(header::CONTENT_TYPE, "application/x-mpegURL")], body).into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn trickplay_tile(
+    State(state): State<Arc<AppState>>,
+    Path((item_id, width, index)): Path<(String, i64, String)>,
+) -> Response {
+    let Some(index) = parse_trickplay_index(&index) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match trickplay_info(&state.db, &item_id, width).await {
+        Ok(Some(info)) if index == 0 => match tokio::fs::read(&info.path).await {
+            Ok(bytes) => {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
+                headers.insert(
+                    header::CONTENT_LENGTH,
+                    HeaderValue::from_str(&bytes.len().to_string())
+                        .unwrap_or_else(|_| HeaderValue::from_static("0")),
+                );
+                (headers, bytes).into_response()
+            }
+            Err(_) => StatusCode::NOT_FOUND.into_response(),
+        },
+        Ok(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+struct TrickplayInfo {
+    width: i64,
+    tile_count: i64,
+    interval_ticks: i64,
+    path: String,
+}
+
+async fn trickplay_info(
+    db: &DatabaseConnection,
+    item_id: &str,
+    width: i64,
+) -> anyhow::Result<Option<TrickplayInfo>> {
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "SELECT tp.width, tp.tile_count, tp.interval_ticks, tp.path FROM trickplay_images tp JOIN media_items mi ON mi.id = tp.item_id WHERE tp.item_id = ? AND tp.width = ? AND mi.is_public = 1",
+            vec![item_id.into(), width.into()],
+        ))
+        .await?;
+    Ok(row.map(|row| TrickplayInfo {
+        width: row.get_i64("width").unwrap_or(width),
+        tile_count: row.get_i64("tile_count").unwrap_or_default(),
+        interval_ticks: row.get_i64("interval_ticks").unwrap_or_default(),
+        path: row.get_str("path").unwrap_or_default(),
+    }))
+}
+
+fn parse_trickplay_index(value: &str) -> Option<i64> {
+    value.trim_end_matches(".jpg").parse().ok()
 }
 
 /// GET /Items/{item_id}/RemoteSearch/Subtitles/{language} — search remote subtitles
@@ -210,6 +854,301 @@ pub async fn user_item_intros() -> Response {
 }
 
 /// GET /Users/{id}/Items/{id}/LocalTrailers — per-user local trailers
-pub async fn user_item_local_trailers() -> Response {
-    Json(json!([])).into_response()
+pub async fn user_item_local_trailers(
+    State(state): State<Arc<AppState>>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Response {
+    match item_extras(&state.db, &user_id, &item_id, ExtraKind::Trailer).await {
+        Ok(items) => Json(media_items_json(items)).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+/// GET /Users/{id}/Items/{id}/SpecialFeatures — per-user special features
+pub async fn user_item_special_features(
+    State(state): State<Arc<AppState>>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Response {
+    match item_extras(&state.db, &user_id, &item_id, ExtraKind::SpecialFeature).await {
+        Ok(items) => Json(media_items_json(items)).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ExtraKind, include_item_types, item_extras, media_segments_value, parse_trickplay_index,
+        query_limit, trickplay_info,
+    };
+    use sea_orm::{ConnectionTrait, Database};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn item(title: &str, path: &str, item_type: &str) -> crate::library::models::MediaItem {
+        crate::library::models::MediaItem {
+            id: "i1".to_string(),
+            title: title.to_string(),
+            path: path.to_string(),
+            library_id: "movies".to_string(),
+            collection_type: "movies".to_string(),
+            parent_id: "m1".to_string(),
+            item_type: item_type.to_string(),
+            is_folder: false,
+            container: None,
+            overview: None,
+            official_rating: None,
+            extended_video_type: None,
+            production_year: None,
+            runtime_ticks: None,
+            size_bytes: None,
+            season_number: None,
+            episode_number: None,
+            community_rating: None,
+            critic_rating: None,
+            created_at: 0,
+            modified_at: 0,
+            is_public: true,
+            is_favorite: false,
+            played: false,
+            playback_position_ticks: 0,
+            played_percentage: None,
+            play_count: 0,
+            last_played_at: None,
+            image_tags: None,
+        }
+    }
+
+    #[test]
+    fn instant_mix_query_defaults_to_audio() {
+        let query = HashMap::new();
+        assert_eq!(include_item_types(&query), vec!["Audio"]);
+        assert_eq!(query_limit(&query), 16);
+    }
+
+    #[test]
+    fn instant_mix_query_accepts_emby_and_jellyfin_casing() {
+        let mut query = HashMap::new();
+        query.insert(
+            "includeItemTypes".to_string(),
+            "Audio,MusicAlbum".to_string(),
+        );
+        query.insert("limit".to_string(), "500".to_string());
+        assert_eq!(include_item_types(&query), vec!["Audio", "MusicAlbum"]);
+        assert_eq!(query_limit(&query), 200);
+    }
+
+    #[test]
+    fn extra_kind_matches_local_extra_paths() {
+        assert!(ExtraKind::Trailer.matches(&item(
+            "Trailer",
+            "Movie/trailers/trailer.mp4",
+            "Video",
+        )));
+        assert!(ExtraKind::SpecialFeature.matches(&item(
+            "Behind the Scenes",
+            "Movie/extras/behind.mp4",
+            "Video",
+        )));
+        assert!(ExtraKind::ThemeSong.matches(&item("Theme", "Movie/theme.mp3", "Audio",)));
+    }
+
+    #[tokio::test]
+    async fn item_extras_find_sibling_extras_for_movie_file() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
+            vec!["movies".into(), "Movies".into(), "movies".into()],
+        ))
+        .await
+        .unwrap();
+        for (id, title, path, parent_id, item_type, is_folder) in [
+            ("movie1", "Movie", "D:/Movie", "movies", "Movie", 1_i64),
+            (
+                "video1",
+                "Movie",
+                "D:/Movie/Movie.mp4",
+                "movie1",
+                "Video",
+                0_i64,
+            ),
+            (
+                "extra1",
+                "Behind the Scenes",
+                "D:/Movie/extras/Behind the Scenes.mp4",
+                "movie1",
+                "Video",
+                0_i64,
+            ),
+        ] {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', ?, ?, ?, 1, 1, 1)",
+                vec![
+                    id.into(),
+                    title.into(),
+                    path.into(),
+                    parent_id.into(),
+                    item_type.into(),
+                    is_folder.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let items = item_extras(&db, "u1", "video1", ExtraKind::SpecialFeature)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "extra1");
+
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE media_items SET is_public = 0 WHERE id = ?",
+            vec!["video1".into()],
+        ))
+        .await
+        .unwrap();
+        assert!(
+            item_extras(&db, "u1", "video1", ExtraKind::SpecialFeature)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn trickplay_info_reads_existing_record() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Video', 0, 1, 1, 1)",
+            vec!["item1".into(), "Video".into(), "D:/video.mkv".into()],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO trickplay_images (id, item_id, width, tile_count, interval_ticks, path, created_at) VALUES (?, ?, ?, ?, ?, ?, 1)",
+            vec![
+                "tp1".into(),
+                "item1".into(),
+                320_i64.into(),
+                3_i64.into(),
+                5_000_000_i64.into(),
+                "D:/tiles.jpg".into(),
+            ],
+        ))
+        .await
+        .unwrap();
+
+        let info = trickplay_info(&db, "item1", 320).await.unwrap().unwrap();
+        assert_eq!(info.tile_count, 3);
+        assert_eq!(info.interval_ticks, 5_000_000);
+        assert_eq!(info.path, "D:/tiles.jpg");
+        assert!(trickplay_info(&db, "item1", 640).await.unwrap().is_none());
+        assert_eq!(parse_trickplay_index("2.jpg"), Some(2));
+
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE media_items SET is_public = 0 WHERE id = ?",
+            vec!["item1".into()],
+        ))
+        .await
+        .unwrap();
+        assert!(trickplay_info(&db, "item1", 320).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn media_segments_use_query_result_shape_and_filter() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, runtime_ticks, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Episode', 0, ?, 1, 1, 1)",
+            vec![
+                "ep1".into(),
+                "Episode".into(),
+                "D:/ep1.mkv".into(),
+                100_i64.into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        for (id, ticks, marker) in [
+            ("intro-start", 10_i64, "IntroStart"),
+            ("intro-end", 20_i64, "IntroEnd"),
+            ("credits", 80_i64, "CreditsStart"),
+        ] {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO chapters (id, item_id, start_position_ticks, name, marker_type, source, created_at, updated_at) VALUES (?, 'ep1', ?, ?, ?, 'test', 1, 1)",
+                vec![id.into(), ticks.into(), marker.into(), marker.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let value = media_segments_value(&db, "ep1", &HashMap::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value["TotalRecordCount"], 2);
+        assert_eq!(value["StartIndex"], 0);
+        assert_eq!(
+            value["Items"][0],
+            json!({
+                "Id": "intro-start",
+                "ItemId": "ep1",
+                "Type": "Intro",
+                "StartTicks": 10,
+                "EndTicks": 20,
+            })
+        );
+        assert_eq!(
+            value["Items"][1],
+            json!({
+                "Id": "credits",
+                "ItemId": "ep1",
+                "Type": "Outro",
+                "StartTicks": 80,
+                "EndTicks": 100,
+            })
+        );
+
+        let mut query = HashMap::new();
+        query.insert("includeSegmentTypes".to_string(), "Intro".to_string());
+        let filtered = media_segments_value(&db, "ep1", &query)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(filtered["TotalRecordCount"], 1);
+        assert_eq!(filtered["Items"][0]["Type"], "Intro");
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE media_items SET is_public = 0 WHERE id = ?",
+            vec!["ep1".into()],
+        ))
+        .await
+        .unwrap();
+        assert!(
+            media_segments_value(&db, "ep1", &HashMap::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            media_segments_value(&db, "missing", &HashMap::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }

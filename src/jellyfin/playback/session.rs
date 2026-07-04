@@ -10,13 +10,13 @@ use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
-    app::state::{AppState, PlaybackSession, PlaybackState},
+    app::state::{AppState, PlaybackSession, PlaybackState, SessionCapabilities},
     entities::user_data::{self, Entity as UserData},
     jellyfin::{
-        auth::request_user_id_or_default,
+        auth::{request_user_id_and_admin_or_default, request_user_id_or_default},
         common::{internal_error, strip_nulls},
         dlna,
-        items::find_media_item,
+        items::{find_media_item, find_media_item_for_admin},
     },
     library::models::media_source_json_with_streams,
     util::{now_unix, unix_to_jellyfin_date},
@@ -29,14 +29,19 @@ pub async fn playback_info(
     Query(query): Query<HashMap<String, String>>,
     body: Option<Json<JsonValue>>,
 ) -> Response {
-    let user_id = request_user_id_or_default(&state, &headers, &query).await;
-    match find_media_item(&state.db, &user_id, &item_id).await {
+    let (user_id, is_admin) = request_user_id_and_admin_or_default(&state, &headers, &query).await;
+    let item_result = if is_admin {
+        find_media_item_for_admin(&state.db, &user_id, &item_id).await
+    } else {
+        find_media_item(&state.db, &user_id, &item_id).await
+    };
+    match item_result {
         Ok(Some(item)) => {
             let profile = dlna::request_device_profile(body.as_ref().map(|Json(value)| value));
 
             // For Movie/Episode folders with child Video files (multi-version), return their media sources
             let media_sources = if item.is_folder && (item.item_type == "Movie" || item.item_type == "Episode") {
-                match super::child_video_sources(&state.db, &item.id).await {
+                match super::child_video_sources(&state.db, &item.id, is_admin).await {
                     Ok(sources) if !sources.is_empty() => sources,
                     Ok(_) => {
                         // No child videos, return the item itself (e.g. Episode folder is the video)
@@ -116,11 +121,7 @@ async fn playback_progress_inner(
         .get("PositionTicks")
         .and_then(JsonValue::as_i64)
         .unwrap_or_default();
-    let user_id = if let Some(user_id) = body.get("UserId").and_then(JsonValue::as_str) {
-        user_id.to_string()
-    } else {
-        request_user_id_or_default(&state, &headers, &query).await
-    };
+    let user_id = request_user_id_or_default(&state, &headers, &query).await;
     let result = upsert_playback_position(&state.db, &user_id, item_id, position_ticks).await;
     if let Err(error) = result {
         return internal_error(error);
@@ -247,6 +248,23 @@ async fn update_playback_session(
         .map(|item| item.title);
     let session_info = crate::jellyfin::sessions::session_info(state, headers, query).await;
     let now = now_unix();
+    let last_activity_date = unix_to_jellyfin_date(now);
+    let client = session_info.client;
+    let device_name = body
+        .get("DeviceName")
+        .and_then(JsonValue::as_str)
+        .unwrap_or(&session_info.device_name)
+        .to_string();
+    let device_id = body
+        .get("DeviceId")
+        .and_then(JsonValue::as_str)
+        .unwrap_or(&session_info.device_id)
+        .to_string();
+    let application_version = session_info.application_version;
+    let playable_media_types = session_info.playable_media_types;
+    let supported_commands = session_info.supported_commands;
+    let supports_media_control = session_info.supports_media_control;
+    let supports_persistent_identifier = session_info.supports_persistent_identifier;
     let session = PlaybackSession {
         id: play_session_id.clone(),
         user_id: user_id.to_string(),
@@ -258,20 +276,14 @@ async fn update_playback_session(
             .and_then(JsonValue::as_array)
             .cloned()
             .unwrap_or_default(),
-        client: session_info.client,
-        device_name: body
-            .get("DeviceName")
-            .and_then(JsonValue::as_str)
-            .unwrap_or(&session_info.device_name)
-            .to_string(),
-        device_id: body
-            .get("DeviceId")
-            .and_then(JsonValue::as_str)
-            .unwrap_or(&session_info.device_id)
-            .to_string(),
-        application_version: session_info.application_version,
+        additional_users: Vec::new(),
+        client: client.clone(),
+        device_name: device_name.clone(),
+        device_id: device_id.clone(),
+        application_version: application_version.clone(),
         is_active: true,
-        last_activity_date: unix_to_jellyfin_date(now),
+        last_activity_date: last_activity_date.clone(),
+        last_playback_check_in: last_activity_date,
         last_activity_unix: now,
         play_state: PlaybackState {
             position_ticks: position_ticks.max(0),
@@ -284,11 +296,23 @@ async fn update_playback_session(
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(true),
         },
-        playable_media_types: session_info.playable_media_types,
-        supports_media_control_commands: session_info.supported_commands.clone(),
-        supported_commands: session_info.supported_commands,
-        supports_media_control: session_info.supports_media_control,
-        supports_persistent_identifier: session_info.supports_persistent_identifier,
+        playable_media_types: playable_media_types.clone(),
+        supports_media_control_commands: supported_commands.clone(),
+        supported_commands: supported_commands.clone(),
+        supports_media_control,
+        supports_remote_control: supports_media_control,
+        supports_persistent_identifier,
+        capabilities: SessionCapabilities {
+            user_id: user_id.to_string(),
+            client,
+            device_name,
+            device_id,
+            application_version,
+            playable_media_types,
+            supported_commands,
+            supports_media_control,
+            supports_persistent_identifier,
+        },
     };
     state
         .playback_sessions

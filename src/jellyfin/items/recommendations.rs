@@ -55,7 +55,7 @@ async fn movie_recommendations_inner(
         .query_all(crate::db::helpers::portable_statement(
             backend,
             &format!(
-                "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' AND COALESCE(user_data.played, 0) = 1 AND COALESCE(user_data.play_count, 0) > 0 {} ORDER BY user_data.last_played_at DESC LIMIT 12",
+                "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' AND media_items.is_public = 1 AND COALESCE(user_data.played, 0) = 1 AND COALESCE(user_data.play_count, 0) > 0 {} ORDER BY user_data.last_played_at DESC LIMIT 12",
                 crate::jellyfin::item_queries::media_item_select_sql(""),
                 parent_id.map(|_p| "AND media_items.library_id = ?").unwrap_or(""),
             ),
@@ -76,7 +76,7 @@ async fn movie_recommendations_inner(
     if recent_movies.is_empty() {
         // Category: Top rated movies
         let top_rated_sql = format!(
-            "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' AND media_items.community_rating IS NOT NULL {} ORDER BY media_items.community_rating DESC LIMIT ?",
+            "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' AND media_items.is_public = 1 AND media_items.community_rating IS NOT NULL {} ORDER BY media_items.community_rating DESC LIMIT ?",
             crate::jellyfin::item_queries::media_item_select_sql(""),
             parent_id
                 .map(|_| "AND media_items.library_id = ?")
@@ -112,7 +112,7 @@ async fn movie_recommendations_inner(
 
         // Category: Recently added movies
         let recent_sql = format!(
-            "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' {} ORDER BY media_items.created_at DESC LIMIT ?",
+            "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' AND media_items.is_public = 1 {} ORDER BY media_items.created_at DESC LIMIT ?",
             crate::jellyfin::item_queries::media_item_select_sql(""),
             parent_id
                 .map(|_| "AND media_items.library_id = ?")
@@ -150,7 +150,7 @@ async fn movie_recommendations_inner(
         let rows = db
             .query_all(crate::db::helpers::portable_statement(
                 backend,
-                r#"SELECT mg_rel.item_id FROM media_genres mg_src JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id AND mg_src.item_id <> mg_rel.item_id WHERE mg_src.item_id = ? GROUP BY mg_rel.item_id ORDER BY COUNT(*) DESC LIMIT 8"#,
+                r#"SELECT mg_rel.item_id FROM media_genres mg_src JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id AND mg_src.item_id <> mg_rel.item_id JOIN media_items mi_rel ON mi_rel.id = mg_rel.item_id WHERE mg_src.item_id = ? AND mi_rel.is_public = 1 GROUP BY mg_rel.item_id ORDER BY COUNT(*) DESC LIMIT 8"#,
                 vec![movie.id.clone().into()],
             ))
             .await?;
@@ -172,7 +172,7 @@ async fn movie_recommendations_inner(
         let items = db
             .query_all(crate::db::helpers::portable_statement(
                 backend,
-                &format!("{} WHERE media_items.id IN ({}) ORDER BY media_items.production_year DESC LIMIT {item_limit}", crate::jellyfin::item_queries::media_item_select_sql(""), ph),
+                &format!("{} WHERE media_items.id IN ({}) AND media_items.is_public = 1 ORDER BY media_items.production_year DESC LIMIT {item_limit}", crate::jellyfin::item_queries::media_item_select_sql(""), ph),
                 {
                     let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
                     for id in &similar_items { vals.push(id.as_str().into()); }
@@ -201,7 +201,7 @@ async fn movie_recommendations_inner(
         let rows = db
             .query_all(crate::db::helpers::portable_statement(
                 backend,
-                r#"SELECT mp2.item_id FROM media_people mp1 JOIN media_people mp2 ON mp1.person_id = mp2.person_id AND mp1.item_id <> mp2.item_id WHERE mp1.item_id = ? AND mp2.item_id NOT IN (SELECT id FROM media_items WHERE item_type IN ('Video', 'Episode')) GROUP BY mp2.item_id LIMIT 4"#,
+                r#"SELECT mp2.item_id FROM media_people mp1 JOIN media_people mp2 ON mp1.person_id = mp2.person_id AND mp1.item_id <> mp2.item_id JOIN media_items mi_rel ON mi_rel.id = mp2.item_id WHERE mp1.item_id = ? AND mi_rel.is_public = 1 AND mi_rel.item_type NOT IN ('Video', 'Episode') GROUP BY mp2.item_id LIMIT 4"#,
                 vec![movie.id.clone().into()],
             ))
             .await?;
@@ -224,7 +224,7 @@ async fn movie_recommendations_inner(
             .query_all(crate::db::helpers::portable_statement(
                 backend,
                 &format!(
-                    "{} WHERE media_items.id IN ({}) LIMIT {item_limit}",
+                    "{} WHERE media_items.id IN ({}) AND media_items.is_public = 1 LIMIT {item_limit}",
                     crate::jellyfin::item_queries::media_item_select_sql(""),
                     ph
                 ),
@@ -268,7 +268,7 @@ pub async fn user_suggestions(
     let (sql, vals) = if let Some(pid) = parent_id {
         (
             format!(
-                "{} WHERE media_items.is_folder = 1 AND media_items.item_type IN ('Movie', 'Series') AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC LIMIT ?",
+                "{} WHERE media_items.is_folder = 1 AND media_items.item_type IN ('Movie', 'Series') AND media_items.is_public = 1 AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC LIMIT ?",
                 crate::jellyfin::item_queries::media_item_select_sql(
                     "AND media_items.library_id = ?"
                 )
@@ -278,7 +278,7 @@ pub async fn user_suggestions(
     } else {
         (
             format!(
-                "{} WHERE media_items.is_folder = 1 AND media_items.item_type IN ('Movie', 'Series') AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC LIMIT ?",
+                "{} WHERE media_items.is_folder = 1 AND media_items.item_type IN ('Movie', 'Series') AND media_items.is_public = 1 AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC LIMIT ?",
                 crate::jellyfin::item_queries::media_item_select_sql("")
             ),
             vec![user_id.clone().into(), (limit as i64).into()],
@@ -421,5 +421,42 @@ pub async fn home_section_items(
         }
         "suggestions" => user_suggestions(State(state), Path(user_id), Query(query)).await,
         _ => Json(json!([])).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::movie_recommendations_inner;
+    use sea_orm::{ConnectionTrait, Database};
+
+    #[tokio::test]
+    async fn movie_recommendations_ignore_private_candidates_before_limit() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES ('movies', 'Movies', 'movies', 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        for (id, title, is_public, rating) in [
+            ("private", "Private", 0, 10.0),
+            ("public", "Public", 1, 8.0),
+        ] {
+            db.execute(crate::db::helpers::portable_statement(
+                db.get_database_backend(),
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, community_rating, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', '', 'Movie', 1, ?, ?, 1, 1, 1)",
+                vec![id.into(), title.into(), id.into(), is_public.into(), rating.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let categories = movie_recommendations_inner(&db, "u1", None, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(categories.len(), 1);
+        assert_eq!(categories[0]["Items"][0]["Id"], "public");
     }
 }

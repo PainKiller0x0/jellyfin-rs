@@ -135,20 +135,6 @@ pub async fn get_intro_markers(
     }
 }
 
-/// Get credits start position for an item.
-pub async fn get_credits_marker(
-    db: &DatabaseConnection,
-    item_id: &str,
-) -> anyhow::Result<Option<i64>> {
-    let backend = db.get_database_backend();
-    let row = db.query_one(portable_statement(
-        backend,
-        "SELECT start_position_ticks FROM chapters WHERE item_id = ? AND marker_type = 'CreditsStart' LIMIT 1",
-        vec![item_id.into()],
-    )).await?;
-    Ok(row.and_then(|r| r.get_i64("start_position_ticks").ok()))
-}
-
 /// Update intro markers for an episode and propagate to siblings in the same season.
 #[allow(dead_code)]
 pub async fn update_intro_for_season(

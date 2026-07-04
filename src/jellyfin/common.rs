@@ -19,10 +19,6 @@ pub async fn empty_array() -> impl IntoResponse {
     Json(Vec::<serde_json::Value>::new())
 }
 
-pub async fn empty_object() -> impl IntoResponse {
-    Json(json!({}))
-}
-
 pub async fn no_content() -> impl IntoResponse {
     StatusCode::NO_CONTENT
 }
@@ -31,7 +27,7 @@ pub fn internal_error(error: anyhow::Error) -> Response {
     tracing::warn!("request failed: {error:#}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "Error": format!("{error:#}") })),
+        Json(json!({ "Error": "Internal server error" })),
     )
         .into_response()
 }
@@ -63,5 +59,27 @@ pub fn strip_nulls(value: JsonValue) -> JsonValue {
         }
         JsonValue::Array(arr) => JsonValue::Array(arr.into_iter().map(strip_nulls).collect()),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+    use serde_json::Value;
+
+    use super::internal_error;
+
+    #[tokio::test]
+    async fn internal_error_does_not_echo_details() {
+        let response = internal_error(anyhow::anyhow!(
+            "database failed at D:/private/media/movie.mkv"
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["Error"], "Internal server error");
+        assert!(!String::from_utf8_lossy(&body).contains("D:/private"));
     }
 }

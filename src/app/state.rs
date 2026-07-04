@@ -41,6 +41,8 @@ pub struct PlaybackSession {
     pub item_name: Option<String>,
     #[serde(rename = "NowPlayingQueue")]
     pub now_playing_queue: Vec<Value>,
+    #[serde(rename = "AdditionalUsers")]
+    pub additional_users: Vec<SessionUserInfo>,
     #[serde(rename = "Client")]
     pub client: String,
     #[serde(rename = "DeviceName")]
@@ -53,6 +55,8 @@ pub struct PlaybackSession {
     pub is_active: bool,
     #[serde(rename = "LastActivityDate")]
     pub last_activity_date: String,
+    #[serde(rename = "LastPlaybackCheckIn")]
+    pub last_playback_check_in: String,
     #[serde(skip_serializing)]
     pub last_activity_unix: i64,
     #[serde(rename = "PlayState")]
@@ -65,8 +69,20 @@ pub struct PlaybackSession {
     pub supported_commands: Vec<String>,
     #[serde(rename = "SupportsMediaControl")]
     pub supports_media_control: bool,
+    #[serde(rename = "SupportsRemoteControl")]
+    pub supports_remote_control: bool,
     #[serde(rename = "SupportsPersistentIdentifier")]
     pub supports_persistent_identifier: bool,
+    #[serde(rename = "Capabilities")]
+    pub capabilities: SessionCapabilities,
+}
+
+#[derive(Clone, Serialize)]
+pub struct SessionUserInfo {
+    #[serde(rename = "UserId")]
+    pub user_id: String,
+    #[serde(rename = "UserName")]
+    pub user_name: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -145,7 +161,10 @@ pub async fn load_tmdb_api_key(db: &sea_orm::DatabaseConnection) -> Option<Strin
             }
         }
     }
-    None
+    std::env::var("JELLYFIN_RS_TMDB_API_KEY")
+        .ok()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
 }
 
 impl AppState {

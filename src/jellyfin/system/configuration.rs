@@ -172,12 +172,14 @@ pub async fn complete_startup(State(state): State<Arc<AppState>>) -> Response {
 }
 
 pub async fn server_configuration(State(state): State<Arc<AppState>>) -> Response {
+    let saved_config = super::server_config_json(&state.db).await;
     Json(json!({
         "ServerName": super::app_setting(&state.db, "ServerName", SERVER_NAME).await,
         "UICulture": super::app_setting(&state.db, "UICulture", "zh-CN").await,
         "MetadataCountryCode": super::app_setting(&state.db, "MetadataCountryCode", "CN").await,
         "PreferredMetadataLanguage": super::app_setting(&state.db, "PreferredMetadataLanguage", "zh-CN").await,
         "EnableRemoteAccess": super::app_setting_bool(&state.db, "EnableRemoteAccess", false).await,
+        "ContentTypes": saved_config.get("ContentTypes").cloned().unwrap_or_else(|| json!([])),
         "CastReceiverApplications": [
             {
                 "Id": "",
@@ -232,8 +234,70 @@ pub async fn default_metadata_options() -> impl IntoResponse {
     }))
 }
 
-pub async fn named_configuration(Path(key): Path<String>) -> impl IntoResponse {
-    let value = match key.as_str() {
+pub async fn named_configuration(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> Response {
+    let Some(key) = known_named_configuration_key(&key) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let value = super::app_setting(&state.db, &named_configuration_setting_key(key), "").await;
+    let value = if value.trim().is_empty() {
+        default_named_configuration(key)
+    } else {
+        serde_json::from_str(&value).unwrap_or_else(|_| default_named_configuration(key))
+    };
+    Json(value).into_response()
+}
+
+pub async fn update_named_configuration(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    Json(request): Json<Value>,
+) -> Response {
+    let Some(key) = known_named_configuration_key(&key) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !request.is_object() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match super::set_app_setting(
+        &state.db,
+        &named_configuration_setting_key(key),
+        &request.to_string(),
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn configuration_pages(
+    Query(_query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    Json(Vec::<Value>::new())
+}
+
+pub async fn dashboard_configuration_page() -> Response {
+    (StatusCode::NOT_FOUND, "").into_response()
+}
+
+fn known_named_configuration_key(key: &str) -> Option<&'static str> {
+    match key.to_ascii_lowercase().as_str() {
+        "encoding" => Some("encoding"),
+        "network" => Some("network"),
+        "livetv" => Some("livetv"),
+        _ => None,
+    }
+}
+
+fn named_configuration_setting_key(key: &str) -> String {
+    format!("named_config:{key}")
+}
+
+fn default_named_configuration(key: &str) -> Value {
+    match key {
         "encoding" => json!({
             "EnableHardwareEncoding": false,
             "EnableThrottling": false,
@@ -251,20 +315,27 @@ pub async fn named_configuration(Path(key): Path<String>) -> impl IntoResponse {
             "TunerHosts": []
         }),
         _ => json!({}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        default_named_configuration, known_named_configuration_key, named_configuration_setting_key,
     };
-    Json(value)
-}
 
-pub async fn update_named_configuration() -> impl IntoResponse {
-    StatusCode::NO_CONTENT
-}
-
-pub async fn configuration_pages(
-    Query(_query): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    Json(Vec::<Value>::new())
-}
-
-pub async fn dashboard_configuration_page() -> Response {
-    (StatusCode::NOT_FOUND, "").into_response()
+    #[test]
+    fn named_configuration_keys_are_whitelisted() {
+        assert_eq!(known_named_configuration_key("Encoding"), Some("encoding"));
+        assert_eq!(known_named_configuration_key("network"), Some("network"));
+        assert_eq!(known_named_configuration_key("unknown"), None);
+        assert_eq!(
+            named_configuration_setting_key("encoding"),
+            "named_config:encoding"
+        );
+        assert_eq!(
+            default_named_configuration("network")["EnableRemoteAccess"],
+            false
+        );
+    }
 }

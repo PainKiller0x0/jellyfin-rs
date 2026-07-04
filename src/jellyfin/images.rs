@@ -22,17 +22,33 @@ use crate::{
     library::image_processing::{
         EncodedImageFormat, ImageRequestOptions, create_collage, create_placeholder, process_image,
     },
+    library::path_utils,
     util::{now_unix, stable_text_id},
 };
 
 mod remote;
 
-pub use remote::{download_remote_image, remote_images, remote_images_providers};
+pub use remote::{
+    download_remote_image, image_by_name_remote, remote_images, remote_images_providers,
+};
+
+const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 pub async fn item_images(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    match crate::jellyfin::user_extras::visible_item_from_request(
+        &state, &headers, &query, &item_id,
+    )
+    .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return internal_error(error),
+    }
     match item_images_inner(&state.db, &item_id).await {
         Ok(images) => Json(images).into_response(),
         Err(error) => internal_error(error),
@@ -45,6 +61,15 @@ pub async fn get_item_image(
     Query(query): Query<HashMap<String, String>>,
     Path((item_id, image_type)): Path<(String, String)>,
 ) -> Response {
+    match crate::jellyfin::user_extras::visible_item_from_request(
+        &state, &headers, &query, &item_id,
+    )
+    .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return internal_error(error),
+    }
     serve_item_image(&state.db, &headers, &query, &item_id, &image_type, 0).await
 }
 
@@ -54,6 +79,15 @@ pub async fn get_item_image_with_index(
     Query(query): Query<HashMap<String, String>>,
     Path((item_id, first, second)): Path<(String, String, String)>,
 ) -> Response {
+    match crate::jellyfin::user_extras::visible_item_from_request(
+        &state, &headers, &query, &item_id,
+    )
+    .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return internal_error(error),
+    }
     let (image_type, image_index) = if let Ok(index) = second.parse::<i64>() {
         (first, index)
     } else {
@@ -70,6 +104,55 @@ pub async fn get_item_image_with_index(
     .await
 }
 
+pub async fn get_item_image_legacy_path(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(mut query): Query<HashMap<String, String>>,
+    Path((
+        item_id,
+        image_type,
+        image_index,
+        _tag,
+        format,
+        max_width,
+        max_height,
+        _percent_played,
+        _unplayed_count,
+    )): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Response {
+    match crate::jellyfin::user_extras::visible_item_from_request(
+        &state, &headers, &query, &item_id,
+    )
+    .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return internal_error(error),
+    }
+    query.entry("Format".to_string()).or_insert(format);
+    query.entry("MaxWidth".to_string()).or_insert(max_width);
+    query.entry("MaxHeight".to_string()).or_insert(max_height);
+    serve_item_image(
+        &state.db,
+        &headers,
+        &query,
+        &item_id,
+        &image_type,
+        image_index.parse::<i64>().unwrap_or_default(),
+    )
+    .await
+}
+
 pub async fn upload_item_image(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -79,12 +162,19 @@ pub async fn upload_item_image(
     if let Some(image_url) = parse_image_url_body(&body) {
         match remote::download_and_cache_image(&state, &item_id, &image_type, &image_url).await {
             Ok(()) => return StatusCode::NO_CONTENT.into_response(),
+            Err(error) if remote::is_rejected_remote_image_url(&error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "Error": error.to_string() })),
+                )
+                    .into_response();
+            }
             Err(error) => return internal_error(error),
         }
     }
     match save_item_image(&state.db, &headers, &item_id, &image_type, 0, body).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => image_write_error(error),
     }
 }
 
@@ -97,6 +187,13 @@ pub async fn upload_item_image_with_index(
     if let Some(image_url) = parse_image_url_body(&body) {
         match remote::download_and_cache_image(&state, &item_id, &second, &image_url).await {
             Ok(()) => return StatusCode::NO_CONTENT.into_response(),
+            Err(error) if remote::is_rejected_remote_image_url(&error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "Error": error.to_string() })),
+                )
+                    .into_response();
+            }
             Err(error) => return internal_error(error),
         }
     }
@@ -116,7 +213,7 @@ pub async fn upload_item_image_with_index(
     .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => image_write_error(error),
     }
 }
 
@@ -164,6 +261,24 @@ pub async fn user_avatar(Path(user_id): Path<String>) -> Response {
     }
 }
 
+pub async fn current_user_avatar(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let user_id = crate::jellyfin::auth::request_user_id_or_default(&state, &headers, &query).await;
+    user_avatar_with_head(user_id, headers, false).await
+}
+
+pub async fn current_user_avatar_head(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let user_id = crate::jellyfin::auth::request_user_id_or_default(&state, &headers, &query).await;
+    user_avatar_with_head(user_id, headers, true).await
+}
+
 pub async fn upload_user_avatar(
     headers: HeaderMap,
     Path(user_id): Path<String>,
@@ -171,7 +286,7 @@ pub async fn upload_user_avatar(
 ) -> Response {
     match save_user_avatar(&headers, &user_id, body).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => image_write_error(error),
     }
 }
 
@@ -180,6 +295,75 @@ pub async fn delete_user_avatar(Path(user_id): Path<String>) -> Response {
         let _ = tokio::fs::remove_file(path).await;
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+pub async fn upload_current_user_avatar(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    let user_id = crate::jellyfin::auth::request_user_id_or_default(&state, &headers, &query).await;
+    match save_user_avatar(&headers, &user_id, body).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => image_write_error(error),
+    }
+}
+
+pub async fn delete_current_user_avatar(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let user_id = crate::jellyfin::auth::request_user_id_or_default(&state, &headers, &query).await;
+    for path in user_avatar_paths(&user_id) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn user_avatar_with_head(user_id: String, headers: HeaderMap, head: bool) -> Response {
+    let Some(path) = find_user_avatar_path(&user_id).await else {
+        return placeholder_image().await.into_response();
+    };
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(_) => return placeholder_image().await.into_response(),
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let etag = stable_text_id(&format!("avatar:{user_id}:{}:{modified}", metadata.len()));
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim_matches('"') == etag)
+    {
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type_from_path(&path.to_string_lossy())),
+    );
+    response_headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&metadata.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response_headers.insert(header::ETAG, value);
+    }
+    if head {
+        return (response_headers, Body::empty()).into_response();
+    }
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (response_headers, Body::from(bytes)).into_response(),
+        Err(_) => placeholder_image().await.into_response(),
+    }
 }
 
 async fn serve_item_image(
@@ -217,6 +401,9 @@ async fn serve_item_image(
     }
 
     let path = model.path.unwrap_or_default();
+    if !image_storage_path_allowed(&path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
 
     // Check processed image cache before doing expensive re-processing
     if should_process(query) {
@@ -356,7 +543,7 @@ async fn collage_source_images(
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            r#"SELECT image_assets.path FROM image_assets JOIN media_items ON media_items.id = image_assets.item_id WHERE media_items.parent_id = ? AND image_assets.image_type = ? ORDER BY media_items.title ASC, image_assets.image_index ASC LIMIT 4"#,
+            r#"SELECT image_assets.path FROM image_assets JOIN media_items ON media_items.id = image_assets.item_id WHERE media_items.parent_id = ? AND media_items.is_public = 1 AND image_assets.image_type = ? ORDER BY media_items.title ASC, image_assets.image_index ASC LIMIT 4"#,
             vec![item_id.into(), preferred_type.into()],
         ))
         .await
@@ -365,7 +552,9 @@ async fn collage_source_images(
     let mut images = Vec::new();
     for row in &rows {
         let path: String = row.get_str("path")?;
-        if let Ok(bytes) = tokio::fs::read(&path).await {
+        if image_storage_path_allowed(&path)
+            && let Ok(bytes) = tokio::fs::read(&path).await
+        {
             images.push(bytes);
         }
     }
@@ -536,7 +725,9 @@ async fn delete_item_image_inner(
     {
         Ok(_) => {
             if let Some(path) = path {
-                let _ = tokio::fs::remove_file(&path).await;
+                if image_storage_path_allowed(&path) {
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
             }
             StatusCode::NO_CONTENT.into_response()
         }
@@ -545,6 +736,9 @@ async fn delete_item_image_inner(
 }
 
 fn decode_image_body(content_type: &str, body: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if body.len() > MAX_IMAGE_BYTES {
+        anyhow::bail!("image is too large");
+    }
     if content_type.starts_with("image/") || content_type == "application/octet-stream" {
         return Ok(body.to_vec());
     }
@@ -553,9 +747,13 @@ fn decode_image_body(content_type: &str, body: &[u8]) -> anyhow::Result<Vec<u8>>
         .split_once(',')
         .map_or(text, |(_, encoded)| encoded)
         .trim();
-    general_purpose::STANDARD
+    let bytes = general_purpose::STANDARD
         .decode(encoded)
-        .context("failed to decode base64 image body")
+        .context("failed to decode base64 image body")?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        anyhow::bail!("image is too large");
+    }
+    Ok(bytes)
 }
 
 fn extension_from_content_type(content_type: &str) -> Option<&'static str> {
@@ -597,6 +795,16 @@ pub fn content_type_from_path(path: &str) -> &'static str {
         "gif" => "image/gif",
         _ => "application/octet-stream",
     }
+}
+
+pub(crate) fn image_storage_path_allowed(path: &str) -> bool {
+    path_utils::path_within_roots(
+        path,
+        &[PathBuf::from("data")
+            .join("images")
+            .to_string_lossy()
+            .to_string()],
+    )
 }
 
 async fn find_user_avatar_path(user_id: &str) -> Option<PathBuf> {
@@ -704,6 +912,21 @@ fn parse_image_url_body(body: &[u8]) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn is_image_too_large(error: &anyhow::Error) -> bool {
+    error.to_string().contains("image is too large")
+}
+
+fn image_write_error(error: anyhow::Error) -> Response {
+    if is_image_too_large(&error) {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "Error": "Image is too large" })),
+        )
+            .into_response();
+    }
+    internal_error(error)
+}
+
 #[allow(dead_code)]
 pub async fn item_image_tags(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<JsonValue> {
     let models = ImageAssets::find()
@@ -721,4 +944,72 @@ pub async fn item_image_tags(db: &DatabaseConnection, item_id: &str) -> anyhow::
             .or_insert_with(|| json!(etag));
     }
     Ok(JsonValue::Object(tags))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_IMAGE_BYTES, decode_image_body, image_storage_path_allowed, is_image_too_large,
+        item_images_inner,
+    };
+    use sea_orm::{ConnectionTrait, Database};
+    use std::fs;
+
+    #[test]
+    fn image_storage_path_allowed_rejects_sibling_directory() {
+        let image_dir = std::path::PathBuf::from("data").join("images");
+        let sibling_dir = std::path::PathBuf::from("data").join("images-other");
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::create_dir_all(&sibling_dir).unwrap();
+        let image = image_dir.join(format!("{}.png", uuid::Uuid::new_v4()));
+        let sibling = sibling_dir.join(format!("{}.png", uuid::Uuid::new_v4()));
+        fs::write(&image, b"ok").unwrap();
+        fs::write(&sibling, b"no").unwrap();
+
+        assert!(image_storage_path_allowed(&image.to_string_lossy()));
+        assert!(!image_storage_path_allowed(&sibling.to_string_lossy()));
+
+        let _ = fs::remove_file(image);
+        let _ = fs::remove_file(sibling);
+    }
+
+    #[test]
+    fn image_body_size_is_limited() {
+        let oversized = vec![0_u8; MAX_IMAGE_BYTES + 1];
+        let error = decode_image_body("image/png", &oversized).unwrap_err();
+        assert!(is_image_too_large(&error));
+
+        let base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, oversized);
+        let error = decode_image_body("text/plain", base64.as_bytes()).unwrap_err();
+        assert!(is_image_too_large(&error));
+    }
+
+    #[tokio::test]
+    async fn private_item_images_still_require_item_visibility_gate() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, 0, 1, 1, 1)",
+            vec!["private".into(), "Private".into(), "/tmp/private.mkv".into()],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, created_at, updated_at) VALUES (?, ?, 'Primary', 0, 'data/images/private.png', 'tag', 1, 1)",
+            vec!["img1".into(), "private".into()],
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            crate::jellyfin::item_queries::find_media_item(&db, "u1", "private")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(item_images_inner(&db, "private").await.unwrap().len(), 1);
+    }
 }

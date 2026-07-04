@@ -1,4 +1,8 @@
-use std::{fs, path::Path, time::UNIX_EPOCH};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::UNIX_EPOCH,
+};
 
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
@@ -77,6 +81,17 @@ pub fn validate_library_path(path: &str) -> anyhow::Result<String> {
     let canonical = canonicalize_path(path)?;
     validate_path(&canonical, Some(false), false)?;
     Ok(canonical)
+}
+
+pub fn path_within_roots(path: &str, roots: &[String]) -> bool {
+    let Some(path) = canonical_existing_path(path) else {
+        return false;
+    };
+    roots.iter().any(|root| {
+        canonical_existing_path(root)
+            .as_deref()
+            .is_some_and(|root| path.starts_with(root))
+    })
 }
 
 pub fn parent_path(path: &str) -> Option<String> {
@@ -180,6 +195,10 @@ fn strip_windows_extended_prefix(path: &str) -> String {
         .unwrap_or_else(|| path.strip_prefix(r"\\?\").unwrap_or(path).to_string())
 }
 
+fn canonical_existing_path(path: &str) -> Option<PathBuf> {
+    fs::canonicalize(normalize_path(path)).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +206,26 @@ mod tests {
     #[test]
     fn normalizes_separators() {
         assert_eq!(normalize_path("a\\b/c"), "a/b/c");
+    }
+
+    #[test]
+    fn path_within_roots_rejects_sibling_paths() {
+        let temp =
+            std::env::temp_dir().join(format!("jellyfin-rs-path-test-{}", uuid::Uuid::new_v4()));
+        let root = temp.join("media");
+        let sibling = temp.join("media-other");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let media_file = root.join("movie.mkv");
+        let other_file = sibling.join("secret.txt");
+        fs::write(&media_file, b"ok").unwrap();
+        fs::write(&other_file, b"no").unwrap();
+
+        let roots = vec![root.to_string_lossy().to_string()];
+        assert!(path_within_roots(&media_file.to_string_lossy(), &roots));
+        assert!(!path_within_roots(&other_file.to_string_lossy(), &roots));
+        assert!(!path_within_roots(&media_file.to_string_lossy(), &[]));
+
+        let _ = fs::remove_dir_all(temp);
     }
 }

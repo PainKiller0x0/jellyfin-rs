@@ -37,7 +37,7 @@ async fn filters2_inner(
         .map(|v| v.split(',').map(str::trim).collect::<Vec<_>>());
 
     // Build WHERE clause based on ParentId and IncludeItemTypes
-    let mut conditions = vec!["1=1".to_string()];
+    let mut conditions = vec!["media_items.is_public = 1".to_string()];
     let mut values: Vec<sea_orm::Value> = Vec::new();
 
     if let Some(pid) = parent_id {
@@ -205,7 +205,9 @@ async fn item_ancestors_inner(
         let row = db
             .query_one(crate::db::helpers::portable_statement(
                 backend,
-                &item_queries::media_item_select_sql("WHERE media_items.id = ?"),
+                &item_queries::media_item_select_sql(
+                    "WHERE media_items.id = ? AND media_items.is_public = 1",
+                ),
                 vec![user_id.into(), id.clone().into()],
             ))
             .await?;
@@ -282,7 +284,7 @@ pub async fn shows_upcoming(
 
     let backend = state.db.get_database_backend();
     let sql = format!(
-        "{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 ORDER BY media_items.created_at DESC LIMIT ?",
+        "{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND media_items.is_public = 1 ORDER BY media_items.created_at DESC LIMIT ?",
         crate::jellyfin::item_queries::media_item_select_sql("")
     );
     let rows = state
@@ -305,47 +307,282 @@ pub async fn genre_by_name(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Response {
-    let backend = state.db.get_database_backend();
-    let row = state
-        .db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT id, name FROM genres WHERE name = ?",
-            vec![name.into()],
-        ))
-        .await;
-
-    match row {
-        Ok(Some(r)) => {
-            let id = r.get_str("id").unwrap_or_default();
-            let name = r.get_str("name").unwrap_or_default();
-            Json(json!({ "Name": name, "Id": id, "Type": "Genre" })).into_response()
-        }
-        _ => StatusCode::NOT_FOUND.into_response(),
-    }
+    named_item_by_name(
+        &state,
+        &name,
+        NamedRelation::new("genres", "media_genres", "genre_id", "Genre"),
+    )
+    .await
 }
 
-/// GET /Studios/{name} — get studio by name
+/// GET /GameGenres/{name}
+pub async fn game_genre_by_name(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    named_item_by_name(
+        &state,
+        &name,
+        NamedRelation::new(
+            "game_genres",
+            "media_game_genres",
+            "game_genre_id",
+            "GameGenre",
+        ),
+    )
+    .await
+}
+
+pub async fn music_genre_by_name(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    named_item_by_name(
+        &state,
+        &name,
+        NamedRelation::new("genres", "media_genres", "genre_id", "MusicGenre"),
+    )
+    .await
+}
+
+/// GET /Studios/{name}
 pub async fn studio_by_name(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Response {
-    let backend = state.db.get_database_backend();
-    let row = state
-        .db
+    named_item_by_name(
+        &state,
+        &name,
+        NamedRelation::new("studios", "media_studios", "studio_id", "Studio"),
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct NamedRelation {
+    table: &'static str,
+    relation_table: &'static str,
+    relation_column: &'static str,
+    item_type: &'static str,
+}
+
+impl NamedRelation {
+    fn new(
+        table: &'static str,
+        relation_table: &'static str,
+        relation_column: &'static str,
+        item_type: &'static str,
+    ) -> Self {
+        Self {
+            table,
+            relation_table,
+            relation_column,
+            item_type,
+        }
+    }
+}
+
+async fn named_item_by_name(state: &AppState, name: &str, relation: NamedRelation) -> Response {
+    match named_item_by_name_inner(&state.db, name, relation).await {
+        Ok(Some(item)) => Json(item).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+async fn named_item_by_name_inner(
+    db: &sea_orm::DatabaseConnection,
+    name: &str,
+    relation: NamedRelation,
+) -> anyhow::Result<Option<Value>> {
+    let sql = format!(
+        "SELECT DISTINCT named.id, named.name FROM {} named JOIN {} rel ON rel.{} = named.id JOIN media_items ON media_items.id = rel.item_id WHERE media_items.is_public = 1 AND named.name = ? LIMIT 1",
+        relation.table, relation.relation_table, relation.relation_column
+    );
+    let row = db
         .query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT id, name FROM studios WHERE name = ?",
+            db.get_database_backend(),
+            &sql,
             vec![name.into()],
         ))
+        .await?;
+
+    Ok(row.map(|r| {
+        let id = r.get_str("id").unwrap_or_default();
+        let name = r.get_str("name").unwrap_or_default();
+        named_item_json(&id, &name, relation.item_type)
+    }))
+}
+
+fn named_item_json(id: &str, name: &str, item_type: &str) -> Value {
+    json!({ "Name": name, "Id": id, "Type": item_type })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NamedRelation, filters2_inner, named_item_by_name_inner, named_item_json};
+    use sea_orm::{ConnectionTrait, Database};
+
+    #[test]
+    fn named_item_json_uses_requested_type() {
+        let item = named_item_json("g1", "Arcade", "GameGenre");
+        assert_eq!(item["Id"], "g1");
+        assert_eq!(item["Name"], "Arcade");
+        assert_eq!(item["Type"], "GameGenre");
+
+        let music = named_item_json("m1", "Rock", "MusicGenre");
+        assert_eq!(music["Type"], "MusicGenre");
+    }
+
+    #[tokio::test]
+    async fn filters2_hides_values_from_private_items() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        insert_media_item(&db, "public", "Public", 1, 2001, "PG").await;
+        insert_media_item(&db, "private", "Private", 0, 2002, "R").await;
+        insert_named(&db, "genres", "g_public", "PublicGenre").await;
+        insert_named(&db, "genres", "g_private", "PrivateGenre").await;
+        link_named(&db, "media_genres", "genre_id", "public", "g_public").await;
+        link_named(&db, "media_genres", "genre_id", "private", "g_private").await;
+
+        let result = filters2_inner(&db, &Default::default()).await.unwrap();
+        assert_eq!(result["Years"], serde_json::json!([2001]));
+        assert_eq!(result["OfficialRatings"], serde_json::json!(["PG"]));
+        assert_eq!(result["Genres"][0]["Name"], "PublicGenre");
+        assert_eq!(result["Genres"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn named_filter_items_require_public_media_relation() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        insert_media_item(&db, "public", "Public", 1, 2001, "PG").await;
+        insert_media_item(&db, "private", "Private", 0, 2002, "R").await;
+        insert_named(&db, "genres", "g_public", "PublicGenre").await;
+        insert_named(&db, "genres", "g_private", "PrivateGenre").await;
+        insert_named(&db, "studios", "s_public", "PublicStudio").await;
+        insert_named(&db, "studios", "s_private", "PrivateStudio").await;
+        insert_named(&db, "game_genres", "gg_public", "PublicGameGenre").await;
+        insert_named(&db, "game_genres", "gg_private", "PrivateGameGenre").await;
+        link_named(&db, "media_genres", "genre_id", "public", "g_public").await;
+        link_named(&db, "media_genres", "genre_id", "private", "g_private").await;
+        link_named(&db, "media_studios", "studio_id", "public", "s_public").await;
+        link_named(&db, "media_studios", "studio_id", "private", "s_private").await;
+        link_named(
+            &db,
+            "media_game_genres",
+            "game_genre_id",
+            "public",
+            "gg_public",
+        )
+        .await;
+        link_named(
+            &db,
+            "media_game_genres",
+            "game_genre_id",
+            "private",
+            "gg_private",
+        )
         .await;
 
-    match row {
-        Ok(Some(r)) => {
-            let id = r.get_str("id").unwrap_or_default();
-            let name = r.get_str("name").unwrap_or_default();
-            Json(json!({ "Name": name, "Id": id, "Type": "Studio" })).into_response()
-        }
-        _ => StatusCode::NOT_FOUND.into_response(),
+        let genre = NamedRelation::new("genres", "media_genres", "genre_id", "Genre");
+        assert_eq!(
+            named_item_by_name_inner(&db, "PublicGenre", genre)
+                .await
+                .unwrap()
+                .unwrap()["Type"],
+            "Genre"
+        );
+        assert!(
+            named_item_by_name_inner(&db, "PrivateGenre", genre)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let studio = NamedRelation::new("studios", "media_studios", "studio_id", "Studio");
+        assert_eq!(
+            named_item_by_name_inner(&db, "PublicStudio", studio)
+                .await
+                .unwrap()
+                .unwrap()["Name"],
+            "PublicStudio"
+        );
+        assert!(
+            named_item_by_name_inner(&db, "PrivateStudio", studio)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let game = NamedRelation::new(
+            "game_genres",
+            "media_game_genres",
+            "game_genre_id",
+            "GameGenre",
+        );
+        assert_eq!(
+            named_item_by_name_inner(&db, "PublicGameGenre", game)
+                .await
+                .unwrap()
+                .unwrap()["Type"],
+            "GameGenre"
+        );
+        assert!(
+            named_item_by_name_inner(&db, "PrivateGameGenre", game)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    async fn insert_media_item(
+        db: &sea_orm::DatabaseConnection,
+        id: &str,
+        title: &str,
+        is_public: i64,
+        year: i64,
+        rating: &str,
+    ) {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, production_year, official_rating, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, ?, ?, ?, 1, 1, 1)",
+            vec![
+                id.into(),
+                title.into(),
+                id.into(),
+                is_public.into(),
+                year.into(),
+                rating.into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn insert_named(db: &sea_orm::DatabaseConnection, table: &str, id: &str, name: &str) {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            &format!("INSERT INTO {table} (id, name, created_at) VALUES (?, ?, 1)"),
+            vec![id.into(), name.into()],
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn link_named(
+        db: &sea_orm::DatabaseConnection,
+        table: &str,
+        column: &str,
+        item_id: &str,
+        value_id: &str,
+    ) {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            &format!("INSERT INTO {table} (item_id, {column}) VALUES (?, ?)"),
+            vec![item_id.into(), value_id.into()],
+        ))
+        .await
+        .unwrap();
     }
 }

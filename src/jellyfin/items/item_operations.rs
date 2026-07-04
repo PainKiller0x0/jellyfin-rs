@@ -14,6 +14,8 @@ use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
     jellyfin::common::internal_error,
+    library::path_utils,
+    playback::streaming::readable_media_path,
     util::{now_unix, stable_text_id},
 };
 
@@ -23,7 +25,7 @@ pub async fn delete_info(
 ) -> Response {
     match item_delete_paths(&state.db, &item_id).await {
         Ok(Some(paths)) => Json(json!({ "Paths": paths })).into_response(),
-        Ok(None) => Json(json!({ "Paths": [] })).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -45,7 +47,8 @@ pub async fn delete_items(
     }
 
     match delete_items_inner(&state, &ids).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(0) => StatusCode::NOT_FOUND.into_response(),
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -55,7 +58,8 @@ pub async fn delete_single_item(
     Path(item_id): Path<String>,
 ) -> Response {
     match delete_items_inner(&state, &[&item_id]).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(0) => StatusCode::NOT_FOUND.into_response(),
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -67,7 +71,24 @@ pub async fn update_item(
 ) -> Response {
     match update_item_inner(&state.db, &item_id, body).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => Json(json!({ "Error": "Item not found" })).into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn update_item_content_type(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let content_type = query
+        .get("contentType")
+        .or_else(|| query.get("ContentType"))
+        .map(String::as_str)
+        .unwrap_or_default();
+    match update_item_content_type_inner(&state.db, &item_id, content_type).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -88,24 +109,31 @@ async fn item_delete_paths(
     ))
 }
 
-async fn delete_items_inner(state: &AppState, ids: &[&str]) -> anyhow::Result<()> {
+async fn delete_items_inner(state: &AppState, ids: &[&str]) -> anyhow::Result<u64> {
+    let deleted = delete_item_records_for_ids(&state.db, ids).await?;
+    if deleted > 0 {
+        crate::jellyfin::system::log_activity(
+            state,
+            &format!("Deleted {deleted} media items"),
+            "MediaDeletion",
+            None,
+            None,
+        )
+        .await;
+    }
+    Ok(deleted)
+}
+
+async fn delete_item_records_for_ids(db: &DatabaseConnection, ids: &[&str]) -> anyhow::Result<u64> {
     let mut deleted = 0u64;
     for id in ids {
-        let rows = descendant_item_rows(&state.db, id).await?;
+        let rows = descendant_item_rows(db, id).await?;
         for (item_id, _) in rows.into_iter().rev() {
-            delete_item_records(&state.db, &item_id).await?;
+            delete_item_records(db, &item_id).await?;
             deleted += 1;
         }
     }
-    crate::jellyfin::system::log_activity(
-        state,
-        &format!("Deleted {deleted} media items"),
-        "MediaDeletion",
-        None,
-        None,
-    )
-    .await;
-    Ok(())
+    Ok(deleted)
 }
 
 async fn descendant_item_rows(
@@ -154,6 +182,18 @@ async fn delete_item_records(db: &DatabaseConnection, item_id: &str) -> anyhow::
     .await
     .with_context(|| format!("failed to delete media item: {item_id}"))?;
     Ok(())
+}
+
+async fn media_item_exists(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<bool> {
+    Ok(db
+        .query_one(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "SELECT id FROM media_items WHERE id = ?",
+            vec![item_id.into()],
+        ))
+        .await
+        .with_context(|| format!("failed to find media item: {item_id}"))?
+        .is_some())
 }
 
 pub(crate) async fn update_item_inner(
@@ -241,6 +281,70 @@ pub(crate) async fn update_item_inner(
     update_people(db, item_id, &body).await?;
 
     Ok(true)
+}
+
+async fn update_item_content_type_inner(
+    db: &DatabaseConnection,
+    item_id: &str,
+    content_type: &str,
+) -> anyhow::Result<bool> {
+    let Some(folder_path) = item_content_type_path(db, item_id).await? else {
+        return Ok(false);
+    };
+    let mut config: Value = serde_json::from_str(
+        &crate::jellyfin::system::app_setting(db, "server_config", "{}").await,
+    )
+    .unwrap_or_else(|_| json!({}));
+    if !config.is_object() {
+        config = json!({});
+    }
+
+    let mut content_types = config
+        .get("ContentTypes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .get("Name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .is_some_and(|name| !name.eq_ignore_ascii_case(&folder_path))
+        })
+        .collect::<Vec<_>>();
+    let content_type = content_type.trim();
+    if !content_type.is_empty() {
+        content_types.push(json!({ "Name": folder_path, "Value": content_type }));
+    }
+    config["ContentTypes"] = Value::Array(content_types);
+    crate::jellyfin::system::set_app_setting(db, "server_config", &config.to_string()).await?;
+    Ok(true)
+}
+
+async fn item_content_type_path(
+    db: &DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(row) = db
+        .query_one(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "SELECT path, is_folder FROM media_items WHERE id = ?",
+            vec![item_id.into()],
+        ))
+        .await
+        .with_context(|| format!("failed to find media item content type path: {item_id}"))?
+    else {
+        return Ok(None);
+    };
+    let path = path_utils::normalize_path(&row.get_str("path")?);
+    if path.trim().is_empty() {
+        return Ok(Some(item_id.to_string()));
+    }
+    if row.get_i64("is_folder").unwrap_or_default() != 0 {
+        return Ok(Some(path));
+    }
+    Ok(Some(path_utils::parent_path(&path).unwrap_or(path)))
 }
 
 async fn update_named_relations(
@@ -344,6 +448,11 @@ pub async fn add_item_tag(
         )
             .into_response();
     };
+    match media_item_exists(&state.db, &item_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return internal_error(e),
+    }
     let backend = state.db.get_database_backend();
     let id = stable_text_id(&format!("tags:{}", name.trim().to_ascii_lowercase()));
     if let Err(e) = state
@@ -384,6 +493,11 @@ pub async fn delete_item_tag(
         )
             .into_response();
     };
+    match media_item_exists(&state.db, &item_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return internal_error(e),
+    }
     let backend = state.db.get_database_backend();
     let id = stable_text_id(&format!("tags:{}", name.trim().to_ascii_lowercase()));
     if let Err(e) = state
@@ -416,14 +530,23 @@ pub async fn delete_item_subtitle(
     match row {
         Ok(Some(r)) => {
             if let Ok(path) = r.get_str("path") {
-                let _ = tokio::fs::remove_file(&path).await;
+                if !readable_media_path(&state.db, &path).await {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                if let Err(error) = tokio::fs::remove_file(&path).await
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    return internal_error(error.into());
+                }
             }
             // Remove from media_streams
-            let _ = state.db.execute(crate::db::helpers::portable_statement(
+            if let Err(error) = state.db.execute(crate::db::helpers::portable_statement(
                 backend,
                 "DELETE FROM media_streams WHERE item_id = ? AND stream_index = ? AND stream_type = 'Subtitle'",
                 vec![item_id.into(), index.into()],
-            )).await;
+            )).await {
+                return internal_error(error.into());
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         _ => StatusCode::NOT_FOUND.into_response(),
@@ -446,6 +569,7 @@ pub async fn make_item_private(
         ))
         .await
     {
+        Ok(result) if result.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error(e.into()),
     }
@@ -467,7 +591,130 @@ pub async fn make_item_public(
         ))
         .await
     {
+        Ok(result) if result.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        delete_item_records_for_ids, media_item_exists, update_item_content_type_inner,
+        update_item_inner,
+    };
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn item_missing_checks_report_false() {
+        let db = test_db().await;
+        assert!(!media_item_exists(&db, "missing").await.unwrap());
+        assert!(
+            !update_item_inner(&db, "missing", json!({ "Name": "Nope" }))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            delete_item_records_for_ids(&db, &["missing"])
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_item_records_removes_descendants() {
+        let db = test_db().await;
+        insert_media_item(&db, "parent", "", 1).await;
+        insert_media_item(&db, "child", "parent", 0).await;
+
+        assert_eq!(
+            delete_item_records_for_ids(&db, &["parent"]).await.unwrap(),
+            2
+        );
+        assert!(!media_item_exists(&db, "parent").await.unwrap());
+        assert!(!media_item_exists(&db, "child").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_public_column_is_migrated() {
+        let db = test_db().await;
+        insert_media_item(&db, "movie", "", 0).await;
+        let result = db
+            .execute(crate::db::helpers::portable_statement(
+                db.get_database_backend(),
+                "UPDATE media_items SET is_public = 0 WHERE id = ?",
+                vec!["movie".into()],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.rows_affected(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_item_content_type_stores_folder_override() {
+        let db = test_db().await;
+        insert_media_item(&db, "file", "", 0).await;
+
+        assert!(
+            update_item_content_type_inner(&db, "file", "tvshows")
+                .await
+                .unwrap()
+        );
+
+        let value = crate::jellyfin::system::app_setting(&db, "server_config", "{}").await;
+        let config: serde_json::Value = serde_json::from_str(&value).unwrap();
+        assert_eq!(config["ContentTypes"][0]["Name"], "/tmp");
+        assert_eq!(config["ContentTypes"][0]["Value"], "tvshows");
+    }
+
+    #[tokio::test]
+    async fn update_item_content_type_empty_value_clears_override() {
+        let db = test_db().await;
+        insert_media_item(&db, "folder", "", 1).await;
+
+        update_item_content_type_inner(&db, "folder", "movies")
+            .await
+            .unwrap();
+        update_item_content_type_inner(&db, "folder", "")
+            .await
+            .unwrap();
+
+        let value = crate::jellyfin::system::app_setting(&db, "server_config", "{}").await;
+        let config: serde_json::Value = serde_json::from_str(&value).unwrap();
+        assert!(config["ContentTypes"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_item_content_type_reports_missing_item() {
+        let db = test_db().await;
+        assert!(
+            !update_item_content_type_inner(&db, "missing", "movies")
+                .await
+                .unwrap()
+        );
+    }
+
+    async fn test_db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        db
+    }
+
+    async fn insert_media_item(db: &DatabaseConnection, id: &str, parent_id: &str, is_folder: i64) {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', ?, 1, 1, 1)",
+            vec![
+                id.into(),
+                id.into(),
+                format!("/tmp/{id}").into(),
+                parent_id.into(),
+                is_folder.into(),
+            ],
+        ))
+        .await
+        .unwrap();
     }
 }

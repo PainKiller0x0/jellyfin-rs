@@ -1570,7 +1570,8 @@ pub async fn require_auth(
             .into_response();
     };
 
-    let needs_admin = admin_required(request.method(), path);
+    let needs_admin = admin_required(request.method(), path)
+        || sessions_read_requires_admin(request.method(), path, &query, &user_id);
     let cross_user_access =
         request_user_target(path, &query).is_some_and(|target| target != user_id);
     let session_control_denied = if let Some(session_id) = session_control_target(path, &query) {
@@ -1752,6 +1753,19 @@ fn package_admin_write(path: &str) -> bool {
 
 fn remote_metadata_search_write(path: &str) -> bool {
     path.starts_with("/Items/RemoteSearch/")
+}
+
+fn sessions_read_requires_admin(
+    method: &Method,
+    path: &str,
+    query: &HashMap<String, String>,
+    user_id: &str,
+) -> bool {
+    if method != Method::GET || path != "/Sessions" {
+        return false;
+    }
+    query_value(query, "ControllableByUserId")
+        .is_none_or(|target| target != user_id)
 }
 
 fn session_user_management_write(path: &str) -> bool {
@@ -2579,6 +2593,7 @@ mod tests {
         assert!(admin_required(&Method::GET, "/Packages/Updates"));
         assert!(admin_required(&Method::POST, "/Sessions/s1/Users/u1"));
         assert!(!admin_required(&Method::POST, "/Sessions/s1/Command"));
+        assert!(!admin_required(&Method::GET, "/Sessions"));
         assert!(!admin_required(&Method::POST, "/Users/u1/Password"));
         assert!(!admin_required(&Method::POST, "/Users/u1/Configuration"));
         assert_eq!(
@@ -2650,6 +2665,39 @@ mod tests {
         assert!(!admin_required(
             &Method::POST,
             "/Users/u1/PlayedItems/i1/Delete"
+        ));
+    }
+
+    #[test]
+    fn sessions_list_requires_admin_except_own_control_query() {
+        assert!(sessions_read_requires_admin(
+            &Method::GET,
+            "/Sessions",
+            &HashMap::new(),
+            "u1"
+        ));
+
+        let own_query = query_map("ControllableByUserId=u1");
+        assert!(!sessions_read_requires_admin(
+            &Method::GET,
+            "/Sessions",
+            &own_query,
+            "u1"
+        ));
+
+        let other_query = query_map("controllableByUserId=u2");
+        assert!(sessions_read_requires_admin(
+            &Method::GET,
+            "/Sessions",
+            &other_query,
+            "u1"
+        ));
+
+        assert!(!sessions_read_requires_admin(
+            &Method::POST,
+            "/Sessions/Capabilities",
+            &HashMap::new(),
+            "u1"
         ));
     }
 

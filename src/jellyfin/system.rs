@@ -4,7 +4,7 @@ use anyhow::Context;
 use axum::{
     Json,
     body::{Body, Bytes},
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, Query, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
@@ -547,13 +547,31 @@ pub struct ParentPathQuery {
 }
 
 #[derive(Deserialize)]
+#[serde(default)]
 pub struct ValidatePathRequest {
-    #[serde(rename = "Path")]
+    #[serde(rename = "Path", alias = "path")]
     path: Option<String>,
-    #[serde(rename = "IsFile")]
+    #[serde(rename = "IsFile", alias = "isFile", alias = "is_file")]
     is_file: Option<bool>,
-    #[serde(rename = "ValidateWritable", alias = "ValidateWriteable", default)]
+    #[serde(
+        rename = "ValidateWritable",
+        alias = "ValidateWriteable",
+        alias = "validateWritable",
+        alias = "validateWriteable",
+        alias = "validate_writable",
+        default
+    )]
     validate_writable: bool,
+}
+
+impl Default for ValidatePathRequest {
+    fn default() -> Self {
+        Self {
+            path: None,
+            is_file: None,
+            validate_writable: false,
+        }
+    }
 }
 
 pub async fn default_directory_browser() -> impl IntoResponse {
@@ -590,22 +608,67 @@ pub async fn parent_path(Query(query): Query<ParentPathQuery>) -> impl IntoRespo
     Json(path_utils::parent_path(&query.path))
 }
 
-pub async fn validate_path(Json(request): Json<ValidatePathRequest>) -> Response {
+pub async fn validate_path(
+    Query(query): Query<HashMap<String, String>>,
+    body: Result<Json<ValidatePathRequest>, JsonRejection>,
+) -> Response {
+    let request = match body {
+        Ok(Json(request)) => request,
+        Err(JsonRejection::MissingJsonContentType(_)) => ValidatePathRequest::default(),
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "Error": error.body_text() })),
+            )
+                .into_response();
+        }
+    };
+    let request = validate_path_request_from_inputs(&query, request);
     let path = request.path.unwrap_or_default();
     match path_utils::validate_path(&path, request.is_file, request.validate_writable) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error)
-            if error.to_string().contains("not found")
-                || error.to_string().contains("required") =>
-        {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "Error": error.to_string() })),
-            )
-                .into_response()
-        }
+        Err(error) if error.to_string().contains("required") => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": error.to_string() })),
+        )
+            .into_response(),
+        Err(error) if error.to_string().contains("not found") => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "Error": error.to_string() })),
+        )
+            .into_response(),
         Err(error) => internal_error(error),
     }
+}
+
+fn validate_path_request_from_inputs(
+    query: &HashMap<String, String>,
+    mut request: ValidatePathRequest,
+) -> ValidatePathRequest {
+    if request
+        .path
+        .as_deref()
+        .is_none_or(|path| path.trim().is_empty())
+    {
+        request.path = query_value(query, "Path");
+    }
+    if request.is_file.is_none() {
+        request.is_file = query_bool_any(query, &["IsFile", "isFile", "is_file"]);
+    }
+    if !request.validate_writable {
+        request.validate_writable = query_bool_any(
+            query,
+            &[
+                "ValidateWritable",
+                "ValidateWriteable",
+                "validateWritable",
+                "validateWriteable",
+                "validate_writable",
+            ],
+        )
+        .unwrap_or(false);
+    }
+    request
 }
 
 pub async fn system_endpoint() -> impl IntoResponse {
@@ -3103,6 +3166,16 @@ fn query_value(query: &HashMap<String, String>, key: &str) -> Option<String> {
         .map(|value| value.trim().to_string())
 }
 
+fn query_bool_any(query: &HashMap<String, String>, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| query_value(query, key))
+        .and_then(|value| match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Some(true),
+            "0" | "false" | "no" => Some(false),
+            _ => None,
+        })
+}
+
 pub async fn fallback_fonts() -> Response {
     Json(fallback_font_entries()).into_response()
 }
@@ -4005,7 +4078,8 @@ mod tests {
         ui_command, update_notification_read_state, usage_stats_breakdown_items,
         usage_stats_duration_histogram_items, usage_stats_hourly_items, usage_stats_session_entry,
         usage_user_entry, user_usage_stats_load_backup_from, user_usage_stats_save_backup_to,
-        user_usage_stats_user_manage, user_view_grouping_options_value, web_strings_value,
+        user_usage_stats_user_manage, user_view_grouping_options_value,
+        validate_path_request_from_inputs, web_strings_value,
     };
     use super::{
         DeviceIdQuery, DirectoryContentsQuery, ParentPathQuery, ValidatePathRequest,
@@ -4129,6 +4203,29 @@ mod tests {
         .unwrap();
         assert_eq!(validate.path.as_deref(), Some("D:/Media"));
         assert!(validate.validate_writable);
+    }
+
+    #[test]
+    fn validate_path_request_merges_emby_query_parameters() {
+        let mut query = HashMap::new();
+        query.insert("Path".to_string(), "D:/Media".to_string());
+        query.insert("IsFile".to_string(), "true".to_string());
+        query.insert("ValidateWriteable".to_string(), "yes".to_string());
+
+        let request = validate_path_request_from_inputs(&query, ValidatePathRequest::default());
+        assert_eq!(request.path.as_deref(), Some("D:/Media"));
+        assert_eq!(request.is_file, Some(true));
+        assert!(request.validate_writable);
+
+        let body_request = ValidatePathRequest {
+            path: Some("E:/Body".to_string()),
+            is_file: Some(false),
+            validate_writable: false,
+        };
+        let request = validate_path_request_from_inputs(&query, body_request);
+        assert_eq!(request.path.as_deref(), Some("E:/Body"));
+        assert_eq!(request.is_file, Some(false));
+        assert!(request.validate_writable);
     }
 
     #[test]

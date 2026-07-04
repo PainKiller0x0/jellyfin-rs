@@ -742,7 +742,7 @@ async fn codec_item_ids(db: &DatabaseConnection, codecs: &[String]) -> anyhow::R
         let rows = db
             .query_all(crate::db::helpers::portable_statement(
                 backend,
-                "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND codec = ?",
+                "SELECT DISTINCT media_streams.item_id FROM media_streams JOIN media_items ON media_items.id = media_streams.item_id WHERE media_items.is_public = 1 AND media_streams.stream_type = 'Video' AND media_streams.codec = ?",
                 vec![codec.as_str().into()],
             ))
             .await
@@ -764,15 +764,15 @@ async fn width_item_ids(
     let backend = db.get_database_backend();
     let (sql, values) = match (min_width, max_width) {
         (Some(_), Some(_)) => (
-            "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND width >= ? AND width <= ?",
+            "SELECT DISTINCT media_streams.item_id FROM media_streams JOIN media_items ON media_items.id = media_streams.item_id WHERE media_items.is_public = 1 AND media_streams.stream_type = 'Video' AND media_streams.width >= ? AND media_streams.width <= ?",
             vec![min_width.into(), max_width.into()],
         ),
         (Some(_), None) => (
-            "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND width >= ?",
+            "SELECT DISTINCT media_streams.item_id FROM media_streams JOIN media_items ON media_items.id = media_streams.item_id WHERE media_items.is_public = 1 AND media_streams.stream_type = 'Video' AND media_streams.width >= ?",
             vec![min_width.into()],
         ),
         (None, Some(_)) => (
-            "SELECT DISTINCT item_id FROM media_streams WHERE stream_type = 'Video' AND width <= ?",
+            "SELECT DISTINCT media_streams.item_id FROM media_streams JOIN media_items ON media_items.id = media_streams.item_id WHERE media_items.is_public = 1 AND media_streams.stream_type = 'Video' AND media_streams.width <= ?",
             vec![max_width.into()],
         ),
         (None, None) => unreachable!("width_item_ids requires at least one bound"),
@@ -798,7 +798,7 @@ async fn parent_item_ids(
         let rows = db
             .query_all(crate::db::helpers::portable_statement(
                 backend,
-                "SELECT DISTINCT parent_id FROM linked_children WHERE item_id = ?",
+                "SELECT DISTINCT linked_children.parent_id FROM linked_children JOIN media_items parent ON parent.id = linked_children.parent_id JOIN media_items child ON child.id = linked_children.item_id WHERE parent.is_public = 1 AND child.is_public = 1 AND linked_children.item_id = ?",
                 vec![id.as_str().into()],
             ))
             .await
@@ -820,7 +820,9 @@ async fn relation_item_ids(
 ) -> anyhow::Result<Vec<String>> {
     let backend = db.get_database_backend();
     let mut item_ids = Vec::new();
-    let sql = format!("SELECT DISTINCT item_id FROM {table} WHERE {id_column} = ?");
+    let sql = format!(
+        "SELECT DISTINCT rel.item_id FROM {table} rel JOIN media_items ON media_items.id = rel.item_id WHERE media_items.is_public = 1 AND rel.{id_column} = ?"
+    );
     for id in ids {
         let rows = db
             .query_all(crate::db::helpers::portable_statement(
@@ -1030,6 +1032,53 @@ mod tests {
         let (items, total) = super::list_media_items(&db, "u1", &query).await.unwrap();
         assert_eq!(total, 1);
         assert_eq!(items[0].id, "public");
+    }
+
+    #[tokio::test]
+    async fn stream_filters_ignore_private_items() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        for (id, is_public, codec, width) in [
+            ("public", 1_i64, "h264", 1920_i64),
+            ("private", 0_i64, "hevc", 3840_i64),
+        ] {
+            db.execute(crate::db::helpers::portable_statement(
+                db.get_database_backend(),
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, ?, 1, 1, 1)",
+                vec![
+                    id.into(),
+                    id.into(),
+                    format!("/tmp/{id}.mkv").into(),
+                    is_public.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+            db.execute(crate::db::helpers::portable_statement(
+                db.get_database_backend(),
+                "INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, width, is_external, created_at) VALUES (?, ?, 0, 'Video', ?, ?, 0, 1)",
+                vec![
+                    format!("{id}-video").into(),
+                    id.into(),
+                    codec.into(),
+                    width.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let mut query = HashMap::new();
+        query.insert("VideoCodecs".to_string(), "hevc".to_string());
+        let (items, total) = super::list_media_items(&db, "u1", &query).await.unwrap();
+        assert_eq!(total, 0);
+        assert!(items.is_empty());
+
+        query.clear();
+        query.insert("MinWidth".to_string(), "3000".to_string());
+        let (items, total) = super::list_media_items(&db, "u1", &query).await.unwrap();
+        assert_eq!(total, 0);
+        assert!(items.is_empty());
     }
 
     #[tokio::test]

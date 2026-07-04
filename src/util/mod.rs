@@ -1,6 +1,6 @@
 use std::{
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use argon2::{
@@ -68,4 +68,15 @@ pub fn verify_password(password: &str, password_hash: &str) -> bool {
                 .ok()
         })
         .is_some()
+}
+
+pub fn http_client() -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .no_proxy();
+    let proxy_url = std::env::var("JELLYFIN_RS_PROXY").unwrap_or_default();
+    if !proxy_url.is_empty() {
+        builder = builder.proxy(reqwest::Proxy::all(&proxy_url)?);
+    }
+    Ok(builder.build()?)
 }

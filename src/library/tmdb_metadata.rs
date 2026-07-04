@@ -137,15 +137,7 @@ pub async fn fetch_episode_tmdb_metadata(
 }
 
 fn build_client() -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
-    let proxy_url = std::env::var("HTTPS_PROXY")
-        .or_else(|_| std::env::var("https_proxy"))
-        .or_else(|_| std::env::var("ALL_PROXY"))
-        .unwrap_or_default();
-    if !proxy_url.is_empty() {
-        builder = builder.proxy(reqwest::Proxy::all(&proxy_url)?);
-    }
-    Ok(builder.build()?)
+    crate::util::http_client()
 }
 
 /// Download poster images for all seasons that belong to a TMDb series

@@ -61,19 +61,7 @@ async fn main() -> anyhow::Result<()> {
     let default_username =
         std::env::var("JELLYFIN_RS_USER").unwrap_or_else(|_| DEFAULT_USER_NAME.to_string());
     let (ws_event_tx, _) = tokio::sync::broadcast::channel::<ws::WsEvent>(64);
-    let http_client = {
-        let mut builder = reqwest::Client::builder();
-        let proxy_url = std::env::var("HTTPS_PROXY")
-            .or_else(|_| std::env::var("https_proxy"))
-            .or_else(|_| std::env::var("ALL_PROXY"))
-            .unwrap_or_default();
-        if !proxy_url.is_empty() {
-            if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
-                builder = builder.proxy(proxy);
-            }
-        }
-        builder.build().context("failed to build HTTP client")?
-    };
+    let http_client = util::http_client().context("failed to build HTTP client")?;
     let sa_config = config::StrmAssistantConfig::load(&db).await;
     let intro_detector = Arc::new(intro_skip::detector::IntroDetector::new(
         sa_config.max_intro_duration_secs,

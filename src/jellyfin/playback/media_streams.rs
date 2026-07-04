@@ -8,6 +8,12 @@ use crate::{
     library::models::{MediaStreamRow, child_video_source_json},
 };
 
+fn visible_media_item_sql(alias: &str) -> String {
+    format!(
+        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
+    )
+}
+
 pub(crate) async fn media_streams_for_item(
     db: &sea_orm::DatabaseConnection,
     item_id: &str,
@@ -49,9 +55,9 @@ pub(crate) async fn child_video_sources(
 ) -> anyhow::Result<Vec<JsonValue>> {
     let backend = db.get_database_backend();
     let visibility = if include_private {
-        ""
+        String::new()
     } else {
-        " AND media_items.is_public = 1"
+        format!(" AND {}", visible_media_item_sql("media_items"))
     };
     let sql = format!(
         "SELECT media_items.id, media_items.title, media_items.path, media_items.container, media_items.runtime_ticks, media_items.size_bytes FROM media_items WHERE media_items.parent_id = ? AND media_items.item_type = 'Video'{visibility} ORDER BY media_items.title ASC"
@@ -122,14 +128,23 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
         let backend = db.get_database_backend();
-        for (id, is_public) in [("public", 1_i64), ("private", 0_i64)] {
+        for (id, parent_id, item_type, is_folder, is_public) in [
+            ("movie", "", "Movie", 1_i64, 1_i64),
+            ("public", "movie", "Video", 0_i64, 1_i64),
+            ("private", "movie", "Video", 0_i64, 0_i64),
+            ("private-parent", "", "Movie", 1_i64, 0_i64),
+            ("hidden-child", "private-parent", "Video", 0_i64, 1_i64),
+        ] {
             db.execute(crate::db::helpers::portable_statement(
                 backend,
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', 'movie', 'Video', 0, ?, 'mkv', 1, 1, 1)",
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?, ?, ?, 'mkv', 1, 1, 1)",
                 vec![
                     id.into(),
                     id.into(),
                     format!("/tmp/{id}.mkv").into(),
+                    parent_id.into(),
+                    item_type.into(),
+                    is_folder.into(),
                     is_public.into(),
                 ],
             ))
@@ -147,6 +162,20 @@ mod tests {
         assert_eq!(
             child_video_sources(&db, "movie", true).await.unwrap().len(),
             2
+        );
+        assert_eq!(
+            child_video_sources(&db, "private-parent", false)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            child_video_sources(&db, "private-parent", true)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

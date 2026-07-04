@@ -301,10 +301,23 @@ pub async fn devices(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DevicesQuery>,
 ) -> Response {
-    let mut items = device_records(&state, query.user_id.as_deref())
+    let items = device_records(&state, query.user_id.as_deref())
         .await
         .into_iter()
-        .map(|record| record.to_json())
+        .collect::<Vec<_>>();
+    let mut custom_names = HashMap::new();
+    for record in &items {
+        custom_names.insert(
+            record.id.clone(),
+            device_custom_name(&state.db, &record.id).await,
+        );
+    }
+    let mut items = items
+        .into_iter()
+        .map(|record| {
+            let custom_name = custom_names.get(&record.id).cloned().flatten();
+            record.to_json(custom_name)
+        })
         .collect::<Vec<_>>();
     items.sort_by(|a, b| {
         a.get("Name")
@@ -408,12 +421,15 @@ pub async fn device_info(
     else {
         return device_not_found();
     };
-    device_records(&state, None)
+    let Some(record) = device_records(&state, None)
         .await
         .into_iter()
         .find(|record| record.id == id)
-        .map(|record| Json(record.to_json()).into_response())
-        .unwrap_or_else(device_not_found)
+    else {
+        return device_not_found();
+    };
+    let custom_name = device_custom_name(&state.db, &record.id).await;
+    Json(record.to_json(custom_name)).into_response()
 }
 
 pub async fn device_options(
@@ -2627,10 +2643,10 @@ impl DeviceRecord {
         }
     }
 
-    fn to_json(&self) -> JsonValue {
+    fn to_json(&self, custom_name: Option<String>) -> JsonValue {
         json!({
             "Name": self.name,
-            "CustomName": null,
+            "CustomName": custom_name,
             "AccessToken": null,
             "Id": self.id,
             "LastUserName": null,
@@ -3947,9 +3963,9 @@ mod tests {
         CameraUploadQuery, CustomQueryRequest, DeviceRecord, FALLBACK_FONTS_PATH,
         TmdbApiKeyRequest, activity_log_entry_json, activity_log_query,
         camera_upload_history_value, connect_unavailable, default_branding_options,
-        default_plugin_repositories, default_scan_library_triggers, device_options_result,
-        empty_query_result, fallback_font_entries, fallback_font_mime_type, fallback_font_path,
-        game_system_display_name, image_by_name_info, is_known_scheduled_task,
+        default_plugin_repositories, default_scan_library_triggers, device_info,
+        device_options_result, empty_query_result, fallback_font_entries, fallback_font_mime_type,
+        fallback_font_path, game_system_display_name, image_by_name_info, is_known_scheduled_task,
         is_safe_fallback_font_name, is_safe_log_name, items_access_value, last_task_result,
         live_tv_channel_mapping_options, live_tv_channel_mapping_options_value,
         live_tv_default_listing_provider, live_tv_default_listing_provider_value,
@@ -3970,7 +3986,10 @@ mod tests {
         usage_user_entry, user_usage_stats_load_backup_from, user_usage_stats_save_backup_to,
         user_usage_stats_user_manage, user_view_grouping_options_value, web_strings_value,
     };
-    use super::{DirectoryContentsQuery, ParentPathQuery, ValidatePathRequest};
+    use super::{
+        DeviceIdQuery, DirectoryContentsQuery, ParentPathQuery, ValidatePathRequest,
+        device_options_key, set_app_setting,
+    };
     use crate::app::state::AppState;
     use crate::app::state::{PlaybackSession, PlaybackState, SessionCapabilities};
     use crate::entities::{access_tokens, activity_log, users};
@@ -4130,7 +4149,7 @@ mod tests {
                 supports_persistent_identifier: true,
             },
         };
-        let device = DeviceRecord::from_session(&session).to_json();
+        let device = DeviceRecord::from_session(&session).to_json(None);
         assert_eq!(device["Id"], "device-1");
         assert_eq!(device["Name"], "Browser");
         assert_eq!(device["AppName"], "Web");
@@ -4150,6 +4169,76 @@ mod tests {
     fn device_options_result_keeps_custom_name() {
         let options = device_options_result("device-1", Some("Living Room".to_string()));
         assert_eq!(options["CustomName"], "Living Room");
+    }
+
+    #[test]
+    fn device_record_json_keeps_custom_name() {
+        let token = access_tokens::Model {
+            id: "t1".to_string(),
+            user_id: "u1".to_string(),
+            token_hash: "hash".to_string(),
+            name: Some("Web".to_string()),
+            device_id: Some("device-1".to_string()),
+            created_at: 1,
+            last_used_at: Some(2),
+            expires_at: None,
+            revoked_at: None,
+        };
+        let device = DeviceRecord::from_token(&token).to_json(Some("Living Room".to_string()));
+        assert_eq!(device["CustomName"], "Living Room");
+        assert_eq!(device["Id"], "device-1");
+    }
+
+    #[tokio::test]
+    async fn device_info_reports_saved_custom_name() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        users::Entity::insert(users::ActiveModel {
+            id: Set("u1".to_string()),
+            username: Set("alice".to_string()),
+            password_hash: Set(None),
+            display_name: Set("Alice".to_string()),
+            is_admin: Set(1),
+            is_disabled: Set(0),
+            created_at: Set(1),
+            updated_at: Set(1),
+            last_login_at: Set(None),
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+        access_tokens::Entity::insert(access_tokens::ActiveModel {
+            id: Set("t1".to_string()),
+            user_id: Set("u1".to_string()),
+            token_hash: Set("hash".to_string()),
+            name: Set(Some("Web".to_string())),
+            device_id: Set(Some("device-1".to_string())),
+            created_at: Set(1),
+            last_used_at: Set(Some(2)),
+            expires_at: Set(None),
+            revoked_at: Set(None),
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+        set_app_setting(&db, &device_options_key("device-1"), "Living Room")
+            .await
+            .unwrap();
+        let state = Arc::new(test_state(db));
+
+        let response = device_info(
+            State(state),
+            Query(DeviceIdQuery {
+                id: Some("device-1".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["CustomName"], "Living Room");
     }
 
     #[tokio::test]
@@ -4208,7 +4297,7 @@ mod tests {
             expires_at: None,
             revoked_at: None,
         };
-        let device = DeviceRecord::from_token(&token).to_json();
+        let device = DeviceRecord::from_token(&token).to_json(None);
         assert_eq!(device["Id"], "device-1");
         assert_eq!(device["Name"], "device-1");
         assert_eq!(device["AppName"], "Web");

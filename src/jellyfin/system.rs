@@ -74,28 +74,34 @@ pub use localization::{
 pub async fn system_info(State(state): State<Arc<AppState>>) -> Response {
     let server_name = app_setting(&state.db, "ServerName", SERVER_NAME).await;
     let startup_completed = app_setting_bool(&state.db, "StartupWizardCompleted", false).await;
-    Json(json!({
-        "ServerName": server_name,
-        "Version": VERSION,
-        "LocalAddress": "http://127.0.0.1:8096",
-        "WanAddress": "http://127.0.0.1:8096",
-        "OperatingSystem": std::env::consts::OS,
-        "StartupWizardCompleted": startup_completed,
-        "HasUpdateAvailable": false,
-    }))
-    .into_response()
+    Json(system_info_value(server_name, startup_completed, true)).into_response()
 }
 
 pub async fn public_system_info(State(state): State<Arc<AppState>>) -> Response {
     let server_name = app_setting(&state.db, "ServerName", SERVER_NAME).await;
     let startup_completed = app_setting_bool(&state.db, "StartupWizardCompleted", false).await;
-    Json(json!({
+    Json(system_info_value(server_name, startup_completed, false)).into_response()
+}
+
+fn system_info_value(
+    server_name: String,
+    startup_completed: bool,
+    include_private: bool,
+) -> JsonValue {
+    let mut value = json!({
         "ServerName": server_name,
         "Version": VERSION,
         "Id": "jellyfin-rs",
+        "ServerId": "jellyfin-rs",
         "StartupWizardCompleted": startup_completed,
-    }))
-    .into_response()
+    });
+    if include_private {
+        value["LocalAddress"] = json!("http://127.0.0.1:8096");
+        value["WanAddress"] = json!("http://127.0.0.1:8096");
+        value["OperatingSystem"] = json!(std::env::consts::OS);
+        value["HasUpdateAvailable"] = json!(false);
+    }
+    value
 }
 
 pub async fn web_strings() -> Response {
@@ -4566,10 +4572,11 @@ mod tests {
         sanitize_file_part, save_camera_upload_to, scan_library_task, smtp_notification_test,
         stop_scheduled_task, sync_data, sync_data_result, sync_empty_query_result,
         sync_empty_response, sync_options_result, sync_play_unavailable, sync_unavailable,
-        system_log_file, system_log_lines, system_logs_query, tmdb_client_configuration_value,
-        ui_command, update_notification_read_state, usage_stats_breakdown_items,
-        usage_stats_duration_histogram_items, usage_stats_hourly_items, usage_stats_session_entry,
-        usage_user_entry, user_usage_stats_load_backup_from, user_usage_stats_save_backup_to,
+        system_info_value, system_log_file, system_log_lines, system_logs_query,
+        tmdb_client_configuration_value, ui_command, update_notification_read_state,
+        usage_stats_breakdown_items, usage_stats_duration_histogram_items,
+        usage_stats_hourly_items, usage_stats_session_entry, usage_user_entry,
+        user_usage_stats_load_backup_from, user_usage_stats_save_backup_to,
         user_usage_stats_user_manage, user_view_grouping_options_value,
         validate_path_request_from_inputs, web_strings_value,
     };
@@ -4601,6 +4608,20 @@ mod tests {
         assert!(options["QualityOptions"].as_array().is_some());
         assert!(options["ProfileOptions"].as_array().is_some());
         assert!(sync_data_result()["ItemIdsToRemove"].as_array().is_some());
+    }
+
+    #[test]
+    fn system_info_reports_server_ids() {
+        let full = system_info_value("Home".to_string(), true, true);
+        assert_eq!(full["Id"], "jellyfin-rs");
+        assert_eq!(full["ServerId"], "jellyfin-rs");
+        assert_eq!(full["ServerName"], "Home");
+        assert!(full["LocalAddress"].as_str().is_some());
+
+        let public = system_info_value("Home".to_string(), false, false);
+        assert_eq!(public["Id"], "jellyfin-rs");
+        assert_eq!(public["ServerId"], "jellyfin-rs");
+        assert!(public.get("LocalAddress").is_none());
     }
 
     #[tokio::test]

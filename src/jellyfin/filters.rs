@@ -99,10 +99,7 @@ pub async fn extended_video_types(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     match list_extended_video_types_inner(&state.db, &query).await {
-        Ok(items) => {
-            let total = items.len();
-            Json(json!({ "Items": items, "TotalRecordCount": total })).into_response()
-        }
+        Ok(items) => Json(paged_query_result(items, &query)).into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -142,7 +139,7 @@ async fn list_extended_video_types_inner(
         .into_iter()
         .map(|name| json!({ "Name": name, "Id": name, "Type": "ExtendedVideoType" }))
         .collect();
-    filter_by_search_and_paginate(&mut items, query);
+    filter_by_search_and_sort(&mut items, query);
     Ok(items)
 }
 
@@ -206,10 +203,7 @@ async fn list_prefixes(
 
 async fn list_years(db: &DatabaseConnection, query: &HashMap<String, String>) -> Response {
     match list_years_inner(db, query).await {
-        Ok(items) => {
-            let total = items.len();
-            Json(json!({ "Items": items, "TotalRecordCount": total })).into_response()
-        }
+        Ok(items) => Json(paged_query_result(items, query)).into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -241,7 +235,7 @@ async fn list_years_inner(
         })
         .collect();
 
-    filter_by_search_and_paginate(&mut items, query);
+    filter_by_search_and_sort(&mut items, query);
     Ok(items)
 }
 
@@ -289,10 +283,7 @@ async fn list_distinct_values(
     query: &HashMap<String, String>,
 ) -> Response {
     match list_distinct_values_inner(db, table, column, query).await {
-        Ok(items) => {
-            let total = items.len();
-            Json(json!({ "Items": items, "TotalRecordCount": total })).into_response()
-        }
+        Ok(items) => Json(paged_query_result(items, query)).into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -328,7 +319,7 @@ async fn list_distinct_values_inner(
         })
         .collect();
 
-    filter_by_search_and_paginate(&mut items, query);
+    filter_by_search_and_sort(&mut items, query);
     Ok(items)
 }
 
@@ -338,10 +329,7 @@ async fn list_media_stream_values(
     query: &HashMap<String, String>,
 ) -> Response {
     match list_media_stream_values_inner(db, column, query).await {
-        Ok(items) => {
-            let total = items.len();
-            Json(json!({ "Items": items, "TotalRecordCount": total })).into_response()
-        }
+        Ok(items) => Json(paged_query_result(items, query)).into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -375,12 +363,12 @@ async fn list_media_stream_values_inner(
         })
         .collect();
 
-    filter_by_search_and_paginate(&mut items, query);
+    filter_by_search_and_sort(&mut items, query);
     Ok(items)
 }
 
-fn filter_by_search_and_paginate(items: &mut Vec<Value>, query: &HashMap<String, String>) {
-    if let Some(search_term) = query.get("SearchTerm").filter(|value| !value.is_empty()) {
+fn filter_by_search_and_sort(items: &mut Vec<Value>, query: &HashMap<String, String>) {
+    if let Some(search_term) = query_value(query, "SearchTerm").filter(|value| !value.is_empty()) {
         let search_term = search_term.to_ascii_lowercase();
         items.retain(|item| {
             item.get("Name")
@@ -402,21 +390,42 @@ fn filter_by_search_and_paginate(items: &mut Vec<Value>, query: &HashMap<String,
             )
     });
     if query
-        .get("SortOrder")
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("SortOrder"))
+        .map(|(_, value)| value)
         .is_some_and(|value| value.eq_ignore_ascii_case("Descending"))
     {
         items.reverse();
     }
+}
 
-    let offset = query
-        .get("StartIndex")
+fn paged_query_result(items: Vec<Value>, query: &HashMap<String, String>) -> Value {
+    let total = items.len();
+    let start_index = query_usize(query, "StartIndex", 0);
+    let limit = query_usize(query, "Limit", usize::MAX);
+    let page = items
+        .into_iter()
+        .skip(start_index)
+        .take(limit)
+        .collect::<Vec<_>>();
+    json!({
+        "Items": page,
+        "TotalRecordCount": total,
+        "StartIndex": start_index,
+    })
+}
+
+fn query_value<'a>(query: &'a HashMap<String, String>, key: &str) -> Option<&'a String> {
+    query
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value)
+}
+
+fn query_usize(query: &HashMap<String, String>, key: &str, default: usize) -> usize {
+    query_value(query, key)
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_default();
-    let limit = query
-        .get("Limit")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(usize::MAX);
-    *items = items.drain(..).skip(offset).take(limit).collect();
+        .unwrap_or(default)
 }
 
 async fn list_filter_items(
@@ -425,10 +434,7 @@ async fn list_filter_items(
     query: &HashMap<String, String>,
 ) -> Response {
     match list_filter_items_inner(db, kind, query).await {
-        Ok(items) => {
-            let total = items.len();
-            Json(json!({ "Items": items, "TotalRecordCount": total })).into_response()
-        }
+        Ok(items) => Json(paged_query_result(items, query)).into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -542,7 +548,7 @@ async fn list_filter_items_inner(
         }
     };
 
-    filter_by_search_and_paginate(&mut items, query);
+    filter_by_search_and_sort(&mut items, query);
     Ok(items)
 }
 
@@ -642,10 +648,12 @@ mod tests {
     use super::{
         FilterKind, list_artist_prefixes, list_distinct_values_inner,
         list_extended_video_types_inner, list_filter_items_inner, list_media_item_prefixes,
-        list_media_stream_values_inner, list_years_inner, year_exists, year_item,
+        list_media_stream_values_inner, list_years_inner, paged_query_result, year_exists,
+        year_item,
     };
     use sea_orm::{ConnectionTrait, Database};
-    use serde_json::Value;
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
 
     #[test]
     fn year_item_has_jellyfin_shape() {
@@ -654,6 +662,27 @@ mod tests {
         assert_eq!(item["Id"], "1999");
         assert_eq!(item["Type"], "Year");
         assert_eq!(item["IsFolder"], true);
+    }
+
+    #[test]
+    fn paged_query_result_keeps_total_count_and_start_index() {
+        let mut query = HashMap::new();
+        query.insert("startIndex".to_string(), "1".to_string());
+        query.insert("limit".to_string(), "1".to_string());
+
+        let result = paged_query_result(
+            vec![
+                json!({ "Name": "A" }),
+                json!({ "Name": "B" }),
+                json!({ "Name": "C" }),
+            ],
+            &query,
+        );
+
+        assert_eq!(result["TotalRecordCount"], 3);
+        assert_eq!(result["StartIndex"], 1);
+        assert_eq!(result["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(result["Items"][0]["Name"], "B");
     }
 
     #[tokio::test]

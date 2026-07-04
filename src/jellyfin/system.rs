@@ -39,6 +39,7 @@ const MAX_CLIENT_LOG_BYTES: usize = 1024 * 1024;
 const MAX_CAMERA_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 const MAX_USER_USAGE_BACKUP_BYTES: usize = 20 * 1024 * 1024;
 const MAX_LOG_LINE_LIMIT: usize = 10_000;
+const MAX_DEVICE_CUSTOM_NAME_LEN: usize = 128;
 const CAMERA_UPLOADS_PATH: &str = "data/camera_uploads";
 const USER_USAGE_BACKUP_PATH: &str = "data/user_usage_stats";
 const FALLBACK_FONTS_PATH: &str = "data/fonts";
@@ -487,10 +488,20 @@ pub async fn update_device_options(
     if !exists {
         return device_not_found();
     }
+    let custom_name = match normalize_device_custom_name(request.custom_name.as_deref()) {
+        Ok(custom_name) => custom_name,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "Error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
     match set_app_setting(
         &state.db,
         &device_options_key(id),
-        request.custom_name.as_deref().unwrap_or_default(),
+        custom_name.as_deref().unwrap_or_default(),
     )
     .await
     {
@@ -2522,6 +2533,19 @@ fn device_options_key(device_id: &str) -> String {
     format!("device_options:{device_id}:custom_name")
 }
 
+fn normalize_device_custom_name(value: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.chars().count() > MAX_DEVICE_CUSTOM_NAME_LEN {
+        anyhow::bail!("CustomName is too long");
+    }
+    if value.contains('\0') || value.chars().any(|c| c.is_control() && c != '\t') {
+        anyhow::bail!("CustomName contains unsupported characters");
+    }
+    Ok(Some(value.to_string()))
+}
+
 async fn revoke_device(state: &AppState, device_id: &str, now: i64) -> anyhow::Result<()> {
     let backend = state.db.get_database_backend();
     state
@@ -3980,9 +4004,9 @@ mod tests {
         live_tv_default_listing_provider, live_tv_default_listing_provider_value,
         live_tv_default_tuner_host, live_tv_default_tuner_host_value, live_tv_guide_info,
         live_tv_info, live_tv_timer_defaults, live_tv_timer_defaults_value, live_tv_unavailable,
-        log_file_entry, notification_items, notification_services_test,
-        notification_services_value, package_install_unavailable, package_list,
-        package_update_list, party_unavailable, play_activity_rows, plugin_list,
+        log_file_entry, normalize_device_custom_name, notification_items,
+        notification_services_test, notification_services_value, package_install_unavailable,
+        package_list, package_update_list, party_unavailable, play_activity_rows, plugin_list,
         report_activity_headers_for_query, report_csv, report_item_headers_for_query,
         reports_activity_result, reports_items_result, required_upload_part,
         run_user_usage_custom_query, safe_log_path, safe_user_usage_backup_file,
@@ -4180,6 +4204,20 @@ mod tests {
     fn device_options_result_keeps_custom_name() {
         let options = device_options_result("device-1", Some("Living Room".to_string()));
         assert_eq!(options["CustomName"], "Living Room");
+    }
+
+    #[test]
+    fn device_custom_name_is_trimmed_and_limited() {
+        assert_eq!(
+            normalize_device_custom_name(Some("  Living Room  "))
+                .unwrap()
+                .as_deref(),
+            Some("Living Room")
+        );
+        assert!(normalize_device_custom_name(None).unwrap().is_none());
+        assert!(normalize_device_custom_name(Some("   ")).unwrap().is_none());
+        assert!(normalize_device_custom_name(Some("bad\nname")).is_err());
+        assert!(normalize_device_custom_name(Some(&"x".repeat(129))).is_err());
     }
 
     #[test]

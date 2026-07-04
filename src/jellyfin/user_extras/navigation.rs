@@ -15,6 +15,12 @@ use crate::{
     jellyfin::{auth::query_user_id_or_request, common::internal_error, item_queries},
 };
 
+fn visible_media_item_sql(alias: &str) -> String {
+    format!(
+        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
+    )
+}
+
 /// GET /Items/Filters2 — return available filter values for a query
 pub async fn filters2(
     State(state): State<Arc<AppState>>,
@@ -37,7 +43,7 @@ async fn filters2_inner(
         .map(|v| v.split(',').map(str::trim).collect::<Vec<_>>());
 
     // Build WHERE clause based on ParentId and IncludeItemTypes
-    let mut conditions = vec!["media_items.is_public = 1".to_string()];
+    let mut conditions = vec![visible_media_item_sql("media_items")];
     let mut values: Vec<sea_orm::Value> = Vec::new();
 
     if let Some(pid) = parent_id {
@@ -204,7 +210,7 @@ async fn item_ancestors_inner(
             .query_one(crate::db::helpers::portable_statement(
                 backend,
                 &item_queries::media_item_select_sql(
-                    "WHERE media_items.id = ? AND media_items.is_public = 1",
+                    "WHERE media_items.id = ? AND media_items.is_public = 1 AND (media_items.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = media_items.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = media_items.parent_id AND parent.is_public = 1))",
                 ),
                 vec![user_id.into(), id.clone().into()],
             ))
@@ -273,8 +279,9 @@ pub async fn shows_upcoming(
     let limit = query_usize(&query, &["Limit", "limit"], 16).min(200);
 
     let backend = state.db.get_database_backend();
+    let visible = visible_media_item_sql("media_items");
     let sql = format!(
-        "{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND media_items.is_public = 1 ORDER BY media_items.created_at DESC",
+        "{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND {visible} ORDER BY media_items.created_at DESC",
         crate::jellyfin::item_queries::media_item_select_sql("")
     );
     let rows = state
@@ -406,8 +413,9 @@ async fn named_item_by_name_inner(
     name: &str,
     relation: NamedRelation,
 ) -> anyhow::Result<Option<Value>> {
+    let visible = visible_media_item_sql("media_items");
     let sql = format!(
-        "SELECT DISTINCT named.id, named.name FROM {} named JOIN {} rel ON rel.{} = named.id JOIN media_items ON media_items.id = rel.item_id WHERE media_items.is_public = 1 AND named.name = ? LIMIT 1",
+        "SELECT DISTINCT named.id, named.name FROM {} named JOIN {} rel ON rel.{} = named.id JOIN media_items ON media_items.id = rel.item_id WHERE {visible} AND named.name = ? LIMIT 1",
         relation.table, relation.relation_table, relation.relation_column
     );
     let row = db
@@ -462,10 +470,24 @@ mod tests {
         crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
         insert_media_item(&db, "public", "Public", 1, 2001, "PG").await;
         insert_media_item(&db, "private", "Private", 0, 2002, "R").await;
+        insert_media_item_with_parent(&db, "hidden-parent", "Hidden Parent", "", 0, 2003, "NC-17")
+            .await;
+        insert_media_item_with_parent(
+            &db,
+            "hidden-child",
+            "Hidden Child",
+            "hidden-parent",
+            1,
+            2004,
+            "G",
+        )
+        .await;
         insert_named(&db, "genres", "g_public", "PublicGenre").await;
         insert_named(&db, "genres", "g_private", "PrivateGenre").await;
+        insert_named(&db, "genres", "g_hidden", "HiddenGenre").await;
         link_named(&db, "media_genres", "genre_id", "public", "g_public").await;
         link_named(&db, "media_genres", "genre_id", "private", "g_private").await;
+        link_named(&db, "media_genres", "genre_id", "hidden-child", "g_hidden").await;
 
         let result = filters2_inner(&db, &Default::default()).await.unwrap();
         assert_eq!(result["Years"], serde_json::json!([2001]));
@@ -480,14 +502,28 @@ mod tests {
         crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
         insert_media_item(&db, "public", "Public", 1, 2001, "PG").await;
         insert_media_item(&db, "private", "Private", 0, 2002, "R").await;
+        insert_media_item_with_parent(&db, "hidden-parent", "Hidden Parent", "", 0, 2003, "NC-17")
+            .await;
+        insert_media_item_with_parent(
+            &db,
+            "hidden-child",
+            "Hidden Child",
+            "hidden-parent",
+            1,
+            2004,
+            "G",
+        )
+        .await;
         insert_named(&db, "genres", "g_public", "PublicGenre").await;
         insert_named(&db, "genres", "g_private", "PrivateGenre").await;
+        insert_named(&db, "genres", "g_hidden", "HiddenGenre").await;
         insert_named(&db, "studios", "s_public", "PublicStudio").await;
         insert_named(&db, "studios", "s_private", "PrivateStudio").await;
         insert_named(&db, "game_genres", "gg_public", "PublicGameGenre").await;
         insert_named(&db, "game_genres", "gg_private", "PrivateGameGenre").await;
         link_named(&db, "media_genres", "genre_id", "public", "g_public").await;
         link_named(&db, "media_genres", "genre_id", "private", "g_private").await;
+        link_named(&db, "media_genres", "genre_id", "hidden-child", "g_hidden").await;
         link_named(&db, "media_studios", "studio_id", "public", "s_public").await;
         link_named(&db, "media_studios", "studio_id", "private", "s_private").await;
         link_named(
@@ -517,6 +553,12 @@ mod tests {
         );
         assert!(
             named_item_by_name_inner(&db, "PrivateGenre", genre)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            named_item_by_name_inner(&db, "HiddenGenre", genre)
                 .await
                 .unwrap()
                 .is_none()
@@ -565,6 +607,9 @@ mod tests {
         insert_episode(&db, "episode-1", "E1", 1, 10).await;
         insert_episode(&db, "episode-2", "E2", 1, 20).await;
         insert_episode(&db, "private", "Private", 0, 30).await;
+        insert_episode_with_parent(&db, "hidden-parent", "Hidden Parent", "", 0, 40).await;
+        insert_episode_with_parent(&db, "hidden-child", "Hidden Child", "hidden-parent", 1, 50)
+            .await;
 
         let state = Arc::new(test_state(db));
         let mut query = HashMap::new();
@@ -592,13 +637,26 @@ mod tests {
         year: i64,
         rating: &str,
     ) {
+        insert_media_item_with_parent(db, id, title, "", is_public, year, rating).await;
+    }
+
+    async fn insert_media_item_with_parent(
+        db: &sea_orm::DatabaseConnection,
+        id: &str,
+        title: &str,
+        parent_id: &str,
+        is_public: i64,
+        year: i64,
+        rating: &str,
+    ) {
         db.execute(crate::db::helpers::portable_statement(
             db.get_database_backend(),
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, production_year, official_rating, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, ?, ?, ?, 1, 1, 1)",
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, production_year, official_rating, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', 0, ?, ?, ?, 1, 1, 1)",
             vec![
                 id.into(),
                 title.into(),
                 id.into(),
+                parent_id.into(),
                 is_public.into(),
                 year.into(),
                 rating.into(),
@@ -615,13 +673,25 @@ mod tests {
         is_public: i64,
         created_at: i64,
     ) {
+        insert_episode_with_parent(db, id, title, "", is_public, created_at).await;
+    }
+
+    async fn insert_episode_with_parent(
+        db: &sea_orm::DatabaseConnection,
+        id: &str,
+        title: &str,
+        parent_id: &str,
+        is_public: i64,
+        created_at: i64,
+    ) {
         db.execute(crate::db::helpers::portable_statement(
             db.get_database_backend(),
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Episode', 0, ?, 1, ?, 1)",
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Episode', 0, ?, 1, ?, 1)",
             vec![
                 id.into(),
                 title.into(),
                 id.into(),
+                parent_id.into(),
                 is_public.into(),
                 created_at.into(),
             ],

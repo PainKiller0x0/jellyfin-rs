@@ -48,7 +48,8 @@ pub async fn playback_info(
                         match super::media_streams_for_item(&state.db, &item.id).await {
                             Ok(streams) => {
                                 let mut ms = media_source_json_with_streams(&item, streams.clone());
-                                dlna::apply_playback_profile(&mut ms, &profile, &streams, &query);
+                                let playback_streams = media_source_streams(&ms);
+                                dlna::apply_playback_profile(&mut ms, &profile, &playback_streams, &query);
                                 vec![ms]
                             }
                             Err(error) => return internal_error(error),
@@ -63,7 +64,8 @@ pub async fn playback_info(
                 match super::media_streams_for_item(&state.db, &item.id).await {
                     Ok(streams) => {
                         let mut media_source = media_source_json_with_streams(&item, streams.clone());
-                        dlna::apply_playback_profile(&mut media_source, &profile, &streams, &query);
+                        let playback_streams = media_source_streams(&media_source);
+                        dlna::apply_playback_profile(&mut media_source, &profile, &playback_streams, &query);
                         vec![media_source]
                     }
                     Err(error) => return internal_error(error),
@@ -78,6 +80,14 @@ pub async fn playback_info(
         .into_response(),
         Err(error) => internal_error(error),
     }
+}
+
+fn media_source_streams(media_source: &JsonValue) -> Vec<JsonValue> {
+    media_source
+        .get("MediaStreams")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub async fn playback_start(

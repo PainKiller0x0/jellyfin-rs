@@ -19,7 +19,7 @@ use crate::{
         common::{internal_error, strip_nulls},
         item_queries::find_library_as_item,
     },
-    library::models::MediaItem,
+    library::models::{MediaItem, media_source_json_with_streams},
 };
 
 pub async fn item_by_id(
@@ -261,32 +261,14 @@ async fn item_json_with_provider_ids(
             .unwrap_or_default();
         if !streams.is_empty() {
             // Rebuild MediaSources with streams included
-            let container = item.container.as_deref().unwrap_or("bin");
-            let source = json!({
-                "Id": item.id,
-                "Name": item.title,
-                "Path": item.path,
-                "Type": "Default",
-                "Protocol": "File",
-                "Container": container,
-                "Size": item.size_bytes,
-                "RunTimeTicks": item.runtime_ticks,
-                "SupportsDirectPlay": true,
-                "SupportsDirectStream": true,
-                "SupportsTranscoding": false,
-                "SupportsProbing": true,
-                "IsInfiniteStream": false,
-                "IsRemote": false,
-                "RequiresOpening": false,
-                "RequiresClosing": false,
-                "MediaStreams": streams,
-                "Formats": [],
-                "RequiredHttpHeaders": {},
-                "DirectStreamUrl": format!("/Videos/{}/stream.{}", item.id, container),
-                "VideoType": "VideoFile",
-            });
+            let source = media_source_json_with_streams(&item, streams.clone());
+            let top_level_streams = source
+                .get("MediaStreams")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             value["MediaSources"] = json!([source]);
-            value["MediaStreams"] = Value::Array(streams);
+            value["MediaStreams"] = Value::Array(top_level_streams);
         }
     }
 

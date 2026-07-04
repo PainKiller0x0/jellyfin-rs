@@ -316,6 +316,8 @@ pub fn media_source_json_with_streams(
     item: &MediaItem,
     media_streams: Vec<JsonValue>,
 ) -> JsonValue {
+    let (media_streams, media_attachments) =
+        split_media_streams_and_attachments(&item.id, media_streams);
     let container = item.container.as_deref().unwrap_or("bin");
     let stream_path = match item.item_type.as_str() {
         "Audio" => format!("/Audio/{}/universal", item.id),
@@ -360,7 +362,10 @@ pub fn media_source_json_with_streams(
     map.insert("SupportsSegmentSeeking".into(), JsonValue::Bool(true));
     map.insert("HasSegments".into(), JsonValue::Bool(false));
     map.insert("MediaStreams".into(), JsonValue::Array(media_streams));
-    map.insert("MediaAttachments".into(), JsonValue::Array(vec![]));
+    map.insert(
+        "MediaAttachments".into(),
+        JsonValue::Array(media_attachments),
+    );
     map.insert("DefaultAudioStreamIndex".into(), JsonValue::Null);
     map.insert("DefaultSubtitleStreamIndex".into(), JsonValue::Null);
     map.insert("Formats".into(), JsonValue::Array(vec![]));
@@ -381,6 +386,54 @@ pub fn media_source_json_with_streams(
     map.insert("OpenToken".into(), JsonValue::Null);
     map.insert("ETag".into(), JsonValue::String(item.id.clone()));
     JsonValue::Object(map)
+}
+
+fn split_media_streams_and_attachments(
+    item_id: &str,
+    streams: Vec<JsonValue>,
+) -> (Vec<JsonValue>, Vec<JsonValue>) {
+    let mut media_streams = Vec::new();
+    let mut attachments = Vec::new();
+    for stream in streams {
+        if stream
+            .get("Type")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Attachment"))
+        {
+            attachments.push(media_attachment_json(item_id, &stream));
+        } else {
+            media_streams.push(stream);
+        }
+    }
+    (media_streams, attachments)
+}
+
+fn media_attachment_json(item_id: &str, stream: &JsonValue) -> JsonValue {
+    let index = stream
+        .get("Index")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or_default();
+    let codec = stream.get("Codec").cloned().unwrap_or(JsonValue::Null);
+    let mime_type = attachment_mime_type(codec.as_str().unwrap_or_default());
+    json!({
+        "Codec": codec,
+        "CodecTag": stream.get("CodecTag").cloned().unwrap_or(JsonValue::Null),
+        "Comment": stream.get("Comment").cloned().unwrap_or(JsonValue::Null),
+        "Index": index,
+        "FileName": stream.get("Title").cloned().unwrap_or(JsonValue::Null),
+        "MimeType": mime_type,
+        "DeliveryUrl": format!("/Videos/{item_id}/{item_id}/Attachments/{index}")
+    })
+}
+
+fn attachment_mime_type(codec: &str) -> &'static str {
+    match codec.to_ascii_lowercase().as_str() {
+        "ttf" | "truetype" => "font/ttf",
+        "otf" | "opentype" => "font/otf",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
 }
 
 pub struct MediaStreamRow {
@@ -600,6 +653,7 @@ pub fn child_video_source_json(
     runtime_ticks: Option<i64>,
     media_streams: Vec<JsonValue>,
 ) -> JsonValue {
+    let (media_streams, media_attachments) = split_media_streams_and_attachments(id, media_streams);
     let mut map = Map::new();
     map.insert("Id".into(), JsonValue::String(id.to_string()));
     map.insert("Name".into(), JsonValue::String(title.to_string()));
@@ -634,7 +688,10 @@ pub fn child_video_source_json(
     map.insert("SupportsSegmentSeeking".into(), JsonValue::Bool(true));
     map.insert("HasSegments".into(), JsonValue::Bool(false));
     map.insert("MediaStreams".into(), JsonValue::Array(media_streams));
-    map.insert("MediaAttachments".into(), JsonValue::Array(vec![]));
+    map.insert(
+        "MediaAttachments".into(),
+        JsonValue::Array(media_attachments),
+    );
     map.insert("DefaultAudioStreamIndex".into(), JsonValue::Null);
     map.insert("DefaultSubtitleStreamIndex".into(), JsonValue::Null);
     map.insert("Formats".into(), JsonValue::Array(vec![]));
@@ -658,4 +715,93 @@ pub fn child_video_source_json(
     map.insert("OpenToken".into(), JsonValue::Null);
     map.insert("ETag".into(), JsonValue::String(id.to_string()));
     JsonValue::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MediaItem, child_video_source_json, media_source_json_with_streams};
+    use serde_json::json;
+
+    #[test]
+    fn media_sources_split_attachments_from_playable_streams() {
+        let source = media_source_json_with_streams(&video_item(), sample_streams());
+
+        assert_eq!(source["MediaStreams"].as_array().unwrap().len(), 1);
+        assert_eq!(source["MediaStreams"][0]["Type"], "Video");
+        assert_eq!(source["MediaAttachments"].as_array().unwrap().len(), 1);
+        assert_eq!(source["MediaAttachments"][0]["Index"], 5);
+        assert_eq!(source["MediaAttachments"][0]["FileName"], "Font.ttf");
+        assert_eq!(source["MediaAttachments"][0]["MimeType"], "font/ttf");
+        assert_eq!(
+            source["MediaAttachments"][0]["DeliveryUrl"],
+            "/Videos/movie/movie/Attachments/5"
+        );
+    }
+
+    #[test]
+    fn child_video_sources_include_media_attachments() {
+        let source = child_video_source_json(
+            "part1",
+            "Part 1",
+            "D:/Movies/part1.mkv",
+            "mkv",
+            Some(123),
+            Some(456),
+            sample_streams(),
+        );
+
+        assert_eq!(source["MediaStreams"].as_array().unwrap().len(), 1);
+        assert_eq!(source["MediaAttachments"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            source["MediaAttachments"][0]["DeliveryUrl"],
+            "/Videos/part1/part1/Attachments/5"
+        );
+    }
+
+    fn sample_streams() -> Vec<serde_json::Value> {
+        vec![
+            json!({ "Index": 0, "Type": "Video", "Codec": "h264" }),
+            json!({
+                "Index": 5,
+                "Type": "Attachment",
+                "Codec": "ttf",
+                "Title": "Font.ttf",
+                "Comment": "subtitle font"
+            }),
+        ]
+    }
+
+    fn video_item() -> MediaItem {
+        MediaItem {
+            id: "movie".to_string(),
+            title: "Movie".to_string(),
+            path: "D:/Movies/movie.mkv".to_string(),
+            library_id: "movies".to_string(),
+            collection_type: "movies".to_string(),
+            parent_id: String::new(),
+            item_type: "Video".to_string(),
+            is_folder: false,
+            container: Some("mkv".to_string()),
+            overview: None,
+            official_rating: None,
+            extended_video_type: None,
+            production_year: None,
+            runtime_ticks: Some(456),
+            size_bytes: Some(123),
+            season_number: None,
+            episode_number: None,
+            community_rating: None,
+            critic_rating: None,
+            created_at: 1,
+            modified_at: 1,
+            is_public: true,
+            is_favorite: false,
+            played: false,
+            playback_position_ticks: 0,
+            played_percentage: None,
+            play_count: 0,
+            last_played_at: None,
+            image_tags: None,
+        }
+    }
 }

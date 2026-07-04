@@ -150,10 +150,7 @@ pub async fn item_collections(
     Path(item_id): Path<String>,
 ) -> Response {
     match item_collections_inner(&state.db, &item_id).await {
-        Ok(items) => {
-            let total = items.len();
-            Json(json!({ "Items": items, "TotalRecordCount": total })).into_response()
-        }
+        Ok(items) => Json(item_collections_result(items)).into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -176,6 +173,11 @@ async fn item_collections_inner(
         .context("failed to list item collections")?;
 
     Ok(rows.iter().map(collection_row_json).collect())
+}
+
+fn item_collections_result(items: Vec<JsonValue>) -> JsonValue {
+    let total = items.len();
+    json!({ "Items": items, "TotalRecordCount": total, "StartIndex": 0 })
 }
 
 async fn add_children(
@@ -927,8 +929,8 @@ pub async fn remove_from_collection_delete(
 #[cfg(test)]
 mod tests {
     use super::{
-        add_children, collection_item_json, get_playlist_inner, playlist_items_inner,
-        playlist_user_inner, playlist_user_permissions_json, remove_children,
+        add_children, collection_item_json, get_playlist_inner, item_collections_result,
+        playlist_items_inner, playlist_user_inner, playlist_user_permissions_json, remove_children,
         set_playlist_user_permission,
     };
     use sea_orm::{ConnectionTrait, Database};
@@ -943,6 +945,15 @@ mod tests {
         assert_eq!(item["Type"], "BoxSet");
         assert_eq!(item["IsFolder"], true);
         assert_eq!(item["ProductionYear"], 1999);
+    }
+
+    #[test]
+    fn item_collections_result_has_query_result_shape() {
+        let result =
+            item_collections_result(vec![collection_item_json("c1", "Collection", None, None)]);
+        assert_eq!(result["TotalRecordCount"], 1);
+        assert_eq!(result["StartIndex"], 0);
+        assert_eq!(result["Items"][0]["Id"], "c1");
     }
 
     #[test]

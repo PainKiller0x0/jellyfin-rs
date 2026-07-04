@@ -21,6 +21,10 @@ use crate::{
     util::{now_unix, stable_text_id},
 };
 
+const MAX_COLLECTION_PLAYLIST_NAME_LEN: usize = 256;
+const MAX_COLLECTION_PLAYLIST_IDS: usize = 1000;
+const MAX_COLLECTION_PLAYLIST_ID_LEN: usize = 256;
+
 /// Filter IDs to only those that exist in media_items.
 async fn filter_existing_ids(
     db: &DatabaseConnection,
@@ -40,46 +44,103 @@ async fn filter_existing_ids(
     Ok(rows.iter().filter_map(|r| r.get_str("id").ok()).collect())
 }
 
-fn ids_query(query: &HashMap<String, String>, keys: &[&str]) -> Vec<String> {
-    keys.iter()
-        .find_map(|key| query.get(*key))
-        .map(|v| {
-            v.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+fn ids_query(
+    query: &HashMap<String, String>,
+    keys: &[&str],
+) -> Result<Vec<String>, (StatusCode, &'static str)> {
+    normalize_item_ids(
+        keys.iter()
+            .find_map(|key| query.get(*key))
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    )
+}
+
+fn item_ids_from_value(
+    value: Option<&JsonValue>,
+) -> Result<Vec<String>, (StatusCode, &'static str)> {
+    match value {
+        Some(JsonValue::Array(items)) => {
+            let mut ids = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(id) = item.as_str() else {
+                    return Err((StatusCode::BAD_REQUEST, "Ids must contain strings"));
+                };
+                ids.push(id.to_string());
+            }
+            normalize_item_ids(ids)
+        }
+        Some(JsonValue::String(items)) => {
+            normalize_item_ids(items.split(',').map(str::to_string).collect())
+        }
+        Some(JsonValue::Null) | None => Ok(Vec::new()),
+        Some(_) => Err((
+            StatusCode::BAD_REQUEST,
+            "Ids must be an array or CSV string",
+        )),
+    }
+}
+
+fn normalize_item_ids(ids: Vec<String>) -> Result<Vec<String>, (StatusCode, &'static str)> {
+    if ids.len() > MAX_COLLECTION_PLAYLIST_IDS {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Too many item ids"));
+    }
+    let mut normalized = Vec::new();
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() || normalized.iter().any(|existing| existing == id) {
+            continue;
+        }
+        if id.len() > MAX_COLLECTION_PLAYLIST_ID_LEN
+            || id.contains('\0')
+            || id.chars().any(char::is_control)
+        {
+            return Err((StatusCode::BAD_REQUEST, "Invalid item id"));
+        }
+        normalized.push(id.to_string());
+    }
+    Ok(normalized)
+}
+
+fn collection_playlist_name(value: Option<&str>) -> Result<String, (StatusCode, &'static str)> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err((StatusCode::BAD_REQUEST, "Name is required"));
+    };
+    if value.chars().count() > MAX_COLLECTION_PLAYLIST_NAME_LEN {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Name is too long"));
+    }
+    if value.contains('\0') || value.chars().any(char::is_control) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid name"));
+    }
+    Ok(value.to_string())
+}
+
+fn validation_error_response(error: (StatusCode, &'static str)) -> Response {
+    (error.0, Json(json!({ "Error": error.1 }))).into_response()
 }
 
 pub async fn create_collection(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let name = query
-        .get("name")
-        .or_else(|| query.get("Name"))
-        .filter(|v| !v.trim().is_empty())
-        .map(|v| v.trim().to_string());
-    let Some(name) = name else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": "name is required" })),
-        )
-            .into_response();
+    let name = match collection_playlist_name(
+        query
+            .get("name")
+            .or_else(|| query.get("Name"))
+            .map(String::as_str),
+    ) {
+        Ok(name) => name,
+        Err(error) => return validation_error_response(error),
     };
-    let ids: Vec<String> = query
-        .get("ids")
-        .or_else(|| query.get("Ids"))
-        .map(|v| {
-            v.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let ids = match ids_query(&query, &["ids", "Ids"]) {
+        Ok(ids) => ids,
+        Err(error) => return validation_error_response(error),
+    };
 
     match create_collection_inner(&state.db, &name, &ids).await {
         Ok(id) => Json(json!({ "Id": id })).into_response(),
@@ -133,7 +194,10 @@ pub async fn add_to_collection(
     Path(collection_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let ids = ids_query(&query, &["ids", "Ids"]);
+    let ids = match ids_query(&query, &["ids", "Ids"]) {
+        Ok(ids) => ids,
+        Err(error) => return validation_error_response(error),
+    };
     match add_children(&state.db, &collection_id, "BoxSet", &ids).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
@@ -316,7 +380,10 @@ pub async fn remove_from_collection(
     Path(collection_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let ids = ids_query(&query, &["ids", "Ids"]);
+    let ids = match ids_query(&query, &["ids", "Ids"]) {
+        Ok(ids) => ids,
+        Err(error) => return validation_error_response(error),
+    };
     match remove_children(&state.db, &collection_id, "BoxSet", &ids).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
@@ -332,34 +399,24 @@ pub async fn create_playlist(
     State(state): State<Arc<AppState>>,
     Json(body): Json<JsonValue>,
 ) -> Response {
-    let Some(name) = body
-        .get("Name")
-        .and_then(JsonValue::as_str)
-        .filter(|v| !v.trim().is_empty())
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": "Name is required" })),
-        )
-            .into_response();
+    if !body.is_object() {
+        return validation_error_response((StatusCode::BAD_REQUEST, "Playlist must be an object"));
+    }
+    let name = match collection_playlist_name(body.get("Name").and_then(JsonValue::as_str)) {
+        Ok(name) => name,
+        Err(error) => return validation_error_response(error),
     };
-
-    let ids: Vec<String> = body
-        .get("Ids")
-        .and_then(JsonValue::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(ToString::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let ids = match item_ids_from_value(body.get("Ids").or_else(|| body.get("ids"))) {
+        Ok(ids) => ids,
+        Err(error) => return validation_error_response(error),
+    };
 
     let media_type = body
         .get("MediaType")
         .and_then(JsonValue::as_str)
         .unwrap_or("Video");
 
-    match create_playlist_inner(&state.db, name, &ids, media_type).await {
+    match create_playlist_inner(&state.db, &name, &ids, media_type).await {
         Ok(id) => Json(json!({ "Id": id })).into_response(),
         Err(error) => internal_error(error),
     }
@@ -494,7 +551,26 @@ pub async fn update_playlist(
     Path(playlist_id): Path<String>,
     Json(body): Json<JsonValue>,
 ) -> Response {
-    match update_playlist_inner(&state.db, &playlist_id, &body).await {
+    if !body.is_object() {
+        return validation_error_response((StatusCode::BAD_REQUEST, "Playlist must be an object"));
+    }
+    let name = if body.get("Name").is_some() {
+        match collection_playlist_name(body.get("Name").and_then(JsonValue::as_str)) {
+            Ok(name) => Some(name),
+            Err(error) => return validation_error_response(error),
+        }
+    } else {
+        None
+    };
+    let ids = if body.get("Ids").is_some() || body.get("ids").is_some() {
+        match item_ids_from_value(body.get("Ids").or_else(|| body.get("ids"))) {
+            Ok(ids) => Some(ids),
+            Err(error) => return validation_error_response(error),
+        }
+    } else {
+        None
+    };
+    match update_playlist_inner(&state.db, &playlist_id, name.as_deref(), ids.as_deref()).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -508,32 +584,25 @@ pub async fn update_playlist(
 async fn update_playlist_inner(
     db: &DatabaseConnection,
     playlist_id: &str,
-    body: &JsonValue,
+    name: Option<&str>,
+    ids: Option<&[String]>,
 ) -> anyhow::Result<bool> {
     if !playlist_exists(db, playlist_id).await? {
         return Ok(false);
     }
     let now = now_unix();
     let backend = db.get_database_backend();
-    if let Some(name) = body
-        .get("Name")
-        .and_then(JsonValue::as_str)
-        .filter(|v| !v.trim().is_empty())
-    {
+    if let Some(name) = name {
         db.execute(crate::db::helpers::portable_statement(
             backend,
             "UPDATE media_items SET title = ?, updated_at = ? WHERE id = ? AND item_type = 'Playlist'",
-            vec![name.trim().into(), now.into(), playlist_id.into()],
+            vec![name.into(), now.into(), playlist_id.into()],
         ))
         .await
         .context("failed to update playlist")?;
     }
 
-    if let Some(ids) = body.get("Ids").and_then(JsonValue::as_array) {
-        let ids: Vec<String> = ids
-            .iter()
-            .filter_map(|id| id.as_str().map(ToString::to_string))
-            .collect();
+    if let Some(ids) = ids {
         let valid_ids = filter_existing_ids(db, &ids).await?;
         db.execute(crate::db::helpers::portable_statement(
             backend,
@@ -781,7 +850,10 @@ pub async fn add_to_playlist(
     Path(playlist_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let ids = ids_query(&query, &["ids", "Ids"]);
+    let ids = match ids_query(&query, &["ids", "Ids"]) {
+        Ok(ids) => ids,
+        Err(error) => return validation_error_response(error),
+    };
     match add_children(&state.db, &playlist_id, "Playlist", &ids).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
@@ -798,7 +870,10 @@ pub async fn remove_from_playlist(
     Path(playlist_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let ids = ids_query(&query, &["ids", "Ids", "entryIds", "EntryIds"]);
+    let ids = match ids_query(&query, &["ids", "Ids", "entryIds", "EntryIds"]) {
+        Ok(ids) => ids,
+        Err(error) => return validation_error_response(error),
+    };
     match remove_children(&state.db, &playlist_id, "Playlist", &ids).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
@@ -878,15 +953,10 @@ pub async fn remove_from_collection_batch(
     Path(collection_id): Path<String>,
     Json(body): Json<JsonValue>,
 ) -> Response {
-    let ids: Vec<String> = body
-        .get("Ids")
-        .and_then(JsonValue::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(ToString::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let ids = match item_ids_from_value(body.get("Ids").or_else(|| body.get("ids"))) {
+        Ok(ids) => ids,
+        Err(error) => return validation_error_response(error),
+    };
 
     if ids.is_empty() {
         return StatusCode::NO_CONTENT.into_response();
@@ -909,7 +979,10 @@ pub async fn remove_from_collection_delete(
     Path(collection_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let ids = ids_query(&query, &["ids", "Ids"]);
+    let ids = match ids_query(&query, &["ids", "Ids"]) {
+        Ok(ids) => ids,
+        Err(error) => return validation_error_response(error),
+    };
 
     if ids.is_empty() {
         return StatusCode::NO_CONTENT.into_response();
@@ -929,8 +1002,10 @@ pub async fn remove_from_collection_delete(
 #[cfg(test)]
 mod tests {
     use super::{
-        add_children, collection_item_json, get_playlist_inner, item_collections_result,
-        playlist_items_inner, playlist_user_inner, playlist_user_permissions_json, remove_children,
+        MAX_COLLECTION_PLAYLIST_IDS, MAX_COLLECTION_PLAYLIST_NAME_LEN, add_children,
+        collection_item_json, collection_playlist_name, get_playlist_inner,
+        item_collections_result, item_ids_from_value, normalize_item_ids, playlist_items_inner,
+        playlist_user_inner, playlist_user_permissions_json, remove_children,
         set_playlist_user_permission,
     };
     use sea_orm::{ConnectionTrait, Database};
@@ -961,6 +1036,39 @@ mod tests {
         let user = playlist_user_permissions_json("u1", false);
         assert_eq!(user["UserId"], "u1");
         assert_eq!(user["CanEdit"], false);
+    }
+
+    #[test]
+    fn collection_playlist_inputs_are_normalized_and_limited() {
+        assert_eq!(
+            collection_playlist_name(Some("  Road Trip  ")).unwrap(),
+            "Road Trip"
+        );
+        assert!(collection_playlist_name(Some("bad\nname")).is_err());
+        assert!(
+            collection_playlist_name(Some(&"x".repeat(MAX_COLLECTION_PLAYLIST_NAME_LEN + 1)))
+                .is_err()
+        );
+
+        assert_eq!(
+            normalize_item_ids(vec![
+                " m1 ".to_string(),
+                "m1".to_string(),
+                "".to_string(),
+                "m2".to_string()
+            ])
+            .unwrap(),
+            vec!["m1".to_string(), "m2".to_string()]
+        );
+        assert_eq!(
+            item_ids_from_value(Some(&json!("m1, m2,,m1"))).unwrap(),
+            vec!["m1".to_string(), "m2".to_string()]
+        );
+        assert!(item_ids_from_value(Some(&json!(["m1", 42]))).is_err());
+        assert!(normalize_item_ids(vec!["bad\nid".to_string()]).is_err());
+        assert!(
+            normalize_item_ids(vec!["x".to_string(); MAX_COLLECTION_PLAYLIST_IDS + 1]).is_err()
+        );
     }
 
     #[tokio::test]

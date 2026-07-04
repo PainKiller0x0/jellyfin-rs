@@ -769,7 +769,7 @@ fn empty_instant_mix_response() -> Response {
 
 /// GET /Items/{id}/CriticReviews — critic reviews
 pub async fn item_critic_reviews() -> Response {
-    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+    Json(json!({ "Items": [], "TotalRecordCount": 0, "StartIndex": 0 })).into_response()
 }
 
 /// GET /Items/{id}/ThumbnailSet — trickplay thumbnail set
@@ -880,12 +880,15 @@ fn parse_trickplay_index(value: &str) -> Option<i64> {
 
 /// GET /Items/{item_id}/RemoteSearch/Subtitles/{language} — search remote subtitles
 pub async fn remote_subtitle_search(
-    State(_state): State<Arc<AppState>>,
-    Path((_item_id, _param)): Path<(String, String)>,
+    State(state): State<Arc<AppState>>,
+    Path((item_id, _param)): Path<(String, String)>,
     Query(_query): Query<HashMap<String, String>>,
 ) -> Response {
-    // Return empty - remote subtitle providers not implemented
-    Json(json!([])).into_response()
+    match public_item_exists(&state.db, &item_id).await {
+        Ok(true) => Json(json!([])).into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => internal_error(error),
+    }
 }
 
 /// POST /Items/{item_id}/RemoteSearch/Subtitles/{subtitle_id} — download remote subtitle
@@ -948,17 +951,34 @@ pub async fn user_item_special_features(
     }
 }
 
+async fn public_item_exists(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<bool> {
+    Ok(db
+        .query_one(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "SELECT 1 AS found FROM media_items WHERE id = ? AND is_public = 1",
+            vec![item_id.into()],
+        ))
+        .await?
+        .is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ExtraKind, empty_instant_mix_response, include_item_types, instant_mix_response,
-        item_extras, item_intros_value, media_segments_value, parse_trickplay_index, query_limit,
+        item_critic_reviews, item_extras, item_intros_value, media_segments_value,
+        parse_trickplay_index, public_item_exists, query_limit, remote_subtitle_search,
         trickplay_info,
     };
-    use axum::{body::to_bytes, response::IntoResponse};
-    use sea_orm::{ConnectionTrait, Database};
+    use axum::{
+        body::to_bytes, extract::Path, extract::Query, extract::State, response::IntoResponse,
+    };
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::{RwLock, broadcast};
+    use uuid::Uuid;
 
     fn item(title: &str, path: &str, item_type: &str) -> crate::library::models::MediaItem {
         crate::library::models::MediaItem {
@@ -1265,5 +1285,88 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn remote_subtitle_search_requires_public_item() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        for (id, is_public) in [("public", 1_i64), ("private", 0_i64)] {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Video', 0, ?, 1, 1, 1)",
+                vec![id.into(), id.into(), format!("D:/{id}.mkv").into(), is_public.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        assert!(public_item_exists(&db, "public").await.unwrap());
+        assert!(!public_item_exists(&db, "private").await.unwrap());
+        assert!(!public_item_exists(&db, "missing").await.unwrap());
+
+        let state = Arc::new(test_state(db));
+        assert_eq!(
+            remote_subtitle_search(
+                State(state.clone()),
+                Path(("public".to_string(), "eng".to_string())),
+                Query(HashMap::new()),
+            )
+            .await
+            .into_response()
+            .status(),
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(
+            remote_subtitle_search(
+                State(state.clone()),
+                Path(("private".to_string(), "eng".to_string())),
+                Query(HashMap::new()),
+            )
+            .await
+            .into_response()
+            .status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            remote_subtitle_search(
+                State(state),
+                Path(("missing".to_string(), "eng".to_string())),
+                Query(HashMap::new()),
+            )
+            .await
+            .into_response()
+            .status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn critic_reviews_empty_result_has_start_index() {
+        let response = item_critic_reviews().await.into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["TotalRecordCount"], 0);
+        assert_eq!(value["StartIndex"], 0);
+        assert!(value["Items"].as_array().unwrap().is_empty());
+    }
+
+    fn test_state(db: DatabaseConnection) -> crate::app::state::AppState {
+        let (ws_event_tx, _) = broadcast::channel(4);
+        crate::app::state::AppState {
+            user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, b"test"),
+            access_token: "test-token".to_string(),
+            db,
+            media_dirs: Vec::new(),
+            http_client: reqwest::Client::new(),
+            tmdb_api_key: RwLock::new(None),
+            playback_sessions: RwLock::new(HashMap::new()),
+            session_capabilities: RwLock::new(HashMap::new()),
+            ws_event_tx,
+            sa_config: crate::config::StrmAssistantConfig::default(),
+            intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),
+            queue_manager: Arc::new(crate::queue::QueueManager::default()),
+        }
     }
 }

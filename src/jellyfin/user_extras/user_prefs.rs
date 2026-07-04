@@ -172,14 +172,10 @@ pub async fn playlist_move_item(
 
 /// GET /Playlists/{id}/AddToPlaylistInfo — info for adding to playlist
 pub async fn add_to_playlist_info(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Path(playlist_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let _user_id = query
-        .get("UserId")
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
     let ids = query
         .get("Ids")
         .map(|v| v.split(',').collect::<Vec<_>>())

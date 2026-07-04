@@ -4,7 +4,7 @@ use anyhow::Context;
 use axum::{
     Json,
     body::{Body, Bytes},
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
@@ -23,8 +23,11 @@ use crate::{
         activity_log::Entity as ActivityLog, app_settings, app_settings::Entity as AppSettings,
         task_results, task_results::Entity as TaskResults, users, users::Entity as Users,
     },
-    jellyfin::common::{image as placeholder_image, internal_error},
     jellyfin::item_queries::library_views,
+    jellyfin::{
+        auth::query_user_id_or_request,
+        common::{image as placeholder_image, internal_error},
+    },
     library::path_utils,
     util::{now_unix, stable_text_id, unix_to_jellyfin_date},
 };
@@ -741,9 +744,10 @@ fn activity_log_entry_json(model: &activity_log::Model) -> JsonValue {
 
 pub async fn users_item_access(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query_value(&query, "UserId").unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     match library_views(&state.db).await {
         Ok(libraries) => Json(items_access_value(&user_id, &libraries)).into_response(),
         Err(error) => internal_error(error),
@@ -752,6 +756,7 @@ pub async fn users_item_access(
 
 pub async fn items_access(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
     body: Option<Json<JsonValue>>,
 ) -> Response {
@@ -760,7 +765,7 @@ pub async fn items_access(
             body.as_ref()
                 .and_then(|Json(body)| json_string(body, "UserId"))
         })
-        .unwrap_or_else(|| state.user_id.to_string());
+        .unwrap_or_else(|| request_user_id.clone());
     match library_views(&state.db).await {
         Ok(libraries) => Json(items_access_value(&user_id, &libraries)).into_response(),
         Err(error) => internal_error(error),

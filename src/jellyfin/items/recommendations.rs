@@ -259,8 +259,14 @@ pub async fn user_suggestions(
 ) -> Response {
     let limit = query
         .get("Limit")
+        .or_else(|| query.get("limit"))
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(16);
+    let start = query
+        .get("StartIndex")
+        .or_else(|| query.get("startIndex"))
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
     let parent_id = query.get("ParentId").map(String::as_str);
 
     // Return recently added unplayed items as suggestions
@@ -268,20 +274,20 @@ pub async fn user_suggestions(
     let (sql, vals) = if let Some(pid) = parent_id {
         (
             format!(
-                "{} WHERE media_items.is_folder = 1 AND media_items.item_type IN ('Movie', 'Series') AND media_items.is_public = 1 AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC LIMIT ?",
+                "{} WHERE media_items.is_folder = 1 AND media_items.item_type IN ('Movie', 'Series') AND media_items.is_public = 1 AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC",
                 crate::jellyfin::item_queries::media_item_select_sql(
                     "AND media_items.library_id = ?"
                 )
             ),
-            vec![user_id.clone().into(), pid.into(), (limit as i64).into()],
+            vec![user_id.clone().into(), pid.into()],
         )
     } else {
         (
             format!(
-                "{} WHERE media_items.is_folder = 1 AND media_items.item_type IN ('Movie', 'Series') AND media_items.is_public = 1 AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC LIMIT ?",
+                "{} WHERE media_items.is_folder = 1 AND media_items.item_type IN ('Movie', 'Series') AND media_items.is_public = 1 AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC",
                 crate::jellyfin::item_queries::media_item_select_sql("")
             ),
-            vec![user_id.clone().into(), (limit as i64).into()],
+            vec![user_id.clone().into()],
         )
     };
 
@@ -291,9 +297,10 @@ pub async fn user_suggestions(
         .await
     {
         Ok(rows) => {
-            let items =
+            let mut items =
                 crate::jellyfin::item_queries::decode_media_items(&rows).unwrap_or_default();
             let total = items.len();
+            items = items.into_iter().skip(start).take(limit).collect();
 
             // Batch load image tags
             let image_tags_map = if !items.is_empty() {
@@ -318,7 +325,8 @@ pub async fn user_suggestions(
                 })
                 .collect();
 
-            Json(json!({ "Items": json_items, "TotalRecordCount": total })).into_response()
+            Json(json!({ "Items": json_items, "TotalRecordCount": total, "StartIndex": start }))
+                .into_response()
         }
         Err(error) => internal_error(error.into()),
     }
@@ -356,8 +364,20 @@ pub async fn home_section_items(
             match crate::jellyfin::item_queries::resume_media_items(&state.db, &user_id).await {
                 Ok(items) => {
                     let total = items.len();
-                    let enriched = super::enrich_resume_items(&state.db, items).await;
-                    Json(json!({ "Items": enriched, "TotalRecordCount": total })).into_response()
+                    let start = query
+                        .get("StartIndex")
+                        .or_else(|| query.get("startIndex"))
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let limit = query
+                        .get("Limit")
+                        .or_else(|| query.get("limit"))
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(total);
+                    let page = items.into_iter().skip(start).take(limit).collect();
+                    let enriched = super::enrich_resume_items(&state.db, page).await;
+                    Json(json!({ "Items": enriched, "TotalRecordCount": total, "StartIndex": start }))
+                        .into_response()
                 }
                 Err(error) => internal_error(error),
             }

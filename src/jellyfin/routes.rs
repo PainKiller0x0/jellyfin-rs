@@ -496,7 +496,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/Users/{user_id}/Connect/Link",
             post(auth::user_connect_link_unavailable).delete(auth::user_connect_link_unavailable),
         )
-        .route("/Items", get(items::items_root).delete(items::delete_items))
+        .route("/Items", get(items::items).delete(items::delete_items))
         .route("/Items/File", get(super::user_extras::item_by_file))
         .route("/Items/Latest", get(items::latest_items_root))
         .route("/Items/Root", get(items::items_root))

@@ -19,7 +19,7 @@ pub use item_operations::{
 };
 pub(super) use lists::media_list_response;
 pub use lists::{
-    items_root, latest_items, latest_items_root, resume_items, trailers, user_items,
+    items, items_root, latest_items, latest_items_root, resume_items, trailers, user_items,
     user_items_root, views,
 };
 pub use metadata_mgmt::{

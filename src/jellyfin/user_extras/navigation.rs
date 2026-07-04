@@ -257,7 +257,7 @@ pub async fn user_items_resume(
         .get("UserId")
         .cloned()
         .unwrap_or_else(|| state.user_id.to_string());
-    crate::jellyfin::items::resume_items(State(state), Path(user_id)).await
+    crate::jellyfin::items::resume_items(State(state), Path(user_id), Query(query)).await
 }
 
 /// GET /Items/Filters — older filters endpoint (same as Filters2)

@@ -72,14 +72,121 @@ pub fn verify_password(password: &str, password_hash: &str) -> bool {
 
 pub fn http_client() -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
-    let proxy_url = std::env::var("JELLYFIN_RS_PROXY").unwrap_or_default();
-    if !proxy_url.is_empty() {
-        builder = builder.no_proxy().proxy(reqwest::Proxy::all(&proxy_url)?);
-    } else if std::env::var("JELLYFIN_RS_NO_PROXY")
-        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
-    {
+    if no_proxy_requested() {
         builder = builder.no_proxy();
+    } else if let Some(proxy_url) = configured_proxy_url() {
+        builder = builder.no_proxy().proxy(reqwest::Proxy::all(&proxy_url)?);
     }
     Ok(builder.build()?)
+}
+
+fn no_proxy_requested() -> bool {
+    std::env::var("JELLYFIN_RS_NO_PROXY")
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn configured_proxy_url() -> Option<String> {
+    std::env::var("JELLYFIN_RS_PROXY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(system_proxy_url)
+}
+
+#[cfg(windows)]
+fn system_proxy_url() -> Option<String> {
+    use winreg::{RegKey, enums::HKEY_CURRENT_USER};
+
+    let settings = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+        .ok()?;
+    let enabled = settings.get_value::<u32, _>("ProxyEnable").unwrap_or(0) != 0;
+    if !enabled {
+        return None;
+    }
+
+    let server = settings
+        .get_value::<String, _>("ProxyServer")
+        .ok()?
+        .trim()
+        .to_string();
+    parse_windows_proxy_server(&server)
+}
+
+#[cfg(not(windows))]
+fn system_proxy_url() -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+fn parse_windows_proxy_server(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let https_proxy = value
+        .split(';')
+        .find_map(|entry| proxy_entry_value(entry, "https"));
+    let http_proxy = value
+        .split(';')
+        .find_map(|entry| proxy_entry_value(entry, "http"));
+    let proxy = https_proxy.or(http_proxy).unwrap_or(value);
+
+    if proxy.contains("://") {
+        Some(proxy.to_string())
+    } else {
+        Some(format!("http://{proxy}"))
+    }
+}
+
+#[cfg(windows)]
+fn proxy_entry_value<'a>(entry: &'a str, expected_scheme: &str) -> Option<&'a str> {
+    let entry = entry.trim();
+    let (scheme, proxy) = entry.split_once('=')?;
+    scheme
+        .eq_ignore_ascii_case(expected_scheme)
+        .then_some(proxy.trim())
+}
+
+#[cfg(test)]
+fn parse_windows_proxy_server_for_test(value: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        parse_windows_proxy_server(value)
+    }
+    #[cfg(not(windows))]
+    {
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else if value.contains("://") {
+            Some(value.to_string())
+        } else {
+            Some(format!("http://{value}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_windows_proxy_server_for_test;
+
+    #[test]
+    fn windows_proxy_server_accepts_host_port() {
+        assert_eq!(
+            parse_windows_proxy_server_for_test("127.0.0.1:7890").as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+    }
+
+    #[test]
+    fn windows_proxy_server_prefers_https_entry() {
+        assert_eq!(
+            parse_windows_proxy_server_for_test("http=127.0.0.1:8080;https=127.0.0.1:7890")
+                .as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+    }
 }

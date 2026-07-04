@@ -32,3 +32,6 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 dashmap = "6"
 cron = "0.13"
 lru = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

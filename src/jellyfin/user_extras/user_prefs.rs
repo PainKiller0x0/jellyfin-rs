@@ -163,11 +163,52 @@ pub async fn play_queue(
 
 /// POST /Playlists/{playlist_id}/Items/{item_id}/Move/{new_index} — reorder playlist
 pub async fn playlist_move_item(
-    State(_state): State<Arc<AppState>>,
-    Path((_playlist_id, _item_id, _new_index)): Path<(String, String, usize)>,
+    State(state): State<Arc<AppState>>,
+    Path((playlist_id, item_id, new_index)): Path<(String, String, usize)>,
 ) -> Response {
-    // Not implemented yet - would need sort_order in linked_children
-    StatusCode::NO_CONTENT.into_response()
+    match move_playlist_item_inner(&state.db, &playlist_id, &item_id, new_index).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+async fn move_playlist_item_inner(
+    db: &sea_orm::DatabaseConnection,
+    playlist_id: &str,
+    item_id: &str,
+    new_index: usize,
+) -> anyhow::Result<bool> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            r#"SELECT lc.item_id FROM linked_children lc JOIN media_items mi ON mi.id = lc.parent_id WHERE lc.parent_id = ? AND mi.item_type = 'Playlist' ORDER BY lc.sort_order ASC"#,
+            vec![playlist_id.into()],
+        ))
+        .await?;
+    let mut ids = rows
+        .iter()
+        .filter_map(|row| row.get_str("item_id").ok())
+        .collect::<Vec<_>>();
+    let Some(index) = ids.iter().position(|id| id == item_id) else {
+        return Ok(false);
+    };
+    let moved = ids.remove(index);
+    ids.insert(new_index.min(ids.len()), moved);
+    for (index, id) in ids.iter().enumerate() {
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE linked_children SET sort_order = ? WHERE parent_id = ? AND item_id = ?",
+            vec![
+                i64::try_from(index).unwrap_or(i64::MAX).into(),
+                playlist_id.into(),
+                id.as_str().into(),
+            ],
+        ))
+        .await?;
+    }
+    Ok(true)
 }
 
 /// GET /Playlists/{id}/AddToPlaylistInfo — info for adding to playlist
@@ -191,6 +232,7 @@ pub async fn add_to_playlist_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{ConnectionTrait, Database};
 
     #[test]
     fn user_setting_value_preserves_strings_and_json_values() {
@@ -204,5 +246,60 @@ mod tests {
     #[test]
     fn typed_setting_key_separates_user_and_key() {
         assert_ne!(typed_setting_key("ab", "c"), typed_setting_key("a", "bc"));
+    }
+
+    #[tokio::test]
+    async fn playlist_move_item_reorders_linked_children() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        for (id, item_type) in [
+            ("playlist", "Playlist"),
+            ("a", "Audio"),
+            ("b", "Audio"),
+            ("c", "Audio"),
+        ] {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', ?, 0, 1, 1, 1, 1)",
+                vec![id.into(), id.into(), id.into(), item_type.into()],
+            ))
+            .await
+            .unwrap();
+        }
+        for (index, id) in ["a", "b", "c"].iter().enumerate() {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES ('playlist', ?, ?)",
+                vec![(*id).into(), i64::try_from(index).unwrap().into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        assert!(
+            move_playlist_item_inner(&db, "playlist", "c", 0)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !move_playlist_item_inner(&db, "playlist", "missing", 0)
+                .await
+                .unwrap()
+        );
+
+        let rows = db
+            .query_all(crate::db::helpers::portable_statement(
+                backend,
+                "SELECT item_id FROM linked_children WHERE parent_id = 'playlist' ORDER BY sort_order ASC",
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let ids = rows
+            .iter()
+            .filter_map(|row| row.get_str("item_id").ok())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["c", "a", "b"]);
     }
 }

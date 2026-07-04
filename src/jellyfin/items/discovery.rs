@@ -18,6 +18,12 @@ use crate::{
 
 use super::media_list_response;
 
+fn visible_media_item_sql(alias: &str) -> String {
+    format!(
+        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
+    )
+}
+
 pub async fn similar_items(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
@@ -308,12 +314,14 @@ async fn next_up_inner(
 ) -> anyhow::Result<Vec<MediaItem>> {
     let backend = db.get_database_backend();
     let (sql, values) = if let Some(series_id) = series_id {
+        let episode_visible = visible_media_item_sql("media_items");
+        let season_visible = visible_media_item_sql("s");
         // For a specific series: return all unwatched episodes, sorted by season and episode number
         (
             format!(
                 r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0
-                    AND media_items.is_public = 1
-                    AND media_items.parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season' AND is_public = 1)
+                    AND {episode_visible}
+                    AND media_items.parent_id IN (SELECT s.id FROM media_items s WHERE s.parent_id = ? AND s.item_type = 'Season' AND {season_visible})
                     AND COALESCE(user_data.played, 0) = 0
                     AND COALESCE(user_data.playback_position_ticks, 0) = 0
                     ORDER BY media_items.parent_id ASC, media_items.episode_number ASC"#,
@@ -322,18 +330,20 @@ async fn next_up_inner(
             vec![user_id.into(), series_id.into()],
         )
     } else {
+        let episode_visible = visible_media_item_sql("media_items");
+        let candidate_visible = visible_media_item_sql("mi3");
         // Global next up: for each series, show the next unwatched episode
         (
             format!(
                 r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0
-                    AND media_items.is_public = 1
+                    AND {episode_visible}
                     AND COALESCE(user_data.played, 0) = 0
                     AND COALESCE(user_data.playback_position_ticks, 0) = 0
                     AND media_items.episode_number = (
                         SELECT MIN(mi3.episode_number) FROM media_items mi3
                         LEFT JOIN user_data ud3 ON ud3.item_id = mi3.id AND ud3.user_id = ?
                         WHERE mi3.parent_id = media_items.parent_id
-                            AND mi3.item_type = 'Episode' AND mi3.is_folder = 0 AND mi3.is_public = 1
+                            AND mi3.item_type = 'Episode' AND mi3.is_folder = 0 AND {candidate_visible}
                             AND COALESCE(ud3.played, 0) = 0
                             AND COALESCE(ud3.playback_position_ticks, 0) = 0
                     )
@@ -374,7 +384,7 @@ fn query_usize(query: &HashMap<String, String>, keys: &[&str], default: usize) -
 
 #[cfg(test)]
 mod tests {
-    use super::{search_hints_inner, shows_next_up, similar_items_inner};
+    use super::{next_up_inner, search_hints_inner, shows_next_up, similar_items_inner};
     use axum::{
         body::to_bytes,
         extract::{Extension, Query, State},
@@ -503,8 +513,24 @@ mod tests {
         insert_media_item_typed(&db, "series", "Series", "", "Series", 1, None).await;
         insert_media_item_typed(&db, "season-1", "S1", "series", "Season", 1, None).await;
         insert_media_item_typed(&db, "season-2", "S2", "series", "Season", 1, None).await;
+        insert_media_item_typed(&db, "season-private", "S3", "series", "Season", 1, None).await;
+        update_item_visibility(&db, "season-private", 0).await;
         insert_media_item_typed(&db, "episode-1", "E1", "season-1", "Episode", 0, Some(1)).await;
         insert_media_item_typed(&db, "episode-2", "E2", "season-2", "Episode", 0, Some(2)).await;
+        insert_media_item_typed(
+            &db,
+            "episode-hidden",
+            "E3",
+            "season-private",
+            "Episode",
+            0,
+            Some(3),
+        )
+        .await;
+
+        let global = next_up_inner(&db, "u1", None).await.unwrap();
+        assert_eq!(global.len(), 2);
+        assert!(global.iter().all(|item| item.id != "episode-hidden"));
 
         let state = Arc::new(test_state(db));
         let mut query = HashMap::new();

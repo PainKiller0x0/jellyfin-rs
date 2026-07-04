@@ -273,18 +273,15 @@ pub async fn shows_upcoming(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .cloned()
+    let user_id = query_value(&query, &["UserId", "userId"])
+        .map(str::to_string)
         .unwrap_or_else(|| state.user_id.to_string());
-    let limit = query
-        .get("Limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16);
+    let start_index = query_usize(&query, &["StartIndex", "startIndex"], 0);
+    let limit = query_usize(&query, &["Limit", "limit"], 16).min(200);
 
     let backend = state.db.get_database_backend();
     let sql = format!(
-        "{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND media_items.is_public = 1 ORDER BY media_items.created_at DESC LIMIT ?",
+        "{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND media_items.is_public = 1 ORDER BY media_items.created_at DESC",
         crate::jellyfin::item_queries::media_item_select_sql("")
     );
     let rows = state
@@ -292,14 +289,35 @@ pub async fn shows_upcoming(
         .query_all(crate::db::helpers::portable_statement(
             backend,
             &sql,
-            vec![user_id.into(), (limit as i64).into()],
+            vec![user_id.into()],
         ))
         .await
         .unwrap_or_default();
 
     let items = crate::jellyfin::item_queries::decode_media_items(&rows).unwrap_or_default();
     let total = items.len();
-    Json(json!({ "Items": items.into_iter().map(|i| crate::jellyfin::common::strip_nulls(i.to_jellyfin_json())).collect::<Vec<_>>(), "TotalRecordCount": total })).into_response()
+    let page = items
+        .into_iter()
+        .skip(start_index)
+        .take(limit)
+        .map(|i| crate::jellyfin::common::strip_nulls(i.to_jellyfin_json()))
+        .collect::<Vec<_>>();
+    Json(json!({ "Items": page, "TotalRecordCount": total, "StartIndex": start_index }))
+        .into_response()
+}
+
+fn query_value<'a>(query: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
+    query
+        .iter()
+        .find(|(key, _)| keys.iter().any(|wanted| key.eq_ignore_ascii_case(wanted)))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+fn query_usize(query: &HashMap<String, String>, keys: &[&str], default: usize) -> usize {
+    query_value(query, keys)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 /// GET /Genres/{name} — get genre by name
@@ -420,8 +438,19 @@ fn named_item_json(id: &str, name: &str, item_type: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{NamedRelation, filters2_inner, named_item_by_name_inner, named_item_json};
-    use sea_orm::{ConnectionTrait, Database};
+    use super::{
+        NamedRelation, filters2_inner, named_item_by_name_inner, named_item_json, shows_upcoming,
+    };
+    use axum::{
+        body::to_bytes,
+        extract::{Query, State},
+        response::IntoResponse,
+    };
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use serde_json::Value;
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::{RwLock, broadcast};
+    use uuid::Uuid;
 
     #[test]
     fn named_item_json_uses_requested_type() {
@@ -536,6 +565,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shows_upcoming_returns_paged_query_result() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        insert_episode(&db, "episode-1", "E1", 1, 10).await;
+        insert_episode(&db, "episode-2", "E2", 1, 20).await;
+        insert_episode(&db, "private", "Private", 0, 30).await;
+
+        let state = Arc::new(test_state(db));
+        let mut query = HashMap::new();
+        query.insert("UserId".to_string(), "u1".to_string());
+        query.insert("StartIndex".to_string(), "1".to_string());
+        query.insert("Limit".to_string(), "1".to_string());
+        let response = shows_upcoming(State(state), Query(query))
+            .await
+            .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["TotalRecordCount"], 2);
+        assert_eq!(value["StartIndex"], 1);
+        let items = value["Items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["Id"], "episode-1");
+    }
+
     async fn insert_media_item(
         db: &sea_orm::DatabaseConnection,
         id: &str,
@@ -554,6 +609,28 @@ mod tests {
                 is_public.into(),
                 year.into(),
                 rating.into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn insert_episode(
+        db: &sea_orm::DatabaseConnection,
+        id: &str,
+        title: &str,
+        is_public: i64,
+        created_at: i64,
+    ) {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Episode', 0, ?, 1, ?, 1)",
+            vec![
+                id.into(),
+                title.into(),
+                id.into(),
+                is_public.into(),
+                created_at.into(),
             ],
         ))
         .await
@@ -584,5 +661,23 @@ mod tests {
         ))
         .await
         .unwrap();
+    }
+
+    fn test_state(db: DatabaseConnection) -> crate::app::state::AppState {
+        let (ws_event_tx, _) = broadcast::channel(4);
+        crate::app::state::AppState {
+            user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, b"test"),
+            access_token: "test-token".to_string(),
+            db,
+            media_dirs: Vec::new(),
+            http_client: reqwest::Client::new(),
+            tmdb_api_key: RwLock::new(None),
+            playback_sessions: RwLock::new(HashMap::new()),
+            session_capabilities: RwLock::new(HashMap::new()),
+            ws_event_tx,
+            sa_config: crate::config::StrmAssistantConfig::default(),
+            intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),
+            queue_manager: Arc::new(crate::queue::QueueManager::default()),
+        }
     }
 }

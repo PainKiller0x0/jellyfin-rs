@@ -19,13 +19,15 @@ use crate::{
     util::{now_unix, unix_to_jellyfin_date},
 };
 
+const USER_DATA_TARGET_NOT_FOUND: &str = "user data target not found";
+
 pub async fn favorite_item(
     State(state): State<Arc<AppState>>,
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Response {
     match set_user_data_flag_json(&state.db, &user_id, &item_id, "is_favorite", true).await {
         Ok(data) => Json(data).into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => user_data_error(error),
     }
 }
 
@@ -35,7 +37,7 @@ pub async fn unfavorite_item(
 ) -> Response {
     match set_user_data_flag_json(&state.db, &user_id, &item_id, "is_favorite", false).await {
         Ok(data) => Json(data).into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => user_data_error(error),
     }
 }
 
@@ -48,7 +50,7 @@ pub async fn current_user_favorite_item(
     let user_id = request_user_id_or_default(&state, &headers, &query).await;
     match set_user_data_flag_json(&state.db, &user_id, &item_id, "is_favorite", true).await {
         Ok(data) => Json(data).into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => user_data_error(error),
     }
 }
 
@@ -61,7 +63,7 @@ pub async fn current_user_unfavorite_item(
     let user_id = request_user_id_or_default(&state, &headers, &query).await;
     match set_user_data_flag_json(&state.db, &user_id, &item_id, "is_favorite", false).await {
         Ok(data) => Json(data).into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => user_data_error(error),
     }
 }
 
@@ -71,7 +73,7 @@ pub async fn mark_played(
 ) -> Response {
     match set_user_data_flag_json(&state.db, &user_id, &item_id, "played", true).await {
         Ok(data) => Json(data).into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => user_data_error(error),
     }
 }
 
@@ -81,7 +83,7 @@ pub async fn mark_unplayed(
 ) -> Response {
     match set_user_data_flag_json(&state.db, &user_id, &item_id, "played", false).await {
         Ok(data) => Json(data).into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => user_data_error(error),
     }
 }
 
@@ -124,7 +126,7 @@ pub async fn hide_from_resume(
     .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => user_data_error(error),
     }
 }
 
@@ -154,7 +156,7 @@ pub async fn set_rating(
             Ok(data) => Json(data).into_response(),
             Err(error) => internal_error(error),
         },
-        Err(error) => internal_error(error),
+        Err(error) => user_data_error(error),
     }
 }
 
@@ -171,7 +173,7 @@ pub async fn delete_rating(
             Ok(data) => Json(data).into_response(),
             Err(error) => internal_error(error),
         },
-        Err(error) => internal_error(error),
+        Err(error) => user_data_error(error),
     }
 }
 
@@ -373,6 +375,7 @@ async fn upsert_played_flag(
     item_id: &str,
     played: bool,
 ) -> anyhow::Result<()> {
+    ensure_user_data_target_visible(db, item_id).await?;
     let now = now_unix();
     match UserData::find_by_id((user_id.to_string(), item_id.to_string()))
         .one(db)
@@ -417,6 +420,7 @@ async fn upsert_user_data_simple(
     item_id: &str,
     apply: impl FnOnce(&mut user_data::ActiveModel),
 ) -> anyhow::Result<()> {
+    ensure_user_data_target_visible(db, item_id).await?;
     let now = now_unix();
     match UserData::find_by_id((user_id.to_string(), item_id.to_string()))
         .one(db)
@@ -444,6 +448,53 @@ async fn upsert_user_data_simple(
         }
     }
     Ok(())
+}
+
+async fn ensure_user_data_target_visible(
+    db: &sea_orm::DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<()> {
+    if public_media_item_exists(db, item_id).await? || public_person_exists(db, item_id).await? {
+        Ok(())
+    } else {
+        anyhow::bail!(USER_DATA_TARGET_NOT_FOUND)
+    }
+}
+
+async fn public_media_item_exists(
+    db: &sea_orm::DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(db
+        .query_one(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "SELECT 1 AS found FROM media_items WHERE id = ? AND is_public = 1 LIMIT 1",
+            vec![item_id.into()],
+        ))
+        .await?
+        .is_some())
+}
+
+async fn public_person_exists(
+    db: &sea_orm::DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(db
+        .query_one(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "SELECT 1 AS found FROM people p JOIN media_people mp ON mp.person_id = p.id JOIN media_items mi ON mi.id = mp.item_id WHERE p.id = ? AND mi.is_public = 1 LIMIT 1",
+            vec![item_id.into()],
+        ))
+        .await?
+        .is_some())
+}
+
+fn user_data_error(error: anyhow::Error) -> Response {
+    if error.to_string().contains(USER_DATA_TARGET_NOT_FOUND) {
+        StatusCode::NOT_FOUND.into_response()
+    } else {
+        internal_error(error)
+    }
 }
 
 /// GET /UserItems/{item_id}/UserData — returns user data for an item
@@ -508,7 +559,7 @@ pub async fn update_user_item_data(
     })
     .await
     {
-        return internal_error(error);
+        return user_data_error(error);
     }
 
     match user_data_json(&state.db, &user_id, &item_id).await {
@@ -619,6 +670,50 @@ mod tests {
         assert_eq!(data["PlayCount"], 3);
         assert_eq!(data["Rating"], 4.5);
         assert_eq!(data["LastPlayedDate"], "1970-01-01T00:01:40Z");
+    }
+
+    #[tokio::test]
+    async fn user_data_writes_require_visible_media_or_person() {
+        let db = seeded_db().await;
+        let backend = db.get_database_backend();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('private', 'Private', '/tmp/private.mkv', '', '', 'Movie', 0, 0, 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO people (id, name, created_at) VALUES ('p1', 'Person', 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_people (item_id, person_id, person_type, sort_order) VALUES ('i1', 'p1', 'Actor', 0)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+        set_user_data_flag_json(&db, "u1", "i1", "is_favorite", true)
+            .await
+            .unwrap();
+        set_user_data_flag_json(&db, "u1", "p1", "is_favorite", true)
+            .await
+            .unwrap();
+        assert!(
+            set_user_data_flag_json(&db, "u1", "private", "is_favorite", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            set_user_data_flag_json(&db, "u1", "missing", "is_favorite", true)
+                .await
+                .is_err()
+        );
     }
 
     async fn seeded_db() -> sea_orm::DatabaseConnection {

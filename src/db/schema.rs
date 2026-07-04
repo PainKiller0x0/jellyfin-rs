@@ -63,7 +63,7 @@ pub fn migrations() -> Vec<Migration> {
             "failed to create media stream item index",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS user_data (user_id TEXT NOT NULL, item_id TEXT NOT NULL, is_favorite BIGINT NOT NULL DEFAULT 0, played BIGINT NOT NULL DEFAULT 0, playback_position_ticks BIGINT NOT NULL DEFAULT 0, played_percentage DOUBLE PRECISION, play_count BIGINT NOT NULL DEFAULT 0, last_played_at BIGINT, updated_at BIGINT NOT NULL, PRIMARY KEY(user_id, item_id), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE)"#,
+            r#"CREATE TABLE IF NOT EXISTS user_data (user_id TEXT NOT NULL, item_id TEXT NOT NULL, is_favorite BIGINT NOT NULL DEFAULT 0, played BIGINT NOT NULL DEFAULT 0, playback_position_ticks BIGINT NOT NULL DEFAULT 0, played_percentage DOUBLE PRECISION, play_count BIGINT NOT NULL DEFAULT 0, last_played_at BIGINT, updated_at BIGINT NOT NULL, PRIMARY KEY(user_id, item_id), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"#,
             "failed to migrate user_data",
         ),
         (

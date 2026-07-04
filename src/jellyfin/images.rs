@@ -12,6 +12,7 @@ use base64::{Engine as _, engine::general_purpose};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
 };
+use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
@@ -33,6 +34,17 @@ pub use remote::{
 };
 
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_BASE64_IMAGE_BODY_BYTES: usize = 14 * 1024 * 1024;
+const MAX_REMOTE_IMAGE_URL_BODY_BYTES: usize = 4096;
+const MAX_IMAGE_INDEX: i64 = 255;
+const MAX_IMAGE_ID_BYTES: usize = 128;
+
+#[derive(Deserialize)]
+pub(crate) struct UserImagePath {
+    user_id: String,
+    image_type: Option<String>,
+    index: Option<i64>,
+}
 
 pub async fn item_images(
     State(state): State<Arc<AppState>>,
@@ -159,6 +171,16 @@ pub async fn upload_item_image(
     Path((item_id, image_type)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
+    let image_type = match canonical_image_type(&image_type) {
+        Some(image_type) => image_type,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "Error": "Unsupported image type" })),
+            )
+                .into_response();
+        }
+    };
     if let Some(image_url) = parse_image_url_body(&body) {
         match remote::download_and_cache_image(&state, &item_id, &image_type, &image_url).await {
             Ok(()) => return StatusCode::NO_CONTENT.into_response(),
@@ -184,8 +206,12 @@ pub async fn upload_item_image_with_index(
     Path((item_id, first, second)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Response {
+    let (image_type, image_index) = match image_type_and_index(&first, &second) {
+        Ok(value) => value,
+        Err(error) => return image_write_error(error),
+    };
     if let Some(image_url) = parse_image_url_body(&body) {
-        match remote::download_and_cache_image(&state, &item_id, &second, &image_url).await {
+        match remote::download_and_cache_image(&state, &item_id, &image_type, &image_url).await {
             Ok(()) => return StatusCode::NO_CONTENT.into_response(),
             Err(error) if remote::is_rejected_remote_image_url(&error) => {
                 return (
@@ -197,11 +223,6 @@ pub async fn upload_item_image_with_index(
             Err(error) => return internal_error(error),
         }
     }
-    let (image_type, image_index) = if let Ok(index) = first.parse::<i64>() {
-        (second, index)
-    } else {
-        (first, second.parse::<i64>().unwrap_or_default())
-    };
     match save_item_image(
         &state.db,
         &headers,
@@ -226,12 +247,19 @@ pub async fn delete_item_image(
 
 pub async fn delete_item_image_with_index(
     State(state): State<Arc<AppState>>,
-    Path((item_id, image_type, index)): Path<(String, String, i64)>,
+    Path((item_id, first, second)): Path<(String, String, String)>,
 ) -> Response {
+    let (image_type, index) = match image_type_and_index(&first, &second) {
+        Ok(value) => value,
+        Err(error) => return image_write_error(error),
+    };
     delete_item_image_inner(&state.db, &item_id, &image_type, index).await
 }
 
-pub async fn user_avatar(Path(user_id): Path<String>) -> Response {
+pub async fn user_avatar(Path(path): Path<UserImagePath>) -> Response {
+    let Some(user_id) = user_avatar_path_user_id(&path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let Some(path) = find_user_avatar_path(&user_id).await else {
         return placeholder_image().await.into_response();
     };
@@ -281,16 +309,30 @@ pub async fn current_user_avatar_head(
 
 pub async fn upload_user_avatar(
     headers: HeaderMap,
-    Path(user_id): Path<String>,
+    Path(path): Path<UserImagePath>,
     body: Bytes,
 ) -> Response {
+    let Some(user_id) = user_avatar_path_user_id(&path) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "Only primary user images are supported" })),
+        )
+            .into_response();
+    };
     match save_user_avatar(&headers, &user_id, body).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => image_write_error(error),
     }
 }
 
-pub async fn delete_user_avatar(Path(user_id): Path<String>) -> Response {
+pub async fn delete_user_avatar(Path(path): Path<UserImagePath>) -> Response {
+    let Some(user_id) = user_avatar_path_user_id(&path) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "Only primary user images are supported" })),
+        )
+            .into_response();
+    };
     for path in user_avatar_paths(&user_id) {
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -601,12 +643,18 @@ async fn save_item_image(
     image_index: i64,
     body: Bytes,
 ) -> anyhow::Result<()> {
+    let item_id = validate_image_id(item_id, "item id")?;
+    let image_type = canonical_image_type(image_type)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported image type"))?;
+    let image_index = validate_image_index(image_index)?;
+    if !image_item_exists(db, item_id).await? {
+        anyhow::bail!("item not found");
+    }
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/octet-stream");
-    let bytes = decode_image_body(content_type, &body)?;
-    let extension = extension_from_content_type(content_type).unwrap_or("bin");
+    let (bytes, extension) = decode_image_body(content_type, &body)?;
     let etag = stable_text_id(&format!(
         "image:{item_id}:{image_type}:{image_index}:{}",
         now_unix()
@@ -650,12 +698,12 @@ async fn save_item_image(
 }
 
 async fn save_user_avatar(headers: &HeaderMap, user_id: &str, body: Bytes) -> anyhow::Result<()> {
+    let user_id = validate_image_id(user_id, "user id")?;
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/octet-stream");
-    let bytes = decode_image_body(content_type, &body)?;
-    let extension = extension_from_content_type(content_type).unwrap_or("png");
+    let (bytes, extension) = decode_image_body(content_type, &body)?;
     let directory = PathBuf::from("data").join("avatars");
     tokio::fs::create_dir_all(&directory)
         .await
@@ -706,6 +754,24 @@ async fn delete_item_image_inner(
     image_type: &str,
     image_index: i64,
 ) -> Response {
+    let item_id = match validate_image_id(item_id, "item id") {
+        Ok(item_id) => item_id,
+        Err(error) => return image_write_error(error),
+    };
+    let image_type = match canonical_image_type(image_type) {
+        Some(image_type) => image_type,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "Error": "Unsupported image type" })),
+            )
+                .into_response();
+        }
+    };
+    let image_index = match validate_image_index(image_index) {
+        Ok(image_index) => image_index,
+        Err(error) => return image_write_error(error),
+    };
     let path = ImageAssets::find()
         .filter(image_assets::Column::ItemId.eq(item_id))
         .filter(image_assets::Column::ImageType.eq(image_type))
@@ -735,12 +801,24 @@ async fn delete_item_image_inner(
     }
 }
 
-fn decode_image_body(content_type: &str, body: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if body.len() > MAX_IMAGE_BYTES {
+fn decode_image_body(content_type: &str, body: &[u8]) -> anyhow::Result<(Vec<u8>, &'static str)> {
+    if body.is_empty() {
+        anyhow::bail!("image body is empty");
+    }
+    let content_type = normalized_content_type(content_type);
+    if supported_image_content_type(&content_type) || content_type == "application/octet-stream" {
+        if body.len() > MAX_IMAGE_BYTES {
+            anyhow::bail!("image is too large");
+        }
+        let extension = detect_image_extension(body)
+            .ok_or_else(|| anyhow::anyhow!("unsupported image content type"))?;
+        return Ok((body.to_vec(), extension));
+    }
+    if body.len() > MAX_BASE64_IMAGE_BODY_BYTES {
         anyhow::bail!("image is too large");
     }
-    if content_type.starts_with("image/") || content_type == "application/octet-stream" {
-        return Ok(body.to_vec());
+    if content_type.starts_with("image/") {
+        anyhow::bail!("unsupported image content type");
     }
     let text = std::str::from_utf8(body).context("image body is not valid utf-8")?;
     let encoded = text
@@ -753,16 +831,45 @@ fn decode_image_body(content_type: &str, body: &[u8]) -> anyhow::Result<Vec<u8>>
     if bytes.len() > MAX_IMAGE_BYTES {
         anyhow::bail!("image is too large");
     }
-    Ok(bytes)
+    let extension = detect_image_extension(&bytes)
+        .ok_or_else(|| anyhow::anyhow!("unsupported image content type"))?;
+    Ok((bytes, extension))
 }
 
 fn extension_from_content_type(content_type: &str) -> Option<&'static str> {
-    match content_type.split(';').next().unwrap_or_default().trim() {
+    match normalized_content_type(content_type).as_str() {
         "image/jpeg" => Some("jpg"),
         "image/png" => Some("png"),
         "image/webp" => Some("webp"),
         "image/gif" => Some("gif"),
         _ => None,
+    }
+}
+
+fn supported_image_content_type(content_type: &str) -> bool {
+    extension_from_content_type(content_type).is_some()
+}
+
+fn normalized_content_type(content_type: &str) -> String {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+pub(super) fn detect_image_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
+        Some("png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
     }
 }
 
@@ -782,13 +889,16 @@ fn extension_from_url(url: &str) -> Option<&'static str> {
 }
 
 pub fn content_type_from_path(path: &str) -> &'static str {
-    match std::path::Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    content_type_from_extension(
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default(),
+    )
+}
+
+pub(super) fn content_type_from_extension(extension: &str) -> &'static str {
+    match extension.to_ascii_lowercase().as_str() {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
         "webp" => "image/webp",
@@ -826,6 +936,20 @@ fn user_avatar_paths(user_id: &str) -> Vec<PathBuf> {
                 .join(format!("{file_stem}.{extension}"))
         })
         .collect()
+}
+
+fn user_avatar_path_user_id(path: &UserImagePath) -> Option<String> {
+    if path
+        .image_type
+        .as_deref()
+        .is_some_and(|image_type| !image_type.eq_ignore_ascii_case("Primary"))
+    {
+        return None;
+    }
+    if path.index.is_some_and(|index| index != 0) {
+        return None;
+    }
+    Some(path.user_id.clone())
 }
 
 fn image_options_from_query(
@@ -903,12 +1027,16 @@ fn sanitize_file_part(value: &str) -> String {
 }
 
 fn parse_image_url_body(body: &[u8]) -> Option<String> {
+    if body.len() > MAX_REMOTE_IMAGE_URL_BODY_BYTES {
+        return None;
+    }
     let text = std::str::from_utf8(body).ok()?;
     let parsed: JsonValue = serde_json::from_str(text).ok()?;
     parsed
         .get("Url")
         .and_then(JsonValue::as_str)
-        .filter(|url| !url.trim().is_empty())
+        .map(str::trim)
+        .filter(|url| !url.is_empty() && url.len() <= 2048)
         .map(ToString::to_string)
 }
 
@@ -917,6 +1045,7 @@ fn is_image_too_large(error: &anyhow::Error) -> bool {
 }
 
 fn image_write_error(error: anyhow::Error) -> Response {
+    let message = error.to_string();
     if is_image_too_large(&error) {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -924,7 +1053,95 @@ fn image_write_error(error: anyhow::Error) -> Response {
         )
             .into_response();
     }
+    if message.contains("not found") {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "Error": "Item not found" })),
+        )
+            .into_response();
+    }
+    if message.contains("empty")
+        || message.contains("invalid")
+        || message.contains("required")
+        || message.contains("unsupported")
+        || message.contains("failed to decode base64")
+        || message.contains("not valid utf-8")
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "Error": message }))).into_response();
+    }
     internal_error(error)
+}
+
+fn image_type_and_index(first: &str, second: &str) -> anyhow::Result<(&'static str, i64)> {
+    if let Ok(index) = first.parse::<i64>() {
+        let image_type = canonical_image_type(second)
+            .ok_or_else(|| anyhow::anyhow!("Unsupported image type"))?;
+        return Ok((image_type, validate_image_index(index)?));
+    }
+    let image_type =
+        canonical_image_type(first).ok_or_else(|| anyhow::anyhow!("Unsupported image type"))?;
+    let index = second
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("invalid image index"))?;
+    Ok((image_type, validate_image_index(index)?))
+}
+
+fn canonical_image_type(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "primary" => Some("Primary"),
+        "art" => Some("Art"),
+        "backdrop" => Some("Backdrop"),
+        "banner" => Some("Banner"),
+        "logo" => Some("Logo"),
+        "thumb" => Some("Thumb"),
+        "disc" => Some("Disc"),
+        "box" => Some("Box"),
+        "boxrear" | "box_rear" | "box-rear" => Some("BoxRear"),
+        "screenshot" => Some("Screenshot"),
+        "menu" => Some("Menu"),
+        "chapter" => Some("Chapter"),
+        "profile" => Some("Profile"),
+        _ => None,
+    }
+}
+
+fn validate_image_index(index: i64) -> anyhow::Result<i64> {
+    if (0..=MAX_IMAGE_INDEX).contains(&index) {
+        Ok(index)
+    } else {
+        anyhow::bail!("invalid image index")
+    }
+}
+
+fn validate_image_id<'a>(value: &'a str, label: &str) -> anyhow::Result<&'a str> {
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("{label} is required");
+    }
+    if value.len() > MAX_IMAGE_ID_BYTES {
+        anyhow::bail!("{label} is too long");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        anyhow::bail!("invalid {label}");
+    }
+    Ok(value)
+}
+
+async fn image_item_exists(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<bool> {
+    let backend = db.get_database_backend();
+    Ok(db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT id FROM media_items WHERE id = ?",
+            vec![item_id.into()],
+        ))
+        .await
+        .context("failed to validate image item")?
+        .is_some())
 }
 
 #[allow(dead_code)]
@@ -949,8 +1166,8 @@ pub async fn item_image_tags(db: &DatabaseConnection, item_id: &str) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_IMAGE_BYTES, decode_image_body, image_storage_path_allowed, is_image_too_large,
-        item_images_inner,
+        MAX_IMAGE_BYTES, canonical_image_type, decode_image_body, image_storage_path_allowed,
+        image_type_and_index, is_image_too_large, item_images_inner,
     };
     use sea_orm::{ConnectionTrait, Database};
     use std::fs;
@@ -982,6 +1199,25 @@ mod tests {
         let base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, oversized);
         let error = decode_image_body("text/plain", base64.as_bytes()).unwrap_err();
         assert!(is_image_too_large(&error));
+    }
+
+    #[test]
+    fn image_upload_rejects_unsupported_types_and_indexes() {
+        assert_eq!(canonical_image_type("backdrop"), Some("Backdrop"));
+        assert!(canonical_image_type("../bad").is_none());
+        assert_eq!(
+            image_type_and_index("Backdrop", "2").unwrap(),
+            ("Backdrop", 2)
+        );
+        assert_eq!(
+            image_type_and_index("2", "Backdrop").unwrap(),
+            ("Backdrop", 2)
+        );
+        assert!(image_type_and_index("Backdrop", "-1").is_err());
+
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#;
+        let error = decode_image_body("image/svg+xml", svg).unwrap_err();
+        assert!(error.to_string().contains("unsupported"));
     }
 
     #[tokio::test]

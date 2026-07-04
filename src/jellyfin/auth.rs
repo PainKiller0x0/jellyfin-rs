@@ -120,6 +120,12 @@ const ADMIN_CONTAINS: &[&str] = &[
 const QUICK_CONNECT_PREFIX: &str = "quick_connect:";
 const QUICK_CONNECT_CODE_PREFIX: &str = "quick_connect_code:";
 const QUICK_CONNECT_TTL_SECONDS: i64 = 10 * 60;
+const MAX_USER_NAME_LEN: usize = 128;
+const MAX_USER_PASSWORD_LEN: usize = 1024;
+const MAX_USER_SETTING_STRING_LEN: usize = 512;
+const MAX_USER_SETTING_ARRAY_ITEMS: usize = 256;
+const MAX_USER_SETTING_OBJECT_FIELDS: usize = 64;
+const MAX_USER_SETTING_DEPTH: usize = 3;
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -275,7 +281,7 @@ pub async fn create_user(
 ) -> Response {
     match create_user_inner(&state.db, request).await {
         Ok(user) => Json(user).into_response(),
-        Err(error) if error.to_string().contains("required") => (
+        Err(error) if user_write_validation_error(&error) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "Error": error.to_string() })),
         )
@@ -317,6 +323,11 @@ async fn update_user_password_response(
         Err(AuthError::Internal(error)) if error.to_string().contains("not found") => (
             StatusCode::NOT_FOUND,
             Json(json!({ "Error": "User not found" })),
+        )
+            .into_response(),
+        Err(AuthError::Internal(error)) if user_write_validation_error(&error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": error.to_string() })),
         )
             .into_response(),
         Err(AuthError::Internal(error)) => internal_error(error),
@@ -408,20 +419,25 @@ async fn update_user_response(
     user_id: &str,
     request: &JsonValue,
 ) -> Response {
-    let Some(name) = request
-        .get("Name")
-        .and_then(JsonValue::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    else {
+    let Some(name) = request.get("Name").and_then(JsonValue::as_str) else {
         return StatusCode::NO_CONTENT.into_response();
+    };
+    let name = match validate_user_name(name) {
+        Ok(name) => name,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "Error": error.to_string() })),
+            )
+                .into_response();
+        }
     };
 
     let result = match Users::find_by_id(user_id).one(db).await {
         Ok(Some(model)) => {
             let mut active: users::ActiveModel = model.into();
-            active.username = Set(name.to_string());
-            active.display_name = Set(name.to_string());
+            active.username = Set(name.clone());
+            active.display_name = Set(name);
             active.updated_at = Set(now_unix());
             active.update(db).await
         }
@@ -1209,25 +1225,24 @@ async fn create_user_inner(
     db: &DatabaseConnection,
     request: CreateUserRequest,
 ) -> anyhow::Result<JsonValue> {
-    let username = request.name.trim();
-    if username.is_empty() {
-        bail!("Name is required");
-    }
+    let username = validate_user_name(&request.name)?;
 
     let now = now_unix();
     let user_id =
         Uuid::new_v5(&Uuid::NAMESPACE_URL, format!("user:{username}").as_bytes()).to_string();
     let password_hash: Option<String> = match request.password.as_deref() {
-        Some(password) if !password.is_empty() => Some(hash_password(password)?),
+        Some(password) if !password.trim().is_empty() => {
+            Some(hash_password(validate_user_password(password)?)?)
+        }
         _ => None,
     };
     let has_password = password_hash.is_some();
 
     let active = users::ActiveModel {
         id: Set(user_id.clone()),
-        username: Set(username.to_string()),
+        username: Set(username.clone()),
         password_hash: Set(password_hash),
-        display_name: Set(username.to_string()),
+        display_name: Set(username.clone()),
         is_admin: Set(0),
         is_disabled: Set(0),
         created_at: Set(now),
@@ -1239,7 +1254,7 @@ async fn create_user_inner(
         .await
         .context("failed to create user")?;
 
-    Ok(user_json(&user_id, username, has_password, false, false))
+    Ok(user_json(&user_id, &username, has_password, false, false))
 }
 
 async fn update_user_configuration_inner(
@@ -1302,6 +1317,7 @@ async fn update_user_password_inner(
                 "New password is required".to_string(),
             ));
         };
+        let new_pw = validate_user_password(new_pw).map_err(AuthError::Internal)?;
         Some(hash_password(new_pw).map_err(AuthError::Internal)?)
     };
 
@@ -1364,6 +1380,38 @@ async fn update_user_policy_inner(
 
 fn policy_bool(policy: &JsonValue, key: &str) -> Option<bool> {
     policy.get(key).and_then(JsonValue::as_bool)
+}
+
+fn user_write_validation_error(error: &anyhow::Error) -> bool {
+    matches!(
+        error.to_string().as_str(),
+        "Name is required" | "Invalid user name" | "Password is too long" | "Invalid password"
+    )
+}
+
+fn validate_user_name(value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("Name is required");
+    }
+    if value.chars().count() > MAX_USER_NAME_LEN
+        || value.contains('\0')
+        || value.chars().any(char::is_control)
+    {
+        bail!("Invalid user name");
+    }
+    Ok(value.to_string())
+}
+
+fn validate_user_password(value: &str) -> anyhow::Result<&str> {
+    let value = value.trim();
+    if value.len() > MAX_USER_PASSWORD_LEN {
+        bail!("Password is too long");
+    }
+    if value.contains('\0') {
+        bail!("Invalid password");
+    }
+    Ok(value)
 }
 
 async fn revoke_user_tokens(
@@ -2115,7 +2163,7 @@ fn merge_user_configuration(mut base: JsonValue, saved: &JsonValue) -> JsonValue
     if let (Some(base), Some(saved)) = (base.as_object_mut(), saved.as_object()) {
         for (key, value) in saved {
             if base.contains_key(key) {
-                base.insert(key.clone(), value.clone());
+                base.insert(key.clone(), normalize_user_setting_value(value, 0));
             }
         }
     }
@@ -2205,11 +2253,47 @@ fn merge_user_policy(mut base: JsonValue, saved: &JsonValue) -> JsonValue {
     if let (Some(base), Some(saved)) = (base.as_object_mut(), saved.as_object()) {
         for (key, value) in saved {
             if base.contains_key(key) {
-                base.insert(key.clone(), value.clone());
+                base.insert(key.clone(), normalize_user_setting_value(value, 0));
             }
         }
     }
     base
+}
+
+fn normalize_user_setting_value(value: &JsonValue, depth: usize) -> JsonValue {
+    match value {
+        JsonValue::String(value) => JsonValue::String(normalize_user_setting_string(value)),
+        JsonValue::Array(values) => JsonValue::Array(
+            values
+                .iter()
+                .take(MAX_USER_SETTING_ARRAY_ITEMS)
+                .map(|value| normalize_user_setting_value(value, depth + 1))
+                .collect(),
+        ),
+        JsonValue::Object(values) => {
+            if depth >= MAX_USER_SETTING_DEPTH {
+                return JsonValue::Object(serde_json::Map::new());
+            }
+            let mut normalized = serde_json::Map::new();
+            for (key, value) in values.iter().take(MAX_USER_SETTING_OBJECT_FIELDS) {
+                let key = normalize_user_setting_string(key);
+                if key.is_empty() {
+                    continue;
+                }
+                normalized.insert(key, normalize_user_setting_value(value, depth + 1));
+            }
+            JsonValue::Object(normalized)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn normalize_user_setting_string(value: &str) -> String {
+    value
+        .chars()
+        .filter(|value| !value.is_control())
+        .take(MAX_USER_SETTING_STRING_LEN)
+        .collect()
 }
 
 async fn app_setting(db: &DatabaseConnection, key: &str, default: &str) -> String {
@@ -2798,6 +2882,18 @@ mod tests {
     }
 
     #[test]
+    fn user_write_inputs_are_validated() {
+        assert_eq!(validate_user_name("  Alice  ").unwrap(), "Alice");
+        assert!(validate_user_name("").is_err());
+        assert!(validate_user_name("bad\nname").is_err());
+        assert!(validate_user_name(&"x".repeat(MAX_USER_NAME_LEN + 1)).is_err());
+
+        assert_eq!(validate_user_password("  secret  ").unwrap(), "secret");
+        assert!(validate_user_password(&"x".repeat(MAX_USER_PASSWORD_LEN + 1)).is_err());
+        assert!(validate_user_password("bad\0password").is_err());
+    }
+
+    #[test]
     fn policy_bool_reads_supported_policy_flags() {
         let policy = json!({ "IsAdministrator": true, "IsDisabled": false });
         assert_eq!(policy_bool(&policy, "IsAdministrator"), Some(true));
@@ -3072,6 +3168,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_user_response_rejects_invalid_name() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'old', 'old', 0, 0, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+        let response = update_user_response(&db, "u1", &json!({ "Name": "bad\nname" })).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let user = user_by_id_inner(&db, "u1").await.unwrap().unwrap();
+        assert_eq!(user.username, "old");
+    }
+
+    #[tokio::test]
     async fn user_policy_round_trips_saved_fields() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
@@ -3137,6 +3252,47 @@ mod tests {
         assert_eq!(merged["SubtitleMode"], "Always");
         assert_eq!(merged["EnableNextEpisodeAutoPlay"], false);
         assert!(merged.get("Unexpected").is_none());
+    }
+
+    #[test]
+    fn user_configuration_and_policy_values_are_limited() {
+        let merged = merge_user_configuration(
+            default_user_configuration(),
+            &json!({
+                "SubtitleMode": format!("{}{}", "x".repeat(MAX_USER_SETTING_STRING_LEN + 20), "\n"),
+                "GroupedFolders": (0..MAX_USER_SETTING_ARRAY_ITEMS + 20)
+                    .map(|index| json!(format!("folder-{index}")))
+                    .collect::<Vec<_>>(),
+                "Unexpected": "ignored"
+            }),
+        );
+        assert_eq!(
+            merged["SubtitleMode"].as_str().unwrap().len(),
+            MAX_USER_SETTING_STRING_LEN
+        );
+        assert!(
+            !merged["SubtitleMode"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .any(char::is_control)
+        );
+        assert_eq!(
+            merged["GroupedFolders"].as_array().unwrap().len(),
+            MAX_USER_SETTING_ARRAY_ITEMS
+        );
+        assert!(merged.get("Unexpected").is_none());
+
+        let nested = json!({
+            "AccessSchedules": [{
+                "Name": "Morning\nShift",
+                "Level1": { "Level2": { "Level3": { "TooDeep": true } } }
+            }]
+        });
+        let policy = merge_user_policy(default_user_policy(false, false), &nested);
+        let schedule = &policy["AccessSchedules"][0];
+        assert_eq!(schedule["Name"], "MorningShift");
+        assert_eq!(schedule["Level1"]["Level2"], json!({}));
     }
 
     fn test_state(db: DatabaseConnection) -> AppState {

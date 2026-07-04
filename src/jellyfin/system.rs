@@ -35,6 +35,8 @@ use crate::{
 const BRANDING_SPLASHSCREEN_PATH: &str = "data/images/branding-splashscreen";
 const BRANDING_SPLASHSCREEN_CONTENT_TYPE_KEY: &str = "BrandingSplashscreenContentType";
 const MAX_BRANDING_SPLASHSCREEN_BYTES: usize = 10 * 1024 * 1024;
+const MAX_BRANDING_LOGIN_DISCLAIMER_BYTES: usize = 16 * 1024;
+const MAX_BRANDING_CUSTOM_CSS_BYTES: usize = 256 * 1024;
 const MAX_CLIENT_LOG_BYTES: usize = 1024 * 1024;
 const MAX_CAMERA_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 const MAX_USER_USAGE_BACKUP_BYTES: usize = 20 * 1024 * 1024;
@@ -121,11 +123,10 @@ pub async fn update_branding_configuration(
     State(state): State<Arc<AppState>>,
     Json(request): Json<JsonValue>,
 ) -> Response {
-    let options = json!({
-        "LoginDisclaimer": request.get("LoginDisclaimer").and_then(JsonValue::as_str).unwrap_or(""),
-        "CustomCss": request.get("CustomCss").and_then(JsonValue::as_str).unwrap_or(""),
-        "SplashscreenEnabled": request.get("SplashscreenEnabled").and_then(JsonValue::as_bool).unwrap_or(false),
-    });
+    let options = match normalize_branding_options(request) {
+        Ok(options) => options,
+        Err(error) => return validation_error_response(error),
+    };
 
     match set_app_setting(&state.db, "BrandingOptions", &options.to_string()).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -193,7 +194,7 @@ pub async fn upload_branding_splashscreen(
         .and_then(|value| value.split(';').next())
         .map(str::trim)
         .unwrap_or_default();
-    if !content_type.starts_with("image/") {
+    if !allowed_branding_image_content_type(content_type) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "Error": "Splashscreen upload must be an image" })),
@@ -1795,7 +1796,9 @@ fn channel_features_value() -> JsonValue {
 
 async fn branding_options(db: &DatabaseConnection) -> JsonValue {
     serde_json::from_str(&app_setting(db, "BrandingOptions", "").await)
-        .unwrap_or_else(|_| default_branding_options())
+        .ok()
+        .and_then(|value| normalize_branding_options(value).ok())
+        .unwrap_or_else(default_branding_options)
 }
 
 fn branding_splashscreen_path() -> PathBuf {
@@ -1808,6 +1811,73 @@ fn default_branding_options() -> JsonValue {
         "CustomCss": "",
         "SplashscreenEnabled": false
     })
+}
+
+fn normalize_branding_options(value: JsonValue) -> Result<JsonValue, (StatusCode, &'static str)> {
+    let Some(object) = value.as_object() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Branding options must be an object",
+        ));
+    };
+    let login_disclaimer = branding_string_field(
+        object,
+        "LoginDisclaimer",
+        MAX_BRANDING_LOGIN_DISCLAIMER_BYTES,
+    )?;
+    let custom_css = branding_string_field(object, "CustomCss", MAX_BRANDING_CUSTOM_CSS_BYTES)?;
+
+    Ok(json!({
+        "LoginDisclaimer": login_disclaimer,
+        "CustomCss": custom_css,
+        "SplashscreenEnabled": object
+            .get("SplashscreenEnabled")
+            .and_then(json_bool_value)
+            .unwrap_or(false),
+    }))
+}
+
+fn branding_string_field(
+    object: &serde_json::Map<String, JsonValue>,
+    key: &'static str,
+    max_bytes: usize,
+) -> Result<String, (StatusCode, &'static str)> {
+    let Some(value) = object.get(key) else {
+        return Ok(String::new());
+    };
+    let Some(value) = value.as_str() else {
+        return Err((StatusCode::BAD_REQUEST, key));
+    };
+    if value.len() > max_bytes {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, key));
+    }
+    if value.contains('\0')
+        || value
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err((StatusCode::BAD_REQUEST, key));
+    }
+    Ok(value.to_string())
+}
+
+fn json_bool_value(value: &JsonValue) -> Option<bool> {
+    value.as_bool().or_else(|| {
+        value
+            .as_str()
+            .and_then(|text| match text.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => Some(true),
+                "0" | "false" | "no" => Some(false),
+                _ => None,
+            })
+    })
+}
+
+fn allowed_branding_image_content_type(content_type: &str) -> bool {
+    matches!(
+        content_type.to_ascii_lowercase().as_str(),
+        "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp"
+    )
 }
 
 fn web_strings_value() -> JsonValue {
@@ -4330,10 +4400,10 @@ mod tests {
         live_tv_default_listing_provider, live_tv_default_listing_provider_value,
         live_tv_default_tuner_host, live_tv_default_tuner_host_value, live_tv_guide_info,
         live_tv_info, live_tv_timer_defaults, live_tv_timer_defaults_value, live_tv_unavailable,
-        log_file_entry, normalize_device_custom_name, normalize_plugin_repositories,
-        normalize_scheduled_task_triggers, notification_items, notification_services_test,
-        notification_services_value, package_install_unavailable, package_list,
-        package_update_list, party_unavailable, play_activity_rows, plugin_list,
+        log_file_entry, normalize_branding_options, normalize_device_custom_name,
+        normalize_plugin_repositories, normalize_scheduled_task_triggers, notification_items,
+        notification_services_test, notification_services_value, package_install_unavailable,
+        package_list, package_update_list, party_unavailable, play_activity_rows, plugin_list,
         report_activity_headers_for_query, report_csv, report_item_headers_for_query,
         reports_activity_result, reports_items_result, required_upload_part,
         run_user_usage_custom_query, safe_log_path, safe_user_usage_backup_file,
@@ -4967,6 +5037,40 @@ mod tests {
         assert_eq!(options["LoginDisclaimer"], "");
         assert_eq!(options["CustomCss"], "");
         assert_eq!(options["SplashscreenEnabled"], false);
+    }
+
+    #[test]
+    fn branding_options_are_normalized_and_limited() {
+        let options = normalize_branding_options(serde_json::json!({
+            "LoginDisclaimer": "Welcome\n",
+            "CustomCss": "body { color: red; }\t",
+            "SplashscreenEnabled": "true",
+            "Ignored": true
+        }))
+        .unwrap();
+        assert_eq!(options["LoginDisclaimer"], "Welcome\n");
+        assert_eq!(options["CustomCss"], "body { color: red; }\t");
+        assert_eq!(options["SplashscreenEnabled"], true);
+        assert!(options["Ignored"].is_null());
+
+        assert!(normalize_branding_options(serde_json::json!([])).is_err());
+        assert!(
+            normalize_branding_options(serde_json::json!({
+                "LoginDisclaimer": "bad\0text"
+            }))
+            .is_err()
+        );
+        assert!(
+            normalize_branding_options(serde_json::json!({
+                "CustomCss": "x".repeat(super::MAX_BRANDING_CUSTOM_CSS_BYTES + 1)
+            }))
+            .is_err()
+        );
+
+        assert!(super::allowed_branding_image_content_type("image/png"));
+        assert!(super::allowed_branding_image_content_type("image/jpeg"));
+        assert!(!super::allowed_branding_image_content_type("image/svg+xml"));
+        assert!(!super::allowed_branding_image_content_type("image/unknown"));
     }
 
     #[test]

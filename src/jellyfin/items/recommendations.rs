@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Context;
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::{IntoResponse, Response},
 };
 use sea_orm::ConnectionTrait;
@@ -12,17 +12,18 @@ use serde_json::{Value, json};
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
-    jellyfin::common::{internal_error, strip_nulls},
+    jellyfin::{
+        auth::query_user_id_or_request,
+        common::{internal_error, strip_nulls},
+    },
 };
 
 pub async fn movie_recommendations(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     let parent_id = query.get("ParentId").map(String::as_str);
     let category_limit = query
         .get("CategoryLimit")
@@ -382,7 +383,7 @@ pub async fn home_section_items(
                 Err(error) => internal_error(error),
             }
         }
-        "nextup" => super::discovery::shows_next_up(State(state), Query(query)).await,
+        "nextup" => super::discovery::shows_next_up_response(state, user_id, query).await,
         "latest-movies" | "latest-tvshows" => {
             let collection_type = if section_id == "latest-movies" {
                 "movies"

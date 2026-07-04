@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Context;
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::{IntoResponse, Response},
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, Value as SeaValue};
@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
-    jellyfin::{common::internal_error, item_queries},
+    jellyfin::{auth::query_user_id_or_request, common::internal_error, item_queries},
     library::models::MediaItem,
 };
 
@@ -262,11 +262,22 @@ async fn search_hints_inner(
 
 pub async fn shows_next_up(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query_value(&query, &["UserId", "userId"])
-        .map(str::to_string)
-        .unwrap_or_else(|| state.user_id.to_string());
+    shows_next_up_response(
+        state,
+        query_user_id_or_request(&query, &request_user_id),
+        query,
+    )
+    .await
+}
+
+pub(super) async fn shows_next_up_response(
+    state: Arc<AppState>,
+    user_id: String,
+    query: HashMap<String, String>,
+) -> Response {
     let series_id = query_value(&query, &["SeriesId", "seriesId"]);
     let start_index = query_usize(&query, &["StartIndex", "startIndex"], 0);
     let limit = query_usize(&query, &["Limit", "limit"], 25).min(200);
@@ -362,7 +373,7 @@ mod tests {
     use super::{search_hints_inner, shows_next_up, similar_items_inner};
     use axum::{
         body::to_bytes,
-        extract::{Query, State},
+        extract::{Extension, Query, State},
         response::IntoResponse,
     };
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
@@ -425,7 +436,7 @@ mod tests {
         query.insert("SeriesId".to_string(), "series".to_string());
         query.insert("StartIndex".to_string(), "1".to_string());
         query.insert("Limit".to_string(), "1".to_string());
-        let response = shows_next_up(State(state), Query(query))
+        let response = shows_next_up(State(state), Extension("u1".to_string()), Query(query))
             .await
             .into_response();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();

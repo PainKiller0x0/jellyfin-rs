@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Context;
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::{IntoResponse, Response},
 };
 use sea_orm::ConnectionTrait;
@@ -12,7 +12,10 @@ use serde_json::{Value, json};
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
-    jellyfin::common::{internal_error, strip_nulls},
+    jellyfin::{
+        auth::query_user_id_or_request,
+        common::{internal_error, strip_nulls},
+    },
     library::models::MediaItem,
 };
 
@@ -53,11 +56,10 @@ fn deduplicate_episodes(items: Vec<MediaItem>) -> Vec<MediaItem> {
 pub async fn show_seasons(
     State(state): State<Arc<AppState>>,
     Path(show_id): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query_value(&query, &["UserId", "userId"])
-        .map(str::to_string)
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     let start_index = query_usize(&query, &["StartIndex", "startIndex"], 0);
     let limit = query_limit(&query);
     match child_items_by_type(&state.db, &user_id, &show_id, "Season").await {
@@ -79,11 +81,10 @@ pub async fn show_seasons(
 pub async fn show_episodes(
     State(state): State<Arc<AppState>>,
     Path(show_id): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query_value(&query, &["UserId", "userId"])
-        .map(str::to_string)
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     let start_index = query_usize(&query, &["StartIndex", "startIndex"], 0);
     let limit = query_limit(&query);
     let result = if let Some(season_id) = query_value(&query, &["SeasonId", "seasonId"]) {
@@ -325,7 +326,7 @@ mod tests {
     };
     use axum::{
         body::to_bytes,
-        extract::{Path, Query, State},
+        extract::{Extension, Path, Query, State},
         response::IntoResponse,
     };
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
@@ -469,9 +470,14 @@ mod tests {
         query.insert("UserId".to_string(), "u1".to_string());
         query.insert("StartIndex".to_string(), "1".to_string());
         query.insert("Limit".to_string(), "1".to_string());
-        let response = show_episodes(State(state), Path("series".to_string()), Query(query))
-            .await
-            .into_response();
+        let response = show_episodes(
+            State(state),
+            Path("series".to_string()),
+            Extension("u1".to_string()),
+            Query(query),
+        )
+        .await
+        .into_response();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
 
@@ -499,9 +505,14 @@ mod tests {
         let state = Arc::new(test_state(db));
         let mut query = HashMap::new();
         query.insert("userId".to_string(), "u1".to_string());
-        let response = show_seasons(State(state), Path("series".to_string()), Query(query))
-            .await
-            .into_response();
+        let response = show_seasons(
+            State(state),
+            Path("series".to_string()),
+            Extension("u1".to_string()),
+            Query(query),
+        )
+        .await
+        .into_response();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
 

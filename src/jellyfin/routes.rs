@@ -706,7 +706,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/Genres/{name}/Images/{image_type}/{index}",
-            get(super::user_extras::genre_image).head(common::no_content),
+            get(super::user_extras::genre_image_with_index).head(common::no_content),
         )
         .route("/GameGenres", get(filters::game_genres))
         .route("/Games/SystemSummaries", get(system::game_system_summaries))
@@ -720,7 +720,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/GameGenres/{name}/Images/{image_type}/{index}",
-            get(super::user_extras::genre_image).head(common::no_content),
+            get(super::user_extras::genre_image_with_index).head(common::no_content),
         )
         .route(
             "/MusicGenres/InstantMix",
@@ -749,7 +749,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/Studios/{name}/Images/{image_type}/{index}",
-            get(super::user_extras::studio_image).head(common::no_content),
+            get(super::user_extras::studio_image_with_index).head(common::no_content),
         )
         .route("/Tags", get(filters::tags))
         .route("/Years", get(filters::years))
@@ -1142,7 +1142,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/MusicGenres/{name}/Images/{image_type}/{index}",
-            get(super::user_extras::genre_image).head(common::no_content),
+            get(super::user_extras::genre_image_with_index).head(common::no_content),
         )
         // ── Notifications ──
         .route("/Notifications/Types", get(system::notification_types))

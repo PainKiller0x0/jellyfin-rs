@@ -11,9 +11,10 @@ pub use file_ops::{
 };
 pub use item_extras::{
     artist_instant_mix, artist_instant_mix_by_id, download_remote_subtitle, genre_image,
-    item_critic_reviews, item_instant_mix, item_intros, item_local_trailers, item_special_features,
-    item_theme_media, item_theme_songs, item_theme_videos, media_segments, music_genre_instant_mix,
-    music_genre_instant_mix_by_name, remote_subtitle_search, studio_image, thumbnail_set,
+    genre_image_with_index, item_critic_reviews, item_instant_mix, item_intros,
+    item_local_trailers, item_special_features, item_theme_media, item_theme_songs,
+    item_theme_videos, media_segments, music_genre_instant_mix, music_genre_instant_mix_by_name,
+    remote_subtitle_search, studio_image, studio_image_with_index, thumbnail_set,
     trickplay_playlist, trickplay_tile, user_item_intros, user_item_local_trailers,
     user_item_special_features,
 };

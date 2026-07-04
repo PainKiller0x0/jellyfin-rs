@@ -951,6 +951,20 @@ pub async fn user_item_special_features(
     }
 }
 
+pub async fn genre_image_with_index(
+    State(_state): State<Arc<AppState>>,
+    Path((_name, _image_type, _index)): Path<(String, String, String)>,
+) -> Response {
+    StatusCode::NOT_FOUND.into_response()
+}
+
+pub async fn studio_image_with_index(
+    State(_state): State<Arc<AppState>>,
+    Path((_name, _image_type, _index)): Path<(String, String, String)>,
+) -> Response {
+    StatusCode::NOT_FOUND.into_response()
+}
+
 async fn public_item_exists(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<bool> {
     Ok(db
         .query_one(crate::db::helpers::portable_statement(
@@ -968,7 +982,7 @@ mod tests {
         ExtraKind, empty_instant_mix_response, include_item_types, instant_mix_response,
         item_critic_reviews, item_extras, item_intros_value, media_segments_value,
         parse_trickplay_index, public_item_exists, query_limit, remote_subtitle_search,
-        trickplay_info,
+        studio_image_with_index, trickplay_info,
     };
     use axum::{
         body::to_bytes, extract::Path, extract::Query, extract::State, response::IntoResponse,
@@ -1047,6 +1061,20 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["TotalRecordCount"], 0);
         assert_eq!(value["StartIndex"], 0);
+    }
+
+    #[tokio::test]
+    async fn indexed_studio_image_path_returns_not_found() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let response = studio_image_with_index(
+            State(Arc::new(test_state(db))),
+            Path(("studio".to_string(), "Primary".to_string(), "0".to_string())),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
     }
 
     #[test]

@@ -264,19 +264,22 @@ pub async fn shows_next_up(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .cloned()
+    let user_id = query_value(&query, &["UserId", "userId"])
+        .map(str::to_string)
         .unwrap_or_else(|| state.user_id.to_string());
-    let series_id = query.get("SeriesId").cloned().filter(|v| !v.is_empty());
-    let limit = query
-        .get("Limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(25);
-    match next_up_inner(&state.db, &user_id, series_id.as_deref(), limit).await {
+    let series_id = query_value(&query, &["SeriesId", "seriesId"]);
+    let start_index = query_usize(&query, &["StartIndex", "startIndex"], 0);
+    let limit = query_usize(&query, &["Limit", "limit"], 25).min(200);
+    match next_up_inner(&state.db, &user_id, series_id).await {
         Ok(items) => {
-            let json_items = crate::jellyfin::items::enrich_episode_list(&state.db, items).await;
-            Json(json!({ "Items": json_items, "TotalRecordCount": json_items.len() }))
+            let total = items.len();
+            let page = items
+                .into_iter()
+                .skip(start_index)
+                .take(limit)
+                .collect::<Vec<_>>();
+            let json_items = crate::jellyfin::items::enrich_episode_list(&state.db, page).await;
+            Json(json!({ "Items": json_items, "TotalRecordCount": total, "StartIndex": start_index }))
                 .into_response()
         }
         Err(error) => internal_error(error),
@@ -287,7 +290,6 @@ async fn next_up_inner(
     db: &DatabaseConnection,
     user_id: &str,
     series_id: Option<&str>,
-    limit: usize,
 ) -> anyhow::Result<Vec<MediaItem>> {
     let backend = db.get_database_backend();
     let (sql, values) = if let Some(series_id) = series_id {
@@ -299,15 +301,10 @@ async fn next_up_inner(
                     AND media_items.parent_id IN (SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Season' AND is_public = 1)
                     AND COALESCE(user_data.played, 0) = 0
                     AND COALESCE(user_data.playback_position_ticks, 0) = 0
-                    ORDER BY media_items.parent_id ASC, media_items.episode_number ASC
-                    LIMIT ?"#,
+                    ORDER BY media_items.parent_id ASC, media_items.episode_number ASC"#,
                 item_queries::media_item_select_sql("")
             ),
-            vec![
-                user_id.into(),
-                series_id.into(),
-                i64::try_from(limit).unwrap_or(25).into(),
-            ],
+            vec![user_id.into(), series_id.into()],
         )
     } else {
         // Global next up: for each series, show the next unwatched episode
@@ -325,15 +322,10 @@ async fn next_up_inner(
                             AND COALESCE(ud3.played, 0) = 0
                             AND COALESCE(ud3.playback_position_ticks, 0) = 0
                     )
-                    ORDER BY media_items.modified_at DESC
-                    LIMIT ?"#,
+                    ORDER BY media_items.modified_at DESC"#,
                 item_queries::media_item_select_sql("")
             ),
-            vec![
-                user_id.into(),
-                user_id.into(),
-                i64::try_from(limit).unwrap_or(i64::MAX).into(),
-            ],
+            vec![user_id.into(), user_id.into()],
         )
     };
 
@@ -351,10 +343,33 @@ pub async fn shows_missing() -> Response {
     Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
 }
 
+fn query_value<'a>(query: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
+    query
+        .iter()
+        .find(|(key, _)| keys.iter().any(|wanted| key.eq_ignore_ascii_case(wanted)))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+fn query_usize(query: &HashMap<String, String>, keys: &[&str], default: usize) -> usize {
+    query_value(query, keys)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{search_hints_inner, similar_items_inner};
-    use sea_orm::{ConnectionTrait, Database};
+    use super::{search_hints_inner, shows_next_up, similar_items_inner};
+    use axum::{
+        body::to_bytes,
+        extract::{Query, State},
+        response::IntoResponse,
+    };
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use serde_json::Value;
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::{RwLock, broadcast};
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn similar_items_require_public_seed_and_hide_private_results() {
@@ -394,6 +409,35 @@ mod tests {
         assert_eq!(hints[1]["Name"], "Alpha Two");
     }
 
+    #[tokio::test]
+    async fn shows_next_up_paging_keeps_total_record_count() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        insert_media_item_typed(&db, "series", "Series", "", "Series", 1, None).await;
+        insert_media_item_typed(&db, "season-1", "S1", "series", "Season", 1, None).await;
+        insert_media_item_typed(&db, "season-2", "S2", "series", "Season", 1, None).await;
+        insert_media_item_typed(&db, "episode-1", "E1", "season-1", "Episode", 0, Some(1)).await;
+        insert_media_item_typed(&db, "episode-2", "E2", "season-2", "Episode", 0, Some(2)).await;
+
+        let state = Arc::new(test_state(db));
+        let mut query = HashMap::new();
+        query.insert("UserId".to_string(), "u1".to_string());
+        query.insert("SeriesId".to_string(), "series".to_string());
+        query.insert("StartIndex".to_string(), "1".to_string());
+        query.insert("Limit".to_string(), "1".to_string());
+        let response = shows_next_up(State(state), Query(query))
+            .await
+            .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["TotalRecordCount"], 2);
+        assert_eq!(value["StartIndex"], 1);
+        let items = value["Items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["Id"], "episode-2");
+    }
+
     async fn insert_media_item(
         db: &sea_orm::DatabaseConnection,
         id: &str,
@@ -404,6 +448,32 @@ mod tests {
             db.get_database_backend(),
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, ?, 1, 1, 1)",
             vec![id.into(), title.into(), id.into(), is_public.into()],
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn insert_media_item_typed(
+        db: &sea_orm::DatabaseConnection,
+        id: &str,
+        title: &str,
+        parent_id: &str,
+        item_type: &str,
+        is_folder: i64,
+        episode_number: Option<i64>,
+    ) {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, episode_number, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?, ?, 1, ?, 1, 1, 1)",
+            vec![
+                id.into(),
+                title.into(),
+                id.into(),
+                parent_id.into(),
+                item_type.into(),
+                is_folder.into(),
+                episode_number.into(),
+            ],
         ))
         .await
         .unwrap();
@@ -427,5 +497,23 @@ mod tests {
         ))
         .await
         .unwrap();
+    }
+
+    fn test_state(db: DatabaseConnection) -> crate::app::state::AppState {
+        let (ws_event_tx, _) = broadcast::channel(4);
+        crate::app::state::AppState {
+            user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, b"test"),
+            access_token: "test-token".to_string(),
+            db,
+            media_dirs: Vec::new(),
+            http_client: reqwest::Client::new(),
+            tmdb_api_key: RwLock::new(None),
+            playback_sessions: RwLock::new(HashMap::new()),
+            session_capabilities: RwLock::new(HashMap::new()),
+            ws_event_tx,
+            sa_config: crate::config::StrmAssistantConfig::default(),
+            intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),
+            queue_manager: Arc::new(crate::queue::QueueManager::default()),
+        }
     }
 }

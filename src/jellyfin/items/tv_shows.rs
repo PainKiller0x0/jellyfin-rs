@@ -55,14 +55,21 @@ pub async fn show_seasons(
     Path(show_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .cloned()
+    let user_id = query_value(&query, &["UserId", "userId"])
+        .map(str::to_string)
         .unwrap_or_else(|| state.user_id.to_string());
+    let start_index = query_usize(&query, &["StartIndex", "startIndex"], 0);
+    let limit = query_limit(&query);
     match child_items_by_type(&state.db, &user_id, &show_id, "Season").await {
         Ok(items) => {
-            let json_items = enrich_season_list(&state.db, &user_id, items).await;
-            Json(json!({ "Items": json_items, "TotalRecordCount": json_items.len() }))
+            let total = items.len();
+            let page = items
+                .into_iter()
+                .skip(start_index)
+                .take(limit)
+                .collect::<Vec<_>>();
+            let json_items = enrich_season_list(&state.db, &user_id, page).await;
+            Json(json!({ "Items": json_items, "TotalRecordCount": total, "StartIndex": start_index }))
                 .into_response()
         }
         Err(error) => internal_error(error),
@@ -74,23 +81,51 @@ pub async fn show_episodes(
     Path(show_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .cloned()
+    let user_id = query_value(&query, &["UserId", "userId"])
+        .map(str::to_string)
         .unwrap_or_else(|| state.user_id.to_string());
-    let result = if let Some(season_id) = query.get("SeasonId") {
+    let start_index = query_usize(&query, &["StartIndex", "startIndex"], 0);
+    let limit = query_limit(&query);
+    let result = if let Some(season_id) = query_value(&query, &["SeasonId", "seasonId"]) {
         child_items_by_type(&state.db, &user_id, season_id, "Episode").await
     } else {
         descendant_episodes(&state.db, &user_id, &show_id).await
     };
     match result {
         Ok(items) => {
-            let json_items = super::enrich_episode_list(&state.db, items).await;
-            Json(json!({ "Items": json_items, "TotalRecordCount": json_items.len() }))
+            let total = items.len();
+            let page = items
+                .into_iter()
+                .skip(start_index)
+                .take(limit)
+                .collect::<Vec<_>>();
+            let json_items = super::enrich_episode_list(&state.db, page).await;
+            Json(json!({ "Items": json_items, "TotalRecordCount": total, "StartIndex": start_index }))
                 .into_response()
         }
         Err(error) => internal_error(error),
     }
+}
+
+fn query_value<'a>(query: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
+    query
+        .iter()
+        .find(|(key, _)| keys.iter().any(|wanted| key.eq_ignore_ascii_case(wanted)))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+fn query_usize(query: &HashMap<String, String>, keys: &[&str], default: usize) -> usize {
+    query_value(query, keys)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn query_limit(query: &HashMap<String, String>) -> usize {
+    query_value(query, &["Limit", "limit"])
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|limit| limit.min(200))
+        .unwrap_or(usize::MAX)
 }
 
 /// Batch-enrich season items with RecursiveItemCount and UnplayedItemCount.
@@ -285,8 +320,19 @@ async fn descendant_episodes(
 
 #[cfg(test)]
 mod tests {
-    use super::{child_items_by_type, descendant_episodes, enrich_season_list};
-    use sea_orm::{ConnectionTrait, Database};
+    use super::{
+        child_items_by_type, descendant_episodes, enrich_season_list, show_episodes, show_seasons,
+    };
+    use axum::{
+        body::to_bytes,
+        extract::{Path, Query, State},
+        response::IntoResponse,
+    };
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use serde_json::Value;
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::{RwLock, broadcast};
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn show_child_queries_hide_private_tree_members() {
@@ -380,6 +426,89 @@ mod tests {
         assert!(private_parent.is_empty());
     }
 
+    #[tokio::test]
+    async fn show_episodes_returns_paged_query_result() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
+            vec!["tv".into(), "TV".into(), "tvshows".into()],
+        ))
+        .await
+        .unwrap();
+        insert_item(&db, "series", "Series", "tv", "Series", 1, 1, None, None).await;
+        insert_item(&db, "season", "S1", "series", "Season", 1, 1, None, None).await;
+        insert_item(
+            &db,
+            "episode-1",
+            "E1",
+            "season",
+            "Episode",
+            0,
+            1,
+            Some(1),
+            Some(1),
+        )
+        .await;
+        insert_item(
+            &db,
+            "episode-2",
+            "E2",
+            "season",
+            "Episode",
+            0,
+            1,
+            Some(1),
+            Some(2),
+        )
+        .await;
+
+        let state = Arc::new(test_state(db));
+        let mut query = HashMap::new();
+        query.insert("UserId".to_string(), "u1".to_string());
+        query.insert("StartIndex".to_string(), "1".to_string());
+        query.insert("Limit".to_string(), "1".to_string());
+        let response = show_episodes(State(state), Path("series".to_string()), Query(query))
+            .await
+            .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["TotalRecordCount"], 2);
+        assert_eq!(value["StartIndex"], 1);
+        let items = value["Items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["Id"], "episode-2");
+    }
+
+    #[tokio::test]
+    async fn show_seasons_returns_start_index() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
+            vec!["tv".into(), "TV".into(), "tvshows".into()],
+        ))
+        .await
+        .unwrap();
+        insert_item(&db, "series", "Series", "tv", "Series", 1, 1, None, None).await;
+        insert_item(&db, "season-1", "S1", "series", "Season", 1, 1, None, None).await;
+
+        let state = Arc::new(test_state(db));
+        let mut query = HashMap::new();
+        query.insert("userId".to_string(), "u1".to_string());
+        let response = show_seasons(State(state), Path("series".to_string()), Query(query))
+            .await
+            .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["TotalRecordCount"], 1);
+        assert_eq!(value["StartIndex"], 0);
+    }
+
     async fn insert_item(
         db: &sea_orm::DatabaseConnection,
         id: &str,
@@ -408,5 +537,23 @@ mod tests {
         ))
         .await
         .unwrap();
+    }
+
+    fn test_state(db: DatabaseConnection) -> crate::app::state::AppState {
+        let (ws_event_tx, _) = broadcast::channel(4);
+        crate::app::state::AppState {
+            user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, b"test"),
+            access_token: "test-token".to_string(),
+            db,
+            media_dirs: Vec::new(),
+            http_client: reqwest::Client::new(),
+            tmdb_api_key: RwLock::new(None),
+            playback_sessions: RwLock::new(HashMap::new()),
+            session_capabilities: RwLock::new(HashMap::new()),
+            ws_event_tx,
+            sa_config: crate::config::StrmAssistantConfig::default(),
+            intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),
+            queue_manager: Arc::new(crate::queue::QueueManager::default()),
+        }
     }
 }

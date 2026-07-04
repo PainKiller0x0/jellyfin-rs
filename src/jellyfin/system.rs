@@ -606,7 +606,12 @@ fn tmdb_client_configuration_value(enabled: bool) -> JsonValue {
 
 #[derive(Deserialize)]
 pub struct TmdbApiKeyRequest {
-    #[serde(rename = "TmdbApiKey")]
+    #[serde(
+        rename = "TmdbApiKey",
+        alias = "ApiKey",
+        alias = "apiKey",
+        alias = "tmdbApiKey"
+    )]
     tmdb_api_key: String,
 }
 
@@ -3819,11 +3824,11 @@ pub async fn encoding_video_codec_information() -> Response {
 mod tests {
     use super::channel_features_value;
     use super::{
-        CameraUploadQuery, CustomQueryRequest, DeviceRecord, camera_upload_history_value,
-        connect_unavailable, default_branding_options, default_plugin_repositories,
-        default_scan_library_triggers, device_options_result, empty_query_result,
-        game_system_display_name, image_by_name_info, is_known_scheduled_task, is_safe_log_name,
-        items_access_value, last_task_result, live_tv_channel_mapping_options,
+        CameraUploadQuery, CustomQueryRequest, DeviceRecord, TmdbApiKeyRequest,
+        camera_upload_history_value, connect_unavailable, default_branding_options,
+        default_plugin_repositories, default_scan_library_triggers, device_options_result,
+        empty_query_result, game_system_display_name, image_by_name_info, is_known_scheduled_task,
+        is_safe_log_name, items_access_value, last_task_result, live_tv_channel_mapping_options,
         live_tv_channel_mapping_options_value, live_tv_default_listing_provider,
         live_tv_default_listing_provider_value, live_tv_default_tuner_host,
         live_tv_default_tuner_host_value, live_tv_guide_info, live_tv_info, live_tv_timer_defaults,
@@ -4306,6 +4311,17 @@ mod tests {
         assert_eq!(disabled["IsTmdbEnabled"], false);
         assert_eq!(disabled["Enabled"], false);
         assert_eq!(disabled["HasApiKey"], false);
+    }
+
+    #[test]
+    fn tmdb_api_key_request_accepts_common_field_names() {
+        let request: TmdbApiKeyRequest =
+            serde_json::from_value(serde_json::json!({ "ApiKey": "abc" })).unwrap();
+        assert_eq!(request.tmdb_api_key, "abc");
+
+        let request: TmdbApiKeyRequest =
+            serde_json::from_value(serde_json::json!({ "tmdbApiKey": "def" })).unwrap();
+        assert_eq!(request.tmdb_api_key, "def");
     }
 
     #[test]

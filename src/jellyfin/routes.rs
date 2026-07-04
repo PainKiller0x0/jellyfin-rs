@@ -791,10 +791,6 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(super::user_extras::trickplay_tile),
         )
         .route(
-            "/Videos/{item_id}/Trickplay/{width}/{index}.jpg",
-            get(super::user_extras::trickplay_tile),
-        )
-        .route(
             "/Videos/{video_id}/{media_source_id}/Attachments/{index}",
             get(super::user_extras::attachment_file),
         )
@@ -1466,6 +1462,11 @@ mod tests {
         let routes = include_str!("routes.rs");
 
         assert!(routes.contains("/Videos/{item_id}/Trickplay/{width}/tiles.m3u8"));
-        assert!(routes.contains("/Videos/{item_id}/Trickplay/{width}/{index}.jpg"));
+        assert!(routes.contains("/Videos/{item_id}/Trickplay/{width}/{index}"));
+    }
+
+    #[test]
+    fn api_routes_build_without_path_pattern_panics() {
+        let _ = super::api_routes();
     }
 }

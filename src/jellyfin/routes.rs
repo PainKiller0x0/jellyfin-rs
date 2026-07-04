@@ -202,12 +202,12 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/Auth/PasswordResetProviders",
             get(auth::password_reset_providers),
         )
-        .route("/Channels", get(common::empty_list))
-        .route("/Channels/Features", get(common::empty_array))
-        .route("/Channels/Items/Latest", get(common::empty_array))
+        .route("/Channels", get(system::channels))
+        .route("/Channels/Features", get(system::all_channel_features))
+        .route("/Channels/Items/Latest", get(system::channel_items))
         .route("/Channels/{channel_id}", get(common::not_found))
-        .route("/Channels/{channel_id}/Features", get(common::not_found))
-        .route("/Channels/{channel_id}/Items", get(common::not_found))
+        .route("/Channels/{channel_id}/Features", get(system::channel_features))
+        .route("/Channels/{channel_id}/Items", get(system::channel_items))
         .route("/LiveTv/Info", get(system::live_tv_info))
         .route("/LiveTv/GuideInfo", get(system::live_tv_guide_info))
         .route(

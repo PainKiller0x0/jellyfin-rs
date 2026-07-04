@@ -1313,6 +1313,22 @@ pub async fn plugins() -> Response {
     Json(plugin_list()).into_response()
 }
 
+pub async fn channels() -> Response {
+    Json(empty_query_result()).into_response()
+}
+
+pub async fn channel_items() -> Response {
+    Json(empty_query_result()).into_response()
+}
+
+pub async fn channel_features() -> Response {
+    Json(channel_features_value()).into_response()
+}
+
+pub async fn all_channel_features() -> Response {
+    Json(Vec::<JsonValue>::new()).into_response()
+}
+
 pub async fn plugin_not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
@@ -1356,6 +1372,25 @@ fn package_list() -> Vec<JsonValue> {
 
 fn plugin_list() -> Vec<JsonValue> {
     Vec::new()
+}
+
+fn empty_query_result() -> JsonValue {
+    json!({ "Items": [], "TotalRecordCount": 0, "StartIndex": 0 })
+}
+
+fn channel_features_value() -> JsonValue {
+    json!({
+        "Name": "",
+        "Id": "",
+        "CanSearch": false,
+        "MediaTypes": [],
+        "ContentTypes": [],
+        "DefaultSortFields": [],
+        "SupportsSortOrderToggle": false,
+        "SupportsLatestMedia": false,
+        "SupportsContentDownloading": false,
+        "AutoRefreshLevels": 0,
+    })
 }
 
 async fn branding_options(db: &DatabaseConnection) -> JsonValue {
@@ -3774,25 +3809,26 @@ pub async fn encoding_video_codec_information() -> Response {
 
 #[cfg(test)]
 mod tests {
+    use super::channel_features_value;
     use super::{
         CameraUploadQuery, CustomQueryRequest, DeviceRecord, camera_upload_history_value,
         connect_unavailable, default_branding_options, default_plugin_repositories,
-        default_scan_library_triggers, device_options_result, game_system_display_name,
-        image_by_name_info, is_known_scheduled_task, is_safe_log_name, items_access_value,
-        last_task_result, live_tv_channel_mapping_options, live_tv_channel_mapping_options_value,
-        live_tv_default_listing_provider, live_tv_default_listing_provider_value,
-        live_tv_default_tuner_host, live_tv_default_tuner_host_value, live_tv_guide_info,
-        live_tv_info, live_tv_timer_defaults, live_tv_timer_defaults_value, live_tv_unavailable,
-        log_file_entry, notification_items, notification_services_test,
-        notification_services_value, package_install_unavailable, package_list, party_unavailable,
-        play_activity_rows, plugin_list, report_activity_headers_for_query, report_csv,
-        report_item_headers_for_query, reports_activity_result, reports_items_result,
-        required_upload_part, run_user_usage_custom_query, safe_log_path,
-        safe_user_usage_backup_file, sanitize_file_part, save_camera_upload_to, scan_library_task,
-        smtp_notification_test, stop_scheduled_task, sync_data, sync_data_result,
-        sync_empty_response, sync_options_result, sync_play_unavailable, sync_unavailable,
-        system_log_file, tmdb_client_configuration_value, ui_command,
-        update_notification_read_state, usage_stats_breakdown_items,
+        default_scan_library_triggers, device_options_result, empty_query_result,
+        game_system_display_name, image_by_name_info, is_known_scheduled_task, is_safe_log_name,
+        items_access_value, last_task_result, live_tv_channel_mapping_options,
+        live_tv_channel_mapping_options_value, live_tv_default_listing_provider,
+        live_tv_default_listing_provider_value, live_tv_default_tuner_host,
+        live_tv_default_tuner_host_value, live_tv_guide_info, live_tv_info, live_tv_timer_defaults,
+        live_tv_timer_defaults_value, live_tv_unavailable, log_file_entry, notification_items,
+        notification_services_test, notification_services_value, package_install_unavailable,
+        package_list, party_unavailable, play_activity_rows, plugin_list,
+        report_activity_headers_for_query, report_csv, report_item_headers_for_query,
+        reports_activity_result, reports_items_result, required_upload_part,
+        run_user_usage_custom_query, safe_log_path, safe_user_usage_backup_file,
+        sanitize_file_part, save_camera_upload_to, scan_library_task, smtp_notification_test,
+        stop_scheduled_task, sync_data, sync_data_result, sync_empty_response, sync_options_result,
+        sync_play_unavailable, sync_unavailable, system_log_file, tmdb_client_configuration_value,
+        ui_command, update_notification_read_state, usage_stats_breakdown_items,
         usage_stats_duration_histogram_items, usage_stats_hourly_items, usage_stats_session_entry,
         usage_user_entry, user_usage_stats_load_backup_from, user_usage_stats_save_backup_to,
         user_usage_stats_user_manage, user_view_grouping_options_value, web_strings_value,
@@ -4005,6 +4041,19 @@ mod tests {
     #[test]
     fn package_list_has_jellyfin_shape() {
         assert!(package_list().is_empty());
+    }
+
+    #[test]
+    fn disabled_channels_have_jellyfin_shapes() {
+        let channels = empty_query_result();
+        assert!(channels["Items"].as_array().unwrap().is_empty());
+        assert_eq!(channels["TotalRecordCount"], 0);
+        assert_eq!(channels["StartIndex"], 0);
+
+        let features = channel_features_value();
+        assert_eq!(features["CanSearch"], false);
+        assert!(features["MediaTypes"].as_array().unwrap().is_empty());
+        assert!(features["ContentTypes"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

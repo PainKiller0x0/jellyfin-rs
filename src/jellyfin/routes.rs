@@ -179,7 +179,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/Packages/Installed/{name}",
             post(system::package_install_unavailable),
         )
-        .route("/Packages/Updates", get(common::empty_array))
+        .route("/Packages/Updates", get(system::package_updates))
         .route(
             "/Packages/Installing/{package_id}",
             delete(system::package_install_unavailable),

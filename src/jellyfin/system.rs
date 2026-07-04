@@ -1277,6 +1277,10 @@ pub async fn package_by_name(Path(name): Path<String>) -> Response {
     Json(package).into_response()
 }
 
+pub async fn package_updates() -> Response {
+    Json(package_update_list()).into_response()
+}
+
 pub async fn package_install_unavailable() -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -1367,6 +1371,10 @@ fn default_plugin_repositories() -> JsonValue {
 }
 
 fn package_list() -> Vec<JsonValue> {
+    Vec::new()
+}
+
+fn package_update_list() -> Vec<JsonValue> {
     Vec::new()
 }
 
@@ -3821,7 +3829,7 @@ mod tests {
         live_tv_default_tuner_host_value, live_tv_guide_info, live_tv_info, live_tv_timer_defaults,
         live_tv_timer_defaults_value, live_tv_unavailable, log_file_entry, notification_items,
         notification_services_test, notification_services_value, package_install_unavailable,
-        package_list, party_unavailable, play_activity_rows, plugin_list,
+        package_list, package_update_list, party_unavailable, play_activity_rows, plugin_list,
         report_activity_headers_for_query, report_csv, report_item_headers_for_query,
         reports_activity_result, reports_items_result, required_upload_part,
         run_user_usage_custom_query, safe_log_path, safe_user_usage_backup_file,
@@ -4041,6 +4049,11 @@ mod tests {
     #[test]
     fn package_list_has_jellyfin_shape() {
         assert!(package_list().is_empty());
+    }
+
+    #[test]
+    fn package_updates_have_emby_shape() {
+        assert!(package_update_list().is_empty());
     }
 
     #[test]

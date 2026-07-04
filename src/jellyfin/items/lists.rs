@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::{IntoResponse, Response},
 };
 use serde_json::{Value, json};
@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::{
     app::state::AppState,
     jellyfin::{
+        auth::query_user_id_or_request,
         common::{internal_error, strip_nulls},
         item_queries::{
             latest_media_items, library_views, list_media_items, list_trailers, resume_media_items,
@@ -31,13 +32,10 @@ pub async fn views(State(state): State<Arc<AppState>>) -> Response {
 
 pub async fn items(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .or_else(|| query.get("userId"))
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     list_items_response(state, user_id, query).await
 }
 
@@ -88,12 +86,10 @@ pub async fn latest_items(
 
 pub async fn latest_items_root(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     let parent_id = query.get("ParentId").map(String::as_str);
     match latest_media_items(&state.db, &user_id, parent_id).await {
         Ok(items) => Json(
@@ -126,14 +122,10 @@ pub async fn resume_items(
 }
 
 pub async fn items_root(
-    State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("userId")
-        .or_else(|| query.get("UserId"))
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     Json(root_folder_value(&user_id)).into_response()
 }
 
@@ -143,13 +135,10 @@ pub async fn user_items_root(Path(user_id): Path<String>) -> Response {
 
 pub async fn trailers(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .or_else(|| query.get("userId"))
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     match list_trailers(&state.db, &user_id, &query).await {
         Ok((items, total)) => {
             media_list_response_with_total(items, total, query_start_index(&query))
@@ -268,6 +257,21 @@ mod tests {
         assert_eq!(value["IsFolder"], true);
         assert!(value.get("Items").is_none());
         assert_eq!(value["UserData"]["ItemId"], value["Id"]);
+    }
+
+    #[test]
+    fn root_folder_defaults_to_request_user() {
+        let query = HashMap::new();
+        let user_id = crate::jellyfin::auth::query_user_id_or_request(&query, "current");
+        assert_eq!(root_folder_value(&user_id)["UserId"], "current");
+    }
+
+    #[test]
+    fn root_folder_query_user_overrides_request_user() {
+        let mut query = HashMap::new();
+        query.insert("userId".to_string(), "target".to_string());
+        let user_id = crate::jellyfin::auth::query_user_id_or_request(&query, "current");
+        assert_eq!(root_folder_value(&user_id)["UserId"], "target");
     }
 
     #[test]

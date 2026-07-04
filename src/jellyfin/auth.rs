@@ -360,13 +360,11 @@ async fn update_user_configuration_response(
     }
 }
 
-fn query_user_id_or_request(query: &HashMap<String, String>, request_user_id: &str) -> String {
-    query
-        .get("userId")
-        .or_else(|| query.get("UserId"))
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|user_id| !user_id.is_empty())
+pub(crate) fn query_user_id_or_request(
+    query: &HashMap<String, String>,
+    request_user_id: &str,
+) -> String {
+    query_user_target(query)
         .unwrap_or(request_user_id)
         .to_string()
 }

@@ -114,6 +114,7 @@ const ADMIN_CONTAINS: &[&str] = &[
     "/Refresh",
     "/Subtitles",
     "/Tags",
+    "/AlternateSources",
     "/metadata/reset",
 ];
 
@@ -2606,6 +2607,10 @@ mod tests {
         assert!(admin_required(&Method::DELETE, "/Audio/i1/Lyrics"));
         assert!(admin_required(&Method::POST, "/Videos/i1/Subtitles"));
         assert!(admin_required(&Method::DELETE, "/Videos/i1/Subtitles/2"));
+        assert!(admin_required(
+            &Method::DELETE,
+            "/Videos/i1/AlternateSources"
+        ));
         assert!(admin_required(&Method::GET, "/Items/i1/MetadataEditor"));
         assert!(admin_required(&Method::GET, "/Items/i1/ExternalIdInfos"));
         assert!(admin_required(&Method::GET, "/Items/i1/RemoteImages"));

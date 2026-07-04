@@ -1321,7 +1321,7 @@ async fn alternate_sources_inner(
     db: &sea_orm::DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Option<Vec<Value>>> {
-    let Some(item) = item_queries::find_media_item_for_admin(db, "", item_id).await? else {
+    let Some(item) = item_queries::find_media_item(db, "", item_id).await? else {
         return Ok(None);
     };
     let parent_id = if item.parent_id.is_empty() {
@@ -1333,12 +1333,12 @@ async fn alternate_sources_inner(
         .query_all(crate::db::helpers::portable_statement(
             db.get_database_backend(),
             &item_queries::media_item_select_sql(
-                "WHERE media_items.parent_id = ? AND media_items.id <> ? AND media_items.item_type = 'Video' ORDER BY media_items.title ASC",
+                "WHERE media_items.parent_id = ? AND media_items.id <> ? AND media_items.item_type = 'Video' AND media_items.is_public = 1 ORDER BY media_items.title ASC",
             ),
             vec!["".into(), parent_id.into(), item.id.as_str().into()],
         ))
         .await?;
-    let items = item_queries::decode_media_items_for_admin(&rows)?;
+    let items = item_queries::decode_media_items(&rows)?;
     let mut sources = Vec::with_capacity(items.len());
     for item in items {
         let streams = crate::jellyfin::playback::media_streams_for_item(db, &item.id)
@@ -1889,15 +1889,22 @@ mod tests {
     async fn alternate_sources_return_and_remove_video_versions() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        for (id, title, parent_id) in [
-            ("parent", "Movie", ""),
-            ("v1", "1080p", "parent"),
-            ("v2", "720p", "parent"),
+        for (id, title, parent_id, is_public) in [
+            ("parent", "Movie", "", 1_i64),
+            ("v1", "1080p", "parent", 1),
+            ("v2", "720p", "parent", 1),
+            ("private", "Private", "parent", 0),
         ] {
             db.execute(crate::db::helpers::portable_statement(
                 db.get_database_backend(),
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, container, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Video', 0, 'mkv', 1, 1, 1)",
-                vec![id.into(), title.into(), format!("/tmp/{id}.mkv").into(), parent_id.into()],
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Video', 0, ?, 'mkv', 1, 1, 1)",
+                vec![
+                    id.into(),
+                    title.into(),
+                    format!("/tmp/{id}.mkv").into(),
+                    parent_id.into(),
+                    is_public.into(),
+                ],
             ))
             .await
             .unwrap();
@@ -1907,6 +1914,7 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0]["Id"], "v2");
         assert_eq!(sources[0]["DirectStreamUrl"], "/Videos/v2/stream.mkv");
+        assert_eq!(alternate_sources_inner(&db, "private").await.unwrap(), None);
 
         assert!(delete_alternate_sources_inner(&db, "v1").await.unwrap());
         let sources = alternate_sources_inner(&db, "v1").await.unwrap().unwrap();

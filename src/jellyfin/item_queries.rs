@@ -557,15 +557,6 @@ pub fn decode_media_items(rows: &[sea_orm::QueryResult]) -> anyhow::Result<Vec<M
         .collect())
 }
 
-pub fn decode_media_items_for_admin(
-    rows: &[sea_orm::QueryResult],
-) -> anyhow::Result<Vec<MediaItem>> {
-    rows.iter()
-        .map(MediaItem::from_query_result)
-        .collect::<Result<Vec<_>, _>>()
-        .context("failed to decode media items")
-}
-
 pub(super) async fn batch_item_image_tags(
     db: &DatabaseConnection,
     item_ids: &[String],

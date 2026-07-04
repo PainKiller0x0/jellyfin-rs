@@ -39,6 +39,12 @@ const MAX_REMOTE_IMAGE_URL_BODY_BYTES: usize = 4096;
 const MAX_IMAGE_INDEX: i64 = 255;
 const MAX_IMAGE_ID_BYTES: usize = 128;
 
+fn visible_media_item_sql(alias: &str) -> String {
+    format!(
+        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
+    )
+}
+
 #[derive(Deserialize)]
 pub(crate) struct UserImagePath {
     user_id: String,
@@ -582,10 +588,14 @@ async fn collage_source_images(
         "Primary"
     };
     let backend = db.get_database_backend();
+    let sql = format!(
+        "SELECT image_assets.path FROM image_assets JOIN media_items mi ON mi.id = image_assets.item_id WHERE mi.parent_id = ? AND {} AND image_assets.image_type = ? ORDER BY mi.title ASC, image_assets.image_index ASC LIMIT 4",
+        visible_media_item_sql("mi")
+    );
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            r#"SELECT image_assets.path FROM image_assets JOIN media_items ON media_items.id = image_assets.item_id WHERE media_items.parent_id = ? AND media_items.is_public = 1 AND image_assets.image_type = ? ORDER BY media_items.title ASC, image_assets.image_index ASC LIMIT 4"#,
+            &sql,
             vec![item_id.into(), preferred_type.into()],
         ))
         .await
@@ -1166,8 +1176,8 @@ pub async fn item_image_tags(db: &DatabaseConnection, item_id: &str) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_IMAGE_BYTES, canonical_image_type, decode_image_body, image_storage_path_allowed,
-        image_type_and_index, is_image_too_large, item_images_inner,
+        MAX_IMAGE_BYTES, canonical_image_type, collage_source_images, decode_image_body,
+        image_storage_path_allowed, image_type_and_index, is_image_too_large, item_images_inner,
     };
     use sea_orm::{ConnectionTrait, Database};
     use std::fs;
@@ -1247,5 +1257,70 @@ mod tests {
                 .is_none()
         );
         assert_eq!(item_images_inner(&db, "private").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn collage_sources_hide_items_under_private_parents() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        for (id, parent_id, is_public) in [
+            ("album", "", 1),
+            ("public-child", "album", 1),
+            ("private-parent", "", 0),
+            ("hidden-child", "private-parent", 1),
+        ] {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', 1, ?, 1, 1, 1)",
+                vec![
+                    id.into(),
+                    id.into(),
+                    format!("/tmp/{id}").into(),
+                    parent_id.into(),
+                    is_public.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let image_dir = std::path::PathBuf::from("data").join("images");
+        fs::create_dir_all(&image_dir).unwrap();
+        let public_image = image_dir.join(format!("public-{}.png", uuid::Uuid::new_v4()));
+        let hidden_image = image_dir.join(format!("hidden-{}.png", uuid::Uuid::new_v4()));
+        fs::write(&public_image, b"public").unwrap();
+        fs::write(&hidden_image, b"hidden").unwrap();
+        for (asset_id, item_id, path) in [
+            ("public-image", "public-child", &public_image),
+            ("hidden-image", "hidden-child", &hidden_image),
+        ] {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, created_at, updated_at) VALUES (?, ?, 'Primary', 0, ?, ?, 1, 1)",
+                vec![
+                    format!("{asset_id}-{}", uuid::Uuid::new_v4()).into(),
+                    item_id.into(),
+                    path.to_string_lossy().to_string().into(),
+                    asset_id.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let images = collage_source_images(&db, "album", "Primary")
+            .await
+            .unwrap();
+        assert_eq!(images, vec![b"public".to_vec()]);
+        assert!(
+            collage_source_images(&db, "private-parent", "Primary")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let _ = fs::remove_file(public_image);
+        let _ = fs::remove_file(hidden_image);
     }
 }

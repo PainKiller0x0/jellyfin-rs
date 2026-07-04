@@ -113,12 +113,10 @@ async fn similar_items_inner(
 
 pub async fn search_hints(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     let search_term = match query.get("SearchTerm").filter(|value| !value.is_empty()) {
         Some(term) => term.clone(),
         None => return Json(json!({ "SearchHints": [], "TotalRecordCount": 0 })).into_response(),

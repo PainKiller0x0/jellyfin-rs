@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -14,7 +14,7 @@ use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
     jellyfin::{
-        auth::request_user_id_and_admin_or_default,
+        auth::{query_user_id_or_request, request_user_id_and_admin_or_default},
         common::{internal_error, strip_nulls},
         item_queries,
     },
@@ -286,13 +286,10 @@ pub(crate) async fn visible_item_from_request(
 pub async fn video_additional_parts(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .or_else(|| query.get("userId"))
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     match additional_parts(&state.db, &user_id, &item_id).await {
         Ok(items) => {
             let total = items.len();

@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -13,6 +13,7 @@ use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
     jellyfin::{
+        auth::query_user_id_or_request,
         common::{internal_error, strip_nulls},
         item_queries,
     },
@@ -23,9 +24,11 @@ use crate::{
 pub async fn item_intros(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    match item_intros_value(&state.db, &request_user_id(&state, &query), &item_id).await {
+    let user_id = query_user_id_or_request(&query, &request_user_id);
+    match item_intros_value(&state.db, &user_id, &item_id).await {
         Ok(value) => Json(value).into_response(),
         Err(error) => internal_error(error),
     }
@@ -35,46 +38,93 @@ pub async fn item_intros(
 pub async fn item_local_trailers(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    item_extra_array(&state, &item_id, &query, ExtraKind::Trailer).await
+    item_extra_array(
+        &state,
+        &request_user_id,
+        &item_id,
+        &query,
+        ExtraKind::Trailer,
+    )
+    .await
 }
 
 /// GET /Items/{item_id}/SpecialFeatures — get special features
 pub async fn item_special_features(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    item_extra_array(&state, &item_id, &query, ExtraKind::SpecialFeature).await
+    item_extra_array(
+        &state,
+        &request_user_id,
+        &item_id,
+        &query,
+        ExtraKind::SpecialFeature,
+    )
+    .await
 }
 
 /// GET /Items/{item_id}/ThemeSongs — theme songs (empty for video server)
 pub async fn item_theme_songs(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    item_theme_result(&state, &item_id, &query, ExtraKind::ThemeSong).await
+    item_theme_result(
+        &state,
+        &request_user_id,
+        &item_id,
+        &query,
+        ExtraKind::ThemeSong,
+    )
+    .await
 }
 
 /// GET /Items/{item_id}/ThemeVideos — theme videos (empty)
 pub async fn item_theme_videos(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    item_theme_result(&state, &item_id, &query, ExtraKind::ThemeVideo).await
+    item_theme_result(
+        &state,
+        &request_user_id,
+        &item_id,
+        &query,
+        ExtraKind::ThemeVideo,
+    )
+    .await
 }
 
 /// GET /Items/{item_id}/ThemeMedia — theme media (empty)
 pub async fn item_theme_media(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let songs = item_theme_result_value(&state, &item_id, &query, ExtraKind::ThemeSong).await;
-    let videos = item_theme_result_value(&state, &item_id, &query, ExtraKind::ThemeVideo).await;
+    let songs = item_theme_result_value(
+        &state,
+        &request_user_id,
+        &item_id,
+        &query,
+        ExtraKind::ThemeSong,
+    )
+    .await;
+    let videos = item_theme_result_value(
+        &state,
+        &request_user_id,
+        &item_id,
+        &query,
+        ExtraKind::ThemeVideo,
+    )
+    .await;
     match (songs, videos) {
         (Ok(theme_songs), Ok(theme_videos)) => Json(json!({
             "ThemeVideosResult": theme_videos,
@@ -89,11 +139,13 @@ pub async fn item_theme_media(
 /// GET /MediaSegments/{item_id} — chapter markers (intro/credits segments)
 async fn item_extra_array(
     state: &AppState,
+    request_user_id: &str,
     item_id: &str,
     query: &HashMap<String, String>,
     kind: ExtraKind,
 ) -> Response {
-    match item_extras(&state.db, &request_user_id(state, query), item_id, kind).await {
+    let user_id = query_user_id_or_request(query, request_user_id);
+    match item_extras(&state.db, &user_id, item_id, kind).await {
         Ok(items) => Json(media_items_json(items)).into_response(),
         Err(error) => internal_error(error),
     }
@@ -101,11 +153,12 @@ async fn item_extra_array(
 
 async fn item_theme_result(
     state: &AppState,
+    request_user_id: &str,
     item_id: &str,
     query: &HashMap<String, String>,
     kind: ExtraKind,
 ) -> Response {
-    match item_theme_result_value(state, item_id, query, kind).await {
+    match item_theme_result_value(state, request_user_id, item_id, query, kind).await {
         Ok(value) => Json(value).into_response(),
         Err(error) => internal_error(error),
     }
@@ -113,11 +166,13 @@ async fn item_theme_result(
 
 async fn item_theme_result_value(
     state: &AppState,
+    request_user_id: &str,
     item_id: &str,
     query: &HashMap<String, String>,
     kind: ExtraKind,
 ) -> anyhow::Result<serde_json::Value> {
-    item_extras(&state.db, &request_user_id(state, query), item_id, kind)
+    let user_id = query_user_id_or_request(query, request_user_id);
+    item_extras(&state.db, &user_id, item_id, kind)
         .await
         .map(|items| theme_result(items, item_id))
 }
@@ -224,14 +279,6 @@ async fn item_intros_value(
     }))
 }
 
-fn request_user_id(state: &AppState, query: &HashMap<String, String>) -> String {
-    query
-        .get("UserId")
-        .or_else(|| query.get("userId"))
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string())
-}
-
 pub async fn media_segments(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
@@ -334,13 +381,10 @@ async fn public_item_runtime_ticks(
 pub async fn item_instant_mix(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .or_else(|| query.get("userId"))
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
 
     match async {
         let seed_ids = seed_ids_for_item(&state.db, &item_id).await?;
@@ -355,32 +399,31 @@ pub async fn item_instant_mix(
 
 pub async fn artist_instant_mix(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let Some(id) = query_param(&query, &["Id", "id", "ItemId", "itemId"]) else {
         return empty_instant_mix_response();
     };
-    artist_instant_mix_for_value(&state, id, &query).await
+    artist_instant_mix_for_value(&state, &request_user_id, id, &query).await
 }
 
 pub async fn artist_instant_mix_by_id(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    artist_instant_mix_for_value(&state, &item_id, &query).await
+    artist_instant_mix_for_value(&state, &request_user_id, &item_id, &query).await
 }
 
 async fn artist_instant_mix_for_value(
     state: &AppState,
+    request_user_id: &str,
     id_or_name: &str,
     query: &HashMap<String, String>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .or_else(|| query.get("userId"))
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(query, request_user_id);
 
     match async {
         let seed_ids = seed_ids_for_artist(&state.db, id_or_name).await?;
@@ -395,32 +438,31 @@ async fn artist_instant_mix_for_value(
 
 pub async fn music_genre_instant_mix(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let Some(id) = query_param(&query, &["Id", "id", "Name", "name"]) else {
         return empty_instant_mix_response();
     };
-    music_genre_instant_mix_for_value(&state, id, &query).await
+    music_genre_instant_mix_for_value(&state, &request_user_id, id, &query).await
 }
 
 pub async fn music_genre_instant_mix_by_name(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    music_genre_instant_mix_for_value(&state, &name, &query).await
+    music_genre_instant_mix_for_value(&state, &request_user_id, &name, &query).await
 }
 
 async fn music_genre_instant_mix_for_value(
     state: &AppState,
+    request_user_id: &str,
     id_or_name: &str,
     query: &HashMap<String, String>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .or_else(|| query.get("userId"))
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(query, request_user_id);
 
     match async {
         let seed_ids = seed_ids_for_music_genre(&state.db, id_or_name, query_limit(query)).await?;

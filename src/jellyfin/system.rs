@@ -2712,40 +2712,28 @@ pub async fn update_server_configuration_partial(
     State(state): State<Arc<AppState>>,
     Json(body): Json<JsonValue>,
 ) -> Response {
-    // Merge with existing config
-    let backend = state.db.get_database_backend();
-    let row = state
-        .db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT value FROM app_settings WHERE key = 'server_config'",
-            vec![],
-        ))
-        .await;
-
-    let mut config: JsonValue = match row {
-        Ok(Some(r)) => {
-            let v: String = r.get_str("value").unwrap_or_else(|_| "{}".to_string());
-            serde_json::from_str(&v).unwrap_or(json!({}))
+    let config = server_config_json(&state.db).await;
+    let config = match configuration::merge_server_configuration_patch(config, body) {
+        Ok(config) => config,
+        Err(error) => {
+            return (
+                error.0,
+                Json(json!({
+                    "Error": error.1
+                })),
+            )
+                .into_response();
         }
-        _ => json!({}),
     };
-
-    // Merge body into config
-    if let (Some(obj), Some(patch)) = (config.as_object_mut(), body.as_object()) {
-        for (k, v) in patch {
-            obj.insert(k.clone(), v.clone());
-        }
+    let value = serde_json::from_str::<JsonValue>(&config).unwrap_or_else(|_| json!({}));
+    if let Err(error) = configuration::sync_runtime_server_settings(&state.db, &value).await {
+        return internal_error(error);
     }
 
-    let now = crate::util::now_unix();
-    let _ = state.db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "INSERT INTO app_settings (key, value, updated_at) VALUES ('server_config', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        vec![config.to_string().into(), now.into()],
-    )).await;
-
-    StatusCode::NO_CONTENT.into_response()
+    match set_app_setting(&state.db, configuration::SERVER_CONFIG_SETTING_KEY, &config).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
 }
 
 /// GET /Features — return server feature support

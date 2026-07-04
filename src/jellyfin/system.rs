@@ -252,7 +252,7 @@ pub async fn client_log_document(headers: HeaderMap, body: Bytes) -> Response {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let file_name = format!("client-{}.log", now_unix());
+    let file_name = client_log_file_name();
     let path = std::path::PathBuf::from("logs").join(&file_name);
     if let Err(error) = tokio::fs::create_dir_all("logs").await {
         return internal_error(error.into());
@@ -261,6 +261,14 @@ pub async fn client_log_document(headers: HeaderMap, body: Bytes) -> Response {
         return internal_error(error.into());
     }
     Json(json!({ "FileName": file_name })).into_response()
+}
+
+fn client_log_file_name() -> String {
+    format!(
+        "client-{}-{}.log",
+        now_unix(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 #[derive(Deserialize, Default)]
@@ -3962,10 +3970,11 @@ mod tests {
     use super::{
         CameraUploadQuery, CustomQueryRequest, DeviceRecord, FALLBACK_FONTS_PATH,
         TmdbApiKeyRequest, activity_log_entry_json, activity_log_query,
-        camera_upload_history_value, connect_unavailable, default_branding_options,
-        default_plugin_repositories, default_scan_library_triggers, device_info,
-        device_options_result, empty_query_result, fallback_font_entries, fallback_font_mime_type,
-        fallback_font_path, game_system_display_name, image_by_name_info, is_known_scheduled_task,
+        camera_upload_history_value, client_log_document, client_log_file_name,
+        connect_unavailable, default_branding_options, default_plugin_repositories,
+        default_scan_library_triggers, device_info, device_options_result, empty_query_result,
+        fallback_font_entries, fallback_font_mime_type, fallback_font_path,
+        game_system_display_name, image_by_name_info, is_known_scheduled_task,
         is_safe_fallback_font_name, is_safe_log_name, items_access_value, last_task_result,
         live_tv_channel_mapping_options, live_tv_channel_mapping_options_value,
         live_tv_default_listing_provider, live_tv_default_listing_provider_value,
@@ -3994,7 +4003,9 @@ mod tests {
     use crate::app::state::{PlaybackSession, PlaybackState, SessionCapabilities};
     use crate::entities::{access_tokens, activity_log, users};
     use axum::{
+        body::Bytes,
         extract::{Path, Query, State},
+        http::HeaderMap,
         response::IntoResponse,
     };
     use sea_orm::{
@@ -5045,6 +5056,39 @@ mod tests {
     #[test]
     fn log_file_entry_rejects_non_logs() {
         assert!(log_file_entry(std::path::Path::new("notes.txt")).is_none());
+    }
+
+    #[test]
+    fn client_log_file_names_are_unique_and_safe() {
+        let first = client_log_file_name();
+        let second = client_log_file_name();
+        assert_ne!(first, second);
+        assert!(is_safe_log_name(&first));
+        assert!(is_safe_log_name(&second));
+    }
+
+    #[tokio::test]
+    async fn client_log_document_writes_unique_safe_log_file() {
+        let root = std::path::PathBuf::from("logs");
+        let existed = root.exists();
+        std::fs::create_dir_all(&root).unwrap();
+
+        let response = client_log_document(HeaderMap::new(), Bytes::from_static(b"hello"))
+            .await
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let name = value["FileName"].as_str().unwrap();
+        assert!(is_safe_log_name(name));
+        assert!(root.join(name).is_file());
+
+        std::fs::remove_file(root.join(name)).unwrap();
+        if !existed {
+            let _ = std::fs::remove_dir(root);
+        }
     }
 
     #[tokio::test]

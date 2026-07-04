@@ -123,8 +123,14 @@ pub async fn search_hints(
         Some(term) => term.clone(),
         None => return Json(json!({ "SearchHints": [], "TotalRecordCount": 0 })).into_response(),
     };
+    let start_index = query
+        .get("StartIndex")
+        .or_else(|| query.get("startIndex"))
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
     let limit = query
         .get("Limit")
+        .or_else(|| query.get("limit"))
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(25);
 
@@ -134,19 +140,15 @@ pub async fn search_hints(
 
     let parent_id = query.get("ParentId").map(String::as_str);
 
-    match search_hints_inner(
-        &state.db,
-        &user_id,
-        &search_term,
-        include_types,
-        parent_id,
-        limit,
-    )
-    .await
-    {
+    match search_hints_inner(&state.db, &user_id, &search_term, include_types, parent_id).await {
         Ok(hints) => {
             let total = hints.len();
-            Json(json!({ "SearchHints": hints, "TotalRecordCount": total })).into_response()
+            let page = hints
+                .into_iter()
+                .skip(start_index)
+                .take(limit)
+                .collect::<Vec<_>>();
+            Json(json!({ "SearchHints": page, "TotalRecordCount": total })).into_response()
         }
         Err(error) => internal_error(error),
     }
@@ -158,7 +160,6 @@ async fn search_hints_inner(
     search_term: &str,
     include_types: Option<Vec<&str>>,
     parent_id: Option<&str>,
-    limit: usize,
 ) -> anyhow::Result<Vec<Value>> {
     let backend = db.get_database_backend();
     let like_pattern = format!("%{}%", search_term);
@@ -198,8 +199,6 @@ async fn search_hints_inner(
             values.push((*t).into());
         }
     }
-    values.push((i64::try_from(limit).unwrap_or(25)).into());
-
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend, &sql, values,
@@ -354,7 +353,7 @@ pub async fn shows_missing() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::similar_items_inner;
+    use super::{search_hints_inner, similar_items_inner};
     use sea_orm::{ConnectionTrait, Database};
 
     #[tokio::test]
@@ -376,6 +375,23 @@ mod tests {
 
         let items = similar_items_inner(&db, "private_seed", 10).await.unwrap();
         assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_hints_inner_returns_all_matches_for_response_paging() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        insert_media_item(&db, "one", "Alpha One", 1).await;
+        insert_media_item(&db, "two", "Alpha Two", 1).await;
+        insert_media_item(&db, "private", "Alpha Private", 0).await;
+
+        let hints = search_hints_inner(&db, "u1", "Alpha", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0]["Name"], "Alpha One");
+        assert_eq!(hints[1]["Name"], "Alpha Two");
     }
 
     async fn insert_media_item(

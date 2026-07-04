@@ -50,6 +50,8 @@ pub(super) const SERVER_CONFIG_SETTING_KEY: &str = "server_config";
 const MAX_SERVER_CONFIGURATION_JSON_BYTES: usize = 256 * 1024;
 const MAX_NAMED_CONFIGURATION_KEY_LEN: usize = 64;
 const MAX_NAMED_CONFIGURATION_JSON_BYTES: usize = 128 * 1024;
+const MAX_STARTUP_TEXT_LEN: usize = 128;
+const MAX_STARTUP_PASSWORD_LEN: usize = 1024;
 
 pub async fn startup_configuration(State(state): State<Arc<AppState>>) -> Response {
     Json(json!({
@@ -76,7 +78,11 @@ pub async fn update_startup_configuration(
         ),
     ] {
         if let Some(value) = value {
-            if let Err(error) = super::set_app_setting(&state.db, key, value.trim()).await {
+            let value = match normalize_startup_text(&value, key, key == "ServerName") {
+                Ok(value) => value,
+                Err(error) => return validation_error_response(error),
+            };
+            if let Err(error) = super::set_app_setting(&state.db, key, &value).await {
                 return internal_error(error);
             }
         }
@@ -99,17 +105,17 @@ pub async fn update_startup_user(
     State(state): State<Arc<AppState>>,
     Json(request): Json<StartupUserRequest>,
 ) -> Response {
-    let username = request.name.trim();
-    if username.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": "Name is required" })),
-        )
-            .into_response();
-    }
+    let username = match normalize_startup_text(&request.name, "Name", true) {
+        Ok(username) => username,
+        Err(error) => return validation_error_response(error),
+    };
+    let password = match normalize_startup_password(&request.password) {
+        Ok(password) => password,
+        Err(error) => return validation_error_response(error),
+    };
 
     let now = now_unix();
-    let password_hash = match hash_password(&request.password) {
+    let password_hash = match hash_password(&password) {
         Ok(hash) => hash,
         Err(error) => return internal_error(error),
     };
@@ -118,9 +124,9 @@ pub async fn update_startup_user(
     let result = match Users::find_by_id(&user_id).one(&state.db).await {
         Ok(Some(model)) => {
             let mut active: users::ActiveModel = model.into();
-            active.username = Set(username.to_string());
+            active.username = Set(username.clone());
             active.password_hash = Set(Some(password_hash));
-            active.display_name = Set(username.to_string());
+            active.display_name = Set(username.clone());
             active.is_admin = Set(1);
             active.is_disabled = Set(0);
             active.updated_at = Set(now);
@@ -129,9 +135,9 @@ pub async fn update_startup_user(
         Ok(None) => {
             let active = users::ActiveModel {
                 id: Set(user_id.clone()),
-                username: Set(username.to_string()),
+                username: Set(username.clone()),
                 password_hash: Set(Some(password_hash)),
-                display_name: Set(username.to_string()),
+                display_name: Set(username.clone()),
                 is_admin: Set(1),
                 is_disabled: Set(0),
                 created_at: Set(now),
@@ -198,7 +204,12 @@ pub async fn update_server_configuration(
         Err(error) => return validation_error_response(error),
     };
 
-    if let Err(error) = sync_runtime_server_settings(&state.db, &request).await {
+    let runtime_settings = match runtime_server_settings(&request) {
+        Ok(settings) => settings,
+        Err(error) => return validation_error_response(error),
+    };
+
+    if let Err(error) = sync_runtime_server_settings(&state.db, runtime_settings).await {
         return internal_error(error);
     }
 
@@ -294,10 +305,10 @@ pub(super) fn merge_server_configuration_patch(
     serialize_server_configuration(&merged)
 }
 
-pub(super) async fn sync_runtime_server_settings(
-    db: &DatabaseConnection,
+pub(super) fn runtime_server_settings(
     request: &Value,
-) -> anyhow::Result<()> {
+) -> Result<Vec<(&'static str, String)>, (StatusCode, &'static str)> {
+    let mut settings = Vec::new();
     for key in [
         "ServerName",
         "UICulture",
@@ -305,17 +316,29 @@ pub(super) async fn sync_runtime_server_settings(
         "PreferredMetadataLanguage",
     ] {
         if let Some(value) = request.get(key).and_then(Value::as_str) {
-            super::set_app_setting(db, key, value.trim()).await?;
+            settings.push((
+                key,
+                normalize_startup_text(value, key, key == "ServerName")?,
+            ));
         }
     }
 
     if let Some(value) = request.get("EnableRemoteAccess").and_then(Value::as_bool) {
-        super::set_app_setting(
-            db,
+        settings.push((
             "EnableRemoteAccess",
-            if value { "true" } else { "false" },
-        )
-        .await?;
+            (if value { "true" } else { "false" }).to_string(),
+        ));
+    }
+
+    Ok(settings)
+}
+
+pub(super) async fn sync_runtime_server_settings(
+    db: &DatabaseConnection,
+    settings: Vec<(&'static str, String)>,
+) -> anyhow::Result<()> {
+    for (key, value) in settings {
+        super::set_app_setting(db, key, &value).await?;
     }
 
     Ok(())
@@ -329,6 +352,38 @@ fn validation_error_response(error: (StatusCode, &'static str)) -> Response {
         })),
     )
         .into_response()
+}
+
+fn normalize_startup_text(
+    value: &str,
+    field: &'static str,
+    required: bool,
+) -> Result<String, (StatusCode, &'static str)> {
+    let value = value.trim();
+    if required && value.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, field));
+    }
+    if value.chars().count() > MAX_STARTUP_TEXT_LEN {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, field));
+    }
+    if value.contains('\0') || value.chars().any(char::is_control) {
+        return Err((StatusCode::BAD_REQUEST, field));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_startup_password(value: &str) -> Result<&str, (StatusCode, &'static str)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Password"));
+    }
+    if value.len() > MAX_STARTUP_PASSWORD_LEN {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Password"));
+    }
+    if value.contains('\0') {
+        return Err((StatusCode::BAD_REQUEST, "Password"));
+    }
+    Ok(value)
 }
 
 fn server_configuration_value(
@@ -469,10 +524,11 @@ fn default_named_configuration(key: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_NAMED_CONFIGURATION_JSON_BYTES, default_named_configuration,
-        merge_server_configuration_patch, named_configuration_setting_key,
-        normalize_named_configuration_key, serialize_named_configuration,
-        server_configuration_value,
+        MAX_NAMED_CONFIGURATION_JSON_BYTES, MAX_STARTUP_PASSWORD_LEN, MAX_STARTUP_TEXT_LEN,
+        default_named_configuration, merge_server_configuration_patch,
+        named_configuration_setting_key, normalize_named_configuration_key,
+        normalize_startup_password, normalize_startup_text, runtime_server_settings,
+        serialize_named_configuration, server_configuration_value,
     };
     use axum::http::StatusCode;
     use serde_json::json;
@@ -510,6 +566,71 @@ mod tests {
         assert_eq!(
             serialize_named_configuration(&oversized).unwrap_err().0,
             StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn startup_inputs_are_normalized_and_limited() {
+        assert_eq!(
+            normalize_startup_text("  Home Server  ", "ServerName", true).unwrap(),
+            "Home Server"
+        );
+        assert_eq!(
+            normalize_startup_text("  ", "UICulture", false).unwrap(),
+            ""
+        );
+        assert_eq!(normalize_startup_password("  secret  ").unwrap(), "secret");
+        assert_eq!(
+            normalize_startup_text("", "ServerName", true)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            normalize_startup_text("bad\nname", "ServerName", true)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            normalize_startup_text(&"x".repeat(MAX_STARTUP_TEXT_LEN + 1), "ServerName", true)
+                .unwrap_err()
+                .0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            normalize_startup_password("").unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            normalize_startup_password(&"x".repeat(MAX_STARTUP_PASSWORD_LEN + 1))
+                .unwrap_err()
+                .0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn runtime_server_settings_validate_text_fields() {
+        let settings = runtime_server_settings(&json!({
+            "ServerName": " Jelly ",
+            "EnableRemoteAccess": true,
+            "UICulture": "en-US"
+        }))
+        .unwrap();
+        assert_eq!(
+            settings,
+            vec![
+                ("ServerName", "Jelly".to_string()),
+                ("UICulture", "en-US".to_string()),
+                ("EnableRemoteAccess", "true".to_string())
+            ]
+        );
+        assert_eq!(
+            runtime_server_settings(&json!({ "ServerName": "bad\nname" }))
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
         );
     }
 

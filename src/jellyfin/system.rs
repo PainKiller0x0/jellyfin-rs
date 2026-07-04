@@ -3172,7 +3172,21 @@ pub async fn update_server_configuration_partial(
         }
     };
     let value = serde_json::from_str::<JsonValue>(&config).unwrap_or_else(|_| json!({}));
-    if let Err(error) = configuration::sync_runtime_server_settings(&state.db, &value).await {
+    let runtime_settings = match configuration::runtime_server_settings(&value) {
+        Ok(settings) => settings,
+        Err(error) => {
+            return (
+                error.0,
+                Json(json!({
+                    "Error": error.1
+                })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(error) =
+        configuration::sync_runtime_server_settings(&state.db, runtime_settings).await
+    {
         return internal_error(error);
     }
 

@@ -766,9 +766,9 @@ pub async fn get_playlist_items(
         .unwrap_or(0);
 
     match playlist_items_inner(&state.db, &playlist_id, offset, limit, is_admin).await {
-        Ok(items) => {
-            let total = items.len();
-            Json(json!({ "Items": items, "TotalRecordCount": total })).into_response()
+        Ok((items, total)) => {
+            Json(json!({ "Items": items, "TotalRecordCount": total, "StartIndex": offset }))
+                .into_response()
         }
         Err(error) => internal_error(error),
     }
@@ -814,8 +814,25 @@ async fn playlist_items_inner(
     offset: usize,
     limit: usize,
     include_private: bool,
-) -> anyhow::Result<Vec<JsonValue>> {
+) -> anyhow::Result<(Vec<JsonValue>, usize)> {
     let backend = db.get_database_backend();
+    let count_row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            if include_private {
+                "SELECT COUNT(*) AS cnt FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ?"
+            } else {
+                "SELECT COUNT(*) AS cnt FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? AND mi.is_public = 1"
+            },
+            vec![playlist_id.into()],
+        ))
+        .await
+        .context("failed to count playlist items")?;
+    let total = count_row
+        .and_then(|row| row.get_i64("cnt").ok())
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0);
+
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
@@ -833,7 +850,7 @@ async fn playlist_items_inner(
         .await
         .context("failed to list playlist items")?;
 
-    Ok(rows
+    let items = rows
         .iter()
         .map(|row| {
             let id: String = row.get_str("id").unwrap_or_default();
@@ -849,7 +866,8 @@ async fn playlist_items_inner(
                 "IndexNumber": sort_order,
             })
         })
-        .collect())
+        .collect();
+    Ok((items, total))
 }
 
 /// POST /Collections/{id}/Items/Delete — batch remove items from collection
@@ -969,24 +987,17 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(
-            playlist_items_inner(&db, "p1", 0, 10, false)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        let (items, total) = playlist_items_inner(&db, "p1", 0, 10, false).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(total, 1);
         assert!(
             remove_children(&db, "p1", "Playlist", &["m1".to_string()])
                 .await
                 .unwrap()
         );
-        assert!(
-            playlist_items_inner(&db, "p1", 0, 10, false)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let (items, total) = playlist_items_inner(&db, "p1", 0, 10, false).await.unwrap();
+        assert!(items.is_empty());
+        assert_eq!(total, 0);
     }
 
     #[tokio::test]
@@ -1008,12 +1019,14 @@ mod tests {
             .unwrap()
         );
 
-        let visible = playlist_items_inner(&db, "p1", 0, 10, false).await.unwrap();
+        let (visible, visible_total) = playlist_items_inner(&db, "p1", 0, 10, false).await.unwrap();
         assert_eq!(visible.len(), 1);
+        assert_eq!(visible_total, 1);
         assert_eq!(visible[0]["Id"], "public");
 
-        let all = playlist_items_inner(&db, "p1", 0, 10, true).await.unwrap();
+        let (all, all_total) = playlist_items_inner(&db, "p1", 0, 10, true).await.unwrap();
         assert_eq!(all.len(), 2);
+        assert_eq!(all_total, 2);
 
         let playlist = get_playlist_inner(&db, "p1", false).await.unwrap().unwrap();
         assert_eq!(playlist["ItemIds"], json!(["public"]));
@@ -1026,6 +1039,32 @@ mod tests {
             .collect::<Vec<_>>();
         item_ids.sort_unstable();
         assert_eq!(item_ids, vec!["private", "public"]);
+    }
+
+    #[tokio::test]
+    async fn playlist_items_total_count_ignores_page_limit() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        insert_media_item(&db, "p1", "Playlist", "Playlist").await;
+        for id in ["m1", "m2", "m3"] {
+            insert_media_item(&db, id, id, "Movie").await;
+        }
+
+        assert!(
+            add_children(
+                &db,
+                "p1",
+                "Playlist",
+                &["m1".to_string(), "m2".to_string(), "m3".to_string()]
+            )
+            .await
+            .unwrap()
+        );
+
+        let (items, total) = playlist_items_inner(&db, "p1", 1, 1, false).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["Id"], "m2");
+        assert_eq!(total, 3);
     }
 
     async fn insert_user(db: &sea_orm::DatabaseConnection, id: &str) {

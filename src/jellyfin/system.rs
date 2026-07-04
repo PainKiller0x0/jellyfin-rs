@@ -599,6 +599,7 @@ pub async fn tmdb_client_configuration(State(state): State<Arc<AppState>>) -> im
 fn tmdb_client_configuration_value(enabled: bool) -> JsonValue {
     json!({
         "IsTmdbEnabled": enabled,
+        "IsEnabled": enabled,
         "Enabled": enabled,
         "HasApiKey": enabled
     })
@@ -4375,11 +4376,13 @@ mod tests {
     fn tmdb_client_configuration_reports_compatible_enabled_fields() {
         let enabled = tmdb_client_configuration_value(true);
         assert_eq!(enabled["IsTmdbEnabled"], true);
+        assert_eq!(enabled["IsEnabled"], true);
         assert_eq!(enabled["Enabled"], true);
         assert_eq!(enabled["HasApiKey"], true);
 
         let disabled = tmdb_client_configuration_value(false);
         assert_eq!(disabled["IsTmdbEnabled"], false);
+        assert_eq!(disabled["IsEnabled"], false);
         assert_eq!(disabled["Enabled"], false);
         assert_eq!(disabled["HasApiKey"], false);
     }

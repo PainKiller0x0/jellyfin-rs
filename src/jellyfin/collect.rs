@@ -25,6 +25,12 @@ const MAX_COLLECTION_PLAYLIST_NAME_LEN: usize = 256;
 const MAX_COLLECTION_PLAYLIST_IDS: usize = 1000;
 const MAX_COLLECTION_PLAYLIST_ID_LEN: usize = 256;
 
+fn visible_media_item_sql(alias: &str) -> String {
+    format!(
+        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
+    )
+}
+
 /// Filter IDs to only those that exist in media_items.
 async fn filter_existing_ids(
     db: &DatabaseConnection,
@@ -845,14 +851,18 @@ async fn get_playlist_inner(
     };
     let title: String = row.get_str("title")?;
 
+    let child_sql = if include_private {
+        "SELECT lc.item_id FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC".to_string()
+    } else {
+        format!(
+            "SELECT lc.item_id FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? AND {} ORDER BY lc.sort_order ASC",
+            visible_media_item_sql("mi")
+        )
+    };
     let child_rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            if include_private {
-                "SELECT lc.item_id FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC"
-            } else {
-                "SELECT lc.item_id FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? AND mi.is_public = 1 ORDER BY lc.sort_order ASC"
-            },
+            &child_sql,
             vec![playlist_id.into()],
         ))
         .await
@@ -1151,14 +1161,18 @@ async fn playlist_items_inner(
     include_private: bool,
 ) -> anyhow::Result<(Vec<JsonValue>, usize)> {
     let backend = db.get_database_backend();
+    let count_sql = if include_private {
+        "SELECT COUNT(*) AS cnt FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ?".to_string()
+    } else {
+        format!(
+            "SELECT COUNT(*) AS cnt FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? AND {}",
+            visible_media_item_sql("mi")
+        )
+    };
     let count_row = db
         .query_one(crate::db::helpers::portable_statement(
             backend,
-            if include_private {
-                "SELECT COUNT(*) AS cnt FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ?"
-            } else {
-                "SELECT COUNT(*) AS cnt FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? AND mi.is_public = 1"
-            },
+            &count_sql,
             vec![playlist_id.into()],
         ))
         .await
@@ -1168,14 +1182,18 @@ async fn playlist_items_inner(
         .and_then(|count| usize::try_from(count).ok())
         .unwrap_or(0);
 
+    let item_sql = if include_private {
+        r#"SELECT mi.id, mi.title, mi.item_type, mi.production_year, mi.runtime_ticks, lc.sort_order FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC LIMIT ? OFFSET ?"#.to_string()
+    } else {
+        format!(
+            "SELECT mi.id, mi.title, mi.item_type, mi.production_year, mi.runtime_ticks, lc.sort_order FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? AND {} ORDER BY lc.sort_order ASC LIMIT ? OFFSET ?",
+            visible_media_item_sql("mi")
+        )
+    };
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            if include_private {
-                r#"SELECT mi.id, mi.title, mi.item_type, mi.production_year, mi.runtime_ticks, lc.sort_order FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC LIMIT ? OFFSET ?"#
-            } else {
-                r#"SELECT mi.id, mi.title, mi.item_type, mi.production_year, mi.runtime_ticks, lc.sort_order FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? AND mi.is_public = 1 ORDER BY lc.sort_order ASC LIMIT ? OFFSET ?"#
-            },
+            &item_sql,
             vec![
                 playlist_id.into(),
                 i64::try_from(limit).unwrap_or(50).into(),
@@ -1492,13 +1510,27 @@ mod tests {
         insert_media_item(&db, "p1", "Playlist", "Playlist").await;
         insert_media_item_with_visibility(&db, "public", "Public", "Movie", 1).await;
         insert_media_item_with_visibility(&db, "private", "Private", "Movie", 0).await;
+        insert_media_item_with_parent(&db, "hidden-parent", "Hidden Parent", "Movie", "", 0).await;
+        insert_media_item_with_parent(
+            &db,
+            "hidden-child",
+            "Hidden Child",
+            "Movie",
+            "hidden-parent",
+            1,
+        )
+        .await;
 
         assert!(
             add_children(
                 &db,
                 "p1",
                 "Playlist",
-                &["public".to_string(), "private".to_string()]
+                &[
+                    "public".to_string(),
+                    "private".to_string(),
+                    "hidden-child".to_string(),
+                ]
             )
             .await
             .unwrap()
@@ -1510,8 +1542,8 @@ mod tests {
         assert_eq!(visible[0]["Id"], "public");
 
         let (all, all_total) = playlist_items_inner(&db, "p1", 0, 10, true).await.unwrap();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all_total, 2);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all_total, 3);
 
         let playlist = get_playlist_inner(&db, "p1", false).await.unwrap().unwrap();
         assert_eq!(playlist["ItemIds"], json!(["public"]));
@@ -1523,7 +1555,7 @@ mod tests {
             .filter_map(|value| value.as_str())
             .collect::<Vec<_>>();
         item_ids.sort_unstable();
-        assert_eq!(item_ids, vec!["private", "public"]);
+        assert_eq!(item_ids, vec!["hidden-child", "private", "public"]);
     }
 
     #[tokio::test]
@@ -1578,13 +1610,25 @@ mod tests {
         item_type: &str,
         is_public: i64,
     ) {
+        insert_media_item_with_parent(db, id, title, item_type, "", is_public).await;
+    }
+
+    async fn insert_media_item_with_parent(
+        db: &sea_orm::DatabaseConnection,
+        id: &str,
+        title: &str,
+        item_type: &str,
+        parent_id: &str,
+        is_public: i64,
+    ) {
         db.execute(crate::db::helpers::portable_statement(
             db.get_database_backend(),
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', ?, 1, ?, 1, 1, 1)",
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?, 1, ?, 1, 1, 1)",
             vec![
                 id.into(),
                 title.into(),
                 id.into(),
+                parent_id.into(),
                 item_type.into(),
                 is_public.into(),
             ],

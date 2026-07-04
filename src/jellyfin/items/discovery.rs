@@ -162,11 +162,18 @@ async fn search_hints_inner(
     let backend = db.get_database_backend();
     let like_pattern = format!("%{}%", search_term);
 
-    let mut where_parts = vec!["media_items.is_folder = 0".to_string()];
+    let mut where_parts = vec![
+        "media_items.is_folder = 0".to_string(),
+        "media_items.is_public = 1".to_string(),
+    ];
     where_parts.push("LOWER(media_items.title) LIKE LOWER(?)".to_string());
 
     if parent_id.is_some() {
         where_parts.push("media_items.parent_id = ?".to_string());
+        where_parts.push(
+            "(EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = ?) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = ? AND parent.is_public = 1))"
+                .to_string(),
+        );
     }
 
     if let Some(types) = &include_types {
@@ -190,6 +197,8 @@ async fn search_hints_inner(
     values.push(user_id.into());
     values.push(like_pattern.clone().into());
     if let Some(pid) = parent_id {
+        values.push(pid.into());
+        values.push(pid.into());
         values.push(pid.into());
     }
     if let Some(types) = &include_types {
@@ -419,6 +428,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_hints_require_visible_parent() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        insert_media_item_typed(&db, "visible-parent", "Visible", "", "Folder", 1, None).await;
+        insert_media_item_typed(&db, "hidden-parent", "Hidden", "", "Folder", 1, None).await;
+        update_item_visibility(&db, "hidden-parent", 0).await;
+        insert_media_item_typed(
+            &db,
+            "visible-child",
+            "Alpha Visible",
+            "visible-parent",
+            "Movie",
+            0,
+            None,
+        )
+        .await;
+        insert_media_item_typed(
+            &db,
+            "hidden-child",
+            "Alpha Hidden",
+            "hidden-parent",
+            "Movie",
+            0,
+            None,
+        )
+        .await;
+
+        let visible = search_hints_inner(&db, "u1", "Alpha", None, Some("visible-parent"))
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0]["ItemId"], "visible-child");
+
+        let hidden = search_hints_inner(&db, "u1", "Alpha", None, Some("hidden-parent"))
+            .await
+            .unwrap();
+        assert!(hidden.is_empty());
+    }
+
+    #[tokio::test]
     async fn shows_next_up_paging_keeps_total_record_count() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
@@ -483,6 +532,16 @@ mod tests {
                 is_folder.into(),
                 episode_number.into(),
             ],
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn update_item_visibility(db: &sea_orm::DatabaseConnection, id: &str, is_public: i64) {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "UPDATE media_items SET is_public = ? WHERE id = ?",
+            vec![is_public.into(), id.into()],
         ))
         .await
         .unwrap();

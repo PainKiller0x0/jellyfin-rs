@@ -36,6 +36,12 @@ const MAX_METADATA_WRITE_IDS: usize = 1000;
 const MAX_METADATA_WRITE_ID_LEN: usize = 256;
 const MAX_MERGE_VERSION_IDS: usize = 100;
 
+fn visible_media_item_sql(alias: &str) -> String {
+    format!(
+        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
+    )
+}
+
 #[derive(Deserialize)]
 pub struct UploadSubtitleRequest {
     #[serde(rename = "Data")]
@@ -165,10 +171,11 @@ async fn item_lyrics_inner(
     item_id: &str,
 ) -> anyhow::Result<Option<Value>> {
     let backend = db.get_database_backend();
+    let visible = visible_media_item_sql("media_items");
     let Some(row) = db
         .query_one(crate::db::helpers::portable_statement(
             backend,
-            "SELECT title, path, runtime_ticks FROM media_items WHERE id = ? AND item_type = 'Audio' AND is_public = 1",
+            &format!("SELECT title, path, runtime_ticks FROM media_items WHERE id = ? AND item_type = 'Audio' AND {visible}"),
             vec![item_id.into()],
         ))
         .await?
@@ -1332,9 +1339,10 @@ async fn alternate_sources_inner(
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             db.get_database_backend(),
-            &item_queries::media_item_select_sql(
-                "WHERE media_items.parent_id = ? AND media_items.id <> ? AND media_items.item_type = 'Video' AND media_items.is_public = 1 ORDER BY media_items.title ASC",
-            ),
+            &item_queries::media_item_select_sql(&format!(
+                "WHERE media_items.parent_id = ? AND media_items.id <> ? AND media_items.item_type = 'Video' AND {} ORDER BY media_items.title ASC",
+                visible_media_item_sql("media_items")
+            )),
             vec!["".into(), parent_id.into(), item.id.as_str().into()],
         ))
         .await?;
@@ -1375,9 +1383,10 @@ async fn audiobooks_next_up_inner(
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             db.get_database_backend(),
-            &item_queries::media_item_select_sql(
-                "WHERE media_items.item_type = 'Audio' AND media_items.is_folder = 0 AND media_items.is_public = 1 AND COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) > 0 ORDER BY user_data.updated_at DESC",
-            ),
+            &item_queries::media_item_select_sql(&format!(
+                "WHERE media_items.item_type = 'Audio' AND media_items.is_folder = 0 AND {} AND COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) > 0 ORDER BY user_data.updated_at DESC",
+                visible_media_item_sql("media_items")
+            )),
             vec![user_id.into()],
         ))
         .await?;
@@ -1535,6 +1544,29 @@ mod tests {
 
         assert_eq!(item_lyrics_inner(&db, "song").await.unwrap(), None);
 
+        let public_child_path = dir.join("public-child.mp3");
+        let public_child_lyric_path = dir.join("public-child.lrc");
+        std::fs::write(&public_child_path, b"audio").unwrap();
+        std::fs::write(&public_child_lyric_path, "[00:02.00]Still hidden").unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('private-parent', 'Private Parent', ?, 'music', '', 'MusicAlbum', 1, 0, 1, 1, 1)",
+            vec![dir.join("private-parent").to_string_lossy().to_string().into()],
+        ))
+        .await
+        .unwrap();
+        insert_audio_item_with_parent(
+            &db,
+            "public-child",
+            "Public Child",
+            &public_child_path,
+            "private-parent",
+            true,
+        )
+        .await;
+        insert_library_path(&db, &dir).await;
+        assert_eq!(item_lyrics_inner(&db, "public-child").await.unwrap(), None);
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1611,6 +1643,17 @@ mod tests {
         path: &std::path::Path,
         is_public: bool,
     ) {
+        insert_audio_item_with_parent(db, id, title, path, "", is_public).await;
+    }
+
+    async fn insert_audio_item_with_parent(
+        db: &DatabaseConnection,
+        id: &str,
+        title: &str,
+        path: &std::path::Path,
+        parent_id: &str,
+        is_public: bool,
+    ) {
         let backend = db.get_database_backend();
         db.execute(crate::db::helpers::portable_statement(
             backend,
@@ -1621,12 +1664,13 @@ mod tests {
         .unwrap();
         db.execute(crate::db::helpers::portable_statement(
             backend,
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, ?, '', 'Audio', 0, ?, 1, 1, 1)",
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'Audio', 0, ?, 1, 1, 1)",
             vec![
                 id.into(),
                 title.into(),
                 path.to_string_lossy().to_string().into(),
                 "music".into(),
+                parent_id.into(),
                 i64::from(is_public).into(),
             ],
         ))
@@ -1928,6 +1972,8 @@ mod tests {
             ("v1", "1080p", "parent", 1),
             ("v2", "720p", "parent", 1),
             ("private", "Private", "parent", 0),
+            ("hidden-parent", "Hidden Parent", "", 0),
+            ("hidden-child", "Hidden Child", "hidden-parent", 1),
         ] {
             db.execute(crate::db::helpers::portable_statement(
                 db.get_database_backend(),
@@ -1949,6 +1995,10 @@ mod tests {
         assert_eq!(sources[0]["Id"], "v2");
         assert_eq!(sources[0]["DirectStreamUrl"], "/Videos/v2/stream.mkv");
         assert_eq!(alternate_sources_inner(&db, "private").await.unwrap(), None);
+        assert_eq!(
+            alternate_sources_inner(&db, "hidden-child").await.unwrap(),
+            None
+        );
 
         assert!(delete_alternate_sources_inner(&db, "v1").await.unwrap());
         let sources = alternate_sources_inner(&db, "v1").await.unwrap().unwrap();
@@ -1971,6 +2021,22 @@ mod tests {
         insert_audio_item(&db, "a2", "Chapter 2", &dir.join("a2.mp3"), true).await;
         db.execute(crate::db::helpers::portable_statement(
             db.get_database_backend(),
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('private-parent', 'Private Parent', ?, 'music', '', 'MusicAlbum', 1, 0, 1, 1, 1)",
+            vec![dir.join("private-parent").to_string_lossy().to_string().into()],
+        ))
+        .await
+        .unwrap();
+        insert_audio_item_with_parent(
+            &db,
+            "hidden-child",
+            "Hidden Child",
+            &dir.join("hidden-child.mp3"),
+            "private-parent",
+            true,
+        )
+        .await;
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
             "INSERT INTO user_data (user_id, item_id, played, playback_position_ticks, play_count, updated_at) VALUES (?, ?, 0, 42, 0, 10)",
             vec!["u1".into(), "a1".into()],
         ))
@@ -1980,6 +2046,13 @@ mod tests {
             db.get_database_backend(),
             "INSERT INTO user_data (user_id, item_id, played, playback_position_ticks, play_count, updated_at) VALUES (?, ?, 1, 100, 1, 20)",
             vec!["u1".into(), "a2".into()],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO user_data (user_id, item_id, played, playback_position_ticks, play_count, updated_at) VALUES (?, ?, 0, 99, 0, 30)",
+            vec!["u1".into(), "hidden-child".into()],
         ))
         .await
         .unwrap();
@@ -2010,7 +2083,28 @@ mod tests {
         insert_audio_item(&db, "a1", "Chapter 1", &dir.join("a1.mp3"), true).await;
         insert_audio_item(&db, "a2", "Chapter 2", &dir.join("a2.mp3"), true).await;
         insert_audio_item(&db, "private", "Private", &dir.join("private.mp3"), false).await;
-        for (id, updated_at) in [("a1", 10_i64), ("a2", 20), ("private", 30)] {
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('hidden-parent', 'Hidden Parent', ?, 'music', '', 'MusicAlbum', 1, 0, 1, 1, 1)",
+            vec![dir.join("hidden-parent").to_string_lossy().to_string().into()],
+        ))
+        .await
+        .unwrap();
+        insert_audio_item_with_parent(
+            &db,
+            "hidden-child",
+            "Hidden Child",
+            &dir.join("hidden-child.mp3"),
+            "hidden-parent",
+            true,
+        )
+        .await;
+        for (id, updated_at) in [
+            ("a1", 10_i64),
+            ("a2", 20),
+            ("private", 30),
+            ("hidden-child", 40),
+        ] {
             db.execute(crate::db::helpers::portable_statement(
                 db.get_database_backend(),
                 "INSERT INTO user_data (user_id, item_id, played, playback_position_ticks, play_count, updated_at) VALUES (?, ?, 0, 42, 0, ?)",

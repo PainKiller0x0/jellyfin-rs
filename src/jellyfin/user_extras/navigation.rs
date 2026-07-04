@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
-    jellyfin::{common::internal_error, item_queries},
+    jellyfin::{auth::query_user_id_or_request, common::internal_error, item_queries},
 };
 
 /// GET /Items/Filters2 — return available filter values for a query
@@ -179,12 +179,10 @@ async fn filters2_inner(
 pub async fn item_ancestors(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     match item_ancestors_inner(&state.db, &user_id, &item_id).await {
         Ok(ancestors) => Json(ancestors).into_response(),
         Err(error) => internal_error(error),
@@ -239,24 +237,20 @@ async fn item_ancestors_inner(
 /// GET /Items/Suggestions — alternative suggestions path
 pub async fn items_suggestions(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     crate::jellyfin::items::user_suggestions(State(state), Path(user_id), Query(query)).await
 }
 
 /// GET /UserItems/Resume — alternative resume path
 pub async fn user_items_resume(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query
-        .get("UserId")
-        .cloned()
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     crate::jellyfin::items::resume_items(State(state), Path(user_id), Query(query)).await
 }
 
@@ -271,11 +265,10 @@ pub async fn items_filters(
 /// GET /Shows/Upcoming — upcoming episodes (recently aired)
 pub async fn shows_upcoming(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id = query_value(&query, &["UserId", "userId"])
-        .map(str::to_string)
-        .unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     let start_index = query_usize(&query, &["StartIndex", "startIndex"], 0);
     let limit = query_usize(&query, &["Limit", "limit"], 16).min(200);
 
@@ -443,7 +436,7 @@ mod tests {
     };
     use axum::{
         body::to_bytes,
-        extract::{Query, State},
+        extract::{Extension, Query, State},
         response::IntoResponse,
     };
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
@@ -578,7 +571,7 @@ mod tests {
         query.insert("UserId".to_string(), "u1".to_string());
         query.insert("StartIndex".to_string(), "1".to_string());
         query.insert("Limit".to_string(), "1".to_string());
-        let response = shows_upcoming(State(state), Query(query))
+        let response = shows_upcoming(State(state), Extension("u1".to_string()), Query(query))
             .await
             .into_response();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();

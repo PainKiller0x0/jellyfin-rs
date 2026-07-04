@@ -8,7 +8,7 @@ use anyhow::Context;
 use axum::{
     Json,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -21,6 +21,7 @@ use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
     jellyfin::{
+        auth::query_user_id_or_request,
         common::{internal_error, strip_nulls},
         item_queries,
     },
@@ -1062,10 +1063,10 @@ pub async fn delete_alternate_source(
 /// GET /AudioBooks/NextUp — audiobooks next up (stub)
 pub async fn audiobooks_next_up(
     State(state): State<Arc<AppState>>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let user_id =
-        query_value(&query, &["UserId", "userId"]).unwrap_or_else(|| state.user_id.to_string());
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     let limit = query_value(&query, &["Limit", "limit"])
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(25)
@@ -1220,7 +1221,7 @@ mod tests {
         upload_lyrics_inner, upload_subtitle_inner,
     };
     use axum::body::{Bytes, to_bytes};
-    use axum::extract::{Query, State};
+    use axum::extract::{Extension, Query, State};
     use axum::response::IntoResponse;
     use base64::{Engine as _, engine::general_purpose};
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
@@ -1628,7 +1629,7 @@ mod tests {
         query.insert("UserId".to_string(), "u1".to_string());
         query.insert("StartIndex".to_string(), "1".to_string());
         query.insert("Limit".to_string(), "1".to_string());
-        let response = audiobooks_next_up(State(state), Query(query))
+        let response = audiobooks_next_up(State(state), Extension("u1".to_string()), Query(query))
             .await
             .into_response();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();

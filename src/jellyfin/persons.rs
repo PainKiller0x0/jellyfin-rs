@@ -19,6 +19,12 @@ use crate::{
     jellyfin::{auth::request_user_id_and_admin_or_default, common::internal_error},
 };
 
+fn visible_media_item_sql(alias: &str) -> String {
+    format!(
+        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
+    )
+}
+
 pub async fn person_by_name(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -212,7 +218,7 @@ async fn artist_list(
     );
     let mut values: Vec<Value> = person_types.iter().map(|value| (*value).into()).collect();
     if !include_private {
-        sql.push_str(" AND mi.is_public = 1");
+        sql.push_str(&format!(" AND {}", visible_media_item_sql("mi")));
     }
 
     if let Some(item_id) = query_param(query, &["ItemId", "itemId", "ParentId", "parentId"])
@@ -333,7 +339,11 @@ async fn has_artist_relation(
             db.get_database_backend(),
             &format!(
                 "SELECT COUNT(*) AS cnt FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id WHERE mp.person_id = ? AND LOWER(mp.person_type) IN ({placeholders}){}",
-                if include_private { "" } else { " AND mi.is_public = 1" }
+                if include_private {
+                    String::new()
+                } else {
+                    format!(" AND {}", visible_media_item_sql("mi"))
+                }
             ),
             values,
         ))
@@ -353,7 +363,11 @@ async fn has_person_relation(
             db.get_database_backend(),
             &format!(
                 "SELECT COUNT(*) AS cnt FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id WHERE mp.person_id = ?{}",
-                if include_private { "" } else { " AND mi.is_public = 1" }
+                if include_private {
+                    String::new()
+                } else {
+                    format!(" AND {}", visible_media_item_sql("mi"))
+                }
             ),
             vec![person_id.into()],
         ))
@@ -506,7 +520,7 @@ async fn fetch_tagged_items(
     // Build WHERE conditions
     let mut where_parts = vec!["mp.person_id = ?".to_string()];
     if !include_private {
-        where_parts.push("mi.is_public = 1".to_string());
+        where_parts.push(visible_media_item_sql("mi"));
     }
     for _ in include_item_types {
         where_parts.push("mi.item_type = ?".to_string());
@@ -620,7 +634,7 @@ async fn count_tagged_items(
     );
     let mut values: Vec<Value> = vec![person_id.into()];
     if !include_private {
-        sql.push_str(" AND mi.is_public = 1");
+        sql.push_str(&format!(" AND {}", visible_media_item_sql("mi")));
     }
 
     if !include_item_types.is_empty() {
@@ -679,8 +693,14 @@ struct PersonRow {
 
 #[cfg(test)]
 mod tests {
-    use super::{artist_person_types, count_tagged_items, fetch_tagged_items, has_person_relation};
+    use super::{
+        artist_person_types, count_tagged_items, fetch_tagged_items, has_person_relation,
+        serve_person_image,
+    };
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
     use sea_orm::{ConnectionTrait, Database};
+    use std::path::PathBuf;
 
     #[test]
     fn artist_type_filter_matches_artist_kind() {
@@ -709,8 +729,12 @@ mod tests {
         insert_person(&db, "p1", "Actor").await;
         insert_media_item(&db, "public", "Public", 1).await;
         insert_media_item(&db, "private", "Private", 0).await;
+        insert_media_item_with_parent(&db, "hidden-parent", "Hidden Parent", "", 0).await;
+        insert_media_item_with_parent(&db, "hidden-child", "Hidden Child", "hidden-parent", 1)
+            .await;
         insert_media_person(&db, "public", "p1", "Actor").await;
         insert_media_person(&db, "private", "p1", "Actor").await;
+        insert_media_person(&db, "hidden-child", "p1", "Actor").await;
 
         let visible = fetch_tagged_items(
             &db,
@@ -749,10 +773,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
         assert_eq!(
             count_tagged_items(&db, "p1", &[], &[], true).await.unwrap(),
-            2
+            3
         );
         assert!(has_person_relation(&db, "p1", false).await.unwrap());
     }
@@ -767,6 +791,89 @@ mod tests {
 
         assert!(!has_person_relation(&db, "p1", false).await.unwrap());
         assert!(has_person_relation(&db, "p1", true).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn public_child_under_private_parent_does_not_expose_person() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        insert_person(&db, "p1", "Actor").await;
+        insert_media_item_with_parent(&db, "hidden-parent", "Hidden Parent", "", 0).await;
+        insert_media_item_with_parent(&db, "hidden-child", "Hidden Child", "hidden-parent", 1)
+            .await;
+        insert_media_person(&db, "hidden-child", "p1", "Actor").await;
+
+        assert!(!has_person_relation(&db, "p1", false).await.unwrap());
+        assert!(has_person_relation(&db, "p1", true).await.unwrap());
+        assert!(
+            fetch_tagged_items(
+                &db,
+                "p1",
+                None,
+                &[],
+                &[],
+                "SortName",
+                "Ascending",
+                10,
+                0,
+                false,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            count_tagged_items(&db, "p1", &[], &[], false)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn person_image_requires_visible_person_relation() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        insert_person(&db, "p1", "Actor").await;
+        insert_media_item_with_parent(&db, "hidden-parent", "Hidden Parent", "", 0).await;
+        insert_media_item_with_parent(&db, "hidden-child", "Hidden Child", "hidden-parent", 1)
+            .await;
+        insert_media_person(&db, "hidden-child", "p1", "Actor").await;
+        insert_media_item(&db, "p1", "Image Asset Placeholder", 1).await;
+
+        let image_path = PathBuf::from("data").join("images").join(format!(
+            "person-private-{}.png",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(image_path.parent().unwrap()).unwrap();
+        std::fs::write(&image_path, b"png").unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, created_at, updated_at) VALUES (?, 'p1', 'Primary', 0, ?, 'tag', 1, 1)",
+            vec![
+                format!("img-{}", uuid::Uuid::new_v4().simple()).into(),
+                image_path.to_string_lossy().to_string().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            serve_person_image(&db, &HeaderMap::new(), "Actor", "Primary", 0, false)
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            serve_person_image(&db, &HeaderMap::new(), "Actor", "Primary", 0, true)
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+
+        std::fs::remove_file(image_path).unwrap();
     }
 
     async fn insert_person(db: &sea_orm::DatabaseConnection, id: &str, name: &str) {
@@ -785,10 +892,26 @@ mod tests {
         title: &str,
         is_public: i64,
     ) {
+        insert_media_item_with_parent(db, id, title, "", is_public).await;
+    }
+
+    async fn insert_media_item_with_parent(
+        db: &sea_orm::DatabaseConnection,
+        id: &str,
+        title: &str,
+        parent_id: &str,
+        is_public: i64,
+    ) {
         db.execute(crate::db::helpers::portable_statement(
             db.get_database_backend(),
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, ?, 1, 1, 1)",
-            vec![id.into(), title.into(), id.into(), is_public.into()],
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', 0, ?, 1, 1, 1)",
+            vec![
+                id.into(),
+                title.into(),
+                id.into(),
+                parent_id.into(),
+                is_public.into(),
+            ],
         ))
         .await
         .unwrap();
@@ -815,8 +938,10 @@ pub async fn person_image(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((name, image_type)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    serve_person_image(&state.db, &headers, &name, &image_type, 0).await
+    let (_, is_admin) = request_user_id_and_admin_or_default(&state, &headers, &query).await;
+    serve_person_image(&state.db, &headers, &name, &image_type, 0, is_admin).await
 }
 
 /// Serve person image with index — GET /Persons/{name}/Images/{imageType}/{index}
@@ -824,13 +949,23 @@ pub async fn person_image_with_index(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((name, first, second)): Path<(String, String, String)>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let (image_type, image_index) = if let Ok(index) = second.parse::<i64>() {
         (first, index)
     } else {
         (second, first.parse::<i64>().unwrap_or_default())
     };
-    serve_person_image(&state.db, &headers, &name, &image_type, image_index).await
+    let (_, is_admin) = request_user_id_and_admin_or_default(&state, &headers, &query).await;
+    serve_person_image(
+        &state.db,
+        &headers,
+        &name,
+        &image_type,
+        image_index,
+        is_admin,
+    )
+    .await
 }
 
 async fn serve_person_image(
@@ -839,6 +974,7 @@ async fn serve_person_image(
     name: &str,
     image_type: &str,
     image_index: i64,
+    include_private: bool,
 ) -> Response {
     // Find person by name
     let person = match find_person_by_name(db, name).await {
@@ -846,6 +982,11 @@ async fn serve_person_image(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return internal_error(e),
     };
+    match has_person_relation(db, &person.id, include_private).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return internal_error(error),
+    }
 
     // Find image asset
     let model = match ImageAssets::find()

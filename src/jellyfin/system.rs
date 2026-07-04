@@ -43,6 +43,8 @@ const MAX_DEVICE_CUSTOM_NAME_LEN: usize = 128;
 const MAX_PLUGIN_REPOSITORIES: usize = 32;
 const MAX_PLUGIN_REPOSITORY_NAME_LEN: usize = 128;
 const MAX_PLUGIN_REPOSITORY_URL_LEN: usize = 2048;
+const MAX_SCHEDULED_TASK_TRIGGERS: usize = 32;
+const MAX_SCHEDULED_TASK_TRIGGERS_JSON_BYTES: usize = 32 * 1024;
 const CAMERA_UPLOADS_PATH: &str = "data/camera_uploads";
 const USER_USAGE_BACKUP_PATH: &str = "data/user_usage_stats";
 const FALLBACK_FONTS_PATH: &str = "data/fonts";
@@ -1324,9 +1326,10 @@ pub async fn update_scheduled_task_triggers(
     if !is_known_scheduled_task(&task_id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if !triggers.is_array() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
+    let triggers = match normalize_scheduled_task_triggers(triggers) {
+        Ok(triggers) => triggers,
+        Err(error) => return validation_error_response(error),
+    };
 
     match set_app_setting(
         &state.db,
@@ -1485,11 +1488,162 @@ pub async fn scan_library_task(db: &DatabaseConnection) -> JsonValue {
 
 async fn scan_library_triggers(db: &DatabaseConnection) -> JsonValue {
     serde_json::from_str(&app_setting(db, "ScheduledTask.scan-library.Triggers", "").await)
-        .unwrap_or_else(|_| default_scan_library_triggers())
+        .ok()
+        .and_then(|value| normalize_scheduled_task_triggers(value).ok())
+        .unwrap_or_else(default_scan_library_triggers)
 }
 
 fn default_scan_library_triggers() -> JsonValue {
     json!([{ "Type": "StartupTrigger" }])
+}
+
+fn normalize_scheduled_task_triggers(
+    value: JsonValue,
+) -> Result<JsonValue, (StatusCode, &'static str)> {
+    let Some(triggers) = value.as_array() else {
+        return Err((StatusCode::BAD_REQUEST, "Triggers must be an array"));
+    };
+    if triggers.len() > MAX_SCHEDULED_TASK_TRIGGERS {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Too many triggers"));
+    }
+
+    let mut normalized = Vec::with_capacity(triggers.len());
+    for trigger in triggers {
+        let Some(trigger) = trigger.as_object() else {
+            return Err((StatusCode::BAD_REQUEST, "Trigger entries must be objects"));
+        };
+        let trigger_type = trigger_string_field(trigger, &["Type", "type"])
+            .and_then(|value| canonical_trigger_type(&value))
+            .or_else(|| inferred_trigger_type(trigger))
+            .ok_or((StatusCode::BAD_REQUEST, "Invalid trigger type"))?;
+
+        let mut object = serde_json::Map::new();
+        object.insert("Type".to_string(), json!(trigger_type));
+        if let Some(value) = trigger_ticks_field(trigger, &["TimeOfDayTicks", "timeOfDayTicks"])? {
+            object.insert("TimeOfDayTicks".to_string(), json!(value));
+        }
+        if let Some(value) = trigger_ticks_field(trigger, &["IntervalTicks", "intervalTicks"])? {
+            object.insert("IntervalTicks".to_string(), json!(value));
+        }
+        if let Some(value) = trigger_ticks_field(trigger, &["MaxRuntimeTicks", "maxRuntimeTicks"])?
+        {
+            object.insert("MaxRuntimeTicks".to_string(), json!(value));
+        }
+        if let Some(value) = trigger_string_field(trigger, &["DayOfWeek", "dayOfWeek"]) {
+            object.insert(
+                "DayOfWeek".to_string(),
+                json!(canonical_day_of_week(&value)?),
+            );
+        }
+        if let Some(value) = trigger_string_field(trigger, &["SystemEvent", "systemEvent"]) {
+            object.insert(
+                "SystemEvent".to_string(),
+                json!(canonical_system_event(&value)?),
+            );
+        }
+        normalized.push(JsonValue::Object(object));
+    }
+
+    let value = JsonValue::Array(normalized);
+    if value.to_string().len() > MAX_SCHEDULED_TASK_TRIGGERS_JSON_BYTES {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Triggers are too large"));
+    }
+    Ok(value)
+}
+
+fn trigger_string_field(
+    object: &serde_json::Map<String, JsonValue>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| object.get(*key))
+        .and_then(JsonValue::as_str)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn trigger_ticks_field(
+    object: &serde_json::Map<String, JsonValue>,
+    keys: &[&str],
+) -> Result<Option<i64>, (StatusCode, &'static str)> {
+    let Some(value) = keys.iter().find_map(|key| object.get(*key)) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(value) = value.as_i64() {
+        return (value >= 0)
+            .then_some(Some(value))
+            .ok_or((StatusCode::BAD_REQUEST, "Trigger ticks must be positive"));
+    }
+    if let Some(value) = value.as_u64().and_then(|value| i64::try_from(value).ok()) {
+        return Ok(Some(value));
+    }
+    if let Some(value) = value
+        .as_str()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .and_then(|value| i64::try_from(value).ok())
+    {
+        return Ok(Some(value));
+    }
+    Err((StatusCode::BAD_REQUEST, "Invalid trigger ticks"))
+}
+
+fn canonical_trigger_type(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "dailytrigger" => Some("DailyTrigger"),
+        "weeklytrigger" => Some("WeeklyTrigger"),
+        "intervaltrigger" => Some("IntervalTrigger"),
+        "startuptrigger" => Some("StartupTrigger"),
+        _ => None,
+    }
+}
+
+fn inferred_trigger_type(trigger: &serde_json::Map<String, JsonValue>) -> Option<&'static str> {
+    if trigger
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("IntervalTicks"))
+    {
+        Some("IntervalTrigger")
+    } else if trigger
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("TimeOfDayTicks"))
+    {
+        Some(
+            if trigger
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("DayOfWeek"))
+            {
+                "WeeklyTrigger"
+            } else {
+                "DailyTrigger"
+            },
+        )
+    } else {
+        None
+    }
+}
+
+fn canonical_day_of_week(value: &str) -> Result<&'static str, (StatusCode, &'static str)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "sunday" => Ok("Sunday"),
+        "monday" => Ok("Monday"),
+        "tuesday" => Ok("Tuesday"),
+        "wednesday" => Ok("Wednesday"),
+        "thursday" => Ok("Thursday"),
+        "friday" => Ok("Friday"),
+        "saturday" => Ok("Saturday"),
+        _ => Err((StatusCode::BAD_REQUEST, "Invalid trigger day")),
+    }
+}
+
+fn canonical_system_event(value: &str) -> Result<&'static str, (StatusCode, &'static str)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "wakefromsleep" => Ok("WakeFromSleep"),
+        "displayconfigurationchange" => Ok("DisplayConfigurationChange"),
+        _ => Err((StatusCode::BAD_REQUEST, "Invalid trigger system event")),
+    }
 }
 
 async fn plugin_repositories(db: &DatabaseConnection) -> JsonValue {
@@ -4177,19 +4331,19 @@ mod tests {
         live_tv_default_tuner_host, live_tv_default_tuner_host_value, live_tv_guide_info,
         live_tv_info, live_tv_timer_defaults, live_tv_timer_defaults_value, live_tv_unavailable,
         log_file_entry, normalize_device_custom_name, normalize_plugin_repositories,
-        notification_items, notification_services_test, notification_services_value,
-        package_install_unavailable, package_list, package_update_list, party_unavailable,
-        play_activity_rows, plugin_list, report_activity_headers_for_query, report_csv,
-        report_item_headers_for_query, reports_activity_result, reports_items_result,
-        required_upload_part, run_user_usage_custom_query, safe_log_path,
-        safe_user_usage_backup_file, sanitize_file_part, save_camera_upload_to, scan_library_task,
-        smtp_notification_test, stop_scheduled_task, sync_data, sync_data_result,
-        sync_empty_query_result, sync_empty_response, sync_options_result, sync_play_unavailable,
-        sync_unavailable, system_log_file, system_log_lines, system_logs_query,
-        tmdb_client_configuration_value, ui_command, update_notification_read_state,
-        usage_stats_breakdown_items, usage_stats_duration_histogram_items,
-        usage_stats_hourly_items, usage_stats_session_entry, usage_user_entry,
-        user_usage_stats_load_backup_from, user_usage_stats_save_backup_to,
+        normalize_scheduled_task_triggers, notification_items, notification_services_test,
+        notification_services_value, package_install_unavailable, package_list,
+        package_update_list, party_unavailable, play_activity_rows, plugin_list,
+        report_activity_headers_for_query, report_csv, report_item_headers_for_query,
+        reports_activity_result, reports_items_result, required_upload_part,
+        run_user_usage_custom_query, safe_log_path, safe_user_usage_backup_file,
+        sanitize_file_part, save_camera_upload_to, scan_library_task, smtp_notification_test,
+        stop_scheduled_task, sync_data, sync_data_result, sync_empty_query_result,
+        sync_empty_response, sync_options_result, sync_play_unavailable, sync_unavailable,
+        system_log_file, system_log_lines, system_logs_query, tmdb_client_configuration_value,
+        ui_command, update_notification_read_state, usage_stats_breakdown_items,
+        usage_stats_duration_histogram_items, usage_stats_hourly_items, usage_stats_session_entry,
+        usage_user_entry, user_usage_stats_load_backup_from, user_usage_stats_save_backup_to,
         user_usage_stats_user_manage, user_view_grouping_options_value,
         validate_path_request_from_inputs, web_strings_value,
     };
@@ -4555,6 +4709,42 @@ mod tests {
         let triggers = default_scan_library_triggers();
         assert_eq!(triggers[0]["Type"], "StartupTrigger");
         assert!(triggers.as_array().is_some());
+    }
+
+    #[test]
+    fn scheduled_task_triggers_are_normalized_and_limited() {
+        let triggers = normalize_scheduled_task_triggers(serde_json::json!([
+            { "type": "intervaltrigger", "intervalTicks": "3000000000", "Ignored": true },
+            { "Type": "WeeklyTrigger", "TimeOfDayTicks": 36000000000_i64, "DayOfWeek": "monday" },
+            { "Type": "StartupTrigger", "SystemEvent": "WakeFromSleep" }
+        ]))
+        .unwrap();
+        assert_eq!(triggers[0]["Type"], "IntervalTrigger");
+        assert_eq!(triggers[0]["IntervalTicks"], 3000000000_i64);
+        assert!(triggers[0]["Ignored"].is_null());
+        assert_eq!(triggers[1]["DayOfWeek"], "Monday");
+        assert_eq!(triggers[2]["SystemEvent"], "WakeFromSleep");
+
+        assert!(normalize_scheduled_task_triggers(serde_json::json!({})).is_err());
+        assert!(normalize_scheduled_task_triggers(serde_json::json!([true])).is_err());
+        assert!(
+            normalize_scheduled_task_triggers(serde_json::json!([
+                { "Type": "UnknownTrigger" }
+            ]))
+            .is_err()
+        );
+        assert!(
+            normalize_scheduled_task_triggers(serde_json::json!([
+                { "Type": "DailyTrigger", "TimeOfDayTicks": -1 }
+            ]))
+            .is_err()
+        );
+        assert!(
+            normalize_scheduled_task_triggers(serde_json::json!([
+                { "Type": "WeeklyTrigger", "DayOfWeek": "Funday" }
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

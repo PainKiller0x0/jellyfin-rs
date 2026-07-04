@@ -862,7 +862,7 @@ async fn trickplay_info(
     let row = db
         .query_one(crate::db::helpers::portable_statement(
             db.get_database_backend(),
-            "SELECT tp.width, tp.tile_count, tp.interval_ticks, tp.path FROM trickplay_images tp JOIN media_items mi ON mi.id = tp.item_id WHERE tp.item_id = ? AND tp.width = ? AND mi.is_public = 1",
+            "SELECT tp.width, tp.tile_count, tp.interval_ticks, tp.path FROM trickplay_images tp JOIN media_items mi ON mi.id = tp.item_id WHERE tp.item_id = ? AND tp.width = ? AND mi.is_public = 1 AND (mi.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = mi.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = mi.parent_id AND parent.is_public = 1))",
             vec![item_id.into(), width.into()],
         ))
         .await?;
@@ -966,12 +966,7 @@ pub async fn studio_image_with_index(
 }
 
 async fn public_item_exists(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<bool> {
-    Ok(db
-        .query_one(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
-            "SELECT 1 AS found FROM media_items WHERE id = ? AND is_public = 1",
-            vec![item_id.into()],
-        ))
+    Ok(item_queries::find_media_item(db, "", item_id)
         .await?
         .is_some())
 }
@@ -1226,6 +1221,34 @@ mod tests {
         .await
         .unwrap();
         assert!(trickplay_info(&db, "item1", 320).await.unwrap().is_none());
+
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('private-parent', 'Private Parent', 'D:/private-parent', '', '', 'Movie', 1, 0, 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('public-child', 'Public Child', 'D:/public-child.mkv', '', 'private-parent', 'Video', 0, 1, 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO trickplay_images (id, item_id, width, tile_count, interval_ticks, path, created_at) VALUES ('tp2', 'public-child', 320, 1, 5000000, 'D:/hidden-tiles.jpg', 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        assert!(
+            trickplay_info(&db, "public-child", 320)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1320,11 +1343,22 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
         let backend = db.get_database_backend();
-        for (id, is_public) in [("public", 1_i64), ("private", 0_i64)] {
+        for (id, parent_id, is_public) in [
+            ("public", "", 1_i64),
+            ("private", "", 0_i64),
+            ("private-parent", "", 0_i64),
+            ("public-child", "private-parent", 1_i64),
+        ] {
             db.execute(crate::db::helpers::portable_statement(
                 backend,
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Video', 0, ?, 1, 1, 1)",
-                vec![id.into(), id.into(), format!("D:/{id}.mkv").into(), is_public.into()],
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Video', 0, ?, 1, 1, 1)",
+                vec![
+                    id.into(),
+                    id.into(),
+                    format!("D:/{id}.mkv").into(),
+                    parent_id.into(),
+                    is_public.into(),
+                ],
             ))
             .await
             .unwrap();
@@ -1332,6 +1366,7 @@ mod tests {
 
         assert!(public_item_exists(&db, "public").await.unwrap());
         assert!(!public_item_exists(&db, "private").await.unwrap());
+        assert!(!public_item_exists(&db, "public-child").await.unwrap());
         assert!(!public_item_exists(&db, "missing").await.unwrap());
 
         let state = Arc::new(test_state(db));

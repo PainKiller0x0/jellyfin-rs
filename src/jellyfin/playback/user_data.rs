@@ -15,7 +15,7 @@ use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
     entities::user_data::{self, Entity as UserData},
-    jellyfin::{auth::request_user_id_or_default, common::internal_error},
+    jellyfin::{auth::request_user_id_or_default, common::internal_error, item_queries},
     util::{now_unix, unix_to_jellyfin_date},
 };
 
@@ -465,12 +465,7 @@ async fn public_media_item_exists(
     db: &sea_orm::DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<bool> {
-    Ok(db
-        .query_one(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
-            "SELECT 1 AS found FROM media_items WHERE id = ? AND is_public = 1 LIMIT 1",
-            vec![item_id.into()],
-        ))
+    Ok(item_queries::find_media_item(db, "", item_id)
         .await?
         .is_some())
 }
@@ -482,7 +477,7 @@ async fn public_person_exists(
     Ok(db
         .query_one(crate::db::helpers::portable_statement(
             db.get_database_backend(),
-            "SELECT 1 AS found FROM people p JOIN media_people mp ON mp.person_id = p.id JOIN media_items mi ON mi.id = mp.item_id WHERE p.id = ? AND mi.is_public = 1 LIMIT 1",
+            "SELECT 1 AS found FROM people p JOIN media_people mp ON mp.person_id = p.id JOIN media_items mi ON mi.id = mp.item_id WHERE p.id = ? AND mi.is_public = 1 AND (mi.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = mi.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = mi.parent_id AND parent.is_public = 1)) LIMIT 1",
             vec![item_id.into()],
         ))
         .await?
@@ -697,6 +692,34 @@ mod tests {
         ))
         .await
         .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('private-parent', 'Private Parent', '/tmp/private-parent', '', '', 'Movie', 1, 0, 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('public-child', 'Public Child', '/tmp/public-child.mkv', '', 'private-parent', 'Movie', 0, 1, 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO people (id, name, created_at) VALUES ('p2', 'Hidden Person', 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_people (item_id, person_id, person_type, sort_order) VALUES ('public-child', 'p2', 'Actor', 0)",
+            vec![],
+        ))
+        .await
+        .unwrap();
 
         set_user_data_flag_json(&db, "u1", "i1", "is_favorite", true)
             .await
@@ -706,6 +729,16 @@ mod tests {
             .unwrap();
         assert!(
             set_user_data_flag_json(&db, "u1", "private", "is_favorite", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            set_user_data_flag_json(&db, "u1", "public-child", "is_favorite", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            set_user_data_flag_json(&db, "u1", "p2", "is_favorite", true)
                 .await
                 .is_err()
         );

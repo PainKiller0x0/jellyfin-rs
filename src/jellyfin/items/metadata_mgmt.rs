@@ -621,7 +621,7 @@ async fn subtitle_list_inner(
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            "SELECT ms.stream_index, ms.codec, ms.language, ms.title, ms.is_external FROM media_streams ms JOIN media_items mi ON mi.id = ms.item_id WHERE ms.item_id = ? AND ms.stream_type = 'Subtitle' AND mi.is_public = 1 ORDER BY ms.stream_index ASC",
+            "SELECT ms.stream_index, ms.codec, ms.language, ms.title, ms.is_external FROM media_streams ms JOIN media_items mi ON mi.id = ms.item_id WHERE ms.item_id = ? AND ms.stream_type = 'Subtitle' AND mi.is_public = 1 AND (mi.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = mi.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = mi.parent_id AND parent.is_public = 1)) ORDER BY ms.stream_index ASC",
             vec![item_id.into()],
         ))
         .await
@@ -647,7 +647,7 @@ async fn subtitle_list_result_inner(
     let exists = db
         .query_one(crate::db::helpers::portable_statement(
             db.get_database_backend(),
-            "SELECT 1 AS found FROM media_items WHERE id = ? AND is_public = 1",
+            "SELECT 1 AS found FROM media_items WHERE id = ? AND is_public = 1 AND (media_items.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = media_items.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = media_items.parent_id AND parent.is_public = 1))",
             vec![item_id.into()],
         ))
         .await?
@@ -1687,6 +1687,40 @@ mod tests {
         assert!(subtitle_list_inner(&db, "song").await.unwrap().is_empty());
         assert!(
             subtitle_list_result_inner(&db, "song")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('private-parent', 'Private Parent', '/tmp/private-parent', '', '', 'Movie', 1, 0, 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('public-child', 'Public Child', '/tmp/public-child.mkv', '', 'private-parent', 'Video', 0, 1, 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, title, is_external, created_at) VALUES ('s2', 'public-child', 3, 'Subtitle', 'srt', 'eng', 'English', 0, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        assert!(
+            subtitle_list_inner(&db, "public-child")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            subtitle_list_result_inner(&db, "public-child")
                 .await
                 .unwrap()
                 .is_none()

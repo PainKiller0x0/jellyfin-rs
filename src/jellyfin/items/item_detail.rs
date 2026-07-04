@@ -15,7 +15,7 @@ use crate::{
     db::row_ext::QueryResultExt,
     entities::people::Entity as People,
     jellyfin::{
-        auth::request_user_id_and_admin_or_default,
+        auth::{query_user_id_or_request, request_user_id_and_admin_or_default},
         common::{internal_error, strip_nulls},
         item_queries::find_library_as_item,
     },
@@ -54,7 +54,13 @@ pub async fn item_by_id_public(
     Path(item_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let (user_id, is_admin) = request_user_id_and_admin_or_default(&state, &headers, &query).await;
+    let (request_user_id, is_admin) =
+        request_user_id_and_admin_or_default(&state, &headers, &query).await;
+    let user_id = if is_admin {
+        query_user_id_or_request(&query, &request_user_id)
+    } else {
+        request_user_id
+    };
     let item_result = if is_admin {
         super::find_media_item_for_admin(&state.db, &user_id, &item_id).await
     } else {

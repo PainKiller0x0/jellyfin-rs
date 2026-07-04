@@ -28,6 +28,12 @@ use crate::{
     util::{now_unix, stable_text_id},
 };
 
+const MAX_LIBRARY_NAME_LEN: usize = 128;
+const MAX_LIBRARY_COLLECTION_TYPE_LEN: usize = 64;
+const MAX_LIBRARY_PATHS_PER_REQUEST: usize = 128;
+const MAX_LIBRARY_PATH_LEN: usize = 4096;
+const MAX_LIBRARY_OPTIONS_JSON_BYTES: usize = 128 * 1024;
+
 #[derive(Deserialize)]
 pub struct VirtualFolderQuery {
     #[serde(rename = "name", alias = "Name")]
@@ -80,6 +86,112 @@ fn parse_json_body(body: Bytes) -> Result<Option<Value>, Response> {
         )
             .into_response()
     })
+}
+
+fn library_write_error(error: anyhow::Error) -> Response {
+    let message = error.to_string();
+    let status = if message.contains("too many")
+        || message.contains("too long")
+        || message.contains("too large")
+    {
+        Some(StatusCode::PAYLOAD_TOO_LARGE)
+    } else if message.contains("required")
+        || message.contains("invalid")
+        || message.contains("exist")
+        || message.contains("not found")
+    {
+        Some(StatusCode::BAD_REQUEST)
+    } else {
+        None
+    };
+    match status {
+        Some(status) => (status, Json(json!({ "Error": message }))).into_response(),
+        None => internal_error(error),
+    }
+}
+
+fn normalize_library_name(name: &str) -> anyhow::Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("name is required");
+    }
+    if name.chars().count() > MAX_LIBRARY_NAME_LEN {
+        bail!("name is too long");
+    }
+    if name.contains('\0') || name.chars().any(char::is_control) {
+        bail!("name is invalid");
+    }
+    Ok(name.to_string())
+}
+
+fn normalize_collection_type(collection_type: Option<&str>, name: &str) -> anyhow::Result<String> {
+    let collection_type = collection_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| collection_type_for_name(name));
+    if collection_type.chars().count() > MAX_LIBRARY_COLLECTION_TYPE_LEN {
+        bail!("collection type is too long");
+    }
+    if collection_type.contains('\0')
+        || collection_type.chars().any(char::is_control)
+        || !collection_type
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("collection type is invalid");
+    }
+    Ok(collection_type.to_string())
+}
+
+fn normalize_library_path_text(path: &str) -> anyhow::Result<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        bail!("path is required");
+    }
+    if path.len() > MAX_LIBRARY_PATH_LEN {
+        bail!("path is too long");
+    }
+    if path.contains('\0') || path.chars().any(char::is_control) {
+        bail!("path is invalid");
+    }
+    Ok(path.to_string())
+}
+
+fn split_library_paths(paths: Option<String>) -> anyhow::Result<Vec<String>> {
+    let Some(paths) = paths else {
+        return Ok(Vec::new());
+    };
+    let mut normalized = Vec::new();
+    let mut seen = 0usize;
+    for path in paths.split('|').flat_map(|value| value.split(',')) {
+        seen += 1;
+        if seen > MAX_LIBRARY_PATHS_PER_REQUEST {
+            bail!("too many paths");
+        }
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let path = normalize_library_path_text(path)?;
+        if !normalized.iter().any(|existing| existing == &path) {
+            normalized.push(path);
+        }
+    }
+    if normalized.len() > MAX_LIBRARY_PATHS_PER_REQUEST {
+        bail!("too many paths");
+    }
+    Ok(normalized)
+}
+
+fn normalize_library_id(id: &str) -> anyhow::Result<String> {
+    let id = id.trim();
+    if id.is_empty() {
+        bail!("Id or Name is required");
+    }
+    if id.len() > 128 || id.contains('\0') || id.chars().any(char::is_control) {
+        bail!("library id is invalid");
+    }
+    Ok(id.to_string())
 }
 
 fn virtual_folder_request(
@@ -214,12 +326,7 @@ pub async fn create_virtual_folder(
     };
     match create_virtual_folder_inner(&state.db, query).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) if error.to_string().contains("required") => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": error.to_string() })),
-        )
-            .into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => library_write_error(error),
     }
 }
 
@@ -229,16 +336,12 @@ pub async fn delete_virtual_folder(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let name = query_string(&query, &["name", "Name"]);
-    let name = name.trim();
-    if name.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": "name is required" })),
-        )
-            .into_response();
-    }
+    let name = match normalize_library_name(&name) {
+        Ok(name) => name,
+        Err(error) => return library_write_error(error),
+    };
 
-    match delete_virtual_folder_inner(&state.db, name).await {
+    match delete_virtual_folder_inner(&state.db, &name).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => internal_error(error),
@@ -256,12 +359,7 @@ pub async fn add_virtual_folder_path(
     };
     match upsert_library_path(&state.db, &query.name, &query.path, None).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) if error.to_string().contains("required") => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": error.to_string() })),
-        )
-            .into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => library_write_error(error),
     }
 }
 
@@ -271,18 +369,19 @@ pub async fn delete_virtual_folder_path(
 ) -> Response {
     let name = query_string(&query, &["name", "Name"]);
     let path = query_string(&query, &["path", "Path"]);
-    if name.trim().is_empty() || path.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": "name and path are required" })),
-        )
-            .into_response();
-    }
+    let name = match normalize_library_name(&name) {
+        Ok(name) => name,
+        Err(error) => return library_write_error(error),
+    };
+    let path = match normalize_library_path_text(&path) {
+        Ok(path) => path,
+        Err(error) => return library_write_error(error),
+    };
 
     match delete_virtual_folder_path_inner(&state.db, &name, &path).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => internal_error(error.into()),
+        Err(error) => library_write_error(error),
     }
 }
 
@@ -360,24 +459,15 @@ async fn create_virtual_folder_inner(
     db: &DatabaseConnection,
     query: VirtualFolderQuery,
 ) -> anyhow::Result<()> {
-    let name = query.name.as_deref().unwrap_or_default().trim();
-    if name.is_empty() {
-        bail!("name is required");
-    }
-
-    let collection_type = query.collection_type.as_deref().unwrap_or("movies").trim();
-    let library_id = library_id_for_name(name);
+    let name = normalize_library_name(query.name.as_deref().unwrap_or_default())?;
+    let collection_type = normalize_collection_type(query.collection_type.as_deref(), &name)?;
+    let library_id = library_id_for_name(&name);
     let now = now_unix();
 
-    upsert_library(db, &library_id, name, collection_type, now).await?;
+    upsert_library(db, &library_id, &name, &collection_type, now).await?;
 
-    if let Some(paths) = query.paths {
-        for path in paths.split('|').flat_map(|value| value.split(',')) {
-            let path = path.trim();
-            if !path.is_empty() {
-                upsert_library_path(db, name, path, Some(collection_type)).await?;
-            }
-        }
+    for path in split_library_paths(query.paths)? {
+        upsert_library_path(db, &name, &path, Some(&collection_type)).await?;
     }
 
     Ok(())
@@ -418,20 +508,14 @@ async fn upsert_library_path(
     path: &str,
     collection_type: Option<&str>,
 ) -> anyhow::Result<()> {
-    let name = name.trim();
-    let path = path_utils::validate_library_path(path)?;
-    if name.is_empty() {
-        bail!("name is required");
-    }
-    if path.is_empty() {
-        bail!("path is required");
-    }
+    let name = normalize_library_name(name)?;
+    let path = path_utils::validate_library_path(&normalize_library_path_text(path)?)?;
 
-    let library_id = library_id_for_name(name);
-    let collection_type = collection_type.unwrap_or_else(|| collection_type_for_name(name));
+    let library_id = library_id_for_name(&name);
+    let collection_type = normalize_collection_type(collection_type, &name)?;
     let now = now_unix();
 
-    upsert_library(db, &library_id, name, collection_type, now).await?;
+    upsert_library(db, &library_id, &name, &collection_type, now).await?;
 
     let path_id = stable_text_id(&format!("library-path:{path}"));
     let existing = LibraryPaths::find_by_id(&path_id).one(db).await?;
@@ -453,7 +537,8 @@ async fn upsert_library_path(
 }
 
 async fn delete_virtual_folder_inner(db: &DatabaseConnection, name: &str) -> anyhow::Result<bool> {
-    let library_id = library_id_for_name(name);
+    let name = normalize_library_name(name)?;
+    let library_id = library_id_for_name(&name);
     let backend = db.get_database_backend();
     if Libraries::find_by_id(&library_id).one(db).await?.is_none() {
         return Ok(false);
@@ -536,9 +621,10 @@ async fn delete_virtual_folder_path_inner(
     name: &str,
     path: &str,
 ) -> anyhow::Result<bool> {
-    let path = path_utils::canonicalize_path(path)?;
+    let name = normalize_library_name(name)?;
+    let path = path_utils::canonicalize_path(&normalize_library_path_text(path)?)?;
     let result = LibraryPaths::delete_many()
-        .filter(library_paths::Column::LibraryId.eq(library_id_for_name(name)))
+        .filter(library_paths::Column::LibraryId.eq(library_id_for_name(&name)))
         .filter(library_paths::Column::Path.eq(path))
         .exec(db)
         .await?;
@@ -550,6 +636,8 @@ async fn rename_virtual_folder_inner(
     name: &str,
     new_name: &str,
 ) -> anyhow::Result<bool> {
+    let name = normalize_library_name(name)?;
+    let new_name = normalize_library_name(new_name)?;
     let result = db
         .execute(crate::db::helpers::portable_statement(
             db.get_database_backend(),
@@ -557,7 +645,7 @@ async fn rename_virtual_folder_inner(
             vec![
                 new_name.into(),
                 now_unix().into(),
-                library_id_for_name(name).into(),
+                library_id_for_name(&name).into(),
             ],
         ))
         .await?;
@@ -570,16 +658,18 @@ async fn update_virtual_folder_path_inner(
     path: &str,
     target_path: &str,
 ) -> anyhow::Result<bool> {
-    let path = path_utils::canonicalize_path(path)?;
-    let target_path = path_utils::validate_library_path(target_path)?;
+    let name = normalize_library_name(name)?;
+    let path = path_utils::canonicalize_path(&normalize_library_path_text(path)?)?;
+    let target_path =
+        path_utils::validate_library_path(&normalize_library_path_text(target_path)?)?;
     let result = db
         .execute(crate::db::helpers::portable_statement(
             db.get_database_backend(),
             "UPDATE library_paths SET path = ?, library_id = ? WHERE library_id = ? AND path = ?",
             vec![
                 target_path.into(),
-                library_id_for_name(name).into(),
-                library_id_for_name(name).into(),
+                library_id_for_name(&name).into(),
+                library_id_for_name(&name).into(),
                 path.into(),
             ],
         ))
@@ -594,9 +684,7 @@ async fn update_library_options_inner(
     let library_id = json_string(body, &["Id", "id"])
         .or_else(|| json_string(body, &["Name", "name"]).map(|name| library_id_for_name(&name)))
         .unwrap_or_default();
-    if library_id.trim().is_empty() {
-        bail!("Id or Name is required");
-    }
+    let library_id = normalize_library_id(&library_id)?;
     if Libraries::find_by_id(&library_id).one(db).await?.is_none() {
         return Ok(false);
     }
@@ -605,7 +693,13 @@ async fn update_library_options_inner(
         .or_else(|| body.get("libraryOptions"))
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if !options.is_object() {
+        bail!("library options must be an object");
+    }
     let value = serde_json::to_string(&options).context("failed to serialize library options")?;
+    if value.len() > MAX_LIBRARY_OPTIONS_JSON_BYTES {
+        bail!("library options are too large");
+    }
     system::set_app_setting(db, &library_options_key(&library_id), &value).await?;
     Ok(true)
 }
@@ -654,21 +748,19 @@ pub async fn rename_virtual_folder(
         Ok(values) => values,
         Err(response) => return response,
     };
-    let name = name.trim();
-    let new_name = new_name.trim();
+    let name = match normalize_library_name(&name) {
+        Ok(name) => name,
+        Err(error) => return library_write_error(error),
+    };
+    let new_name = match normalize_library_name(&new_name) {
+        Ok(name) => name,
+        Err(error) => return library_write_error(error),
+    };
 
-    if name.is_empty() || new_name.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": "name and newName are required" })),
-        )
-            .into_response();
-    }
-
-    match rename_virtual_folder_inner(&state.db, name, new_name).await {
+    match rename_virtual_folder_inner(&state.db, &name, &new_name).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => library_write_error(error),
     }
 }
 
@@ -680,12 +772,7 @@ pub async fn update_library_options(
     match update_library_options_inner(&state.db, &body).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) if error.to_string().contains("required") => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": error.to_string() })),
-        )
-            .into_response(),
-        Err(error) => internal_error(error),
+        Err(error) => library_write_error(error),
     }
 }
 
@@ -699,32 +786,27 @@ pub async fn update_virtual_folder_path(
         Ok(values) => values,
         Err(response) => return response,
     };
-    let name = name.trim();
-    let path = path.trim();
-    let new_path = new_path.trim();
+    let name = match normalize_library_name(&name) {
+        Ok(name) => name,
+        Err(error) => return library_write_error(error),
+    };
+    let path = match normalize_library_path_text(&path) {
+        Ok(path) => path,
+        Err(error) => return library_write_error(error),
+    };
 
-    if name.is_empty() || path.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": "name and path are required" })),
-        )
-            .into_response();
-    }
-
-    let target_path = if !new_path.is_empty() { new_path } else { path };
-    match update_virtual_folder_path_inner(&state.db, name, path, target_path).await {
+    let target_path = if new_path.trim().is_empty() {
+        path.clone()
+    } else {
+        match normalize_library_path_text(&new_path) {
+            Ok(path) => path,
+            Err(error) => return library_write_error(error),
+        }
+    };
+    match update_virtual_folder_path_inner(&state.db, &name, &path, &target_path).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(error)
-            if error.to_string().contains("required") || error.to_string().contains("exist") =>
-        {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "Error": error.to_string() })),
-            )
-                .into_response()
-        }
-        Err(error) => internal_error(error),
+        Err(error) => library_write_error(error),
     }
 }
 
@@ -820,11 +902,13 @@ fn query_result(items: Vec<Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
+        MAX_LIBRARY_NAME_LEN, MAX_LIBRARY_OPTIONS_JSON_BYTES, MAX_LIBRARY_PATHS_PER_REQUEST,
         VirtualFolderQuery, delete_virtual_folder_inner, delete_virtual_folder_path_inner,
-        library_options_result, library_path_request, query_result, query_string,
-        rename_virtual_folder_inner, rename_virtual_folder_request, update_library_options_inner,
-        update_virtual_folder_path_inner, update_virtual_folder_path_request,
-        virtual_folder_request,
+        library_options_result, library_path_request, normalize_collection_type,
+        normalize_library_name, normalize_library_path_text, query_result, query_string,
+        rename_virtual_folder_inner, rename_virtual_folder_request, split_library_paths,
+        update_library_options_inner, update_virtual_folder_path_inner,
+        update_virtual_folder_path_request, virtual_folder_request,
     };
     use crate::db::row_ext::QueryResultExt;
     use axum::body::Bytes;
@@ -852,6 +936,31 @@ mod tests {
         assert_eq!(result["TotalRecordCount"], 1);
         assert_eq!(result["StartIndex"], 0);
         assert_eq!(result["Items"][0]["Name"], "Movies");
+    }
+
+    #[test]
+    fn library_write_inputs_are_normalized_and_limited() {
+        assert_eq!(normalize_library_name(" Movies ").unwrap(), "Movies");
+        assert!(normalize_library_name("Bad\nName").is_err());
+        assert!(normalize_library_name(&"x".repeat(MAX_LIBRARY_NAME_LEN + 1)).is_err());
+        assert_eq!(
+            normalize_collection_type(Some("tvshows"), "Movies").unwrap(),
+            "tvshows"
+        );
+        assert!(normalize_collection_type(Some("bad/type"), "Movies").is_err());
+        assert_eq!(
+            normalize_library_path_text(" D:/Media ").unwrap(),
+            "D:/Media"
+        );
+        assert!(normalize_library_path_text("bad\0path").is_err());
+        assert_eq!(
+            split_library_paths(Some("A|B,C,A".to_string())).unwrap(),
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
+        );
+        assert!(
+            split_library_paths(Some(vec!["A"; MAX_LIBRARY_PATHS_PER_REQUEST + 1].join(",")))
+                .is_err()
+        );
     }
 
     #[test]
@@ -971,6 +1080,28 @@ mod tests {
             )
             .await
             .unwrap()
+        );
+        assert!(
+            update_library_options_inner(
+                &db,
+                &serde_json::json!({
+                    "Name": "Movies",
+                    "LibraryOptions": []
+                }),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            update_library_options_inner(
+                &db,
+                &serde_json::json!({
+                    "Name": "Movies",
+                    "LibraryOptions": { "Value": "x".repeat(MAX_LIBRARY_OPTIONS_JSON_BYTES) }
+                }),
+            )
+            .await
+            .is_err()
         );
     }
 

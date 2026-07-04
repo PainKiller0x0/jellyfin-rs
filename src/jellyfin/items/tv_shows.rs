@@ -19,6 +19,12 @@ use crate::{
     library::models::MediaItem,
 };
 
+fn visible_media_item_sql(alias: &str) -> String {
+    format!(
+        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
+    )
+}
+
 /// Deduplicate episodes by (parent_id, season_number, episode_number).
 /// When multiple video files exist for the same episode (multi-version),
 /// keep the one with the largest size_bytes (highest quality).
@@ -150,9 +156,9 @@ async fn enrich_season_list(
     if !series_ids.is_empty() {
         let backend = db.get_database_backend();
         let placeholders = series_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT id, title FROM media_items WHERE id IN ({placeholders}) AND is_public = 1"
-        );
+        let visible = visible_media_item_sql("media_items");
+        let sql =
+            format!("SELECT id, title FROM media_items WHERE id IN ({placeholders}) AND {visible}");
         let values: Vec<sea_orm::Value> = series_ids.iter().map(|id| id.as_str().into()).collect();
         if let Ok(rows) = db
             .query_all(crate::db::helpers::portable_statement(
@@ -173,8 +179,9 @@ async fn enrich_season_list(
     if !season_ids.is_empty() {
         let backend = db.get_database_backend();
         let placeholders = season_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let visible = visible_media_item_sql("media_items");
         let sql = format!(
-            "SELECT parent_id, COUNT(*) AS cnt FROM media_items WHERE parent_id IN ({placeholders}) AND item_type = 'Episode' AND is_public = 1 GROUP BY parent_id"
+            "SELECT parent_id, COUNT(*) AS cnt FROM media_items WHERE parent_id IN ({placeholders}) AND item_type = 'Episode' AND {visible} GROUP BY parent_id"
         );
         let values: Vec<sea_orm::Value> = season_ids.iter().map(|id| id.as_str().into()).collect();
         if let Ok(rows) = db
@@ -196,8 +203,9 @@ async fn enrich_season_list(
     if !season_ids.is_empty() {
         let backend = db.get_database_backend();
         let placeholders = season_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let visible = visible_media_item_sql("mi");
         let sql = format!(
-            "SELECT mi.parent_id, COUNT(*) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id IN ({placeholders}) AND mi.item_type = 'Episode' AND mi.is_public = 1 AND ud.user_id = ? AND ud.played = 1 GROUP BY mi.parent_id"
+            "SELECT mi.parent_id, COUNT(*) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id IN ({placeholders}) AND mi.item_type = 'Episode' AND {visible} AND ud.user_id = ? AND ud.played = 1 GROUP BY mi.parent_id"
         );
         let mut values: Vec<sea_orm::Value> =
             season_ids.iter().map(|id| id.as_str().into()).collect();
@@ -250,7 +258,8 @@ async fn child_items_by_type(
         .query_all(crate::db::helpers::portable_statement(
             backend,
             &crate::jellyfin::item_queries::media_item_select_sql(&format!(
-                "WHERE media_items.parent_id = ? AND media_items.item_type = ? AND media_items.is_public = 1 {order}"
+                "WHERE media_items.parent_id = ? AND media_items.item_type = ? AND {} {order}",
+                visible_media_item_sql("media_items")
             )),
             vec![user_id.into(), parent_id.into(), item_type.into()],
         ))
@@ -289,8 +298,12 @@ async fn descendant_episodes(
         .query_all(crate::db::helpers::portable_statement(
             backend,
             &format!(
-                r#"WITH RECURSIVE tree(id) AS (SELECT id FROM media_items WHERE id = ? AND is_public = 1 UNION ALL SELECT media_items.id FROM media_items JOIN tree ON media_items.parent_id = tree.id WHERE media_items.is_public = 1) {} WHERE media_items.id IN (SELECT id FROM tree WHERE id <> ?) AND media_items.item_type = 'Episode' AND media_items.is_public = 1 ORDER BY media_items.title ASC"#,
+                r#"WITH RECURSIVE tree(id) AS (SELECT media_items.id FROM media_items WHERE media_items.id = ? AND {} UNION ALL SELECT media_items.id FROM media_items JOIN tree ON media_items.parent_id = tree.id WHERE {}) {} WHERE media_items.id IN (SELECT id FROM tree WHERE id <> ?) AND media_items.item_type = 'Episode' AND {} ORDER BY media_items.title ASC"#,
+                visible_media_item_sql("media_items"),
+                visible_media_item_sql("media_items"),
                 crate::jellyfin::item_queries::media_item_select_sql("").trim()
+                ,
+                visible_media_item_sql("media_items")
             ),
             vec![show_id.into(), user_id.into(), show_id.into()],
         ))
@@ -425,6 +438,11 @@ mod tests {
             .await
             .unwrap();
         assert!(private_parent.is_empty());
+
+        let private_season_children = child_items_by_type(&db, "u1", "season-private", "Episode")
+            .await
+            .unwrap();
+        assert!(private_season_children.is_empty());
     }
 
     #[tokio::test]

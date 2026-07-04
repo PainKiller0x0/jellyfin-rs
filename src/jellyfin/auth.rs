@@ -1581,7 +1581,14 @@ pub async fn require_auth(
     } else {
         false
     };
-    if needs_admin || cross_user_access || session_control_denied {
+    let session_read_denied = if let Some(session_id) = session_read_target(path, &query) {
+        session_read_allowed(&state, &session_id, &user_id)
+            .await
+            .is_some_and(|allowed| !allowed)
+    } else {
+        false
+    };
+    if needs_admin || cross_user_access || session_control_denied || session_read_denied {
         match user_by_id_inner(&state.db, &user_id).await {
             Ok(Some(user)) if cross_user_access && !user.is_admin => {
                 return (
@@ -1591,6 +1598,13 @@ pub async fn require_auth(
                     .into_response();
             }
             Ok(Some(user)) if session_control_denied && !user.is_admin => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "Error": "Session access is denied" })),
+                )
+                    .into_response();
+            }
+            Ok(Some(user)) if session_read_denied && !user.is_admin => {
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({ "Error": "Session access is denied" })),
@@ -1818,6 +1832,16 @@ fn session_control_target<'a>(
     }
 }
 
+fn session_read_target(path: &str, query: &HashMap<String, String>) -> Option<String> {
+    let path = api_path(path);
+    if path != "/Sessions/PlayQueue" {
+        return None;
+    }
+    query_value(query, "Id")
+        .or_else(|| query_value(query, "PlaySessionId"))
+        .filter(|value| !value.trim().is_empty())
+}
+
 async fn session_control_allowed(
     state: &AppState,
     session_id: &str,
@@ -1826,12 +1850,23 @@ async fn session_control_allowed(
     let sessions = state.playback_sessions.read().await;
     sessions.get(session_id).map(|session| {
         session.supports_remote_control
-            && (session.user_id == user_id
-                || session
-                    .additional_users
-                    .iter()
-                    .any(|user| user.user_id == user_id))
+            && session_user_matches(session, user_id)
     })
+}
+
+async fn session_read_allowed(state: &AppState, session_id: &str, user_id: &str) -> Option<bool> {
+    let sessions = state.playback_sessions.read().await;
+    sessions
+        .get(session_id)
+        .map(|session| session_user_matches(session, user_id))
+}
+
+fn session_user_matches(session: &PlaybackSession, user_id: &str) -> bool {
+    session.user_id == user_id
+        || session
+            .additional_users
+            .iter()
+            .any(|user| user.user_id == user_id)
 }
 
 fn api_path(path: &str) -> &str {
@@ -2771,6 +2806,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_read_target_reads_play_queue_paths() {
+        assert_eq!(
+            session_read_target("/Sessions/PlayQueue", &query_map("Id=s1")).as_deref(),
+            Some("s1")
+        );
+        assert_eq!(
+            session_read_target("/emby/Sessions/PlayQueue", &query_map("PlaySessionId=s2"))
+                .as_deref(),
+            Some("s2")
+        );
+        assert_eq!(
+            session_read_target("/Sessions/PlayQueue", &HashMap::new()),
+            None
+        );
+        assert_eq!(
+            session_read_target("/Sessions/s1/Playing", &HashMap::new()),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn session_control_allowed_requires_control_user() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -2794,6 +2850,27 @@ mod tests {
             Some(false)
         );
         assert_eq!(session_control_allowed(&state, "missing", "u1").await, None);
+    }
+
+    #[tokio::test]
+    async fn session_read_allowed_requires_session_user() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let state = test_state(db);
+        let mut session = test_playback_session();
+        session.supports_remote_control = false;
+        state
+            .playback_sessions
+            .write()
+            .await
+            .insert("s1".to_string(), session);
+
+        assert_eq!(session_read_allowed(&state, "s1", "u1").await, Some(true));
+        assert_eq!(session_read_allowed(&state, "s1", "u2").await, Some(true));
+        assert_eq!(
+            session_read_allowed(&state, "s1", "stranger").await,
+            Some(false)
+        );
+        assert_eq!(session_read_allowed(&state, "missing", "u1").await, None);
     }
 
     #[tokio::test]

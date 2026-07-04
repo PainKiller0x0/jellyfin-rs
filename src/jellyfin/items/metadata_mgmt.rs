@@ -1070,13 +1070,23 @@ pub async fn audiobooks_next_up(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(25)
         .min(200);
+    let start_index = query_value(&query, &["StartIndex", "startIndex"])
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
 
-    match audiobooks_next_up_inner(&state.db, &user_id, limit).await {
+    match audiobooks_next_up_inner(&state.db, &user_id).await {
         Ok(items) => {
             let total = items.len();
+            let page = items
+                .into_iter()
+                .skip(start_index)
+                .take(limit)
+                .map(|item| strip_nulls(item.to_jellyfin_json()))
+                .collect::<Vec<_>>();
             Json(json!({
-                "Items": items.into_iter().map(|item| strip_nulls(item.to_jellyfin_json())).collect::<Vec<_>>(),
-                "TotalRecordCount": total
+                "Items": page,
+                "TotalRecordCount": total,
+                "StartIndex": start_index
             }))
             .into_response()
         }
@@ -1178,18 +1188,17 @@ async fn delete_alternate_sources_inner(
 async fn audiobooks_next_up_inner(
     db: &sea_orm::DatabaseConnection,
     user_id: &str,
-    limit: usize,
 ) -> anyhow::Result<Vec<crate::library::models::MediaItem>> {
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             db.get_database_backend(),
             &item_queries::media_item_select_sql(
-                "WHERE media_items.item_type = 'Audio' AND media_items.is_folder = 0 AND COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) > 0 ORDER BY user_data.updated_at DESC LIMIT ?",
+                "WHERE media_items.item_type = 'Audio' AND media_items.is_folder = 0 AND media_items.is_public = 1 AND COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) > 0 ORDER BY user_data.updated_at DESC",
             ),
-            vec![user_id.into(), i64::try_from(limit).unwrap_or(25).into()],
+            vec![user_id.into()],
         ))
         .await?;
-    item_queries::decode_media_items_for_admin(&rows)
+    item_queries::decode_media_items(&rows)
 }
 
 fn query_value(query: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
@@ -1203,19 +1212,22 @@ fn query_value(query: &HashMap<String, String>, keys: &[&str]) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::{
-        UploadSubtitleRequest, alternate_sources_inner, audiobooks_next_up_inner,
-        available_recording_options, available_recording_options_value,
+        UploadSubtitleRequest, alternate_sources_inner, audiobooks_next_up,
+        audiobooks_next_up_inner, available_recording_options, available_recording_options_value,
         delete_alternate_sources_inner, delete_lyrics_inner, item_counts_inner, item_lyrics_inner,
         lyrics_value_from_text, metadata_editor_info_inner, parse_lrc_timestamp, stop_encodings,
         subtitle_format, subtitle_list_inner, subtitle_provider_info, subtitle_suffix,
         upload_lyrics_inner, upload_subtitle_inner,
     };
-    use axum::body::Bytes;
+    use axum::body::{Bytes, to_bytes};
+    use axum::extract::{Query, State};
     use axum::response::IntoResponse;
     use base64::{Engine as _, engine::general_purpose};
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
-    use serde_json::json;
-    use std::collections::HashMap;
+    use serde_json::{Value, json};
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::{RwLock, broadcast};
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn lyrics_report_missing() {
@@ -1575,15 +1587,58 @@ mod tests {
         .await
         .unwrap();
 
-        let items = audiobooks_next_up_inner(&db, "u1", 25).await.unwrap();
+        let items = audiobooks_next_up_inner(&db, "u1").await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "a1");
         assert!(
-            audiobooks_next_up_inner(&db, "u2", 25)
+            audiobooks_next_up_inner(&db, "u2")
                 .await
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn audiobooks_next_up_returns_query_result_page() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let dir = std::env::temp_dir();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, ?, ?, 0, 0, 1, 1)",
+            vec!["u1".into(), "alice".into(), "Alice".into()],
+        ))
+        .await
+        .unwrap();
+        insert_audio_item(&db, "a1", "Chapter 1", &dir.join("a1.mp3"), true).await;
+        insert_audio_item(&db, "a2", "Chapter 2", &dir.join("a2.mp3"), true).await;
+        insert_audio_item(&db, "private", "Private", &dir.join("private.mp3"), false).await;
+        for (id, updated_at) in [("a1", 10_i64), ("a2", 20), ("private", 30)] {
+            db.execute(crate::db::helpers::portable_statement(
+                db.get_database_backend(),
+                "INSERT INTO user_data (user_id, item_id, played, playback_position_ticks, play_count, updated_at) VALUES (?, ?, 0, 42, 0, ?)",
+                vec!["u1".into(), id.into(), updated_at.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let state = Arc::new(test_state(db));
+        let mut query = HashMap::new();
+        query.insert("UserId".to_string(), "u1".to_string());
+        query.insert("StartIndex".to_string(), "1".to_string());
+        query.insert("Limit".to_string(), "1".to_string());
+        let response = audiobooks_next_up(State(state), Query(query))
+            .await
+            .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["TotalRecordCount"], 2);
+        assert_eq!(value["StartIndex"], 1);
+        let items = value["Items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["Id"], "a1");
     }
 
     #[tokio::test]
@@ -1688,5 +1743,23 @@ mod tests {
         let counts = item_counts_inner(&db, &query).await.unwrap();
         assert_eq!(counts["MovieCount"], 1);
         assert_eq!(counts["ItemCount"], 1);
+    }
+
+    fn test_state(db: DatabaseConnection) -> crate::app::state::AppState {
+        let (ws_event_tx, _) = broadcast::channel(4);
+        crate::app::state::AppState {
+            user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, b"test"),
+            access_token: "test-token".to_string(),
+            db,
+            media_dirs: Vec::new(),
+            http_client: reqwest::Client::new(),
+            tmdb_api_key: RwLock::new(None),
+            playback_sessions: RwLock::new(HashMap::new()),
+            session_capabilities: RwLock::new(HashMap::new()),
+            ws_event_tx,
+            sa_config: crate::config::StrmAssistantConfig::default(),
+            intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),
+            queue_manager: Arc::new(crate::queue::QueueManager::default()),
+        }
     }
 }

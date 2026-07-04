@@ -1993,6 +1993,7 @@ fn item_query_scoped_user_path(path: &str) -> bool {
         [_, "Ancestors"]
             | [_, "InstantMix"]
             | [_, "LocalTrailers"]
+            | [_, "PlaybackInfo"]
             | [_, "SpecialFeatures"]
             | [_, "ThemeMedia"]
             | [_, "ThemeSongs"]
@@ -2931,6 +2932,7 @@ mod tests {
             "/Items/i1/Ancestors",
             "/Items/i1/InstantMix",
             "/Items/i1/LocalTrailers",
+            "/Items/i1/PlaybackInfo",
             "/Items/i1/SpecialFeatures",
             "/Items/i1/ThemeMedia",
             "/Items/i1/ThemeSongs",

@@ -57,7 +57,7 @@ async fn item_by_file_inner(
     let where_clause = if include_private {
         "WHERE media_items.path = ?"
     } else {
-        "WHERE media_items.path = ? AND media_items.is_public = 1"
+        "WHERE media_items.path = ? AND media_items.is_public = 1 AND (media_items.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = media_items.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = media_items.parent_id AND parent.is_public = 1))"
     };
     let row = db
         .query_one(crate::db::helpers::portable_statement(
@@ -345,20 +345,9 @@ async fn additional_parts(
     item_id: &str,
 ) -> anyhow::Result<Vec<MediaItem>> {
     let backend = db.get_database_backend();
-    let sql = item_queries::media_item_select_sql(
-        "WHERE media_items.id = ? AND media_items.is_public = 1",
-    );
-    let Some(row) = db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
-            &sql,
-            vec![user_id.into(), item_id.into()],
-        ))
-        .await?
-    else {
+    let Some(item) = item_queries::find_media_item(db, user_id, item_id).await? else {
         return Ok(Vec::new());
     };
-    let item = MediaItem::from_query_result(&row)?;
     let Some(stack) = stack_info(&item) else {
         return Ok(Vec::new());
     };
@@ -367,13 +356,15 @@ async fn additional_parts(
         .query_all(crate::db::helpers::portable_statement(
             backend,
             &item_queries::media_item_select_sql(
-                "WHERE media_items.parent_id = ? AND media_items.item_type = ? AND media_items.id <> ? AND media_items.is_public = 1 ORDER BY media_items.title ASC",
+                "WHERE media_items.parent_id = ? AND media_items.item_type = ? AND media_items.id <> ? AND media_items.is_public = 1 AND (EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = ?) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = ? AND parent.is_public = 1)) ORDER BY media_items.title ASC",
             ),
             vec![
                 user_id.into(),
                 item.parent_id.as_str().into(),
                 item.item_type.as_str().into(),
                 item.id.as_str().into(),
+                item.parent_id.as_str().into(),
+                item.parent_id.as_str().into(),
             ],
         ))
         .await?;
@@ -421,6 +412,13 @@ mod tests {
         ))
         .await
         .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES ('movie1', 'Movie', 'D:/Movie', 'movies', 'movies', 'Movie', 1, 1, 'mkv', 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
         for (id, title, path, is_public) in [
             ("p1", "Movie", "D:/Movie/Movie CD1.mkv", 1),
             ("p2", "Movie", "D:/Movie/Movie CD2.mkv", 1),
@@ -441,6 +439,32 @@ mod tests {
         assert_eq!(parts[0].id, "p2");
         assert!(additional_parts(&db, "u1", "p2").await.unwrap().is_empty());
         assert!(additional_parts(&db, "u1", "p3").await.unwrap().is_empty());
+
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES ('private-parent', 'Private Parent', 'D:/Hidden', 'movies', 'movies', 'Movie', 1, 0, 'mkv', 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        for (id, path) in [
+            ("hidden-p1", "D:/Hidden/Hidden CD1.mkv"),
+            ("hidden-p2", "D:/Hidden/Hidden CD2.mkv"),
+        ] {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES (?, 'Hidden', ?, 'movies', 'private-parent', 'Video', 0, 1, 'mkv', 1, 1, 1)",
+                vec![id.into(), path.into()],
+            ))
+            .await
+            .unwrap();
+        }
+        assert!(
+            additional_parts(&db, "u1", "hidden-p1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -621,6 +645,69 @@ mod tests {
                 .unwrap()
                 .id,
             "private"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn item_by_file_hides_items_under_private_parent() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "jellyfin-rs-private-parent-file-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let media_path = dir.join("child.mkv");
+        std::fs::write(&media_path, b"child").unwrap();
+        let backend = db.get_database_backend();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
+            vec!["movies".into(), "Movies".into(), "movies".into()],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO library_paths (id, library_id, path, created_at) VALUES (?, ?, ?, 1)",
+            vec![
+                "lp1".into(),
+                "movies".into(),
+                dir.to_string_lossy().to_string().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES ('private-parent', 'Private Parent', 'D:/hidden', 'movies', '', 'Movie', 1, 0, 'mkv', 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES ('public-child', 'Public Child', ?, 'movies', 'private-parent', 'Video', 0, 1, 'mkv', 1, 1, 1)",
+            vec![media_path.to_string_lossy().to_string().into()],
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            item_by_file_inner(&db, "u1", &media_path.to_string_lossy(), false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            item_by_file_inner(&db, "u1", &media_path.to_string_lossy(), true)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "public-child"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();

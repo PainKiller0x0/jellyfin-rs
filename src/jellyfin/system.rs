@@ -875,6 +875,19 @@ pub async fn items_access(
                 .and_then(|Json(body)| json_string(body, "UserId"))
         })
         .unwrap_or_else(|| request_user_id.clone());
+    if user_id != request_user_id {
+        match Users::find_by_id(&request_user_id).one(&state.db).await {
+            Ok(Some(user)) if user.is_admin != 0 => {}
+            Ok(Some(_)) | Ok(None) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "Error": "User access is denied" })),
+                )
+                    .into_response();
+            }
+            Err(error) => return internal_error(error.into()),
+        }
+    }
     match library_views(&state.db).await {
         Ok(libraries) => Json(items_access_value(&user_id, &libraries)).into_response(),
         Err(error) => internal_error(error),
@@ -4588,8 +4601,9 @@ mod tests {
     use crate::app::state::{PlaybackSession, PlaybackState, SessionCapabilities};
     use crate::entities::{access_tokens, activity_log, users};
     use axum::{
+        Json,
         body::Bytes,
-        extract::{Path, Query, State},
+        extract::{Extension, Path, Query, State},
         http::HeaderMap,
         response::IntoResponse,
     };
@@ -5343,6 +5357,76 @@ mod tests {
         assert_eq!(value["Items"][0]["ItemId"], "lib1");
         assert_eq!(value["Items"][0]["HasAccess"], true);
         assert_eq!(value["Items"][0]["CanPlay"], true);
+    }
+
+    #[tokio::test]
+    async fn items_access_rejects_body_user_for_non_admin() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        users::Entity::insert(users::ActiveModel {
+            id: Set("u1".to_string()),
+            username: Set("alice".to_string()),
+            password_hash: Set(None),
+            display_name: Set("Alice".to_string()),
+            is_admin: Set(0),
+            is_disabled: Set(0),
+            created_at: Set(1),
+            updated_at: Set(1),
+            last_login_at: Set(None),
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+        let state = Arc::new(test_state(db));
+
+        let response = super::items_access(
+            State(state),
+            Extension("u1".to_string()),
+            Query(HashMap::new()),
+            Some(Json(serde_json::json!({ "UserId": "u2" }))),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn items_access_allows_body_user_for_admin() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        users::Entity::insert(users::ActiveModel {
+            id: Set("admin".to_string()),
+            username: Set("admin".to_string()),
+            password_hash: Set(None),
+            display_name: Set("Admin".to_string()),
+            is_admin: Set(1),
+            is_disabled: Set(0),
+            created_at: Set(1),
+            updated_at: Set(1),
+            last_login_at: Set(None),
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+        let state = Arc::new(test_state(db));
+
+        let response = super::items_access(
+            State(state),
+            Extension("admin".to_string()),
+            Query(HashMap::new()),
+            Some(Json(serde_json::json!({ "UserId": "u2" }))),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(value["UserId"], "u2");
     }
 
     #[test]

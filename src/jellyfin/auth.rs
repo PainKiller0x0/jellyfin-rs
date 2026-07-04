@@ -1700,7 +1700,9 @@ fn item_image_write(path: &str) -> bool {
 
 fn metadata_admin_read(path: &str) -> bool {
     path.starts_with("/Items/")
-        && (path.ends_with("/MetadataEditor") || path.ends_with("/ExternalIdInfos"))
+        && (path.ends_with("/MetadataEditor")
+            || path.ends_with("/ExternalIdInfos")
+            || path.contains("/RemoteImages"))
 }
 
 fn item_delete_info_read(path: &str) -> bool {
@@ -2556,6 +2558,11 @@ mod tests {
         assert!(admin_required(&Method::DELETE, "/Videos/i1/Subtitles/2"));
         assert!(admin_required(&Method::GET, "/Items/i1/MetadataEditor"));
         assert!(admin_required(&Method::GET, "/Items/i1/ExternalIdInfos"));
+        assert!(admin_required(&Method::GET, "/Items/i1/RemoteImages"));
+        assert!(admin_required(
+            &Method::GET,
+            "/Items/i1/RemoteImages/Providers"
+        ));
         assert!(admin_required(&Method::GET, "/Items/i1/DeleteInfo"));
         assert!(admin_required(&Method::GET, "/Items/i1/File"));
         assert!(admin_required(&Method::GET, "/Items/File"));

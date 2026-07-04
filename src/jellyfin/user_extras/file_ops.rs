@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::{Extension, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use sea_orm::ConnectionTrait;
@@ -71,49 +71,84 @@ async fn item_by_file_inner(
         .map_err(Into::into)
 }
 
+pub async fn attachment_file(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((item_id, _media_source_id, index)): Path<(String, String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    stream_attachment_response(&state, &headers, &query, &item_id, &index).await
+}
+
 pub async fn attachment_stream(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((item_id, _media_source_id, index)): Path<(String, String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    match visible_item_from_request(&state, &headers, &query, &item_id).await {
+    stream_attachment_response(&state, &headers, &query, &item_id, &index).await
+}
+
+async fn stream_attachment_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+    item_id: &str,
+    index: &str,
+) -> Response {
+    match visible_item_from_request(state, headers, query, item_id).await {
         Ok(Some(_)) => {}
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return internal_error(error),
     }
 
-    // Look for external subtitle attachment files
-    let backend = state.db.get_database_backend();
-    let row = state.db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT path FROM media_streams WHERE item_id = ? AND stream_type = 'Subtitle' AND is_external = 1 AND stream_index = ?",
-            vec![item_id.into(), index.parse::<i64>().unwrap_or(0).into()],
-        ))
-        .await;
-
-    match row {
-        Ok(Some(r)) => {
-            if let Ok(path) = r.get_str("path") {
-                if !readable_media_path(&state.db, &path).await {
-                    return StatusCode::NOT_FOUND.into_response();
-                }
-                match tokio::fs::read(&path).await {
-                    Ok(bytes) => {
-                        return (
-                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-                            bytes,
-                        )
-                            .into_response();
-                    }
-                    Err(_) => return StatusCode::NOT_FOUND.into_response(),
-                }
+    match attachment_path(&state.db, item_id, index).await {
+        Ok(Some(path)) => {
+            if !readable_media_path(&state.db, &path).await {
+                return StatusCode::NOT_FOUND.into_response();
             }
-            StatusCode::NOT_FOUND.into_response()
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/octet-stream"),
+                    );
+                    headers.insert(
+                        header::CONTENT_LENGTH,
+                        HeaderValue::from_str(&bytes.len().to_string())
+                            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+                    );
+                    (headers, bytes).into_response()
+                }
+                Err(_) => StatusCode::NOT_FOUND.into_response(),
+            }
         }
-        _ => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => internal_error(error),
     }
+}
+
+async fn attachment_path(
+    db: &sea_orm::DatabaseConnection,
+    item_id: &str,
+    index: &str,
+) -> anyhow::Result<Option<String>> {
+    let index = index
+        .trim()
+        .trim_end_matches(".bin")
+        .parse::<i64>()
+        .unwrap_or(-1);
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "SELECT path FROM media_streams WHERE item_id = ? AND stream_index = ? AND path IS NOT NULL AND path <> '' AND (stream_type = 'Attachment' OR (stream_type = 'Subtitle' AND is_external = 1))",
+            vec![item_id.into(), index.into()],
+        ))
+        .await?;
+    row.map(|row| row.get_str("path"))
+        .transpose()
+        .map_err(Into::into)
 }
 
 /// HEAD /Items/{item_id}/Images/{image_type} — HEAD request for image (ETag caching)
@@ -361,7 +396,7 @@ fn stack_info(item: &MediaItem) -> Option<(String, i64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{additional_parts, item_by_file_inner, safe_download_filename};
+    use super::{additional_parts, attachment_path, item_by_file_inner, safe_download_filename};
     use sea_orm::{ConnectionTrait, Database};
 
     #[test]
@@ -406,6 +441,66 @@ mod tests {
         assert_eq!(parts[0].id, "p2");
         assert!(additional_parts(&db, "u1", "p2").await.unwrap().is_empty());
         assert!(additional_parts(&db, "u1", "p3").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn attachment_path_accepts_attachments_and_external_subtitles_only() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES ('movie', 'Movie', 'D:/Movie/movie.mkv', '', '', 'Video', 0, 1, 'mkv', 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        for (id, index, stream_type, path, is_external) in [
+            ("font", 1_i64, "Attachment", "D:/Movie/font.ttf", 0_i64),
+            ("subtitle", 2_i64, "Subtitle", "D:/Movie/sub.srt", 1_i64),
+            (
+                "embedded",
+                3_i64,
+                "Subtitle",
+                "D:/Movie/embedded.srt",
+                0_i64,
+            ),
+            ("missing-path", 4_i64, "Attachment", "", 0_i64),
+        ] {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO media_streams (id, item_id, stream_index, stream_type, path, is_external, created_at) VALUES (?, 'movie', ?, ?, ?, ?, 1)",
+                vec![
+                    id.into(),
+                    index.into(),
+                    stream_type.into(),
+                    path.into(),
+                    is_external.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            attachment_path(&db, "movie", "1").await.unwrap().as_deref(),
+            Some("D:/Movie/font.ttf")
+        );
+        assert_eq!(
+            attachment_path(&db, "movie", "2.bin")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("D:/Movie/sub.srt")
+        );
+        assert!(attachment_path(&db, "movie", "3").await.unwrap().is_none());
+        assert!(attachment_path(&db, "movie", "4").await.unwrap().is_none());
+        assert!(
+            attachment_path(&db, "movie", "not-a-number")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -6,8 +6,8 @@ mod user_prefs;
 
 pub(crate) use file_ops::visible_item_from_request;
 pub use file_ops::{
-    attachment_stream, download_item, item_by_file, item_file_info, item_image_head,
-    item_image_index_head, video_additional_parts,
+    attachment_file, attachment_stream, download_item, item_by_file, item_file_info,
+    item_image_head, item_image_index_head, video_additional_parts,
 };
 pub use item_extras::{
     artist_instant_mix, artist_instant_mix_by_id, download_remote_subtitle, genre_image,

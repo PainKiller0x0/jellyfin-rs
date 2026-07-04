@@ -789,7 +789,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/Videos/{video_id}/{media_source_id}/Attachments/{index}",
-            get(common::not_found),
+            get(super::user_extras::attachment_file),
         )
         .route(
             "/Videos/{item_id}/stream.{container}",

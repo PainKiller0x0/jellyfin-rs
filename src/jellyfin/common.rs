@@ -12,7 +12,7 @@ pub async fn not_found() -> impl IntoResponse {
 }
 
 pub async fn empty_list() -> impl IntoResponse {
-    Json(json!({ "Items": [], "TotalRecordCount": 0 }))
+    Json(json!({ "Items": [], "TotalRecordCount": 0, "StartIndex": 0 }))
 }
 
 pub async fn empty_array() -> impl IntoResponse {
@@ -67,7 +67,17 @@ mod tests {
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
     use serde_json::Value;
 
-    use super::internal_error;
+    use super::{empty_list, internal_error};
+
+    #[tokio::test]
+    async fn empty_list_has_query_result_shape() {
+        let response = empty_list().await.into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["Items"].as_array().unwrap().is_empty());
+        assert_eq!(value["TotalRecordCount"], 0);
+        assert_eq!(value["StartIndex"], 0);
+    }
 
     #[tokio::test]
     async fn internal_error_does_not_echo_details() {

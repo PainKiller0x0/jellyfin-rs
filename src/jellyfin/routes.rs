@@ -286,7 +286,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(items::available_recording_options),
         )
         .route("/LiveTv/Recordings/Series", get(common::empty_list))
-        .route("/LiveTv/Recordings/Folders", get(common::empty_array))
+        .route("/LiveTv/Recordings/Folders", get(common::empty_list))
         .route("/LiveTv/Recordings/Groups", get(common::empty_list))
         .route(
             "/LiveTv/Recordings/Groups/{group_id}",

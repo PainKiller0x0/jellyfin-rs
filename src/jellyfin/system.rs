@@ -479,7 +479,7 @@ pub async fn sync_options() -> impl IntoResponse {
 }
 
 pub async fn sync_empty_query_result() -> Response {
-    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+    Json(json!({ "Items": [], "TotalRecordCount": 0, "StartIndex": 0 })).into_response()
 }
 
 pub async fn sync_data() -> Response {
@@ -3839,9 +3839,10 @@ mod tests {
         reports_activity_result, reports_items_result, required_upload_part,
         run_user_usage_custom_query, safe_log_path, safe_user_usage_backup_file,
         sanitize_file_part, save_camera_upload_to, scan_library_task, smtp_notification_test,
-        stop_scheduled_task, sync_data, sync_data_result, sync_empty_response, sync_options_result,
-        sync_play_unavailable, sync_unavailable, system_log_file, tmdb_client_configuration_value,
-        ui_command, update_notification_read_state, usage_stats_breakdown_items,
+        stop_scheduled_task, sync_data, sync_data_result, sync_empty_query_result,
+        sync_empty_response, sync_options_result, sync_play_unavailable, sync_unavailable,
+        system_log_file, tmdb_client_configuration_value, ui_command,
+        update_notification_read_state, usage_stats_breakdown_items,
         usage_stats_duration_histogram_items, usage_stats_hourly_items, usage_stats_session_entry,
         usage_user_entry, user_usage_stats_load_backup_from, user_usage_stats_save_backup_to,
         user_usage_stats_user_manage, user_view_grouping_options_value, web_strings_value,
@@ -3867,6 +3868,18 @@ mod tests {
         assert!(options["QualityOptions"].as_array().is_some());
         assert!(options["ProfileOptions"].as_array().is_some());
         assert!(sync_data_result()["ItemIdsToRemove"].as_array().is_some());
+    }
+
+    #[tokio::test]
+    async fn sync_empty_query_result_has_start_index() {
+        let response = sync_empty_query_result().await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["TotalRecordCount"], 0);
+        assert_eq!(value["StartIndex"], 0);
+        assert!(value["Items"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

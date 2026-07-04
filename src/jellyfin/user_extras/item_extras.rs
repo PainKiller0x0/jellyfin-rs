@@ -21,6 +21,12 @@ use crate::{
 };
 
 /// GET /Items/{item_id}/Intros — get intros (returns empty, not supported)
+fn visible_media_item_sql(alias: &str) -> String {
+    format!(
+        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
+    )
+}
+
 pub async fn item_intros(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
@@ -183,9 +189,30 @@ async fn item_extras(
     item_id: &str,
     kind: ExtraKind,
 ) -> anyhow::Result<Vec<MediaItem>> {
-    let sql = item_queries::media_item_select_sql(
-        "WHERE media_items.id IN (WITH RECURSIVE target(id, root_id) AS (SELECT id, CASE WHEN is_folder = 0 AND parent_id <> '' THEN parent_id ELSE id END FROM media_items WHERE id = ? AND is_public = 1), tree(id) AS (SELECT root_id FROM target UNION ALL SELECT child.id FROM media_items child JOIN tree ON child.parent_id = tree.id AND child.is_public = 1) SELECT id FROM tree WHERE id <> (SELECT id FROM target)) AND media_items.is_folder = 0 AND media_items.is_public = 1 ORDER BY media_items.title ASC",
-    );
+    let target_visible = visible_media_item_sql("media_items");
+    let child_visible = visible_media_item_sql("child");
+    let item_visible = visible_media_item_sql("media_items");
+    let sql = item_queries::media_item_select_sql(&format!(
+        r#"WHERE media_items.id IN (
+            WITH RECURSIVE target(id, root_id) AS (
+                SELECT media_items.id,
+                       CASE
+                           WHEN media_items.is_folder = 0 AND media_items.parent_id <> '' THEN media_items.parent_id
+                           ELSE media_items.id
+                       END
+                FROM media_items
+                WHERE media_items.id = ? AND {target_visible}
+            ),
+            tree(id) AS (
+                SELECT root_id FROM target
+                UNION ALL
+                SELECT child.id FROM media_items child
+                JOIN tree ON child.parent_id = tree.id AND {child_visible}
+            )
+            SELECT id FROM tree WHERE id <> (SELECT id FROM target)
+        ) AND media_items.is_folder = 0 AND {item_visible}
+        ORDER BY media_items.title ASC"#
+    ));
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             db.get_database_backend(),
@@ -367,10 +394,13 @@ async fn public_item_runtime_ticks(
     db: &DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Option<i64>> {
+    let visible = visible_media_item_sql("media_items");
+    let sql =
+        format!("SELECT runtime_ticks FROM media_items WHERE media_items.id = ? AND {visible}");
     Ok(db
         .query_one(crate::db::helpers::portable_statement(
             db.get_database_backend(),
-            "SELECT runtime_ticks FROM media_items WHERE id = ? AND is_public = 1",
+            &sql,
             vec![item_id.into()],
         ))
         .await?
@@ -477,10 +507,14 @@ async fn music_genre_instant_mix_for_value(
 
 async fn seed_ids_for_item(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Vec<String>> {
     let backend = db.get_database_backend();
+    let visible = visible_media_item_sql("media_items");
+    let seed_sql = format!(
+        "SELECT item_type, is_folder FROM media_items WHERE media_items.id = ? AND {visible}"
+    );
     let row = db
         .query_one(crate::db::helpers::portable_statement(
             backend,
-            "SELECT item_type, is_folder FROM media_items WHERE id = ? AND is_public = 1",
+            &seed_sql,
             vec![item_id.into()],
         ))
         .await?;
@@ -492,29 +526,26 @@ async fn seed_ids_for_item(db: &DatabaseConnection, item_id: &str) -> anyhow::Re
     let is_folder = row.get_i64("is_folder").unwrap_or_default() != 0;
 
     if matches!(item_type.as_str(), "Playlist" | "BoxSet") {
-        return query_string_column(
-            db,
+        let source_visible = visible_media_item_sql("source");
+        let audio_visible = visible_media_item_sql("audio");
+        let sql = format!(
             r#"SELECT DISTINCT audio.id
                FROM linked_children lc
                JOIN media_items source ON source.id = lc.item_id
                JOIN media_items audio ON (audio.id = source.id OR audio.parent_id = source.id)
-               WHERE lc.parent_id = ? AND source.is_public = 1 AND audio.is_public = 1 AND audio.item_type = 'Audio' AND audio.is_folder = 0
+               WHERE lc.parent_id = ? AND {source_visible} AND {audio_visible} AND audio.item_type = 'Audio' AND audio.is_folder = 0
                GROUP BY audio.id
-               ORDER BY MIN(audio.title) ASC"#,
-            vec![item_id.into()],
-            "id",
-        )
-        .await;
+               ORDER BY MIN(audio.title) ASC"#
+        );
+        return query_string_column(db, &sql, vec![item_id.into()], "id").await;
     }
 
     if is_folder || item_type == "MusicAlbum" {
-        let children = query_string_column(
-            db,
-            "SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Audio' AND is_folder = 0 AND is_public = 1 ORDER BY title ASC",
-            vec![item_id.into()],
-            "id",
-        )
-        .await?;
+        let child_visible = visible_media_item_sql("media_items");
+        let sql = format!(
+            "SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Audio' AND is_folder = 0 AND {child_visible} ORDER BY title ASC"
+        );
+        let children = query_string_column(db, &sql, vec![item_id.into()], "id").await?;
         if !children.is_empty() {
             return Ok(children);
         }
@@ -530,24 +561,23 @@ async fn seed_ids_for_artist(
     let Some(person_id) = resolve_named_id(db, "people", id_or_name).await? else {
         return Ok(Vec::new());
     };
-    query_string_column(
-        db,
+    let source_visible = visible_media_item_sql("source");
+    let audio_visible = visible_media_item_sql("audio");
+    let sql = format!(
         r#"SELECT DISTINCT audio.id
            FROM media_people mp
            JOIN media_items source ON source.id = mp.item_id
            JOIN media_items audio ON (audio.id = source.id OR audio.parent_id = source.id)
            WHERE mp.person_id = ?
-             AND source.is_public = 1
-             AND audio.is_public = 1
+             AND {source_visible}
+             AND {audio_visible}
              AND LOWER(COALESCE(mp.person_type, '')) IN ('artist', 'musicartist', 'albumartist', 'audioalbumartist')
              AND audio.item_type = 'Audio'
              AND audio.is_folder = 0
            GROUP BY audio.id
-           ORDER BY MIN(audio.title) ASC"#,
-        vec![person_id.into()],
-        "id",
-    )
-    .await
+           ORDER BY MIN(audio.title) ASC"#
+    );
+    query_string_column(db, &sql, vec![person_id.into()], "id").await
 }
 
 async fn seed_ids_for_music_genre(
@@ -558,24 +588,23 @@ async fn seed_ids_for_music_genre(
     let Some(genre_id) = resolve_named_id(db, "genres", id_or_name).await? else {
         return Ok(Vec::new());
     };
-    query_string_column(
-        db,
+    let source_visible = visible_media_item_sql("source");
+    let audio_visible = visible_media_item_sql("audio");
+    let sql = format!(
         r#"SELECT DISTINCT audio.id
            FROM media_genres mg
            JOIN media_items source ON source.id = mg.item_id
            JOIN media_items audio ON (audio.id = source.id OR audio.parent_id = source.id)
            WHERE mg.genre_id = ?
-             AND source.is_public = 1
-             AND audio.is_public = 1
+             AND {source_visible}
+             AND {audio_visible}
              AND audio.item_type = 'Audio'
              AND audio.is_folder = 0
            GROUP BY audio.id
            ORDER BY MIN(audio.title) ASC
-           LIMIT ?"#,
-        vec![genre_id.into(), limit.into()],
-        "id",
-    )
-    .await
+           LIMIT ?"#
+    );
+    query_string_column(db, &sql, vec![genre_id.into(), limit.into()], "id").await
 }
 
 async fn instant_mix_from_seed_ids(
@@ -593,6 +622,7 @@ async fn instant_mix_from_seed_ids(
     let item_types = include_item_types(query);
     let seed_placeholders = placeholders(seed_ids.len());
     let type_placeholders = placeholders(item_types.len());
+    let item_visible = visible_media_item_sql("mi");
     let sql = format!(
         r#"SELECT mg_rel.item_id
            FROM media_genres mg_src
@@ -600,7 +630,7 @@ async fn instant_mix_from_seed_ids(
            JOIN media_items mi ON mi.id = mg_rel.item_id
            WHERE mg_src.item_id IN ({seed_placeholders})
              AND mg_rel.item_id NOT IN ({seed_placeholders})
-             AND mi.is_public = 1
+             AND {item_visible}
              AND mi.is_folder = 0
              AND mi.item_type IN ({type_placeholders})
            GROUP BY mg_rel.item_id
@@ -642,8 +672,9 @@ async fn fetch_items_by_ids(
 
     let id_placeholders = placeholders(ids.len());
     let type_placeholders = placeholders(item_types.len());
+    let visible = visible_media_item_sql("media_items");
     let sql = item_queries::media_item_select_sql(&format!(
-        "WHERE media_items.id IN ({id_placeholders}) AND media_items.is_folder = 0 AND media_items.is_public = 1 AND media_items.item_type IN ({type_placeholders})"
+        "WHERE media_items.id IN ({id_placeholders}) AND media_items.is_folder = 0 AND {visible} AND media_items.item_type IN ({type_placeholders})"
     ));
     let mut values: Vec<SeaValue> = vec![user_id.into()];
     push_values(&mut values, &ids);
@@ -974,9 +1005,10 @@ async fn public_item_exists(db: &DatabaseConnection, item_id: &str) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::{
-        ExtraKind, empty_instant_mix_response, include_item_types, instant_mix_response,
-        item_critic_reviews, item_extras, item_intros_value, media_segments_value,
-        parse_trickplay_index, public_item_exists, query_limit, remote_subtitle_search,
+        ExtraKind, empty_instant_mix_response, include_item_types, instant_mix_from_seed_ids,
+        instant_mix_response, item_critic_reviews, item_extras, item_intros_value,
+        media_segments_value, parse_trickplay_index, public_item_exists, query_limit,
+        remote_subtitle_search, seed_ids_for_artist, seed_ids_for_item, seed_ids_for_music_genre,
         studio_image_with_index, trickplay_info,
     };
     use axum::{
@@ -1056,6 +1088,120 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["TotalRecordCount"], 0);
         assert_eq!(value["StartIndex"], 0);
+    }
+
+    #[tokio::test]
+    async fn instant_mix_ignores_items_under_private_parents() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+
+        for (id, title, parent_id, item_type, is_folder, is_public) in [
+            ("song1", "Alpha", "", "Audio", 0_i64, 1_i64),
+            ("song2", "Beta", "", "Audio", 0_i64, 1_i64),
+            ("playlist", "Playlist", "", "Playlist", 1_i64, 1_i64),
+            (
+                "private-parent",
+                "Private Parent",
+                "",
+                "MusicAlbum",
+                1_i64,
+                0_i64,
+            ),
+            (
+                "hidden-song",
+                "Hidden",
+                "private-parent",
+                "Audio",
+                0_i64,
+                1_i64,
+            ),
+        ] {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?, ?, ?, 1, 1, 1)",
+                vec![
+                    id.into(),
+                    title.into(),
+                    format!("D:/{id}.mp3").into(),
+                    parent_id.into(),
+                    item_type.into(),
+                    is_folder.into(),
+                    is_public.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES ('playlist', 'song1', 0), ('playlist', 'hidden-song', 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO people (id, name, created_at) VALUES ('artist1', 'Artist', 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        for item_id in ["song1", "hidden-song"] {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO media_people (item_id, person_id, person_type, sort_order) VALUES (?, 'artist1', 'Artist', 0)",
+                vec![item_id.into()],
+            ))
+            .await
+            .unwrap();
+        }
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO genres (id, name, created_at) VALUES ('genre1', 'Genre', 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        for item_id in ["song1", "song2", "hidden-song"] {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO media_genres (item_id, genre_id) VALUES (?, 'genre1')",
+                vec![item_id.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            seed_ids_for_item(&db, "hidden-song").await.unwrap().len(),
+            0
+        );
+        assert_eq!(
+            seed_ids_for_item(&db, "playlist").await.unwrap(),
+            vec!["song1".to_string()]
+        );
+        assert_eq!(
+            seed_ids_for_artist(&db, "artist1").await.unwrap(),
+            vec!["song1".to_string()]
+        );
+        let genre_seed_ids = seed_ids_for_music_genre(&db, "genre1", 16).await.unwrap();
+        assert!(genre_seed_ids.contains(&"song1".to_string()));
+        assert!(genre_seed_ids.contains(&"song2".to_string()));
+        assert!(!genre_seed_ids.contains(&"hidden-song".to_string()));
+
+        let related =
+            instant_mix_from_seed_ids(&db, "u1", &["song1".to_string()], &HashMap::new(), false)
+                .await
+                .unwrap();
+        assert_eq!(
+            related
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["song2"]
+        );
     }
 
     #[tokio::test]
@@ -1175,6 +1321,62 @@ mod tests {
         );
         assert_eq!(
             item_intros_value(&db, "u1", "video1").await.unwrap()["TotalRecordCount"],
+            0
+        );
+
+        for (id, title, path, parent_id, item_type, is_folder, is_public) in [
+            (
+                "hidden-movie",
+                "Hidden Movie",
+                "D:/Hidden",
+                "movies",
+                "Movie",
+                1_i64,
+                0_i64,
+            ),
+            (
+                "hidden-video",
+                "Hidden Movie",
+                "D:/Hidden/Movie.mp4",
+                "hidden-movie",
+                "Video",
+                0_i64,
+                1_i64,
+            ),
+            (
+                "hidden-extra",
+                "Hidden Behind the Scenes",
+                "D:/Hidden/extras/Behind the Scenes.mp4",
+                "hidden-movie",
+                "Video",
+                0_i64,
+                1_i64,
+            ),
+        ] {
+            db.execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', ?, ?, ?, ?, 1, 1, 1)",
+                vec![
+                    id.into(),
+                    title.into(),
+                    path.into(),
+                    parent_id.into(),
+                    item_type.into(),
+                    is_folder.into(),
+                    is_public.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+        assert!(
+            item_extras(&db, "u1", "hidden-video", ExtraKind::SpecialFeature)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            item_intros_value(&db, "u1", "hidden-video").await.unwrap()["TotalRecordCount"],
             0
         );
     }
@@ -1332,6 +1534,34 @@ mod tests {
         );
         assert!(
             media_segments_value(&db, "missing", &HashMap::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, runtime_ticks, modified_at, created_at, updated_at) VALUES ('private-parent', 'Private Parent', 'D:/private-parent', '', '', 'Series', 1, 0, NULL, 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, runtime_ticks, modified_at, created_at, updated_at) VALUES ('hidden-episode', 'Hidden Episode', 'D:/hidden-episode.mkv', '', 'private-parent', 'Episode', 0, 1, 100, 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "INSERT INTO chapters (id, item_id, start_position_ticks, name, marker_type, source, created_at, updated_at) VALUES ('hidden-intro', 'hidden-episode', 10, 'IntroStart', 'IntroStart', 'test', 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        assert!(
+            media_segments_value(&db, "hidden-episode", &HashMap::new())
                 .await
                 .unwrap()
                 .is_none()

@@ -35,6 +35,7 @@ pub async fn tmdb_movie_search(
                 .and_then(|year| year.parse::<i64>().ok());
             json!({
                 "Name": movie.title,
+                "Type": "Movie",
                 "ProductionYear": year,
                 "SearchProviderName": "TheMovieDb",
                 "ProviderIds": { "Tmdb": movie.id.to_string() },
@@ -114,6 +115,7 @@ pub async fn tmdb_movie_details(
 
     Ok(json!({
         "Name": response.title,
+        "Type": "Movie",
         "Overview": response.overview,
         "ProductionYear": year,
         "CommunityRating": response.vote_average,
@@ -170,6 +172,7 @@ pub async fn tmdb_tv_search(
                 .and_then(|year| year.parse::<i64>().ok());
             json!({
                 "Name": show.name,
+                "Type": "Series",
                 "ProductionYear": year,
                 "SearchProviderName": "TheMovieDb",
                 "ProviderIds": { "Tmdb": show.id.to_string() },
@@ -250,6 +253,7 @@ pub async fn tmdb_tv_details(
 
     Ok(json!({
         "Name": response.name,
+        "Type": "Series",
         "Overview": response.overview,
         "ProductionYear": year,
         "CommunityRating": response.vote_average,
@@ -297,6 +301,7 @@ pub async fn tmdb_person_search(
         .map(|person| {
             json!({
                 "Name": person.name,
+                "Type": "Person",
                 "SearchProviderName": "TheMovieDb",
                 "ProviderIds": { "Tmdb": person.id.to_string() },
                 "ImageUrl": person.profile_path.map(|path| format!("https://image.tmdb.org/t/p/w185{path}")),
@@ -354,6 +359,7 @@ pub async fn tmdb_person_details(
 
     Ok(json!({
         "Name": response.name,
+        "Type": "Person",
         "Overview": response.biography,
         "ProviderIds": {
             "Tmdb": response.id.to_string(),

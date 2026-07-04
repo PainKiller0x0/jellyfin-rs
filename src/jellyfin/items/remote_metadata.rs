@@ -6,10 +6,12 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use sea_orm::ConnectionTrait;
 use serde_json::{Value, json};
 
 use crate::{
     app::state::AppState,
+    db::row_ext::QueryResultExt,
     jellyfin::{common::internal_error, providers},
 };
 
@@ -84,7 +86,7 @@ pub async fn apply_remote_search(
     Path(item_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let body = enrich_remote_search_result(&state, body).await;
+    let body = enrich_remote_search_result(&state, &item_id, body).await;
     let mut update = json!({});
     if let Some(name) = body.get("Name").cloned() {
         update["Name"] = name;
@@ -115,7 +117,7 @@ pub async fn apply_remote_search(
     }
 }
 
-async fn enrich_remote_search_result(state: &AppState, body: Value) -> Value {
+async fn enrich_remote_search_result(state: &AppState, item_id: &str, body: Value) -> Value {
     let Some(api_key) = state
         .tmdb_api_key
         .read()
@@ -135,7 +137,9 @@ async fn enrich_remote_search_result(state: &AppState, body: Value) -> Value {
         return body;
     };
 
-    let item_type = body.get("Type").and_then(Value::as_str).unwrap_or("");
+    let item_type = remote_result_type_or_item_type(state, &body, item_id)
+        .await
+        .unwrap_or_default();
 
     let details = if item_type.eq_ignore_ascii_case("Series") {
         providers::tmdb_tv_details(&state.http_client, &api_key, tmdb_id).await
@@ -154,9 +158,40 @@ async fn enrich_remote_search_result(state: &AppState, body: Value) -> Value {
     }
 }
 
+async fn remote_result_type_or_item_type(
+    state: &AppState,
+    body: &Value,
+    item_id: &str,
+) -> Option<String> {
+    if let Some(item_type) = body
+        .get("Type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(item_type.to_string());
+    }
+    item_type_for_id(&state.db, item_id).await.ok().flatten()
+}
+
+async fn item_type_for_id(
+    db: &sea_orm::DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "SELECT item_type FROM media_items WHERE id = ?",
+            vec![item_id.into()],
+        ))
+        .await?;
+    Ok(row.and_then(|row| row.get_str("item_type").ok()))
+}
+
 fn merge_remote_search_values(mut base: Value, details: Value) -> Value {
     for key in [
         "Name",
+        "Type",
         "Overview",
         "ProductionYear",
         "Genres",
@@ -186,6 +221,7 @@ fn merge_remote_search_values(mut base: Value, details: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{ConnectionTrait, Database};
 
     #[test]
     fn remote_search_item_type_uses_last_path_segment() {
@@ -197,5 +233,44 @@ mod tests {
             remote_search_item_type("/emby/Items/RemoteSearch/Series/"),
             "Series"
         );
+    }
+
+    #[test]
+    fn merge_remote_search_values_preserves_remote_type() {
+        let merged = merge_remote_search_values(
+            json!({
+                "Name": "Old",
+                "ProviderIds": { "Tmdb": "1" }
+            }),
+            json!({
+                "Name": "New",
+                "Type": "Series",
+                "ProviderIds": { "Tvdb": "2" }
+            }),
+        );
+
+        assert_eq!(merged["Name"], "New");
+        assert_eq!(merged["Type"], "Series");
+        assert_eq!(merged["ProviderIds"]["Tmdb"], "1");
+        assert_eq!(merged["ProviderIds"]["Tvdb"], "2");
+    }
+
+    #[tokio::test]
+    async fn remote_result_type_falls_back_to_item_type() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        db.execute(crate::db::helpers::portable_statement(
+            db.get_database_backend(),
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Series', 1, 1, 1, 1)",
+            vec!["series1".into(), "Series".into(), "/tmp/series".into()],
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            item_type_for_id(&db, "series1").await.unwrap(),
+            Some("Series".to_string())
+        );
+        assert_eq!(item_type_for_id(&db, "missing").await.unwrap(), None);
     }
 }

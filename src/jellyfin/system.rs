@@ -40,6 +40,9 @@ const MAX_CAMERA_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 const MAX_USER_USAGE_BACKUP_BYTES: usize = 20 * 1024 * 1024;
 const MAX_LOG_LINE_LIMIT: usize = 10_000;
 const MAX_DEVICE_CUSTOM_NAME_LEN: usize = 128;
+const MAX_PLUGIN_REPOSITORIES: usize = 32;
+const MAX_PLUGIN_REPOSITORY_NAME_LEN: usize = 128;
+const MAX_PLUGIN_REPOSITORY_URL_LEN: usize = 2048;
 const CAMERA_UPLOADS_PATH: &str = "data/camera_uploads";
 const USER_USAGE_BACKUP_PATH: &str = "data/user_usage_stats";
 const FALLBACK_FONTS_PATH: &str = "data/fonts";
@@ -1372,9 +1375,10 @@ pub async fn update_repositories(
     State(state): State<Arc<AppState>>,
     Json(repositories): Json<JsonValue>,
 ) -> Response {
-    if !repositories.is_array() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
+    let repositories = match normalize_plugin_repositories(repositories) {
+        Ok(repositories) => repositories,
+        Err(error) => return validation_error_response(error),
+    };
 
     match set_app_setting(&state.db, "PluginRepositories", &repositories.to_string()).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1490,11 +1494,118 @@ fn default_scan_library_triggers() -> JsonValue {
 
 async fn plugin_repositories(db: &DatabaseConnection) -> JsonValue {
     serde_json::from_str(&app_setting(db, "PluginRepositories", "").await)
-        .unwrap_or_else(|_| default_plugin_repositories())
+        .ok()
+        .and_then(|value| normalize_plugin_repositories(value).ok())
+        .unwrap_or_else(default_plugin_repositories)
 }
 
 fn default_plugin_repositories() -> JsonValue {
     JsonValue::Array(Vec::new())
+}
+
+fn normalize_plugin_repositories(
+    value: JsonValue,
+) -> Result<JsonValue, (StatusCode, &'static str)> {
+    let Some(repositories) = value.as_array() else {
+        return Err((StatusCode::BAD_REQUEST, "Repositories must be an array"));
+    };
+    if repositories.len() > MAX_PLUGIN_REPOSITORIES {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Too many repositories"));
+    }
+
+    let mut normalized = Vec::with_capacity(repositories.len());
+    for repository in repositories {
+        let Some(repository) = repository.as_object() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Repository entries must be objects",
+            ));
+        };
+        let name = repository_string_field(repository, &["Name", "name"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        validate_repository_text(&name, MAX_PLUGIN_REPOSITORY_NAME_LEN, "Repository name")?;
+
+        let url = repository_string_field(repository, &["Url", "URL", "url"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        validate_repository_text(&url, MAX_PLUGIN_REPOSITORY_URL_LEN, "Repository URL")?;
+        if !url.is_empty() && !is_supported_repository_url(&url) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Repository URL must use http or https",
+            ));
+        }
+
+        normalized.push(json!({
+            "Name": name,
+            "Url": url,
+            "Enabled": repository_bool_field(repository, &["Enabled", "enabled"]).unwrap_or(false)
+        }));
+    }
+
+    Ok(JsonValue::Array(normalized))
+}
+
+fn repository_string_field(
+    object: &serde_json::Map<String, JsonValue>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| object.get(*key))
+        .and_then(JsonValue::as_str)
+        .map(ToString::to_string)
+}
+
+fn repository_bool_field(
+    object: &serde_json::Map<String, JsonValue>,
+    keys: &[&str],
+) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| object.get(*key))
+        .and_then(|value| {
+            value.as_bool().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|text| match text.trim().to_ascii_lowercase().as_str() {
+                        "1" | "true" | "yes" => Some(true),
+                        "0" | "false" | "no" => Some(false),
+                        _ => None,
+                    })
+            })
+        })
+}
+
+fn validate_repository_text(
+    value: &str,
+    max_len: usize,
+    field: &'static str,
+) -> Result<(), (StatusCode, &'static str)> {
+    if value.chars().count() > max_len {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, field));
+    }
+    if value.contains('\0') || value.chars().any(char::is_control) {
+        return Err((StatusCode::BAD_REQUEST, field));
+    }
+    Ok(())
+}
+
+fn is_supported_repository_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
+fn validation_error_response(error: (StatusCode, &'static str)) -> Response {
+    (
+        error.0,
+        Json(json!({
+            "Error": error.1
+        })),
+    )
+        .into_response()
 }
 
 fn package_list() -> Vec<JsonValue> {
@@ -4065,19 +4176,20 @@ mod tests {
         live_tv_default_listing_provider, live_tv_default_listing_provider_value,
         live_tv_default_tuner_host, live_tv_default_tuner_host_value, live_tv_guide_info,
         live_tv_info, live_tv_timer_defaults, live_tv_timer_defaults_value, live_tv_unavailable,
-        log_file_entry, normalize_device_custom_name, notification_items,
-        notification_services_test, notification_services_value, package_install_unavailable,
-        package_list, package_update_list, party_unavailable, play_activity_rows, plugin_list,
-        report_activity_headers_for_query, report_csv, report_item_headers_for_query,
-        reports_activity_result, reports_items_result, required_upload_part,
-        run_user_usage_custom_query, safe_log_path, safe_user_usage_backup_file,
-        sanitize_file_part, save_camera_upload_to, scan_library_task, smtp_notification_test,
-        stop_scheduled_task, sync_data, sync_data_result, sync_empty_query_result,
-        sync_empty_response, sync_options_result, sync_play_unavailable, sync_unavailable,
-        system_log_file, system_log_lines, system_logs_query, tmdb_client_configuration_value,
-        ui_command, update_notification_read_state, usage_stats_breakdown_items,
-        usage_stats_duration_histogram_items, usage_stats_hourly_items, usage_stats_session_entry,
-        usage_user_entry, user_usage_stats_load_backup_from, user_usage_stats_save_backup_to,
+        log_file_entry, normalize_device_custom_name, normalize_plugin_repositories,
+        notification_items, notification_services_test, notification_services_value,
+        package_install_unavailable, package_list, package_update_list, party_unavailable,
+        play_activity_rows, plugin_list, report_activity_headers_for_query, report_csv,
+        report_item_headers_for_query, reports_activity_result, reports_items_result,
+        required_upload_part, run_user_usage_custom_query, safe_log_path,
+        safe_user_usage_backup_file, sanitize_file_part, save_camera_upload_to, scan_library_task,
+        smtp_notification_test, stop_scheduled_task, sync_data, sync_data_result,
+        sync_empty_query_result, sync_empty_response, sync_options_result, sync_play_unavailable,
+        sync_unavailable, system_log_file, system_log_lines, system_logs_query,
+        tmdb_client_configuration_value, ui_command, update_notification_read_state,
+        usage_stats_breakdown_items, usage_stats_duration_histogram_items,
+        usage_stats_hourly_items, usage_stats_session_entry, usage_user_entry,
+        user_usage_stats_load_backup_from, user_usage_stats_save_backup_to,
         user_usage_stats_user_manage, user_view_grouping_options_value,
         validate_path_request_from_inputs, web_strings_value,
     };
@@ -4449,6 +4561,40 @@ mod tests {
     fn empty_repository_list_has_jellyfin_shape() {
         let repositories = default_plugin_repositories();
         assert!(repositories.as_array().is_some());
+    }
+
+    #[test]
+    fn plugin_repositories_are_normalized_and_limited() {
+        let repositories = normalize_plugin_repositories(serde_json::json!([
+            {
+                "name": " Stable ",
+                "url": "https://repo.jellyfin.org/releases/plugin/manifest-stable.json",
+                "enabled": "true",
+                "Ignored": "field"
+            }
+        ]))
+        .unwrap();
+        assert_eq!(repositories[0]["Name"], "Stable");
+        assert_eq!(
+            repositories[0]["Url"],
+            "https://repo.jellyfin.org/releases/plugin/manifest-stable.json"
+        );
+        assert_eq!(repositories[0]["Enabled"], true);
+        assert!(repositories[0]["Ignored"].is_null());
+
+        assert!(normalize_plugin_repositories(serde_json::json!({})).is_err());
+        assert!(
+            normalize_plugin_repositories(serde_json::json!([
+                { "Name": "bad", "Url": "file:///tmp/repo.json", "Enabled": true }
+            ]))
+            .is_err()
+        );
+        assert!(
+            normalize_plugin_repositories(serde_json::json!([
+                { "Name": "bad\nname", "Url": "https://example.com/repo.json" }
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

@@ -487,11 +487,7 @@ pub async fn password_reset_providers() -> impl IntoResponse {
 
 pub async fn api_keys(State(state): State<Arc<AppState>>) -> Response {
     match api_keys_inner(&state.db).await {
-        Ok(keys) => Json(json!({
-            "Items": keys,
-            "TotalRecordCount": keys.len()
-        }))
-        .into_response(),
+        Ok(keys) => Json(auth_query_result(keys)).into_response(),
         Err(error) => internal_error(error),
     }
 }
@@ -1048,6 +1044,14 @@ fn quick_connect_secret_key(secret: &str) -> String {
 
 fn quick_connect_code_key(code: &str) -> String {
     format!("{QUICK_CONNECT_CODE_PREFIX}{code}")
+}
+
+fn auth_query_result(items: Vec<JsonValue>) -> JsonValue {
+    json!({
+        "Items": items,
+        "TotalRecordCount": items.len(),
+        "StartIndex": 0
+    })
 }
 
 async fn api_keys_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<JsonValue>> {
@@ -2754,6 +2758,14 @@ mod tests {
         let providers = name_id_pairs(&[("Default", "Provider")]);
         assert_eq!(providers[0]["Name"], "Default");
         assert_eq!(providers[0]["Id"], "Provider");
+    }
+
+    #[test]
+    fn auth_query_results_include_start_index() {
+        let result = auth_query_result(vec![json!({ "AppName": "Web" })]);
+        assert_eq!(result["TotalRecordCount"], 1);
+        assert_eq!(result["StartIndex"], 0);
+        assert_eq!(result["Items"][0]["AppName"], "Web");
     }
 
     #[test]

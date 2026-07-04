@@ -1749,7 +1749,7 @@ fn package_admin_write(path: &str) -> bool {
 }
 
 fn remote_metadata_search_write(path: &str) -> bool {
-    path.eq_ignore_ascii_case("/Items/RemoteSearch/Person")
+    path.starts_with("/Items/RemoteSearch/")
 }
 
 fn session_user_management_write(path: &str) -> bool {
@@ -2560,7 +2560,8 @@ mod tests {
         assert!(admin_required(&Method::GET, "/Items/i1/File"));
         assert!(admin_required(&Method::GET, "/Items/File"));
         assert!(admin_required(&Method::POST, "/Items/RemoteSearch/Person"));
-        assert!(!admin_required(&Method::POST, "/Items/RemoteSearch/Movie"));
+        assert!(admin_required(&Method::POST, "/Items/RemoteSearch/Movie"));
+        assert!(admin_required(&Method::POST, "/Items/RemoteSearch/Series"));
         assert!(admin_required(&Method::GET, "/Dlna/ProfileInfos"));
         assert!(admin_required(&Method::GET, "/Dlna/Profiles/Default"));
         assert!(admin_required(&Method::POST, "/Dlna/Profiles"));

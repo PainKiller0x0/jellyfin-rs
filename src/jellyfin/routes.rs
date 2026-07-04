@@ -791,6 +791,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(super::user_extras::trickplay_tile),
         )
         .route(
+            "/Videos/{item_id}/Trickplay/{width}/{index}.jpg",
+            get(super::user_extras::trickplay_tile),
+        )
+        .route(
             "/Videos/{video_id}/{media_source_id}/Attachments/{index}",
             get(super::user_extras::attachment_file),
         )
@@ -1453,4 +1457,15 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/websocket", get(ws::ws_handler))
         .route("/WebSocket", get(ws::ws_handler))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn trickplay_routes_include_openapi_tile_path() {
+        let routes = include_str!("routes.rs");
+
+        assert!(routes.contains("/Videos/{item_id}/Trickplay/{width}/tiles.m3u8"));
+        assert!(routes.contains("/Videos/{item_id}/Trickplay/{width}/{index}.jpg"));
+    }
 }

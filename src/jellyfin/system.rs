@@ -4,7 +4,7 @@ use anyhow::Context;
 use axum::{
     Json,
     body::{Body, Bytes},
-    extract::{Extension, Path, Query, State, rejection::JsonRejection},
+    extract::{Extension, OriginalUri, Path, Query, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
@@ -1474,6 +1474,14 @@ pub async fn channels() -> Response {
 
 pub async fn channel_items() -> Response {
     Json(empty_query_result()).into_response()
+}
+
+pub async fn live_tv_recording_folders(OriginalUri(uri): OriginalUri) -> Response {
+    if uri.path().starts_with("/emby/") {
+        Json(Vec::<JsonValue>::new()).into_response()
+    } else {
+        Json(empty_query_result()).into_response()
+    }
 }
 
 pub async fn channel_features() -> Response {
@@ -4572,10 +4580,11 @@ mod tests {
         live_tv_channel_mapping_options, live_tv_channel_mapping_options_value,
         live_tv_default_listing_provider, live_tv_default_listing_provider_value,
         live_tv_default_tuner_host, live_tv_default_tuner_host_value, live_tv_guide_info,
-        live_tv_info, live_tv_timer_defaults, live_tv_timer_defaults_value, live_tv_unavailable,
-        log_file_entry, normalize_branding_options, normalize_device_custom_name,
-        normalize_device_id, normalize_device_ids, normalize_notification_ids,
-        normalize_notification_level, normalize_notification_text, normalize_plugin_repositories,
+        live_tv_info, live_tv_recording_folders, live_tv_timer_defaults,
+        live_tv_timer_defaults_value, live_tv_unavailable, log_file_entry,
+        normalize_branding_options, normalize_device_custom_name, normalize_device_id,
+        normalize_device_ids, normalize_notification_ids, normalize_notification_level,
+        normalize_notification_text, normalize_plugin_repositories,
         normalize_scheduled_task_triggers, notification_items, notification_services_test,
         notification_services_value, package_install_unavailable, package_list,
         package_update_list, party_unavailable, play_activity_rows, plugin_list,
@@ -4603,8 +4612,8 @@ mod tests {
     use axum::{
         Json,
         body::Bytes,
-        extract::{Extension, Path, Query, State},
-        http::HeaderMap,
+        extract::{Extension, OriginalUri, Path, Query, State},
+        http::{HeaderMap, Uri},
         response::IntoResponse,
     };
     use sea_orm::{
@@ -4622,6 +4631,31 @@ mod tests {
         assert!(options["QualityOptions"].as_array().is_some());
         assert!(options["ProfileOptions"].as_array().is_some());
         assert!(sync_data_result()["ItemIdsToRemove"].as_array().is_some());
+    }
+
+    #[tokio::test]
+    async fn recording_folders_match_jellyfin_and_emby_shapes() {
+        let jellyfin = live_tv_recording_folders(OriginalUri(
+            "/LiveTv/Recordings/Folders".parse::<Uri>().unwrap(),
+        ))
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(jellyfin.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["Items"].as_array().unwrap().is_empty());
+
+        let emby = live_tv_recording_folders(OriginalUri(
+            "/emby/LiveTv/Recordings/Folders".parse::<Uri>().unwrap(),
+        ))
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(emby.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value.as_array().unwrap().is_empty());
     }
 
     #[test]

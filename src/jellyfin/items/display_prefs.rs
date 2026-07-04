@@ -15,6 +15,10 @@ use crate::{
     util::now_unix,
 };
 
+const MAX_DISPLAY_PREFERENCES_JSON_BYTES: usize = 64 * 1024;
+const MAX_DISPLAY_PREFERENCES_ID_LEN: usize = 128;
+const MAX_DISPLAY_PREFERENCES_CLIENT_LEN: usize = 128;
+
 pub async fn get_display_preferences(
     State(state): State<Arc<AppState>>,
     Extension(request_user_id): Extension<String>,
@@ -40,12 +44,10 @@ pub async fn update_display_preferences(
     let now = now_unix();
     let user_id = display_pref_user_id(&request_user_id, &query);
     let client = display_pref_client(&query);
-    let mut prefs = body;
-    if let Some(object) = prefs.as_object_mut() {
-        object.entry("Id").or_insert_with(|| json!(prefs_id));
-        object.entry("Client").or_insert_with(|| json!(client));
-    }
-    let prefs_json = prefs.to_string();
+    let prefs_json = match serialize_display_preferences(body, &prefs_id, &client) {
+        Ok(value) => value,
+        Err(error) => return validation_error_response(error.0, error.1),
+    };
     let id = display_preferences_key(&prefs_id, &user_id, &client);
     let backend = state.db.get_database_backend();
     match state
@@ -110,7 +112,48 @@ fn display_pref_client(query: &std::collections::HashMap<String, String>) -> Str
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .unwrap_or("default")
-        .to_string()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_DISPLAY_PREFERENCES_CLIENT_LEN)
+        .collect::<String>()
+}
+
+fn serialize_display_preferences(
+    mut prefs: Value,
+    prefs_id: &str,
+    client: &str,
+) -> Result<String, (StatusCode, &'static str)> {
+    let Some(object) = prefs.as_object_mut() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Display preferences must be a JSON object",
+        ));
+    };
+    let prefs_id = sanitize_display_preference_part(prefs_id, MAX_DISPLAY_PREFERENCES_ID_LEN);
+    let client = sanitize_display_preference_part(client, MAX_DISPLAY_PREFERENCES_CLIENT_LEN);
+    object.entry("Id").or_insert_with(|| json!(prefs_id));
+    object.entry("Client").or_insert_with(|| json!(client));
+    let serialized = prefs.to_string();
+    if serialized.len() > MAX_DISPLAY_PREFERENCES_JSON_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Display preferences are too large",
+        ));
+    }
+    Ok(serialized)
+}
+
+fn sanitize_display_preference_part(value: &str, max_len: usize) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max_len)
+        .collect::<String>()
+}
+
+fn validation_error_response(status: StatusCode, message: &'static str) -> Response {
+    (status, Json(json!({ "Error": message }))).into_response()
 }
 
 fn display_preferences_key(prefs_id: &str, user_id: &str, client: &str) -> String {
@@ -160,8 +203,37 @@ mod tests {
     #[test]
     fn display_pref_client_accepts_jellyfin_casing() {
         let mut query = HashMap::new();
-        query.insert("Client".to_string(), "Web".to_string());
-        assert_eq!(display_pref_client(&query), "Web");
+        query.insert("Client".to_string(), "Web\nBad".to_string());
+        assert_eq!(display_pref_client(&query), "WebBad");
+
+        query.insert("Client".to_string(), "x".repeat(160));
+        assert_eq!(
+            display_pref_client(&query).chars().count(),
+            MAX_DISPLAY_PREFERENCES_CLIENT_LEN
+        );
+    }
+
+    #[test]
+    fn display_preferences_payload_is_object_and_limited() {
+        let serialized =
+            serialize_display_preferences(json!({ "SortBy": "SortName" }), "home", "Web").unwrap();
+        let value: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(value["Id"], "home");
+        assert_eq!(value["Client"], "Web");
+
+        assert!(serialize_display_preferences(json!([]), "home", "Web").is_err());
+        assert!(
+            serialize_display_preferences(
+                json!({
+                    "CustomPrefs": {
+                        "large": "x".repeat(MAX_DISPLAY_PREFERENCES_JSON_BYTES)
+                    }
+                }),
+                "home",
+                "Web"
+            )
+            .is_err()
+        );
     }
 
     #[test]

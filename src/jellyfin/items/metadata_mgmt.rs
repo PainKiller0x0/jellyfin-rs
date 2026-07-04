@@ -32,6 +32,9 @@ use crate::{
 
 const MAX_SUBTITLE_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_LYRICS_BYTES: u64 = 1024 * 1024;
+const MAX_METADATA_WRITE_IDS: usize = 1000;
+const MAX_METADATA_WRITE_ID_LEN: usize = 256;
+const MAX_MERGE_VERSION_IDS: usize = 100;
 
 #[derive(Deserialize)]
 pub struct UploadSubtitleRequest {
@@ -662,63 +665,27 @@ async fn subtitle_list_result_inner(
 
 pub async fn metadata_reset(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
+    Query(query): Query<HashMap<String, String>>,
+    body: Option<Json<Value>>,
 ) -> Response {
-    let item_ids: Vec<&str> = body
-        .get("Ids")
-        .and_then(Value::as_str)
-        .map(|ids| {
-            ids.split(',')
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-
+    let body = body.as_ref().map(|Json(body)| body);
+    let item_ids = match metadata_ids_from_query_or_body(
+        &query,
+        body,
+        &["Ids", "ids"],
+        MAX_METADATA_WRITE_IDS,
+    ) {
+        Ok(ids) => ids,
+        Err(error) => return metadata_validation_error(error),
+    };
     if item_ids.is_empty() {
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    let now = now_unix();
-    let backend = state.db.get_database_backend();
-    for item_id in &item_ids {
-        let _ = state
-            .db
-            .execute(crate::db::helpers::portable_statement(
-                backend,
-                "UPDATE media_items SET overview = NULL, production_year = NULL, updated_at = ? WHERE id = ?",
-                vec![now.into(), (*item_id).into()],
-            ))
-            .await;
-
-        for table in [
-            "media_people",
-            "media_genres",
-            "media_tags",
-            "media_studios",
-            "provider_ids",
-        ] {
-            let _ = state
-                .db
-                .execute(crate::db::helpers::portable_statement(
-                    backend,
-                    &format!("DELETE FROM {table} WHERE item_id = ?"),
-                    vec![(*item_id).into()],
-                ))
-                .await;
-        }
-
-        crate::jellyfin::system::log_activity(
-            &state,
-            "Metadata reset",
-            "MetadataReset",
-            None,
-            Some(item_id),
-        )
-        .await;
+    match metadata_reset_inner(&state, &item_ids).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
     }
-
-    StatusCode::NO_CONTENT.into_response()
 }
 
 pub async fn item_counts(
@@ -981,70 +948,263 @@ fn content_type_options() -> Value {
 /// POST /Videos/MergeVersions — merge multiple video items into one multi-version item
 pub async fn merge_versions(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
+    Query(query): Query<HashMap<String, String>>,
+    body: Option<Json<Value>>,
 ) -> Response {
-    let Some(ids) = body.get("Ids").and_then(Value::as_array) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": "Ids is required" })),
-        )
-            .into_response();
-    };
-    let item_ids: Vec<String> = ids
-        .iter()
-        .filter_map(|v| v.as_str().map(ToString::to_string))
-        .collect();
+    let body = body.as_ref().map(|Json(body)| body);
+    let item_ids =
+        match metadata_ids_from_query_or_body(&query, body, &["Ids", "ids"], MAX_MERGE_VERSION_IDS)
+        {
+            Ok(ids) => ids,
+            Err(error) => return metadata_validation_error(error),
+        };
     if item_ids.len() < 2 {
-        return (
+        return metadata_validation_error((
             StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": "Need at least 2 items to merge" })),
-        )
-            .into_response();
+            "Need at least 2 items to merge",
+        ));
     }
 
-    let backend = state.db.get_database_backend();
+    match merge_versions_inner(&state.db, &item_ids).await {
+        Ok(MergeVersionsResult::Merged) => StatusCode::NO_CONTENT.into_response(),
+        Ok(MergeVersionsResult::MissingItem) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "Error": "Item not found" })),
+        )
+            .into_response(),
+        Ok(MergeVersionsResult::InvalidItem) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "Ids must reference video items" })),
+        )
+            .into_response(),
+        Err(error) => internal_error(error),
+    }
+
     // Find the parent of the first item — this becomes the target parent
-    let first_id = &item_ids[0];
-    let parent_row = state
-        .db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT parent_id, item_type FROM media_items WHERE id = ?",
-            vec![first_id.as_str().into()],
-        ))
-        .await;
-
-    let (parent_id, _item_type) = match parent_row {
-        Ok(Some(r)) => {
-            let pid = r.get_str("parent_id").unwrap_or_default();
-            let it = r.get_str("item_type").unwrap_or_default();
-            (pid, it)
-        }
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-
     // If the first item doesn't have a parent (it's a top-level item), create a folder for it
-    let target_parent = if parent_id.is_empty() || parent_id == *first_id {
-        // The first item IS the folder — move others into it
-        first_id.clone()
-    } else {
-        parent_id
-    };
+    // The first item IS the folder — move others into it
 
     // Move all other items to be children of the target parent
-    let now = crate::util::now_unix();
-    for id in &item_ids[1..] {
-        let _ = state.db.execute(crate::db::helpers::portable_statement(
-            backend,
-            "UPDATE media_items SET parent_id = ?, updated_at = ? WHERE id = ? AND item_type = 'Video'",
-            vec![target_parent.clone().into(), now.into(), id.as_str().into()],
-        )).await;
-    }
-
-    StatusCode::NO_CONTENT.into_response()
 }
 
 /// GET /Videos/ActiveEncodings — list active transcodings (stub)
+fn metadata_ids_from_query_or_body(
+    query: &HashMap<String, String>,
+    body: Option<&Value>,
+    keys: &[&str],
+    max_ids: usize,
+) -> Result<Vec<String>, (StatusCode, &'static str)> {
+    if let Some(ids) = query_value(query, keys) {
+        return normalize_metadata_ids(ids.split(',').map(str::to_string).collect(), max_ids);
+    }
+    let value = keys.iter().find_map(|key| {
+        body.and_then(|body| {
+            body.as_object().and_then(|object| {
+                object
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(key))
+                    .map(|(_, value)| value)
+            })
+        })
+    });
+    metadata_ids_from_value(value, max_ids)
+}
+
+fn metadata_ids_from_value(
+    value: Option<&Value>,
+    max_ids: usize,
+) -> Result<Vec<String>, (StatusCode, &'static str)> {
+    match value {
+        Some(Value::Array(items)) => {
+            let mut ids = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(id) = item.as_str() else {
+                    return Err((StatusCode::BAD_REQUEST, "Ids must contain strings"));
+                };
+                ids.push(id.to_string());
+            }
+            normalize_metadata_ids(ids, max_ids)
+        }
+        Some(Value::String(ids)) => {
+            normalize_metadata_ids(ids.split(',').map(str::to_string).collect(), max_ids)
+        }
+        Some(Value::Null) | None => Ok(Vec::new()),
+        Some(_) => Err((
+            StatusCode::BAD_REQUEST,
+            "Ids must be an array or CSV string",
+        )),
+    }
+}
+
+fn normalize_metadata_ids(
+    ids: Vec<String>,
+    max_ids: usize,
+) -> Result<Vec<String>, (StatusCode, &'static str)> {
+    if ids.len() > max_ids {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Too many item ids"));
+    }
+    let mut normalized = Vec::new();
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() || normalized.iter().any(|existing| existing == id) {
+            continue;
+        }
+        if id.len() > MAX_METADATA_WRITE_ID_LEN
+            || id.contains('\0')
+            || id.chars().any(char::is_control)
+        {
+            return Err((StatusCode::BAD_REQUEST, "Invalid item id"));
+        }
+        normalized.push(id.to_string());
+    }
+    Ok(normalized)
+}
+
+fn metadata_validation_error(error: (StatusCode, &'static str)) -> Response {
+    (error.0, Json(json!({ "Error": error.1 }))).into_response()
+}
+
+async fn metadata_reset_inner(state: &AppState, item_ids: &[String]) -> anyhow::Result<usize> {
+    let now = now_unix();
+    let backend = state.db.get_database_backend();
+    let mut reset_count = 0;
+    for item_id in item_ids {
+        let result = state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "UPDATE media_items SET overview = NULL, production_year = NULL, updated_at = ? WHERE id = ?",
+                vec![now.into(), item_id.as_str().into()],
+            ))
+            .await
+            .with_context(|| format!("failed to reset metadata: {item_id}"))?;
+        if result.rows_affected() == 0 {
+            continue;
+        }
+        reset_count += 1;
+
+        for table in [
+            "media_people",
+            "media_genres",
+            "media_tags",
+            "media_studios",
+            "provider_ids",
+        ] {
+            state
+                .db
+                .execute(crate::db::helpers::portable_statement(
+                    backend,
+                    &format!("DELETE FROM {table} WHERE item_id = ?"),
+                    vec![item_id.as_str().into()],
+                ))
+                .await
+                .with_context(|| format!("failed to clear metadata table {table}: {item_id}"))?;
+        }
+
+        crate::jellyfin::system::log_activity(
+            state,
+            "Metadata reset",
+            "MetadataReset",
+            None,
+            Some(item_id),
+        )
+        .await;
+    }
+    Ok(reset_count)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MergeVersionsResult {
+    Merged,
+    MissingItem,
+    InvalidItem,
+}
+
+struct MergeItem {
+    id: String,
+    parent_id: String,
+    item_type: String,
+    is_folder: bool,
+}
+
+async fn merge_versions_inner(
+    db: &sea_orm::DatabaseConnection,
+    item_ids: &[String],
+) -> anyhow::Result<MergeVersionsResult> {
+    let items = merge_version_items(db, item_ids).await?;
+    if items.len() != item_ids.len() {
+        return Ok(MergeVersionsResult::MissingItem);
+    }
+    if items.iter().any(|item| !mergeable_video_item(item)) {
+        return Ok(MergeVersionsResult::InvalidItem);
+    }
+
+    let first = &items[0];
+    let target_parent = if first.parent_id.is_empty() || first.parent_id == first.id {
+        first.id.clone()
+    } else {
+        first.parent_id.clone()
+    };
+
+    let now = now_unix();
+    let backend = db.get_database_backend();
+    for id in &item_ids[1..] {
+        db.execute(crate::db::helpers::portable_statement(
+            backend,
+            "UPDATE media_items SET parent_id = ?, updated_at = ? WHERE id = ?",
+            vec![target_parent.clone().into(), now.into(), id.as_str().into()],
+        ))
+        .await
+        .with_context(|| format!("failed to merge video version: {id}"))?;
+    }
+
+    Ok(MergeVersionsResult::Merged)
+}
+
+async fn merge_version_items(
+    db: &sea_orm::DatabaseConnection,
+    item_ids: &[String],
+) -> anyhow::Result<Vec<MergeItem>> {
+    if item_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let backend = db.get_database_backend();
+    let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let rows = db
+        .query_all(crate::db::helpers::portable_statement(
+            backend,
+            &format!(
+                "SELECT id, parent_id, item_type, is_folder FROM media_items WHERE id IN ({placeholders})"
+            ),
+            item_ids.iter().map(|id| id.as_str().into()).collect(),
+        ))
+        .await
+        .context("failed to load video versions")?;
+    let mut items = Vec::new();
+    for id in item_ids {
+        if let Some(row) = rows.iter().find(|row| {
+            row.get_str("id")
+                .is_ok_and(|row_id| row_id.as_str() == id.as_str())
+        }) {
+            items.push(MergeItem {
+                id: row.get_str("id")?,
+                parent_id: row.get_opt_str("parent_id")?.unwrap_or_default(),
+                item_type: row.get_str("item_type")?,
+                is_folder: row.get_i64("is_folder").unwrap_or_default() != 0,
+            });
+        }
+    }
+    Ok(items)
+}
+
+fn mergeable_video_item(item: &MergeItem) -> bool {
+    !item.is_folder
+        && matches!(
+            item.item_type.as_str(),
+            "Video" | "Movie" | "Episode" | "Trailer"
+        )
+}
+
 pub async fn active_encodings() -> Response {
     Json(json!([])).into_response()
 }
@@ -1235,13 +1395,16 @@ fn query_value(query: &HashMap<String, String>, keys: &[&str]) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::{
-        UploadSubtitleRequest, alternate_sources_inner, audiobooks_next_up,
-        audiobooks_next_up_inner, available_recording_options, available_recording_options_value,
-        delete_alternate_sources_inner, delete_lyrics_inner, item_counts_inner, item_lyrics_inner,
-        lyrics_value_from_text, metadata_editor_info_inner, parse_lrc_timestamp, stop_encodings,
-        subtitle_format, subtitle_list_inner, subtitle_list_result_inner, subtitle_provider_info,
-        subtitle_suffix, upload_lyrics_inner, upload_subtitle_inner,
+        MAX_MERGE_VERSION_IDS, MergeVersionsResult, UploadSubtitleRequest, alternate_sources_inner,
+        audiobooks_next_up, audiobooks_next_up_inner, available_recording_options,
+        available_recording_options_value, delete_alternate_sources_inner, delete_lyrics_inner,
+        item_counts_inner, item_lyrics_inner, lyrics_value_from_text, merge_versions_inner,
+        metadata_editor_info_inner, metadata_ids_from_query_or_body, metadata_reset_inner,
+        normalize_metadata_ids, parse_lrc_timestamp, stop_encodings, subtitle_format,
+        subtitle_list_inner, subtitle_list_result_inner, subtitle_provider_info, subtitle_suffix,
+        upload_lyrics_inner, upload_subtitle_inner,
     };
+    use crate::db::row_ext::QueryResultExt;
     use axum::body::{Bytes, to_bytes};
     use axum::extract::{Extension, Query, State};
     use axum::response::IntoResponse;
@@ -1585,6 +1748,141 @@ mod tests {
         assert_eq!(options["CanRecordSeries"], false);
         assert_eq!(options["RecordingFolders"], json!([]));
         assert_eq!(options["Defaults"]["PrePaddingSeconds"], 0);
+    }
+
+    #[test]
+    fn metadata_write_ids_accept_query_and_body_shapes() {
+        let mut query = HashMap::new();
+        query.insert("ids".to_string(), " a,b,a ,, c ".to_string());
+        let ids =
+            metadata_ids_from_query_or_body(&query, None, &["Ids", "ids"], MAX_MERGE_VERSION_IDS)
+                .unwrap();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+
+        let body = json!({ "Ids": ["v1", "v2"] });
+        let ids =
+            metadata_ids_from_query_or_body(&HashMap::new(), Some(&body), &["Ids", "ids"], 10)
+                .unwrap();
+        assert_eq!(ids, vec!["v1", "v2"]);
+
+        assert!(normalize_metadata_ids(vec!["bad\nid".to_string()], 10).is_err());
+        assert!(
+            normalize_metadata_ids(
+                vec!["x".to_string(); MAX_MERGE_VERSION_IDS + 1],
+                MAX_MERGE_VERSION_IDS
+            )
+            .is_err()
+        );
+        assert!(
+            metadata_ids_from_query_or_body(
+                &HashMap::new(),
+                Some(&json!({ "Ids": [1] })),
+                &["Ids", "ids"],
+                10
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_reset_and_merge_versions_are_limited_and_persisted() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        let state = test_state(db);
+        for (id, title, item_type, parent_id, overview, production_year) in [
+            ("v1", "1080p", "Video", "movie", "overview", 2024_i64),
+            ("v2", "720p", "Video", "", "overview", 2024_i64),
+            ("audio", "Song", "Audio", "", "overview", 2024_i64),
+        ] {
+            state
+                .db
+                .execute(crate::db::helpers::portable_statement(
+                    backend,
+                    "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, overview, production_year, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?, 0, ?, ?, 1, 1, 1)",
+                    vec![
+                        id.into(),
+                        title.into(),
+                        format!("/tmp/{id}").into(),
+                        parent_id.into(),
+                        item_type.into(),
+                        overview.into(),
+                        production_year.into(),
+                    ],
+                ))
+                .await
+                .unwrap();
+        }
+        state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', '1')",
+                vec!["v1".into()],
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            metadata_reset_inner(&state, &["v1".to_string(), "missing".to_string()])
+                .await
+                .unwrap(),
+            1
+        );
+        let row = state
+            .db
+            .query_one(crate::db::helpers::portable_statement(
+                backend,
+                "SELECT overview, production_year FROM media_items WHERE id = ?",
+                vec!["v1".into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.get_opt_str("overview").unwrap().is_none());
+        assert!(row.get_opt_i64("production_year").unwrap().is_none());
+        assert!(
+            state
+                .db
+                .query_one(crate::db::helpers::portable_statement(
+                    backend,
+                    "SELECT 1 AS found FROM provider_ids WHERE item_id = ?",
+                    vec!["v1".into()],
+                ))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(
+            merge_versions_inner(&state.db, &["v1".to_string(), "v2".to_string()])
+                .await
+                .unwrap(),
+            MergeVersionsResult::Merged
+        );
+        let row = state
+            .db
+            .query_one(crate::db::helpers::portable_statement(
+                backend,
+                "SELECT parent_id FROM media_items WHERE id = ?",
+                vec!["v2".into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.get_str("parent_id").unwrap(), "movie");
+        assert_eq!(
+            merge_versions_inner(&state.db, &["v1".to_string(), "missing".to_string()])
+                .await
+                .unwrap(),
+            MergeVersionsResult::MissingItem
+        );
+        assert_eq!(
+            merge_versions_inner(&state.db, &["v1".to_string(), "audio".to_string()])
+                .await
+                .unwrap(),
+            MergeVersionsResult::InvalidItem
+        );
     }
 
     #[tokio::test]

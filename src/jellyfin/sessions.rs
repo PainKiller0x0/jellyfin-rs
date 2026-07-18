@@ -707,7 +707,7 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn auth_value_reads_comma_separated_emby_header() {
+    fn auth_value_reads_comma_separated_jellyfin_header() {
         let header =
             r#"MediaBrowser Client="Web", Device="Browser", DeviceId="dev1", Version="1.0""#;
         assert_eq!(auth_value(header, "Client").as_deref(), Some("Web"));
@@ -719,16 +719,19 @@ mod tests {
     #[test]
     fn session_key_uses_token_when_present() {
         let mut headers = HeaderMap::new();
-        headers.insert("X-Emby-Token", "abc".parse().unwrap());
+        headers.insert(
+            "Authorization",
+            r#"MediaBrowser Client="Web", Token="abc""#.parse().unwrap(),
+        );
         let query = HashMap::new();
         assert_eq!(session_key(&headers, &query, "device-1"), "abc");
     }
 
     #[test]
-    fn device_info_uses_raw_authorization_header_not_token_only() {
+    fn device_info_uses_authorization_header_not_token_only() {
         let mut headers = HeaderMap::new();
         headers.insert(
-            "X-Emby-Authorization",
+            "Authorization",
             HeaderValue::from_static(
                 r#"MediaBrowser Client="Web", Device="Browser", DeviceId="dev1", Version="1.0", Token="abc""#,
             ),
@@ -741,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn device_info_reads_jellyfin_media_browser_authorization_header() {
+    fn device_info_ignores_legacy_token_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-MediaBrowser-Authorization",
@@ -750,10 +753,10 @@ mod tests {
             ),
         );
         let device = device_info_from_headers(&headers);
-        assert_eq!(device.client, "Tsukimi");
-        assert_eq!(device.device_name, "Desktop");
-        assert_eq!(device.device_id, "dev2");
-        assert_eq!(device.version, "1.2.3");
+        assert_eq!(device.client, "jellyfin-rs");
+        assert_eq!(device.device_name, "Unknown Device");
+        assert_eq!(device.device_id, "");
+        assert_eq!(device.version, "0.1.0");
     }
 
     #[test]
@@ -761,7 +764,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         let long_device_id = "d".repeat(MAX_SESSION_ID_LEN + 20);
         headers.insert(
-            "X-Emby-Authorization",
+            "Authorization",
             HeaderValue::from_str(&format!(
                 r#"MediaBrowser Client=" Web ", Device="{}", DeviceId="{long_device_id}", Version="1.0""#,
                 "B".repeat(MAX_SESSION_TEXT_LEN + 20)

@@ -4548,12 +4548,11 @@ mod tests {
         CameraUploadQuery, CustomQueryRequest, DeviceRecord, FALLBACK_FONTS_PATH,
         TmdbApiKeyRequest, activity_log_entry_json, activity_log_query,
         camera_upload_history_value, client_log_document, client_log_file_name,
-        connect_unavailable, default_branding_options, default_plugin_repositories,
-        default_scan_library_triggers, device_info, device_options_result, empty_query_result,
-        fallback_font_entries, fallback_font_mime_type, fallback_font_path,
-        game_system_display_name, image_by_name_info, is_known_scheduled_task,
-        is_safe_fallback_font_name, is_safe_log_name, items_access_value, last_task_result,
-        live_tv_channel_mapping_options, live_tv_channel_mapping_options_value,
+        default_branding_options, default_plugin_repositories, default_scan_library_triggers,
+        device_info, device_options_result, empty_query_result, fallback_font_entries,
+        fallback_font_mime_type, fallback_font_path, game_system_display_name, image_by_name_info,
+        is_known_scheduled_task, is_safe_fallback_font_name, is_safe_log_name, items_access_value,
+        last_task_result, live_tv_channel_mapping_options, live_tv_channel_mapping_options_value,
         live_tv_default_listing_provider, live_tv_default_listing_provider_value,
         live_tv_default_tuner_host, live_tv_default_tuner_host_value, live_tv_guide_info,
         live_tv_info, live_tv_recording_folders, live_tv_timer_defaults,
@@ -5098,12 +5097,6 @@ mod tests {
     #[tokio::test]
     async fn package_install_reports_unavailable() {
         let response = package_install_unavailable().await.into_response();
-        assert_eq!(response.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
-    }
-
-    #[tokio::test]
-    async fn connect_reports_unavailable() {
-        let response = connect_unavailable().await.into_response();
         assert_eq!(response.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
     }
 

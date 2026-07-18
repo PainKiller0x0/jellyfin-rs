@@ -2675,8 +2675,7 @@ mod tests {
             &Method::POST,
             "/Users/AuthenticateByName"
         ));
-        assert!(is_public_request(&Method::POST, "/Users/u1/Authenticate"));
-        assert!(!is_public_request(&Method::GET, "/Users/u1/Authenticate"));
+        assert!(!is_public_request(&Method::POST, "/Users/u1/Authenticate"));
         assert!(is_public_request(
             &Method::POST,
             "/Users/AuthenticateWithQuickConnect"
@@ -2699,7 +2698,11 @@ mod tests {
         ));
         assert!(!is_public_request(&Method::GET, "/Dlna/ProfileInfos"));
         assert!(!is_public_request(&Method::GET, "/Dlna/Profiles/Default"));
-        assert_eq!(api_path("/emby/System/Info/Public"), "/System/Info/Public");
+        assert_eq!(api_path("/System/Info/Public"), "/System/Info/Public");
+        assert_eq!(
+            api_path("/emby/System/Info/Public"),
+            "/emby/System/Info/Public"
+        );
     }
 
     #[test]
@@ -2710,7 +2713,11 @@ mod tests {
         ));
         assert!(is_public_request(
             &Method::HEAD,
-            api_path("/emby/Videos/17c24581-7ecf-5adf-a2a6-c85fe4d1fbf8/stream.mkv")
+            "/Videos/17c24581-7ecf-5adf-a2a6-c85fe4d1fbf8/stream.mkv"
+        ));
+        assert!(!is_public_request(
+            &Method::HEAD,
+            "/emby/Videos/17c24581-7ecf-5adf-a2a6-c85fe4d1fbf8/stream.mkv"
         ));
         assert!(is_public_request(&Method::GET, "/Videos/item/stream"));
         assert!(is_public_request(
@@ -2885,12 +2892,6 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn connect_link_reports_unavailable() {
-        let response = user_connect_link_unavailable().await.into_response();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-    }
-
     #[test]
     fn user_path_target_detects_only_user_scoped_paths() {
         assert_eq!(user_path_target("/Users/u1"), Some("u1"));
@@ -2901,12 +2902,9 @@ mod tests {
         assert_eq!(user_path_target("/Users/Public"), None);
         assert_eq!(user_path_target("/Users/Query"), None);
         assert_eq!(user_path_target("/UserFavoriteItems/i1"), None);
+        assert_eq!(user_path_target(api_path("/Users/u1/Items/i1")), Some("u1"));
         assert_eq!(
-            user_path_target(api_path("/emby/Users/u1/Items/i1")),
-            Some("u1")
-        );
-        assert_eq!(
-            request_user_target("/emby/Users/u2/Items/i1", &HashMap::new()),
+            request_user_target("/Users/u2/Items/i1", &HashMap::new()),
             Some("u2")
         );
     }
@@ -2925,7 +2923,7 @@ mod tests {
         assert_eq!(request_user_target("/Users/Password", &query), Some("u1"));
         assert_eq!(
             request_user_target("/emby/DisplayPreferences/home", &query),
-            Some("u1")
+            None
         );
         assert_eq!(request_user_target("/Items/i1", &query), None);
     }
@@ -2938,7 +2936,7 @@ mod tests {
             Some("s2")
         );
         assert_eq!(
-            session_control_target("/emby/Sessions/s1/Command", &HashMap::new()),
+            session_control_target("/Sessions/s1/Command", &HashMap::new()),
             Some("s1")
         );
         assert_eq!(
@@ -2962,8 +2960,7 @@ mod tests {
             Some("s1")
         );
         assert_eq!(
-            session_read_target("/emby/Sessions/PlayQueue", &query_map("PlaySessionId=s2"))
-                .as_deref(),
+            session_read_target("/Sessions/PlayQueue", &query_map("PlaySessionId=s2")).as_deref(),
             Some("s2")
         );
         assert_eq!(
@@ -3052,10 +3049,7 @@ mod tests {
         assert_eq!(request_user_target("/Users/ItemAccess", &query), Some("u3"));
         assert_eq!(request_user_target("/Items/Access", &query), Some("u3"));
         assert_eq!(request_user_target("/Sync/Targets", &query), Some("u3"));
-        assert_eq!(
-            request_user_target("/emby/Sync/Options", &query),
-            Some("u3")
-        );
+        assert_eq!(request_user_target("/Sync/Options", &query), Some("u3"));
     }
 
     #[test]
@@ -3130,7 +3124,7 @@ mod tests {
     }
 
     #[test]
-    fn token_parser_accepts_emby_auth_header() {
+    fn token_parser_accepts_jellyfin_authorization_value() {
         assert_eq!(
             auth_header_value_token(
                 r#"MediaBrowser Client="x", Device="y", DeviceId="z", Token="abc""#
@@ -3139,13 +3133,13 @@ mod tests {
             Some("abc")
         );
         assert_eq!(
-            auth_header_value_token(r#"Emby UserId="u", token="lower""#).as_deref(),
-            Some("lower")
+            auth_header_value_token(r#"Emby UserId="u", token="lower""#),
+            None
         );
     }
 
     #[test]
-    fn request_token_accepts_bearer_and_mediabrowser_token_headers() {
+    fn request_token_accepts_authorization_header_only() {
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", "Bearer abc".parse().unwrap());
         assert_eq!(
@@ -3155,10 +3149,7 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("X-MediaBrowser-Token", "xyz".parse().unwrap());
-        assert_eq!(
-            request_token(&headers, &HashMap::new()).as_deref(),
-            Some("xyz")
-        );
+        assert_eq!(request_token(&headers, &HashMap::new()), None);
     }
 
     #[test]
@@ -3194,8 +3185,9 @@ mod tests {
         assert!(validate_api_key_token("bad/key").is_err());
         assert!(validate_api_key_token(&"x".repeat(MAX_API_KEY_TOKEN_LEN + 1)).is_err());
 
-        let query: CreateApiKeyQuery = serde_json::from_value(json!({ "App": "Emby" })).unwrap();
-        assert_eq!(query.app.as_deref(), Some("Emby"));
+        let query: CreateApiKeyQuery =
+            serde_json::from_value(json!({ "App": "Jellyfin" })).unwrap();
+        assert_eq!(query.app.as_deref(), Some("Jellyfin"));
     }
 
     #[tokio::test]
@@ -3404,7 +3396,7 @@ mod tests {
         let state = test_state(db);
         let mut headers = HeaderMap::new();
         headers.insert(
-            "X-Emby-Authorization",
+            "Authorization",
             r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="header-device", Version="10.10.0""#
                 .parse()
                 .unwrap(),
@@ -3462,7 +3454,7 @@ mod tests {
         let state = Arc::new(test_state(db));
         let mut headers = HeaderMap::new();
         headers.insert(
-            "X-Emby-Authorization",
+            "Authorization",
             r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="quick-device", Version="10.10.0", Token="existing-token""#
                 .parse()
                 .unwrap(),
@@ -3480,7 +3472,7 @@ mod tests {
         .unwrap();
         let token = login["AccessToken"].as_str().unwrap().to_string();
         headers.insert(
-            "X-Emby-Authorization",
+            "Authorization",
             format!(
                 r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="quick-device", Version="10.10.0", Token="{token}""#
             )

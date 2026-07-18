@@ -21,7 +21,7 @@ sea-orm = { version = "1.1", features = ["runtime-tokio", "sqlx-postgres", "sqlx
 sqlx = { version = "0.8", features = ["migrate", "sqlite"] }
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.0", features = ["v4", "v5", "serde"] }

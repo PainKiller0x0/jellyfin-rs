@@ -41,6 +41,18 @@ cargo run --release
 
 服务默认监听 `http://127.0.0.1:8096`。使用管理员账号连接任意 Jellyfin 客户端。
 
+### 管理后台 / Admin Console
+
+管理后台位于 `admin/`，基于 Vue 3、Vite、TypeScript、Pinia、Element Plus 和 UnoCSS 构建。
+
+```bash
+pnpm --dir admin install
+pnpm --dir admin build
+cargo run --release
+```
+
+构建后访问 `http://127.0.0.1:8096/admin`。开发模式可运行 `pnpm --dir admin dev`，默认代理到 `VITE_JELLYFIN_API_BASE`。
+
 ## 配置 / Configuration
 
 | 环境变量 | 默认值 | 说明 |

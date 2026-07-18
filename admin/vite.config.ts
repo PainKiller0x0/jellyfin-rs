@@ -9,6 +9,7 @@ export default defineConfig(({ mode }) => {
   const apiBase = env.VITE_JELLYFIN_API_BASE || 'http://127.0.0.1:8096';
 
   return {
+    base: mode === 'production' ? '/admin/' : '/',
     plugins: [vue(), UnoCSS()],
     resolve: {
       alias: {

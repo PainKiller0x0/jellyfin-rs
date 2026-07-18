@@ -5,7 +5,11 @@ use axum::Router;
 use sea_orm::{ConnectOptions, Database};
 use tokio::sync::RwLock;
 use tokio::{net::TcpListener, signal};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use tracing::info;
 use uuid::Uuid;
 
@@ -157,8 +161,11 @@ async fn main() -> anyhow::Result<()> {
     let api_routes = jellyfin::routes::api_routes().route_layer(
         axum::middleware::from_fn_with_state(state.clone(), jellyfin::auth::require_auth),
     );
+    let admin_service =
+        ServeDir::new("admin/dist").not_found_service(ServeFile::new("admin/dist/index.html"));
     let app = Router::new()
         .nest("/emby", api_routes.clone())
+        .nest_service("/admin", admin_service)
         .merge(api_routes)
         .fallback(jellyfin::routes::not_found)
         .with_state(state)

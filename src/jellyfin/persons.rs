@@ -15,7 +15,10 @@ use serde_json::{Value as JsonValue, json};
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
-    entities::{image_assets::Entity as ImageAssets, people::Entity as People},
+    entities::{
+        image_assets::{self, Entity as ImageAssets},
+        people::Entity as People,
+    },
     jellyfin::{auth::request_user_id_and_admin_or_default, common::internal_error},
 };
 
@@ -989,13 +992,7 @@ async fn serve_person_image(
     }
 
     // Find image asset
-    let model = match ImageAssets::find()
-        .filter(crate::entities::image_assets::Column::ItemId.eq(&person.id))
-        .filter(crate::entities::image_assets::Column::ImageType.eq(image_type))
-        .filter(crate::entities::image_assets::Column::ImageIndex.eq(image_index))
-        .one(db)
-        .await
-    {
+    let model = match find_person_image_asset(db, &person.id, image_type, image_index).await {
         Ok(m) => m,
         Err(e) => return internal_error(e.into()),
     };
@@ -1034,4 +1031,37 @@ async fn serve_person_image(
         response_headers.insert(header::ETAG, value);
     }
     (response_headers, Body::from(bytes)).into_response()
+}
+
+async fn find_person_image_asset(
+    db: &DatabaseConnection,
+    person_id: &str,
+    image_type: &str,
+    image_index: i64,
+) -> anyhow::Result<Option<image_assets::Model>> {
+    let backend = db.get_database_backend();
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT id, item_id, image_type, image_index, path, etag, width, height, size_bytes, created_at, updated_at FROM image_assets WHERE item_id = ? AND image_type = ? AND CAST(image_index AS TEXT) = ? LIMIT 1",
+            vec![person_id.into(), image_type.into(), image_index.to_string().into()],
+        ))
+        .await?;
+
+    row.map(|row| {
+        Ok(image_assets::Model {
+            id: row.get_str("id")?,
+            item_id: row.get_str("item_id")?,
+            image_type: row.get_str("image_type")?,
+            image_index: row.get_i64("image_index")?,
+            path: row.get_opt_str("path")?,
+            etag: row.get_opt_str("etag")?,
+            width: row.get_opt_i64("width")?,
+            height: row.get_opt_i64("height")?,
+            size_bytes: row.get_opt_i64("size_bytes")?,
+            created_at: row.get_i64("created_at")?,
+            updated_at: row.get_i64("updated_at")?,
+        })
+    })
+    .transpose()
 }

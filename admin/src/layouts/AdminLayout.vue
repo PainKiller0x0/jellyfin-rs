@@ -36,6 +36,11 @@ const menuItems: MenuItem[] = [
     path: '/users',
     title: '用户',
     icon: 'User'
+  },
+  {
+    path: '/settings',
+    title: '设置',
+    icon: 'Setting'
   }
 ];
 

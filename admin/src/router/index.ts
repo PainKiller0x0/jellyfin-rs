@@ -41,6 +41,12 @@ const routes: RouteRecordRaw[] = [
         name: 'users',
         component: () => import('@/views/users/UsersView.vue'),
         meta: { title: '用户', icon: 'User' }
+      },
+      {
+        path: 'settings',
+        name: 'settings',
+        component: () => import('@/views/settings/SettingsView.vue'),
+        meta: { title: '设置', icon: 'Setting' }
       }
     ]
   },

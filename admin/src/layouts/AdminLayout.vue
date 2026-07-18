@@ -31,6 +31,11 @@ const menuItems: MenuItem[] = [
     path: '/tasks',
     title: '计划任务',
     icon: 'Clock'
+  },
+  {
+    path: '/users',
+    title: '用户',
+    icon: 'User'
   }
 ];
 

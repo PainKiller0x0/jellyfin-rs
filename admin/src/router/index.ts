@@ -35,6 +35,12 @@ const routes: RouteRecordRaw[] = [
         name: 'tasks',
         component: () => import('@/views/tasks/TasksView.vue'),
         meta: { title: '计划任务', icon: 'Clock' }
+      },
+      {
+        path: 'users',
+        name: 'users',
+        component: () => import('@/views/users/UsersView.vue'),
+        meta: { title: '用户', icon: 'User' }
       }
     ]
   },

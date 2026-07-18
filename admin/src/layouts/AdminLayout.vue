@@ -21,6 +21,11 @@ const menuItems: MenuItem[] = [
     path: '/dashboard',
     title: '控制台',
     icon: 'DataLine'
+  },
+  {
+    path: '/libraries',
+    title: '媒体库',
+    icon: 'FolderOpened'
   }
 ];
 

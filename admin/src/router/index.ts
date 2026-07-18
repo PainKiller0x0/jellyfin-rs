@@ -23,6 +23,12 @@ const routes: RouteRecordRaw[] = [
         name: 'dashboard',
         component: () => import('@/views/dashboard/DashboardView.vue'),
         meta: { title: '控制台', icon: 'DataLine' }
+      },
+      {
+        path: 'libraries',
+        name: 'libraries',
+        component: () => import('@/views/library/LibraryView.vue'),
+        meta: { title: '媒体库', icon: 'FolderOpened' }
       }
     ]
   },

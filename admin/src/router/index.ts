@@ -29,6 +29,12 @@ const routes: RouteRecordRaw[] = [
         name: 'libraries',
         component: () => import('@/views/library/LibraryView.vue'),
         meta: { title: '媒体库', icon: 'FolderOpened' }
+      },
+      {
+        path: 'tasks',
+        name: 'tasks',
+        component: () => import('@/views/tasks/TasksView.vue'),
+        meta: { title: '计划任务', icon: 'Clock' }
       }
     ]
   },

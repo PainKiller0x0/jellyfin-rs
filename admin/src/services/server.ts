@@ -24,6 +24,20 @@ export function scheduledTasks(token: string) {
   return request<ScheduledTask[]>('/ScheduledTasks', { token });
 }
 
+export function runScheduledTask(token: string, taskId: string) {
+  return request<unknown>(`/ScheduledTasks/Running/${encodeURIComponent(taskId)}`, {
+    method: 'POST',
+    token
+  });
+}
+
+export function stopScheduledTask(token: string, taskId: string) {
+  return request<void>(`/ScheduledTasks/Running/${encodeURIComponent(taskId)}`, {
+    method: 'DELETE',
+    token
+  });
+}
+
 export function activityLog(token: string, limit = 6) {
   return request<QueryResult<ActivityLogEntry>>(`/System/ActivityLog/Entries?Limit=${limit}`, {
     token

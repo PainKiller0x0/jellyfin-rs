@@ -46,6 +46,15 @@ export type ScheduledTaskResult = {
   ErrorMessage?: string | null;
 };
 
+export type ScheduledTaskTrigger = {
+  Type: string;
+  TimeOfDayTicks?: number;
+  IntervalTicks?: number;
+  MaxRuntimeTicks?: number;
+  DayOfWeek?: string;
+  SystemEvent?: string;
+};
+
 export type ScheduledTask = {
   Name: string;
   State: string;
@@ -55,6 +64,7 @@ export type ScheduledTask = {
   Category: string;
   IsHidden: boolean;
   LastExecutionResult?: ScheduledTaskResult | null;
+  Triggers?: ScheduledTaskTrigger[];
 };
 
 export type PlaybackSession = {

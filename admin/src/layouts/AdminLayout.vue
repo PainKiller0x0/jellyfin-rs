@@ -26,6 +26,11 @@ const menuItems: MenuItem[] = [
     path: '/libraries',
     title: '媒体库',
     icon: 'FolderOpened'
+  },
+  {
+    path: '/tasks',
+    title: '计划任务',
+    icon: 'Clock'
   }
 ];
 

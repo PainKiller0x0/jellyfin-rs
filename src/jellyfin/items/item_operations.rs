@@ -754,10 +754,10 @@ pub async fn delete_item_subtitle(
                 if !readable_media_path(&state.db, &path).await {
                     return StatusCode::NOT_FOUND.into_response();
                 }
-                if let Err(error) = tokio::fs::remove_file(&path).await
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    return internal_error(error.into());
+                if let Err(error) = tokio::fs::remove_file(&path).await {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return internal_error(error.into());
+                    }
                 }
             }
             // Remove from media_streams

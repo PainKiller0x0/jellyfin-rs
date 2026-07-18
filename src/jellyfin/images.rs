@@ -604,10 +604,10 @@ async fn collage_source_images(
     let mut images = Vec::new();
     for row in &rows {
         let path: String = row.get_str("path")?;
-        if image_storage_path_allowed(&path)
-            && let Ok(bytes) = tokio::fs::read(&path).await
-        {
-            images.push(bytes);
+        if image_storage_path_allowed(&path) {
+            if let Ok(bytes) = tokio::fs::read(&path).await {
+                images.push(bytes);
+            }
         }
     }
     Ok(images)

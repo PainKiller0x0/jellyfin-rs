@@ -223,10 +223,10 @@ pub async fn upload_branding_splashscreen(
     }
 
     let path = branding_splashscreen_path();
-    if let Some(directory) = path.parent()
-        && let Err(error) = tokio::fs::create_dir_all(directory).await
-    {
-        return internal_error(error.into());
+    if let Some(directory) = path.parent() {
+        if let Err(error) = tokio::fs::create_dir_all(directory).await {
+            return internal_error(error.into());
+        }
     }
     if let Err(error) = tokio::fs::write(&path, &body).await {
         return internal_error(error.into());
@@ -2913,10 +2913,10 @@ async fn camera_upload_history_value(
     device_id: &str,
 ) -> anyhow::Result<JsonValue> {
     let value = app_setting(db, &camera_upload_history_key(device_id), "").await;
-    if !value.trim().is_empty()
-        && let Ok(history) = serde_json::from_str::<JsonValue>(&value)
-    {
-        return Ok(history);
+    if !value.trim().is_empty() {
+        if let Ok(history) = serde_json::from_str::<JsonValue>(&value) {
+            return Ok(history);
+        }
     }
     Ok(json!({ "DeviceId": device_id, "FilesUploaded": [] }))
 }

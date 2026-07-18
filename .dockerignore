@@ -2,6 +2,9 @@ target/
 .git/
 .claude/
 data/
+media/
+admin/node_modules/
+admin/dist/
 *.db
 Dockerfile
 docker-compose.yml

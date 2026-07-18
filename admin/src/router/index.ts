@@ -3,12 +3,20 @@ import 'nprogress/nprogress.css';
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router';
 
 import AdminLayout from '@/layouts/AdminLayout.vue';
+import { useAuthStore } from '@/stores/auth';
 
 const routes: RouteRecordRaw[] = [
+  {
+    path: '/login',
+    name: 'login',
+    component: () => import('@/views/login/LoginView.vue'),
+    meta: { title: '登录' }
+  },
   {
     path: '/',
     component: AdminLayout,
     redirect: '/dashboard',
+    meta: { requiresAuth: true },
     children: [
       {
         path: 'dashboard',
@@ -33,9 +41,31 @@ const router = createRouter({
 
 NProgress.configure({ showSpinner: false });
 
-router.beforeEach(to => {
+router.beforeEach(async to => {
   NProgress.start();
   document.title = `${String(to.meta.title ?? '管理后台')} - jellyfin-rs`;
+
+  const authStore = useAuthStore();
+  authStore.restore();
+
+  if (authStore.isAuthenticated && !authStore.user) {
+    await authStore.fetchMe().catch(async () => {
+      await authStore.logout();
+    });
+  }
+
+  if (to.name === 'login' && authStore.isAuthenticated) {
+    return { path: '/' };
+  }
+
+  if (to.matched.some(record => record.meta.requiresAuth) && !authStore.isAuthenticated) {
+    return {
+      path: '/login',
+      query: {
+        redirect: to.fullPath
+      }
+    };
+  }
 });
 
 router.afterEach(() => {

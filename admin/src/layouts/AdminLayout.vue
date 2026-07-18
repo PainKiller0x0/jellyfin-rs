@@ -3,6 +3,7 @@ import { computed } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import { useAppStore } from '@/stores/app';
+import { useAuthStore } from '@/stores/auth';
 
 type MenuItem = {
   path: string;
@@ -13,6 +14,7 @@ type MenuItem = {
 const route = useRoute();
 const router = useRouter();
 const appStore = useAppStore();
+const authStore = useAuthStore();
 
 const menuItems: MenuItem[] = [
   {
@@ -26,6 +28,13 @@ const activeMenu = computed(() => route.path);
 
 function handleSelect(path: string) {
   router.push(path);
+}
+
+async function handleCommand(command: string) {
+  if (command === 'logout') {
+    await authStore.logout();
+    await router.replace('/login');
+  }
 }
 </script>
 
@@ -72,7 +81,25 @@ function handleSelect(path: string) {
 
         <ElSpace :size="12">
           <ElTag effect="plain" type="success">Element Plus</ElTag>
-          <ElAvatar :size="32">A</ElAvatar>
+          <ElDropdown trigger="click" @command="handleCommand">
+            <button class="admin-layout__account" type="button">
+              <ElAvatar :size="32">{{ authStore.userName.slice(0, 1).toUpperCase() }}</ElAvatar>
+              <span>{{ authStore.userName }}</span>
+              <ElIcon>
+                <ArrowDown />
+              </ElIcon>
+            </button>
+            <template #dropdown>
+              <ElDropdownMenu>
+                <ElDropdownItem command="logout">
+                  <ElIcon>
+                    <SwitchButton />
+                  </ElIcon>
+                  退出登录
+                </ElDropdownItem>
+              </ElDropdownMenu>
+            </template>
+          </ElDropdown>
         </ElSpace>
       </ElHeader>
 
@@ -181,6 +208,31 @@ function handleSelect(path: string) {
   padding: 0;
 }
 
+.admin-layout__account {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 220px;
+  height: 40px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--admin-text);
+  background: transparent;
+  cursor: pointer;
+
+  span {
+    overflow: hidden;
+    max-width: 120px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &:hover {
+    background: #f1f5f9;
+  }
+}
+
 @media (max-width: 760px) {
   .admin-layout__aside {
     position: fixed;
@@ -193,6 +245,11 @@ function handleSelect(path: string) {
   }
 
   .admin-layout__subtitle {
+    display: none;
+  }
+
+  .admin-layout__account span,
+  .admin-layout__account .el-icon {
     display: none;
   }
 }

@@ -423,11 +423,7 @@ async fn serve_item_image(
     image_index: i64,
 ) -> Response {
     let options = image_options_from_query(query, image_type);
-    let model = match ImageAssets::find()
-        .filter(image_assets::Column::ItemId.eq(item_id))
-        .filter(image_assets::Column::ImageType.eq(image_type))
-        .filter(image_assets::Column::ImageIndex.eq(image_index))
-        .one(db)
+    let model = match find_item_image_asset(db, item_id, image_type, image_index)
         .await
         .with_context(|| {
             format!("failed to find image asset: {item_id}:{image_type}:{image_index}")
@@ -548,6 +544,40 @@ async fn serve_item_image(
         response_headers.insert(header::ETAG, value);
     }
     (response_headers, Body::from(bytes)).into_response()
+}
+
+async fn find_item_image_asset(
+    db: &DatabaseConnection,
+    item_id: &str,
+    image_type: &str,
+    image_index: i64,
+) -> anyhow::Result<Option<image_assets::Model>> {
+    let backend = db.get_database_backend();
+    let row = db
+        .query_one(crate::db::helpers::portable_statement(
+            backend,
+            "SELECT id, item_id, image_type, image_index, path, etag, width, height, size_bytes, created_at, updated_at FROM image_assets WHERE item_id = ? AND image_type = ? AND CAST(image_index AS TEXT) = ? LIMIT 1",
+            vec![item_id.into(), image_type.into(), image_index.to_string().into()],
+        ))
+        .await
+        .context("failed to query item image asset")?;
+
+    row.map(|row| {
+        Ok(image_assets::Model {
+            id: row.get_str("id")?,
+            item_id: row.get_str("item_id")?,
+            image_type: row.get_str("image_type")?,
+            image_index: row.get_i64("image_index")?,
+            path: row.get_opt_str("path")?,
+            etag: row.get_opt_str("etag")?,
+            width: row.get_opt_i64("width")?,
+            height: row.get_opt_i64("height")?,
+            size_bytes: row.get_opt_i64("size_bytes")?,
+            created_at: row.get_i64("created_at")?,
+            updated_at: row.get_i64("updated_at")?,
+        })
+    })
+    .transpose()
 }
 
 async fn dynamic_image_response(

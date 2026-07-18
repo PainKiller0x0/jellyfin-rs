@@ -529,7 +529,7 @@ async fn seed_ids_for_item(db: &DatabaseConnection, item_id: &str) -> anyhow::Re
         let source_visible = visible_media_item_sql("source");
         let audio_visible = visible_media_item_sql("audio");
         let sql = format!(
-            r#"SELECT DISTINCT audio.id
+            r#"SELECT audio.id
                FROM linked_children lc
                JOIN media_items source ON source.id = lc.item_id
                JOIN media_items audio ON (audio.id = source.id OR audio.parent_id = source.id)
@@ -564,7 +564,7 @@ async fn seed_ids_for_artist(
     let source_visible = visible_media_item_sql("source");
     let audio_visible = visible_media_item_sql("audio");
     let sql = format!(
-        r#"SELECT DISTINCT audio.id
+        r#"SELECT audio.id
            FROM media_people mp
            JOIN media_items source ON source.id = mp.item_id
            JOIN media_items audio ON (audio.id = source.id OR audio.parent_id = source.id)
@@ -591,7 +591,7 @@ async fn seed_ids_for_music_genre(
     let source_visible = visible_media_item_sql("source");
     let audio_visible = visible_media_item_sql("audio");
     let sql = format!(
-        r#"SELECT DISTINCT audio.id
+        r#"SELECT audio.id
            FROM media_genres mg
            JOIN media_items source ON source.id = mg.item_id
            JOIN media_items audio ON (audio.id = source.id OR audio.parent_id = source.id)

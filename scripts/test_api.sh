@@ -12,7 +12,14 @@ if [[ ! -x "$VENV/bin/python" ]]; then
   uv pip install --python "$VENV/bin/python" httpx
 fi
 
-exec "$VENV/bin/python" "$ROOT/scripts/tsukimi_jellyfin_api_smoke.py" \
+"$VENV/bin/python" "$ROOT/scripts/tsukimi_jellyfin_api_smoke.py" \
   --base-url "$BASE_URL" \
   --username "$USERNAME" \
   --password "$PASSWORD"
+
+exec "$VENV/bin/python" "$ROOT/scripts/jellyfin_openapi_compat.py" \
+  --base-url "$BASE_URL" \
+  --username "$USERNAME" \
+  --password "$PASSWORD" \
+  --spec "$ROOT/docs/jellyfin-openapi-stable.json" \
+  --routes-source "$ROOT/src/jellyfin/routes.rs"

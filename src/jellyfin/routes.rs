@@ -580,7 +580,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/Items/{item_id}/Images/{image_type}/{image_index}/{tag}/{format}/{max_width}/{max_height}/{percent_played}/{unplayed_count}",
-            get(images::get_item_image_legacy_path).head(super::user_extras::item_image_index_head),
+            get(images::get_item_image_legacy_path).head(images::get_item_image_legacy_path),
         )
         .route(
             "/Items/{item_id}/Images/{image_type}/Delete",

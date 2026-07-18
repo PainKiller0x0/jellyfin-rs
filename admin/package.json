@@ -1,0 +1,41 @@
+{
+  "name": "@jellyfin-rs/admin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Vue admin console for jellyfin-rs, built with the SoybeanAdmin Element Plus stack.",
+  "author": {
+    "name": "dydydd",
+    "email": "admin@lidream.cn"
+  },
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vue-tsc --noEmit --skipLibCheck && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "typecheck": "vue-tsc --noEmit --skipLibCheck"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "dayjs": "^1.11.20",
+    "element-plus": "^2.13.6",
+    "nprogress": "^0.2.0",
+    "pinia": "^3.0.4",
+    "vue": "^3.5.31",
+    "vue-router": "^4.6.4"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/nprogress": "^0.2.3",
+    "@unocss/preset-icons": "^66.6.7",
+    "@unocss/preset-uno": "^66.6.7",
+    "@unocss/transformer-directives": "^66.6.7",
+    "@unocss/transformer-variant-group": "^66.6.7",
+    "@unocss/vite": "^66.6.7",
+    "@vitejs/plugin-vue": "^6.0.5",
+    "sass": "^1.98.0",
+    "typescript": "^5.9.3",
+    "unocss": "^66.6.7",
+    "vite": "npm:rolldown-vite@7.3.1",
+    "vue-tsc": "^3.2.6"
+  }
+}

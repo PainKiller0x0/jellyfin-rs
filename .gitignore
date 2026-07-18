@@ -1,8 +1,11 @@
 /target
+/admin/node_modules
+/admin/dist
 *.db
 *.db-shm
 *.db-wal
 /data/images/
 /data/avatars/
 .env
+.env.local
 scripts/

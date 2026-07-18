@@ -6,6 +6,14 @@ use crate::{
     util::{hash_password, infer_library_id_from_path, now_unix, stable_text_id},
 };
 
+fn default_library(id: &str) -> (&str, &str) {
+    match id {
+        "tvshows" => ("TV Shows", "tvshows"),
+        "music" => ("Music", "music"),
+        _ => ("Movies", "movies"),
+    }
+}
+
 pub async fn seed_default_data(state: &AppState) -> anyhow::Result<()> {
     let now = now_unix();
     let username =
@@ -78,6 +86,23 @@ pub async fn seed_default_data(state: &AppState) -> anyhow::Result<()> {
     for path in &state.media_dirs {
         let path = path.to_string_lossy().to_string();
         let library_id = infer_library_id_from_path(&path);
+        let (library_name, collection_type) = default_library(library_id);
+        state
+            .db
+            .execute(crate::db::helpers::portable_statement(
+                backend,
+                r#"INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING"#,
+                vec![
+                    library_id.into(),
+                    library_name.into(),
+                    collection_type.into(),
+                    now.into(),
+                    now.into(),
+                ],
+            ))
+            .await
+            .with_context(|| format!("failed to seed library for path: {path}"))?;
+
         state
             .db
             .execute(crate::db::helpers::portable_statement(

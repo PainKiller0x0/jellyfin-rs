@@ -459,8 +459,7 @@ fn session_key(headers: &HeaderMap, query: &HashMap<String, String>, device_id: 
 
 fn device_info_from_headers(headers: &HeaderMap) -> DeviceInfo {
     let authorization = headers
-        .get("X-Emby-Authorization")
-        .or_else(|| headers.get("Authorization"))
+        .get("Authorization")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     DeviceInfo {
@@ -739,6 +738,22 @@ mod tests {
         assert_eq!(device.device_name, "Browser");
         assert_eq!(device.device_id, "dev1");
         assert_eq!(device.version, "1.0");
+    }
+
+    #[test]
+    fn device_info_reads_jellyfin_media_browser_authorization_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-MediaBrowser-Authorization",
+            HeaderValue::from_static(
+                r#"MediaBrowser Client="Tsukimi", Device="Desktop", DeviceId="dev2", Version="1.2.3""#,
+            ),
+        );
+        let device = device_info_from_headers(&headers);
+        assert_eq!(device.client, "Tsukimi");
+        assert_eq!(device.device_name, "Desktop");
+        assert_eq!(device.device_id, "dev2");
+        assert_eq!(device.version, "1.2.3");
     }
 
     #[test]

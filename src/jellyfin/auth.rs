@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::{Context, bail};
 use axum::{
     Json,
-    body::Body,
+    body::{Body, Bytes},
     extract::{Extension, Path, Query, Request, State},
     http::{HeaderMap, Method, StatusCode, header},
     middleware::Next,
@@ -34,11 +34,8 @@ const PUBLIC_PATHS: &[&str] = &[
     "/System/Info/Public",
     "/System/Endpoint",
     "/System/Ping",
-    "/Users/authenticatebyname",
     "/Users/AuthenticateByName",
-    "/users/authenticatebyname",
     "/Users/Public",
-    "/users/public",
     "/Users/ForgotPassword",
     "/Users/ForgotPassword/Pin",
     "/QuickConnect/Enabled",
@@ -67,7 +64,6 @@ const ADMIN_PREFIXES: &[&str] = &[
     "/Backup",
     "/BackupRestore",
     "/Branding/Splashscreen",
-    "/Connect/Pending",
     "/Devices",
     "/Dlna/ProfileInfos",
     "/Dlna/Profiles",
@@ -108,7 +104,6 @@ const ADMIN_CONTAINS: &[&str] = &[
     "/MergeVersions",
     "/Password",
     "/Policy",
-    "/Connect/Link",
     "/RemoteImages/Download",
     "/RemoteSearch/Apply",
     "/Refresh",
@@ -132,25 +127,40 @@ const MAX_USER_SETTING_DEPTH: usize = 3;
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
-    #[serde(rename = "Username")]
+    #[serde(
+        rename = "Username",
+        alias = "username",
+        alias = "UserName",
+        alias = "userName",
+        alias = "Name",
+        alias = "name",
+        alias = "User",
+        alias = "user",
+        default
+    )]
     username: String,
-    #[serde(rename = "Pw", alias = "Password", default)]
+    #[serde(
+        rename = "Pw",
+        alias = "pw",
+        alias = "Password",
+        alias = "password",
+        alias = "Pass",
+        alias = "pass",
+        default
+    )]
     password: String,
-    #[serde(rename = "DeviceId")]
-    device_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct AuthenticateUserRequest {
-    #[serde(rename = "Pw", alias = "Password", default)]
-    password: String,
-    #[serde(rename = "DeviceId")]
+    #[serde(
+        rename = "DeviceId",
+        alias = "deviceId",
+        alias = "DeviceID",
+        alias = "device_id"
+    )]
     device_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct QuickConnectAuthenticateRequest {
-    #[serde(rename = "Secret")]
+    #[serde(rename = "Secret", alias = "secret")]
     secret: String,
 }
 
@@ -201,8 +211,15 @@ struct QuickConnectRecord {
 pub async fn authenticate_by_name(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<LoginRequest>,
+    Query(query): Query<HashMap<String, String>>,
+    body: Bytes,
 ) -> Response {
+    let request = match login_request_from_parts(&query, &body) {
+        Ok(request) => request,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "Error": error }))).into_response();
+        }
+    };
     match authenticate_by_name_inner(&state, &headers, request).await {
         Ok(response) => Json(response).into_response(),
         Err(AuthError::Unauthorized(message)) => {
@@ -1554,6 +1571,7 @@ pub async fn require_auth(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    let raw_path = request.uri().path().to_string();
     let path = api_path(request.uri().path());
     if is_public_request(request.method(), path) {
         return next.run(request).await;
@@ -1564,6 +1582,13 @@ pub async fn require_auth(
         Ok(user_id) => user_id,
         Err(error) => return internal_error(error),
     }) else {
+        tracing::warn!(
+            method = %request.method(),
+            raw_path = %raw_path,
+            normalized_path = %path,
+            media_stream_public = unauthenticated_media_stream_path(path),
+            "request rejected before handler: authentication token is required"
+        );
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "Error": "Authentication token is required" })),
@@ -1633,13 +1658,6 @@ fn is_public_request(method: &Method, path: &str) -> bool {
         return true;
     }
     if method == Method::POST
-        && path
-            .strip_prefix("/Users/")
-            .is_some_and(|rest| rest.ends_with("/Authenticate"))
-    {
-        return true;
-    }
-    if method == Method::POST
         && path.strip_prefix("/Dlna/").is_some_and(|rest| {
             rest.ends_with("/connectionmanager/control")
                 || rest.ends_with("/contentdirectory/control")
@@ -1649,10 +1667,8 @@ fn is_public_request(method: &Method, path: &str) -> bool {
     }
     if matches!(
         path,
-        "/Users/authenticatebyname"
-            | "/Users/AuthenticateByName"
+        "/Users/AuthenticateByName"
             | "/Users/AuthenticateWithQuickConnect"
-            | "/users/authenticatebyname"
             | "/Users/ForgotPassword"
             | "/Users/ForgotPassword/Pin"
             | "/QuickConnect/Authorize"
@@ -1661,7 +1677,9 @@ fn is_public_request(method: &Method, path: &str) -> bool {
         return method == Method::POST;
     }
     matches!(method, &Method::GET | &Method::HEAD)
-        && (PUBLIC_PATHS.contains(&path) || dlna_discovery_path(path))
+        && (PUBLIC_PATHS.contains(&path)
+            || dlna_discovery_path(path)
+            || unauthenticated_media_stream_path(path))
 }
 
 fn admin_required(method: &Method, path: &str) -> bool {
@@ -1727,9 +1745,80 @@ fn item_delete_info_read(path: &str) -> bool {
 
 fn item_file_info_read(path: &str) -> bool {
     path == "/Items/File"
-        || (path.starts_with("/Items/")
-            && path.ends_with("/File")
-            && path.trim_matches('/').split('/').count() == 3)
+}
+
+fn unauthenticated_media_stream_path(path: &str) -> bool {
+    video_stream_path(path) || audio_stream_path(path) || item_original_file_path(path)
+}
+
+fn item_original_file_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/Items/") else {
+        return false;
+    };
+    matches!(rest.split('/').collect::<Vec<_>>().as_slice(), [_, "File"])
+}
+
+fn video_stream_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/Videos/") else {
+        return false;
+    };
+    let parts = rest.split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [_, file] => stream_file_name(file) || video_playlist_name(file),
+        [_, "hls" | "hls1", _, _] => true,
+        [_, media_source_id, file] if !media_source_id.is_empty() => stream_file_name(file),
+        [_, "Subtitles", _, file] => subtitle_stream_file_name(file),
+        [_, _, "Subtitles", _, file] => subtitle_stream_file_name(file),
+        [_, _, "Subtitles", _, _, file] => subtitle_stream_file_name(file),
+        [_, _, "Attachments", _] | [_, _, "Attachments", _, "Stream"] => true,
+        _ => false,
+    }
+}
+
+fn audio_stream_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/Audio/") else {
+        return false;
+    };
+    let parts = rest.split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [_, file] => audio_stream_file_name(file) || audio_playlist_name(file),
+        [_, "hls1", _, _] => true,
+        _ => false,
+    }
+}
+
+fn stream_file_name(file: &str) -> bool {
+    let file = file.to_ascii_lowercase();
+    file == "stream"
+        || file.starts_with("stream.")
+        || file == "original"
+        || file.starts_with("original.")
+}
+
+fn audio_stream_file_name(file: &str) -> bool {
+    let file = file.to_ascii_lowercase();
+    file == "stream"
+        || file.starts_with("stream.")
+        || file == "universal"
+        || file.starts_with("universal.")
+}
+
+fn video_playlist_name(file: &str) -> bool {
+    matches!(
+        file.to_ascii_lowercase().as_str(),
+        "subtitles.m3u8" | "live.m3u8" | "main.m3u8" | "master.m3u8"
+    )
+}
+
+fn audio_playlist_name(file: &str) -> bool {
+    matches!(
+        file.to_ascii_lowercase().as_str(),
+        "main.m3u8" | "master.m3u8"
+    )
+}
+
+fn subtitle_stream_file_name(file: &str) -> bool {
+    file.to_ascii_lowercase().starts_with("stream.")
 }
 
 fn dlna_discovery_path(path: &str) -> bool {
@@ -1869,9 +1958,7 @@ fn session_user_matches(session: &PlaybackSession, user_id: &str) -> bool {
 }
 
 fn api_path(path: &str) -> &str {
-    path.strip_prefix("/emby")
-        .filter(|p| !p.is_empty())
-        .unwrap_or(path)
+    path
 }
 
 fn user_path_target(path: &str) -> Option<&str> {
@@ -2150,10 +2237,7 @@ pub fn request_token(headers: &HeaderMap, query: &HashMap<String, String>) -> Op
         .or_else(|| query.get("apiKey"))
         .filter(|token| !token.trim().is_empty())
         .cloned()
-        .or_else(|| header_token(headers, "X-Emby-Token"))
-        .or_else(|| header_token(headers, "X-MediaBrowser-Token"))
         .or_else(|| header_token(headers, header::AUTHORIZATION.as_str()))
-        .or_else(|| header_token(headers, "X-Emby-Authorization"))
 }
 
 pub fn header_token(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -2489,45 +2573,82 @@ fn query_value(query: &HashMap<String, String>, key: &str) -> Option<String> {
         .map(|(_, value)| value.trim().to_string())
 }
 
-/// GET /Users/{id}/Authenticate — legacy auth endpoint (stub)
-pub async fn user_authenticate_legacy(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(user_id): Path<String>,
-    Json(request): Json<AuthenticateUserRequest>,
-) -> Response {
-    let user = match user_by_id_inner(&state.db, &user_id).await {
-        Ok(Some(user)) => user,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return internal_error(error),
-    };
-    if user.is_disabled {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "Error": "User is disabled" })),
-        )
-            .into_response();
-    }
+fn query_value_any(query: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
+    query
+        .iter()
+        .find(|(candidate, _)| keys.iter().any(|key| candidate.eq_ignore_ascii_case(key)))
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 
-    match authenticate_user(&state, &headers, user, &request.password, request.device_id).await {
-        Ok(response) => Json(response).into_response(),
-        Err(AuthError::Unauthorized(message)) => {
-            (StatusCode::UNAUTHORIZED, Json(json!({ "Error": message }))).into_response()
+fn login_request_from_parts(
+    query: &HashMap<String, String>,
+    body: &[u8],
+) -> Result<LoginRequest, String> {
+    let mut request = if body.iter().all(u8::is_ascii_whitespace) {
+        LoginRequest {
+            username: String::new(),
+            password: String::new(),
+            device_id: None,
         }
-        Err(AuthError::Internal(error)) => internal_error(error),
+    } else {
+        let trimmed = trim_ascii_whitespace(body);
+        if trimmed.first() == Some(&b'{') {
+            serde_json::from_slice::<LoginRequest>(trimmed)
+                .map_err(|_| "Invalid authentication request".to_string())?
+        } else {
+            let form = std::str::from_utf8(trimmed)
+                .map_err(|_| "Invalid authentication request".to_string())?;
+            let values = query_map(form);
+            let mut request = LoginRequest {
+                username: String::new(),
+                password: String::new(),
+                device_id: None,
+            };
+            fill_login_request_from_map(&mut request, &values);
+            request
+        }
+    };
+    fill_login_request_from_map(&mut request, query);
+    Ok(request)
+}
+
+fn fill_login_request_from_map(request: &mut LoginRequest, values: &HashMap<String, String>) {
+    if request.username.trim().is_empty() {
+        if let Some(username) = query_value_any(
+            values,
+            &["Username", "UserName", "userName", "Name", "User"],
+        ) {
+            request.username = username;
+        }
+    }
+    if request.password.trim().is_empty() {
+        if let Some(password) = query_value_any(values, &["Pw", "Password", "Pass"]) {
+            request.password = password;
+        }
+    }
+    if request
+        .device_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        request.device_id = query_value_any(values, &["DeviceId", "DeviceID", "deviceId"]);
     }
 }
 
-/// POST /Users/{id}/Connect/Link — link user to Emby Connect (stub)
-
-/// DELETE /Users/{id}/Connect/Link — unlink from Emby Connect (stub)
-
-pub async fn user_connect_link_unavailable() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({ "Error": "Emby Connect linking is not available" })),
-    )
-        .into_response()
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
 }
 
 #[derive(Debug)]
@@ -2582,6 +2703,28 @@ mod tests {
     }
 
     #[test]
+    fn auth_rules_allow_direct_media_streams_for_external_players() {
+        assert!(is_public_request(
+            &Method::GET,
+            "/Videos/17c24581-7ecf-5adf-a2a6-c85fe4d1fbf8/stream.mkv"
+        ));
+        assert!(is_public_request(
+            &Method::HEAD,
+            api_path("/emby/Videos/17c24581-7ecf-5adf-a2a6-c85fe4d1fbf8/stream.mkv")
+        ));
+        assert!(is_public_request(&Method::GET, "/Videos/item/stream"));
+        assert!(is_public_request(
+            &Method::GET,
+            "/Videos/item/source/original.mkv"
+        ));
+        assert!(is_public_request(&Method::GET, "/Audio/item/universal"));
+        assert!(is_public_request(&Method::GET, "/Items/item/File"));
+        assert!(!is_public_request(&Method::GET, "/Videos/ActiveEncodings"));
+        assert!(!is_public_request(&Method::POST, "/Videos/MergeVersions"));
+        assert!(!is_public_request(&Method::GET, "/Items/File"));
+    }
+
+    #[test]
     fn auth_rules_protect_user_and_admin_writes() {
         assert!(!admin_required(&Method::GET, "/Users/abc"));
         assert!(admin_required(&Method::POST, "/Users/abc"));
@@ -2619,7 +2762,7 @@ mod tests {
             "/Items/i1/RemoteImages/Providers"
         ));
         assert!(admin_required(&Method::GET, "/Items/i1/DeleteInfo"));
-        assert!(admin_required(&Method::GET, "/Items/i1/File"));
+        assert!(!admin_required(&Method::GET, "/Items/i1/File"));
         assert!(admin_required(&Method::GET, "/Items/File"));
         assert!(admin_required(&Method::POST, "/Items/RemoteSearch/Person"));
         assert!(admin_required(&Method::POST, "/Items/RemoteSearch/Movie"));
@@ -3214,6 +3357,36 @@ mod tests {
         assert_eq!(value["SupportedCommands"], json!(["Play", "Stop"]));
         assert_eq!(value["AdditionalUsers"], json!([]));
         assert_eq!(value["NowPlayingQueue"], json!([]));
+    }
+
+    #[test]
+    fn login_request_accepts_emby_form_and_query_shapes() {
+        let request = login_request_from_parts(
+            &HashMap::new(),
+            b"username=alice&password=secret&deviceId=d1",
+        )
+        .unwrap();
+        assert_eq!(request.username, "alice");
+        assert_eq!(request.password, "secret");
+        assert_eq!(request.device_id.as_deref(), Some("d1"));
+
+        let query = query_map("Name=bob&Pw=pw1&DeviceID=d2");
+        let request = login_request_from_parts(&query, b"").unwrap();
+        assert_eq!(request.username, "bob");
+        assert_eq!(request.password, "pw1");
+        assert_eq!(request.device_id.as_deref(), Some("d2"));
+    }
+
+    #[test]
+    fn login_request_accepts_lowercase_json_shape() {
+        let request = login_request_from_parts(
+            &HashMap::new(),
+            br#"{"username":"alice","password":"secret","deviceId":"d1"}"#,
+        )
+        .unwrap();
+        assert_eq!(request.username, "alice");
+        assert_eq!(request.password, "secret");
+        assert_eq!(request.device_id.as_deref(), Some("d1"));
     }
 
     #[tokio::test]

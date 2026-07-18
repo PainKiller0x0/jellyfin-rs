@@ -55,7 +55,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   requestHeaders.set('Accept', 'application/json');
 
   if (token) {
-    requestHeaders.set('X-Emby-Token', token);
+    requestHeaders.set('Authorization', `MediaBrowser Token="${token}"`);
   }
 
   let requestBody = body as BodyInit | null | undefined;

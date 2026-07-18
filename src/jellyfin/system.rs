@@ -4,7 +4,7 @@ use anyhow::Context;
 use axum::{
     Json,
     body::{Body, Bytes},
-    extract::{Extension, OriginalUri, Path, Query, State, rejection::JsonRejection},
+    extract::{Extension, Path, Query, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
@@ -118,14 +118,6 @@ pub async fn web_string_set() -> Response {
 
 pub async fn quick_connect_enabled() -> impl IntoResponse {
     Json(true)
-}
-
-pub async fn connect_unavailable() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({ "Error": "Connect is not available on this server" })),
-    )
-        .into_response()
 }
 
 pub async fn branding_configuration(State(state): State<Arc<AppState>>) -> Response {
@@ -1476,12 +1468,8 @@ pub async fn channel_items() -> Response {
     Json(empty_query_result()).into_response()
 }
 
-pub async fn live_tv_recording_folders(OriginalUri(uri): OriginalUri) -> Response {
-    if uri.path().starts_with("/emby/") {
-        Json(Vec::<JsonValue>::new()).into_response()
-    } else {
-        Json(empty_query_result()).into_response()
-    }
+pub async fn live_tv_recording_folders() -> Response {
+    Json(empty_query_result()).into_response()
 }
 
 pub async fn channel_features() -> Response {
@@ -4538,18 +4526,6 @@ pub async fn openapi_json() -> Response {
     }
 }
 
-pub async fn emby_openapi_json() -> Response {
-    match tokio::fs::read("docs/emby-openapi.json").await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
 pub async fn encoding_codec_configuration_defaults() -> Response {
     Json(json!({
         "IsEnabled": false,
@@ -4612,8 +4588,8 @@ mod tests {
     use axum::{
         Json,
         body::Bytes,
-        extract::{Extension, OriginalUri, Path, Query, State},
-        http::{HeaderMap, Uri},
+        extract::{Extension, Path, Query, State},
+        http::HeaderMap,
         response::IntoResponse,
     };
     use sea_orm::{
@@ -4624,7 +4600,7 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn sync_options_result_has_emby_shape() {
+    fn sync_options_result_has_jellyfin_shape() {
         let options = sync_options_result();
         assert!(options["Targets"].as_array().is_some());
         assert!(options["Options"].as_array().is_some());
@@ -4634,28 +4610,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recording_folders_match_jellyfin_and_emby_shapes() {
-        let jellyfin = live_tv_recording_folders(OriginalUri(
-            "/LiveTv/Recordings/Folders".parse::<Uri>().unwrap(),
-        ))
-        .await
-        .into_response();
-        let body = axum::body::to_bytes(jellyfin.into_body(), usize::MAX)
+    async fn recording_folders_return_jellyfin_query_result_shape() {
+        let response = live_tv_recording_folders().await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(value["Items"].as_array().unwrap().is_empty());
-
-        let emby = live_tv_recording_folders(OriginalUri(
-            "/emby/LiveTv/Recordings/Folders".parse::<Uri>().unwrap(),
-        ))
-        .await
-        .into_response();
-        let body = axum::body::to_bytes(emby.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(value.as_array().unwrap().is_empty());
+        assert_eq!(value["TotalRecordCount"], 0);
     }
 
     #[test]

@@ -1,7 +1,14 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
 
 use anyhow::Context;
-use axum::Router;
+use axum::{
+    Router,
+    body::Body,
+    extract::Request,
+    http::{HeaderMap, header},
+    middleware::Next,
+    response::Response,
+};
 use sea_orm::{ConnectOptions, Database};
 use tokio::sync::RwLock;
 use tokio::{net::TcpListener, signal};
@@ -164,11 +171,11 @@ async fn main() -> anyhow::Result<()> {
     let admin_service =
         ServeDir::new("admin/dist").not_found_service(ServeFile::new("admin/dist/index.html"));
     let app = Router::new()
-        .nest("/emby", api_routes.clone())
         .nest_service("/admin", admin_service)
         .merge(api_routes)
         .fallback(jellyfin::routes::not_found)
         .with_state(state)
+        .layer(axum::middleware::from_fn(log_http_request))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
@@ -176,6 +183,8 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to bind server")?;
     info!("listening on http://{addr}");
+    info!("http api request logging enabled");
+    info!("jellyfin api routes enabled");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -185,4 +194,123 @@ async fn main() -> anyhow::Result<()> {
 
 async fn shutdown_signal() {
     let _ = signal::ctrl_c().await;
+}
+
+async fn log_http_request(request: Request<Body>, next: Next) -> Response {
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let path = uri.path().to_string();
+    let query = uri.query().map(sanitize_query).unwrap_or_default();
+    let user_agent = header_value(request.headers(), header::USER_AGENT.as_str());
+    let jellyfin_client = jellyfin_auth_field(request.headers(), "Client");
+    let jellyfin_device = jellyfin_auth_field(request.headers(), "Device");
+    let jellyfin_device_id = jellyfin_auth_field(request.headers(), "DeviceId");
+    let started = Instant::now();
+
+    tracing::info!(
+        method = %method,
+        path = %path,
+        query = %query,
+        user_agent = %user_agent,
+        jellyfin_client = %jellyfin_client,
+        jellyfin_device = %jellyfin_device,
+        jellyfin_device_id = %jellyfin_device_id,
+        "http api request started"
+    );
+
+    let response = next.run(request).await;
+    let status = response.status();
+    let elapsed_ms = started.elapsed().as_millis();
+
+    tracing::info!(
+        method = %method,
+        path = %path,
+        query = %query,
+        status = status.as_u16(),
+        elapsed_ms,
+        user_agent = %user_agent,
+        jellyfin_client = %jellyfin_client,
+        jellyfin_device = %jellyfin_device,
+        jellyfin_device_id = %jellyfin_device_id,
+        "http api request"
+    );
+
+    response
+}
+
+fn sanitize_query(query: &str) -> String {
+    let sanitized = query
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            if sensitive_query_key(key) {
+                format!("{key}=<redacted>")
+            } else if value.is_empty() {
+                key.to_string()
+            } else {
+                format!("{key}={}", truncate_log_value(value, 160))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    truncate_log_value(&sanitized, 1024)
+}
+
+fn sensitive_query_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("token")
+        || key.contains("api_key")
+        || key.contains("apikey")
+        || key.contains("access_key")
+        || key.contains("authorization")
+        || key == "pw"
+        || key.contains("password")
+        || key.contains("secret")
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| truncate_log_value(value.trim(), 240))
+        .unwrap_or_default()
+}
+
+fn jellyfin_auth_field(headers: &HeaderMap, field: &str) -> String {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| auth_header_field(value, field))
+        .map(|value| truncate_log_value(&value, 160))
+        .unwrap_or_default()
+}
+
+fn auth_header_field(value: &str, field: &str) -> Option<String> {
+    value.split(',').find_map(|part| {
+        let part = part
+            .trim()
+            .strip_prefix("MediaBrowser ")
+            .unwrap_or_else(|| part.trim())
+            .trim();
+        let (key, value) = part.split_once('=')?;
+        key.trim().eq_ignore_ascii_case(field).then(|| {
+            value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string()
+        })
+    })
+}
+
+fn truncate_log_value(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value.to_string();
+    }
+    let mut end = max_len;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &value[..end])
 }

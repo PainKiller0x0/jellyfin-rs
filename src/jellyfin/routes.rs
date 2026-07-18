@@ -15,8 +15,14 @@ use crate::{
         stream_audio, stream_audio_container, stream_audio_container_head, stream_audio_head,
         stream_audio_simple, stream_audio_simple_head, stream_subtitle, stream_subtitle_head,
         stream_subtitle_with_source, stream_subtitle_with_source_head, stream_subtitle_with_ticks,
-        stream_subtitle_with_ticks_head, stream_video, stream_video_head, stream_video_simple,
-        stream_video_simple_head,
+        stream_subtitle_with_ticks_head, stream_video, stream_video_head, stream_video_original,
+        stream_video_original_container, stream_video_original_container_head,
+        stream_video_original_head, stream_video_original_with_source,
+        stream_video_original_with_source_container,
+        stream_video_original_with_source_container_head, stream_video_original_with_source_head,
+        stream_video_simple, stream_video_simple_head, stream_video_with_source,
+        stream_video_with_source_head, stream_video_with_source_simple,
+        stream_video_with_source_simple_head,
     },
     ws,
 };
@@ -378,15 +384,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(library::update_virtual_folder_path),
         )
         .route(
-            "/Users/authenticatebyname",
-            post(auth::authenticate_by_name),
-        )
-        .route(
             "/Users/AuthenticateByName",
-            post(auth::authenticate_by_name),
-        )
-        .route(
-            "/users/authenticatebyname",
             post(auth::authenticate_by_name),
         )
         .route("/Users", get(auth::list_users).post(auth::update_user_legacy))
@@ -404,7 +402,6 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(auth::authenticate_with_quick_connect),
         )
         .route("/Users/Public", get(auth::public_users))
-        .route("/users/public", get(auth::public_users))
         .route("/Users/Me", get(auth::current_user))
         .route("/Users/New", post(auth::create_user))
         .route(
@@ -491,14 +488,6 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(auth::update_user_configuration),
         )
         .route("/Users/{user_id}/Policy", post(auth::update_user_policy))
-        .route(
-            "/Users/{user_id}/Authenticate",
-            post(auth::user_authenticate_legacy),
-        )
-        .route(
-            "/Users/{user_id}/Connect/Link",
-            post(auth::user_connect_link_unavailable).delete(auth::user_connect_link_unavailable),
-        )
         .route("/Items", get(items::items).delete(items::delete_items))
         .route("/Items/File", get(super::user_extras::item_by_file))
         .route("/Items/Latest", get(items::latest_items_root))
@@ -530,11 +519,11 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/Items/{item_id}/Download",
-            get(super::user_extras::download_item),
+            get(super::user_extras::download_item).head(super::user_extras::download_item_head),
         )
         .route(
             "/Items/{item_id}/File",
-            get(super::user_extras::item_file_info),
+            get(super::user_extras::item_file_info).head(super::user_extras::item_file_info_head),
         )
         .route(
             "/Items/{item_id}/ThemeMedia",
@@ -801,6 +790,31 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route(
             "/Videos/{item_id}/stream",
             get(stream_video_simple).head(stream_video_simple_head),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/stream.{container}",
+            get(stream_video_with_source).head(stream_video_with_source_head),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/stream",
+            get(stream_video_with_source_simple).head(stream_video_with_source_simple_head),
+        )
+        .route(
+            "/Videos/{item_id}/original.{container}",
+            get(stream_video_original_container).head(stream_video_original_container_head),
+        )
+        .route(
+            "/Videos/{item_id}/original",
+            get(stream_video_original).head(stream_video_original_head),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/original.{container}",
+            get(stream_video_original_with_source_container)
+                .head(stream_video_original_with_source_container_head),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/original",
+            get(stream_video_original_with_source).head(stream_video_original_with_source_head),
         )
         .route(
             "/Videos/{item_id}/subtitles.m3u8",
@@ -1088,13 +1102,6 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         // ── Branding CSS ──
         .route("/Branding/Css", get(system::branding_css))
         .route("/Branding/Css.css", get(system::branding_css))
-        // ── Connect ──
-        .route("/Connect/Exchange", get(system::connect_unavailable))
-        .route("/Connect/Pending", get(system::connect_unavailable))
-        .route(
-            "/Users/{user_id}/Connect/Link/Delete",
-            post(auth::user_connect_link_unavailable),
-        )
         // ── Devices 补全 ──
         .route("/Devices", get(system::devices).delete(system::delete_devices))
         .route(
@@ -1196,7 +1203,6 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         // ── OpenApi / Swagger ──
         .route("/openapi", get(system::openapi_json))
         .route("/openapi.json", get(system::openapi_json))
-        .route("/emby-openapi.json", get(system::emby_openapi_json))
         .route("/swagger", get(system::openapi_json))
         .route("/swagger.json", get(system::openapi_json))
         // ── Party / SyncPlay ──
@@ -1463,6 +1469,16 @@ mod tests {
 
         assert!(routes.contains("/Videos/{item_id}/Trickplay/{width}/tiles.m3u8"));
         assert!(routes.contains("/Videos/{item_id}/Trickplay/{width}/{index}"));
+    }
+
+    #[test]
+    fn emby_video_stream_routes_include_media_source_variants() {
+        let routes = include_str!("routes.rs");
+
+        assert!(routes.contains("/Videos/{item_id}/{media_source_id}/stream.{container}"));
+        assert!(routes.contains("/Videos/{item_id}/{media_source_id}/stream"));
+        assert!(routes.contains("/Videos/{item_id}/original"));
+        assert!(routes.contains("/Videos/{item_id}/{media_source_id}/original"));
     }
 
     #[test]

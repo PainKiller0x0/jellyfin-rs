@@ -2,6 +2,7 @@
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus';
 import { computed, onMounted, reactive, ref } from 'vue';
 
+import DirectoryPicker from '@/components/DirectoryPicker.vue';
 import * as libraryApi from '@/services/library';
 import { useAuthStore } from '@/stores/auth';
 import type { VirtualFolder } from '@/types/library';
@@ -23,6 +24,8 @@ const saving = ref(false);
 const folders = ref<VirtualFolder[]>([]);
 const createDialogVisible = ref(false);
 const pathDialogVisible = ref(false);
+const directoryPickerVisible = ref(false);
+const directoryPickerTarget = ref<'create' | 'path'>('create');
 const formRef = ref<FormInstance>();
 const pathFormRef = ref<FormInstance>();
 
@@ -89,6 +92,14 @@ function parsePaths(value: string) {
     .split('\n')
     .map(path => path.trim())
     .filter(Boolean);
+}
+
+function appendCreatePath(path: string) {
+  const paths = parsePaths(form.pathsText);
+  if (!paths.includes(path)) {
+    paths.push(path);
+  }
+  form.pathsText = paths.join('\n');
 }
 
 async function submitCreate() {
@@ -210,6 +221,19 @@ function openPathDialog(folder?: VirtualFolder) {
   pathDialogVisible.value = true;
 }
 
+function openDirectoryPicker(target: 'create' | 'path') {
+  directoryPickerTarget.value = target;
+  directoryPickerVisible.value = true;
+}
+
+function handleDirectorySelect(path: string) {
+  if (directoryPickerTarget.value === 'create') {
+    appendCreatePath(path);
+  } else {
+    pathForm.path = path;
+  }
+}
+
 onMounted(loadFolders);
 </script>
 
@@ -280,7 +304,15 @@ onMounted(loadFolders);
           </ElSelect>
         </ElFormItem>
         <ElFormItem label="路径">
-          <ElInput v-model="form.pathsText" :rows="4" type="textarea" />
+          <div class="library-page__path-input">
+            <ElInput v-model="form.pathsText" :rows="4" type="textarea" />
+            <ElButton @click="openDirectoryPicker('create')">
+              <ElIcon>
+                <FolderOpened />
+              </ElIcon>
+              选择
+            </ElButton>
+          </div>
         </ElFormItem>
       </ElForm>
       <template #footer>
@@ -297,7 +329,15 @@ onMounted(loadFolders);
           </ElSelect>
         </ElFormItem>
         <ElFormItem label="路径" prop="path">
-          <ElInput v-model.trim="pathForm.path" />
+          <ElInput v-model.trim="pathForm.path">
+            <template #append>
+              <ElButton @click="openDirectoryPicker('path')">
+                <ElIcon>
+                  <FolderOpened />
+                </ElIcon>
+              </ElButton>
+            </template>
+          </ElInput>
         </ElFormItem>
       </ElForm>
       <template #footer>
@@ -305,6 +345,12 @@ onMounted(loadFolders);
         <ElButton :loading="saving" type="primary" @click="submitPath">保存</ElButton>
       </template>
     </ElDialog>
+
+    <DirectoryPicker
+      v-model="directoryPickerVisible"
+      title="选择媒体目录"
+      @select="handleDirectorySelect"
+    />
   </section>
 </template>
 
@@ -345,9 +391,21 @@ onMounted(loadFolders);
   width: 100%;
 }
 
+.library-page__path-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  width: 100%;
+  align-items: start;
+}
+
 @media (max-width: 760px) {
   .library-page__heading {
     flex-direction: column;
+  }
+
+  .library-page__path-input {
+    grid-template-columns: 1fr;
   }
 }
 </style>

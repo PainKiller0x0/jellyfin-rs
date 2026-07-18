@@ -16,3 +16,13 @@ export type LibraryPathPayload = {
   name: string;
   path: string;
 };
+
+export type DirectoryEntry = {
+  Name: string;
+  Path: string;
+  Type: 'Directory' | 'File';
+};
+
+export type DefaultDirectoryBrowser = {
+  Path?: string | null;
+};

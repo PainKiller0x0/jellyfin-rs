@@ -387,6 +387,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/Users/AuthenticateByName",
             post(auth::authenticate_by_name),
         )
+        .route(
+            "/Users/authenticatebyname",
+            post(auth::authenticate_by_name),
+        )
         .route("/Users", get(auth::list_users).post(auth::update_user_legacy))
         .route("/Users/Query", get(auth::users_query))
         .route("/Users/Prefixes", get(filters::users_prefixes))

@@ -35,6 +35,7 @@ const PUBLIC_PATHS: &[&str] = &[
     "/System/Endpoint",
     "/System/Ping",
     "/Users/AuthenticateByName",
+    "/Users/authenticatebyname",
     "/Users/Public",
     "/Users/ForgotPassword",
     "/Users/ForgotPassword/Pin",
@@ -1654,6 +1655,7 @@ pub async fn require_auth(
 }
 
 fn is_public_request(method: &Method, path: &str) -> bool {
+    let path = api_path(path);
     if method == Method::OPTIONS {
         return true;
     }
@@ -1668,6 +1670,7 @@ fn is_public_request(method: &Method, path: &str) -> bool {
     if matches!(
         path,
         "/Users/AuthenticateByName"
+            | "/Users/authenticatebyname"
             | "/Users/AuthenticateWithQuickConnect"
             | "/Users/ForgotPassword"
             | "/Users/ForgotPassword/Pin"
@@ -1683,6 +1686,7 @@ fn is_public_request(method: &Method, path: &str) -> bool {
 }
 
 fn admin_required(method: &Method, path: &str) -> bool {
+    let path = api_path(path);
     if matches!(path, "/Users" | "/Users/Query" | "/Users/Prefixes") {
         return true;
     }
@@ -1748,6 +1752,7 @@ fn item_file_info_read(path: &str) -> bool {
 }
 
 fn unauthenticated_media_stream_path(path: &str) -> bool {
+    let path = api_path(path);
     video_stream_path(path) || audio_stream_path(path) || item_original_file_path(path)
 }
 
@@ -1865,6 +1870,7 @@ fn sessions_read_requires_admin(
     query: &HashMap<String, String>,
     user_id: &str,
 ) -> bool {
+    let path = api_path(path);
     if method != Method::GET || path != "/Sessions" {
         return false;
     }
@@ -1958,7 +1964,10 @@ fn session_user_matches(session: &PlaybackSession, user_id: &str) -> bool {
 }
 
 fn api_path(path: &str) -> &str {
-    path
+    path.strip_prefix("/emby")
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        .map(|rest| if rest.is_empty() { "/" } else { rest })
+        .unwrap_or(path)
 }
 
 fn user_path_target(path: &str) -> Option<&str> {
@@ -2237,7 +2246,17 @@ pub fn request_token(headers: &HeaderMap, query: &HashMap<String, String>) -> Op
         .or_else(|| query.get("apiKey"))
         .filter(|token| !token.trim().is_empty())
         .cloned()
-        .or_else(|| header_token(headers, header::AUTHORIZATION.as_str()))
+        .or_else(|| {
+            [
+                header::AUTHORIZATION.as_str(),
+                "X-Emby-Token",
+                "X-MediaBrowser-Token",
+                "X-Emby-Authorization",
+                "X-MediaBrowser-Authorization",
+            ]
+            .iter()
+            .find_map(|name| header_token(headers, name))
+        })
 }
 
 pub fn header_token(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -2251,24 +2270,37 @@ pub fn header_token(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 fn auth_header_value_token(value: &str) -> Option<String> {
-    let value = value.trim();
-    let value = match value.split_once(' ') {
-        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("MediaBrowser") => rest.trim(),
-        Some((scheme, _)) if scheme.eq_ignore_ascii_case("Emby") => return None,
-        _ => value,
-    };
+    auth_header_value_field(value, "Token")
+}
 
+pub fn auth_header_value_field(value: &str, field: &str) -> Option<String> {
     value.split(',').find_map(|part| {
-        let token_part = part.trim().split_whitespace().find(|part| {
-            part.strip_prefix("Token=")
-                .or_else(|| part.strip_prefix("token="))
-                .is_some()
-        })?;
-        token_part
-            .split_once('=')
-            .map(|(_, token)| token.trim_matches('"').to_string())
-            .filter(|token| !token.is_empty())
+        let part = auth_header_part(part);
+        let (key, value) = part.split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case(field)
+            .then(|| {
+                value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string()
+            })
+            .filter(|value| !value.is_empty())
     })
+}
+
+fn auth_header_part(value: &str) -> &str {
+    let value = value.trim();
+    match value.split_once(' ') {
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("MediaBrowser")
+                || scheme.eq_ignore_ascii_case("Emby") =>
+        {
+            rest.trim()
+        }
+        _ => value,
+    }
 }
 
 fn bearer_token(value: &str) -> Option<String> {
@@ -2706,10 +2738,12 @@ mod tests {
         assert!(!is_public_request(&Method::GET, "/Dlna/ProfileInfos"));
         assert!(!is_public_request(&Method::GET, "/Dlna/Profiles/Default"));
         assert_eq!(api_path("/System/Info/Public"), "/System/Info/Public");
-        assert_eq!(
-            api_path("/emby/System/Info/Public"),
-            "/emby/System/Info/Public"
-        );
+        assert_eq!(api_path("/emby/System/Info/Public"), "/System/Info/Public");
+        assert_eq!(api_path("/emby"), "/");
+        assert!(is_public_request(
+            &Method::POST,
+            "/emby/Users/authenticatebyname"
+        ));
     }
 
     #[test]
@@ -2722,7 +2756,7 @@ mod tests {
             &Method::HEAD,
             "/Videos/17c24581-7ecf-5adf-a2a6-c85fe4d1fbf8/stream.mkv"
         ));
-        assert!(!is_public_request(
+        assert!(is_public_request(
             &Method::HEAD,
             "/emby/Videos/17c24581-7ecf-5adf-a2a6-c85fe4d1fbf8/stream.mkv"
         ));
@@ -2930,7 +2964,7 @@ mod tests {
         assert_eq!(request_user_target("/Users/Password", &query), Some("u1"));
         assert_eq!(
             request_user_target("/emby/DisplayPreferences/home", &query),
-            None
+            Some("u1")
         );
         assert_eq!(request_user_target("/Items/i1", &query), None);
     }
@@ -3140,13 +3174,17 @@ mod tests {
             Some("abc")
         );
         assert_eq!(
-            auth_header_value_token(r#"Emby UserId="u", token="lower""#),
-            None
+            auth_header_value_token(r#"Emby UserId="u", token="lower""#).as_deref(),
+            Some("lower")
+        );
+        assert_eq!(
+            auth_header_value_field(r#"Emby Client=Tsukimi,Device=linux"#, "Client").as_deref(),
+            Some("Tsukimi")
         );
     }
 
     #[test]
-    fn request_token_accepts_authorization_header_only() {
+    fn request_token_accepts_jellyfin_token_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", "Bearer abc".parse().unwrap());
         assert_eq!(
@@ -3156,7 +3194,27 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("X-MediaBrowser-Token", "xyz".parse().unwrap());
-        assert_eq!(request_token(&headers, &HashMap::new()), None);
+        assert_eq!(
+            request_token(&headers, &HashMap::new()).as_deref(),
+            Some("xyz")
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Emby-Token", "emby-token".parse().unwrap());
+        assert_eq!(
+            request_token(&headers, &HashMap::new()).as_deref(),
+            Some("emby-token")
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Emby-Authorization",
+            r#"Emby Client=Tsukimi,Token="auth-token""#.parse().unwrap(),
+        );
+        assert_eq!(
+            request_token(&headers, &HashMap::new()).as_deref(),
+            Some("auth-token")
+        );
     }
 
     #[test]

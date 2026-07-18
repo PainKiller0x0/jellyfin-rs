@@ -172,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
         ServeDir::new("admin/dist").not_found_service(ServeFile::new("admin/dist/index.html"));
     let app = Router::new()
         .nest_service("/admin", admin_service)
+        .nest("/emby", api_routes.clone())
         .merge(api_routes)
         .fallback(jellyfin::routes::not_found)
         .with_state(state)
@@ -278,21 +279,29 @@ fn header_value(headers: &HeaderMap, name: &str) -> String {
 }
 
 fn jellyfin_auth_field(headers: &HeaderMap, field: &str) -> String {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| auth_header_field(value, field))
+    jellyfin_auth_header_field(headers, field)
         .map(|value| truncate_log_value(&value, 160))
         .unwrap_or_default()
 }
 
+fn jellyfin_auth_header_field(headers: &HeaderMap, field: &str) -> Option<String> {
+    [
+        header::AUTHORIZATION.as_str(),
+        "X-Emby-Authorization",
+        "X-MediaBrowser-Authorization",
+    ]
+    .iter()
+    .find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| auth_header_field(value, field))
+    })
+}
+
 fn auth_header_field(value: &str, field: &str) -> Option<String> {
     value.split(',').find_map(|part| {
-        let part = part
-            .trim()
-            .strip_prefix("MediaBrowser ")
-            .unwrap_or_else(|| part.trim())
-            .trim();
+        let part = auth_header_part(part);
         let (key, value) = part.split_once('=')?;
         key.trim().eq_ignore_ascii_case(field).then(|| {
             value
@@ -302,6 +311,19 @@ fn auth_header_field(value: &str, field: &str) -> Option<String> {
                 .to_string()
         })
     })
+}
+
+fn auth_header_part(value: &str) -> &str {
+    let value = value.trim();
+    match value.split_once(' ') {
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("MediaBrowser")
+                || scheme.eq_ignore_ascii_case("Emby") =>
+        {
+            rest.trim()
+        }
+        _ => value,
+    }
 }
 
 fn truncate_log_value(value: &str, max_len: usize) -> String {

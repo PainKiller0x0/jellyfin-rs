@@ -17,7 +17,7 @@ use crate::{
     },
     entities::users::Entity as Users,
     jellyfin::{
-        auth::{request_token, request_user_id_or_default},
+        auth::{auth_header_value_field, request_token, request_user_id_or_default},
         common::internal_error,
     },
     util::{now_unix, stable_text_id, unix_to_jellyfin_date},
@@ -458,37 +458,39 @@ fn session_key(headers: &HeaderMap, query: &HashMap<String, String>, device_id: 
 }
 
 fn device_info_from_headers(headers: &HeaderMap) -> DeviceInfo {
-    let authorization = headers
-        .get("Authorization")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
     DeviceInfo {
-        client: auth_value(authorization, "Client")
+        client: auth_value_from_headers(headers, "Client")
             .and_then(|value| normalize_session_text(&value, MAX_SESSION_TEXT_LEN))
             .unwrap_or_else(|| "jellyfin-rs".to_string()),
-        device_name: auth_value(authorization, "Device")
+        device_name: auth_value_from_headers(headers, "Device")
             .and_then(|value| normalize_session_text(&value, MAX_SESSION_TEXT_LEN))
             .unwrap_or_else(|| "Unknown Device".to_string()),
-        device_id: auth_value(authorization, "DeviceId")
+        device_id: auth_value_from_headers(headers, "DeviceId")
             .and_then(|value| normalize_session_text(&value, MAX_SESSION_ID_LEN))
             .unwrap_or_default(),
-        version: auth_value(authorization, "Version")
+        version: auth_value_from_headers(headers, "Version")
             .and_then(|value| normalize_session_text(&value, MAX_SESSION_TEXT_LEN))
             .unwrap_or_else(|| "0.1.0".to_string()),
     }
 }
 
-fn auth_value(header: &str, key: &str) -> Option<String> {
-    header.split(',').find_map(|part| {
-        let part = part
-            .trim()
-            .strip_prefix("MediaBrowser ")
-            .unwrap_or(part.trim());
-        let (name, value) = part.split_once('=')?;
-        name.eq_ignore_ascii_case(key)
-            .then(|| value.trim_matches('"').to_string())
-            .filter(|value| !value.is_empty())
+fn auth_value_from_headers(headers: &HeaderMap, key: &str) -> Option<String> {
+    [
+        "Authorization",
+        "X-Emby-Authorization",
+        "X-MediaBrowser-Authorization",
+    ]
+    .iter()
+    .find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| auth_value(value, key))
     })
+}
+
+fn auth_value(header: &str, key: &str) -> Option<String> {
+    auth_header_value_field(header, key)
 }
 
 fn default_if_empty(values: Vec<String>, default: Vec<String>) -> Vec<String> {
@@ -744,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn device_info_ignores_legacy_token_headers() {
+    fn device_info_accepts_jellyfin_compat_authorization_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-MediaBrowser-Authorization",
@@ -753,10 +755,23 @@ mod tests {
             ),
         );
         let device = device_info_from_headers(&headers);
-        assert_eq!(device.client, "jellyfin-rs");
-        assert_eq!(device.device_name, "Unknown Device");
-        assert_eq!(device.device_id, "");
-        assert_eq!(device.version, "0.1.0");
+        assert_eq!(device.client, "Tsukimi");
+        assert_eq!(device.device_name, "Desktop");
+        assert_eq!(device.device_id, "dev2");
+        assert_eq!(device.version, "1.2.3");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Emby-Authorization",
+            HeaderValue::from_static(
+                "Emby Client=Tsukimi,Device=linux,DeviceId=dev3,Version=26.7.3",
+            ),
+        );
+        let device = device_info_from_headers(&headers);
+        assert_eq!(device.client, "Tsukimi");
+        assert_eq!(device.device_name, "linux");
+        assert_eq!(device.device_id, "dev3");
+        assert_eq!(device.version, "26.7.3");
     }
 
     #[test]

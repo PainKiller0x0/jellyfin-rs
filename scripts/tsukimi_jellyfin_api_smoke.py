@@ -9,10 +9,10 @@ from urllib.parse import urljoin
 import httpx
 
 
-CLIENT = "Codex Jellyfin API"
-DEVICE = "Docker API Smoke"
-DEVICE_ID = "codex-jellyfin-api"
-VERSION = "0.0.0"
+CLIENT = "Tsukimi"
+DEVICE = "linux"
+DEVICE_ID = "codex-tsukimi-api"
+VERSION = "26.7.3"
 
 
 @dataclass
@@ -25,6 +25,7 @@ class CheckResult:
 class JellyfinApi:
     def __init__(self, base_url: str, username: str, password: str) -> None:
         self.base_url = base_url.rstrip("/") + "/"
+        self.api_prefix = "emby/"
         self.username = username
         self.password = password
         self.client = httpx.Client(timeout=30.0, follow_redirects=False)
@@ -32,28 +33,32 @@ class JellyfinApi:
         self.user_id = ""
         self.headers = {
             "Accept": "application/json",
-            "Authorization": self.auth_header(),
+            "User-Agent": f"{CLIENT}/{VERSION} - {DEVICE}",
+            "X-Emby-authorization": self.auth_header(),
         }
 
     def auth_header(self, include_token: bool = False) -> str:
         parts = [
-            f'Client="{CLIENT}"',
-            f'Device="{DEVICE}"',
-            f'DeviceId="{DEVICE_ID}"',
-            f'Version="{VERSION}"',
+            f"Client={CLIENT}",
+            f"Device={DEVICE}",
+            f"DeviceId={DEVICE_ID}",
+            f"Version={VERSION}",
         ]
         if self.user_id:
-            parts.insert(0, f'UserId="{self.user_id}"')
+            parts.insert(0, f"UserId={self.user_id}")
         if include_token and self.token:
-            parts.append(f'Token="{self.token}"')
-        return "MediaBrowser " + ", ".join(parts)
+            parts.append(f"Token={self.token}")
+        return "Emby " + ",".join(parts)
 
     def url(self, path: str) -> str:
+        return urljoin(self.base_url, self.api_prefix + path.lstrip("/"))
+
+    def root_url(self, path: str) -> str:
         return urljoin(self.base_url, path.lstrip("/"))
 
     def login(self) -> dict[str, Any]:
         response = self.client.post(
-            self.url("Users/AuthenticateByName"),
+            self.url("Users/authenticatebyname"),
             headers=self.headers | {"Content-Type": "application/json"},
             json={"Username": self.username, "Pw": self.password},
         )
@@ -63,7 +68,9 @@ class JellyfinApi:
         self.user_id = data["User"]["Id"]
         self.headers = {
             "Accept": "application/json",
-            "Authorization": self.auth_header(include_token=True),
+            "User-Agent": f"{CLIENT}/{VERSION} - {DEVICE}",
+            "X-Emby-Token": self.token,
+            "X-Emby-authorization": self.auth_header(include_token=True),
         }
         return data
 
@@ -154,28 +161,28 @@ def run(args: argparse.Namespace) -> int:
     api = JellyfinApi(args.base_url, args.username, args.password)
     checks: list[CheckResult] = []
 
-    public = api.client.get(api.url("System/Info/Public"), timeout=10.0)
-    checks.append(expect_status("public system info", public, 200))
+    public = api.client.get(api.root_url("System/Info/Public"), timeout=10.0)
+    checks.append(expect_status("root public system info", public, 200))
+
+    prefixed_public = api.client.get(api.url("System/Info/Public"), timeout=10.0)
+    checks.append(expect_status("emby-prefixed public system info", prefixed_public, 200))
 
     login = api.login()
     session_info = login.get("SessionInfo", {})
     checks.append(
         CheckResult(
-            "login returns Jellyfin session client",
+            "login returns Tsukimi session client",
             session_info.get("Client") == CLIENT,
             f"Client={session_info.get('Client')!r}",
         )
     )
 
-    emby_prefixed = api.client.get(api.url("emby/System/Info/Public"), timeout=10.0)
-    checks.append(expect_status("emby prefix is not exposed", emby_prefixed, 404))
-
     emby_token = api.client.get(
-        api.url("System/Info"),
+        api.root_url("System/Info"),
         headers={"Accept": "application/json", "X-Emby-Token": api.token},
         timeout=10.0,
     )
-    checks.append(expect_status("X-Emby-Token is not accepted", emby_token, 401))
+    checks.append(expect_status("X-Emby-Token authenticates root API", emby_token, 200))
 
     for name, response in [
         ("system info", api.get("System/Info")),
@@ -183,6 +190,7 @@ def run(args: argparse.Namespace) -> int:
         ("scheduled tasks", api.get("ScheduledTasks")),
         ("activity log", api.get("System/ActivityLog/Entries", hasUserId="false")),
         ("users me", api.get("Users/Me")),
+        ("user by id", api.get(f"Users/{api.user_id}")),
         ("sessions", api.get("Sessions")),
         ("library media folders", api.get("Library/MediaFolders")),
         ("library views", api.get(f"Users/{api.user_id}/Views")),

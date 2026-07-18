@@ -650,6 +650,9 @@ fn safe_backup_file_name(
         return Err("Backup file name is required");
     }
     let path = Path::new(name);
+    if name.contains('/') || name.contains('\\') {
+        return Err("Backup file name must not contain a path");
+    }
     if path.components().count() != 1
         || path.file_name().and_then(|value| value.to_str()) != Some(name)
     {

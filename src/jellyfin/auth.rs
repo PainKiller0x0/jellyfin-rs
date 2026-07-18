@@ -2251,6 +2251,13 @@ pub fn header_token(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 fn auth_header_value_token(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = match value.split_once(' ') {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("MediaBrowser") => rest.trim(),
+        Some((scheme, _)) if scheme.eq_ignore_ascii_case("Emby") => return None,
+        _ => value,
+    };
+
     value.split(',').find_map(|part| {
         let token_part = part.trim().split_whitespace().find(|part| {
             part.strip_prefix("Token=")

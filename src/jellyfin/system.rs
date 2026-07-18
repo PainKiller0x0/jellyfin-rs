@@ -3163,6 +3163,9 @@ fn safe_log_path(name: &str) -> Option<std::path::PathBuf> {
 }
 
 fn is_safe_log_name(name: &str) -> bool {
+    if name.contains('/') || name.contains('\\') {
+        return false;
+    }
     let path = std::path::Path::new(name);
     path.file_name().and_then(|part| part.to_str()) == Some(name)
         && (name.ends_with(".log") || name.ends_with("_err.log"))

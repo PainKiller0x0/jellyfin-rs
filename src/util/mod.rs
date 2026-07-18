@@ -40,17 +40,6 @@ pub fn unix_to_jellyfin_date(timestamp: i64) -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
-pub fn infer_library_id_from_path(path: &str) -> &'static str {
-    let path = path.to_ascii_lowercase();
-    if path.contains("music") || path.contains("audio") || path.contains("song") {
-        "music"
-    } else if path.contains("show") || path.contains("series") || path.contains("tv") {
-        "tvshows"
-    } else {
-        "movies"
-    }
-}
-
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     Ok(Argon2::default()
@@ -121,6 +110,11 @@ fn system_proxy_url() -> Option<String> {
 
 #[cfg(windows)]
 fn parse_windows_proxy_server(value: &str) -> Option<String> {
+    parse_windows_proxy_server_value(value)
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_proxy_server_value(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
         return None;
@@ -141,7 +135,7 @@ fn parse_windows_proxy_server(value: &str) -> Option<String> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn proxy_entry_value<'a>(entry: &'a str, expected_scheme: &str) -> Option<&'a str> {
     let entry = entry.trim();
     let (scheme, proxy) = entry.split_once('=')?;
@@ -152,21 +146,7 @@ fn proxy_entry_value<'a>(entry: &'a str, expected_scheme: &str) -> Option<&'a st
 
 #[cfg(test)]
 fn parse_windows_proxy_server_for_test(value: &str) -> Option<String> {
-    #[cfg(windows)]
-    {
-        parse_windows_proxy_server(value)
-    }
-    #[cfg(not(windows))]
-    {
-        let value = value.trim();
-        if value.is_empty() {
-            None
-        } else if value.contains("://") {
-            Some(value.to_string())
-        } else {
-            Some(format!("http://{value}"))
-        }
-    }
+    parse_windows_proxy_server_value(value)
 }
 
 #[cfg(test)]

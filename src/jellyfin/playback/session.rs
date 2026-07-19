@@ -629,17 +629,22 @@ async fn record_playback_watch_event(
     let now = now_unix();
     let item_id = canonical_watch_item_id(db, item_id).await?;
     let existing = watch_session_row(db, play_session_id).await?;
+    if existing
+        .as_ref()
+        .is_some_and(|session| session.ended_at.is_some())
+        && event != PlaybackEvent::Start
+    {
+        return Ok(());
+    }
     let starts_new_session = existing
         .as_ref()
-        .map(|session| {
-            event == PlaybackEvent::Start
-                && (session.ended_at.is_some() || session.item_id != item_id)
-        })
+        .map(|session| session.ended_at.is_some() || session.item_id != item_id)
         .unwrap_or(true);
 
-    if let Some(session) = existing.as_ref().filter(|session| {
-        session.ended_at.is_none() && !(event == PlaybackEvent::Start && starts_new_session)
-    }) {
+    if let Some(session) = existing
+        .as_ref()
+        .filter(|session| session.ended_at.is_none() && !starts_new_session)
+    {
         let delta_seconds = watch_delta_seconds(
             session.last_event_at,
             now,
@@ -657,6 +662,10 @@ async fn record_playback_watch_event(
             )
             .await?;
         }
+    }
+
+    if starts_new_session && event == PlaybackEvent::Stopped {
+        return Ok(());
     }
 
     if starts_new_session {

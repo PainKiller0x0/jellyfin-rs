@@ -14,9 +14,6 @@ import type {
   PlaybackMap,
   PlaybackRegion,
   PlaybackSession,
-  PlaybackStats,
-  PlaybackStatsSeries,
-  PlaybackStatsUser,
   ScheduledTask,
   SystemInfo
 } from '@/types/server';
@@ -110,7 +107,6 @@ const state = reactive<{
   system: SystemInfo | null;
   counts: ItemCounts | null;
   playbackMap: PlaybackMap | null;
-  playbackStats: PlaybackStats | null;
   sessions: PlaybackSession[];
   tasks: ScheduledTask[];
   activities: ActivityLogEntry[];
@@ -119,7 +115,6 @@ const state = reactive<{
   system: null,
   counts: null,
   playbackMap: null,
-  playbackStats: null,
   sessions: [],
   tasks: [],
   activities: [],
@@ -128,14 +123,8 @@ const state = reactive<{
 
 const regionRows = computed(() => state.playbackMap?.Regions ?? []);
 const recentPlaybackEvents = computed(() => state.playbackMap?.RecentEvents.slice(0, 6) ?? []);
-const watchDailyRows = computed(() => state.playbackStats?.Daily ?? []);
-const topWatchUsers = computed(() => state.playbackStats?.Users.slice(0, 5) ?? []);
-const topWatchSeries = computed(() => state.playbackStats?.Series.slice(0, 5) ?? []);
 const totalViewerCount = computed(() => regionRows.value.reduce((total, region) => total + region.UserCount, 0));
 const maxRegionUsers = computed(() => Math.max(1, ...regionRows.value.map(region => region.UserCount)));
-const maxDailyWatchSeconds = computed(() => Math.max(1, ...watchDailyRows.value.map(point => point.WatchSeconds)));
-const maxUserWatchSeconds = computed(() => Math.max(1, ...topWatchUsers.value.map(user => user.WatchSeconds)));
-const maxSeriesWatchSeconds = computed(() => Math.max(1, ...topWatchSeries.value.map(series => series.WatchSeconds)));
 const provinceRegionGroups = computed(() => {
   const groups = new Map<
     string,
@@ -214,15 +203,9 @@ const cards = computed(() => [
     tone: 'warning'
   },
   {
-    label: '观影时长',
-    value: formatDuration(state.playbackStats?.TotalWatchSeconds),
-    hint: `今日 ${formatDuration(state.playbackStats?.TodayWatchSeconds)}`,
-    tone: 'primary'
-  },
-  {
     label: '播放次数',
-    value: formatNumber(state.playbackStats?.TotalPlayCount ?? state.playbackMap?.TotalPlayCount),
-    hint: `${formatNumber(state.playbackStats?.UserCount)} 用户 / ${formatNumber(state.playbackStats?.ItemCount)} 内容`,
+    value: formatNumber(state.playbackMap?.TotalPlayCount),
+    hint: `${formatNumber(state.playbackMap?.RegionCount)} 个地区/IP 段`,
     tone: 'success'
   },
   {
@@ -246,14 +229,13 @@ async function loadDashboard() {
   loading.value = true;
   loadError.value = '';
   try {
-    const [system, counts, sessions, tasks, activities, playbackMap, playbackStats, logs] = await Promise.all([
+    const [system, counts, sessions, tasks, activities, playbackMap, logs] = await Promise.all([
       serverApi.systemInfo(authStore.token),
       serverApi.itemCounts(authStore.token),
       serverApi.activeSessions(authStore.token),
       serverApi.scheduledTasks(authStore.token),
       serverApi.activityLog(authStore.token),
       serverApi.playbackMap(authStore.token),
-      serverApi.playbackStats(authStore.token),
       serverApi.adminLogs(authStore.token, 0, 120)
     ]);
     state.system = system;
@@ -262,7 +244,6 @@ async function loadDashboard() {
     state.tasks = tasks;
     state.activities = activities.Items;
     state.playbackMap = playbackMap;
-    state.playbackStats = playbackStats;
     state.httpLogs = logs.Items;
     logLastId.value = logs.LastId;
     await nextTick(scrollLogsToBottom);
@@ -296,12 +277,7 @@ async function pollPlaybackMap() {
     return;
   }
   try {
-    const [playbackMap, playbackStats] = await Promise.all([
-      serverApi.playbackMap(authStore.token),
-      serverApi.playbackStats(authStore.token)
-    ]);
-    state.playbackMap = playbackMap;
-    state.playbackStats = playbackStats;
+    state.playbackMap = await serverApi.playbackMap(authStore.token);
   } catch {
     // Transient polling errors are ignored; manual refresh still reports failures.
   }
@@ -327,22 +303,6 @@ function scrollLogsToBottom() {
 
 function formatNumber(value: number | undefined) {
   return typeof value === 'number' ? value.toLocaleString() : '-';
-}
-
-function formatDuration(value: number | undefined) {
-  if (typeof value !== 'number') {
-    return '-';
-  }
-  const seconds = Math.max(0, Math.round(value));
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  if (hours > 0) {
-    return `${hours.toLocaleString()}小时${minutes ? `${minutes}分` : ''}`;
-  }
-  if (minutes > 0) {
-    return `${minutes}分钟`;
-  }
-  return `${seconds}秒`;
 }
 
 function formatDate(value?: string | null) {
@@ -466,27 +426,6 @@ function regionHeatStyle(region: PlaybackRegion) {
   };
 }
 
-function watchTrendStyle(seconds: number) {
-  const ratio = Math.min(1, seconds / maxDailyWatchSeconds.value);
-  return {
-    height: `${Math.max(4, ratio * 100)}%`
-  };
-}
-
-function userWatchBarStyle(user: PlaybackStatsUser) {
-  const ratio = Math.min(1, user.WatchSeconds / maxUserWatchSeconds.value);
-  return {
-    width: `${Math.max(8, ratio * 100)}%`
-  };
-}
-
-function seriesWatchBarStyle(series: PlaybackStatsSeries) {
-  const ratio = Math.min(1, series.WatchSeconds / maxSeriesWatchSeconds.value);
-  return {
-    width: `${Math.max(8, ratio * 100)}%`
-  };
-}
-
 function logLine(entry: AdminHttpLogEntry) {
   const query = entry.Query ? `?${entry.Query}` : '';
   return `${entry.Method} ${entry.Path}${query}`;
@@ -522,74 +461,6 @@ onBeforeUnmount(stopPolling);
         <div class="dashboard-page__stat-label">{{ card.label }}</div>
         <div class="dashboard-page__stat-value">{{ card.value }}</div>
         <ElTag :type="card.tone" effect="plain">{{ card.hint }}</ElTag>
-      </ElCard>
-    </div>
-
-    <div class="dashboard-page__grid dashboard-page__grid--watch">
-      <ElCard class="dashboard-page__panel" shadow="never">
-        <template #header>
-          <div class="dashboard-page__panel-title">
-            <ElIcon>
-              <DataAnalysis />
-            </ElIcon>
-            <span>按日观影时长</span>
-          </div>
-        </template>
-
-        <div class="dashboard-page__watch-chart" :aria-label="`最近 ${state.playbackStats?.Days ?? 30} 日观影时长`">
-          <ElTooltip
-            v-for="point in watchDailyRows"
-            :key="point.Date"
-            :content="`${point.Date} · ${formatDuration(point.WatchSeconds)} · ${point.PlayCount} 次播放`"
-            placement="top"
-            :show-after="120"
-          >
-            <div class="dashboard-page__watch-day">
-              <span class="dashboard-page__watch-bar" :style="watchTrendStyle(point.WatchSeconds)"></span>
-              <small>{{ dayjs(point.Date).format('MM-DD') }}</small>
-            </div>
-          </ElTooltip>
-          <ElEmpty v-if="!watchDailyRows.length" :image-size="80" description="暂无观影时长" />
-        </div>
-      </ElCard>
-
-      <ElCard class="dashboard-page__panel" shadow="never">
-        <template #header>
-          <div class="dashboard-page__panel-title">
-            <ElIcon>
-              <Histogram />
-            </ElIcon>
-            <span>用户 / 剧集时长</span>
-          </div>
-        </template>
-
-        <div class="dashboard-page__watch-rank-grid">
-          <div class="dashboard-page__watch-rank">
-            <div class="dashboard-page__watch-rank-title">用户</div>
-            <div v-for="user in topWatchUsers" :key="user.UserId" class="dashboard-page__watch-rank-row">
-              <div>
-                <strong>{{ user.UserName || user.UserId }}</strong>
-                <span>{{ user.PlayCount }} 次播放</span>
-                <b :style="userWatchBarStyle(user)"></b>
-              </div>
-              <ElTag effect="plain">{{ formatDuration(user.WatchSeconds) }}</ElTag>
-            </div>
-            <ElEmpty v-if="!topWatchUsers.length" :image-size="72" description="暂无用户数据" />
-          </div>
-
-          <div class="dashboard-page__watch-rank">
-            <div class="dashboard-page__watch-rank-title">剧集</div>
-            <div v-for="series in topWatchSeries" :key="series.SeriesId" class="dashboard-page__watch-rank-row">
-              <div>
-                <strong>{{ series.SeriesName || series.SeriesId }}</strong>
-                <span>{{ series.ItemCount }} 个条目 · {{ series.PlayCount }} 次播放</span>
-                <b :style="seriesWatchBarStyle(series)"></b>
-              </div>
-              <ElTag effect="plain">{{ formatDuration(series.WatchSeconds) }}</ElTag>
-            </div>
-            <ElEmpty v-if="!topWatchSeries.length" :image-size="72" description="暂无剧集数据" />
-          </div>
-        </div>
       </ElCard>
     </div>
 
@@ -897,113 +768,6 @@ onBeforeUnmount(stopPolling);
   align-items: stretch;
 }
 
-.dashboard-page__grid--watch {
-  grid-template-columns: minmax(0, 1.15fr) minmax(360px, 0.85fr);
-}
-
-.dashboard-page__watch-chart {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(18px, 1fr));
-  gap: 8px;
-  align-items: end;
-  min-height: 240px;
-  padding: 14px 10px 8px;
-  border: 1px solid var(--admin-border);
-  border-radius: 8px;
-  background:
-    linear-gradient(180deg, rgba(37, 99, 235, 0.06), rgba(255, 255, 255, 0) 42%),
-    #ffffff;
-}
-
-.dashboard-page__watch-day {
-  display: grid;
-  grid-template-rows: minmax(160px, 1fr) 22px;
-  gap: 8px;
-  min-width: 0;
-  align-items: end;
-}
-
-.dashboard-page__watch-bar {
-  display: block;
-  min-height: 4px;
-  border-radius: 5px 5px 2px 2px;
-  background: linear-gradient(180deg, #2563eb 0%, #0f766e 100%);
-  box-shadow: 0 6px 14px rgba(37, 99, 235, 0.14);
-}
-
-.dashboard-page__watch-day small {
-  overflow: hidden;
-  color: var(--admin-muted);
-  font-size: 10px;
-  line-height: 1.2;
-  text-align: center;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.dashboard-page__watch-rank-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-}
-
-.dashboard-page__watch-rank {
-  display: grid;
-  align-content: start;
-  gap: 10px;
-  min-width: 0;
-}
-
-.dashboard-page__watch-rank-title {
-  color: var(--admin-muted);
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.dashboard-page__watch-rank-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: center;
-  min-height: 54px;
-  padding: 9px 10px;
-  border: 1px solid var(--admin-border);
-  border-radius: 8px;
-  background: #ffffff;
-}
-
-.dashboard-page__watch-rank-row div {
-  display: grid;
-  min-width: 0;
-  gap: 4px;
-}
-
-.dashboard-page__watch-rank-row strong,
-.dashboard-page__watch-rank-row span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.dashboard-page__watch-rank-row strong {
-  font-size: 13px;
-}
-
-.dashboard-page__watch-rank-row span {
-  color: var(--admin-muted);
-  font-size: 12px;
-}
-
-.dashboard-page__watch-rank-row b {
-  display: block;
-  width: 8%;
-  height: 3px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: linear-gradient(90deg, #2563eb 0%, #dc6a3d 100%);
-}
-
 .dashboard-page__map {
   display: grid;
   gap: 14px;
@@ -1266,10 +1030,6 @@ onBeforeUnmount(stopPolling);
     grid-template-columns: 1fr;
   }
 
-  .dashboard-page__grid--watch {
-    grid-template-columns: 1fr;
-  }
-
   .dashboard-page__log-row {
     grid-template-columns: 120px 58px minmax(180px, 1fr);
   }
@@ -1286,24 +1046,6 @@ onBeforeUnmount(stopPolling);
 
   .dashboard-page__map-surface {
     min-height: 240px;
-  }
-
-  .dashboard-page__watch-chart {
-    grid-template-columns: repeat(auto-fit, minmax(14px, 1fr));
-    min-height: 190px;
-    gap: 5px;
-  }
-
-  .dashboard-page__watch-day {
-    grid-template-rows: minmax(124px, 1fr) 18px;
-  }
-
-  .dashboard-page__watch-day small {
-    display: none;
-  }
-
-  .dashboard-page__watch-rank-grid {
-    grid-template-columns: 1fr;
   }
 
   .dashboard-page__region {

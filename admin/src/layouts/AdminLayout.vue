@@ -28,6 +28,11 @@ const menuItems: MenuItem[] = [
     icon: 'FolderOpened'
   },
   {
+    path: '/playback-stats',
+    title: '观影统计',
+    icon: 'DataAnalysis'
+  },
+  {
     path: '/tasks',
     title: '计划任务',
     icon: 'Clock'

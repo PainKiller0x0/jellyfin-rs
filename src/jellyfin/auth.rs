@@ -2633,8 +2633,7 @@ fn login_request_from_parts(
     } else {
         let trimmed = trim_ascii_whitespace(body);
         if trimmed.first() == Some(&b'{') {
-            serde_json::from_slice::<LoginRequest>(trimmed)
-                .map_err(|_| "Invalid authentication request".to_string())?
+            login_request_from_json(trimmed)?
         } else {
             let form = std::str::from_utf8(trimmed)
                 .map_err(|_| "Invalid authentication request".to_string())?;
@@ -2650,6 +2649,53 @@ fn login_request_from_parts(
     };
     fill_login_request_from_map(&mut request, query);
     Ok(request)
+}
+
+fn login_request_from_json(body: &[u8]) -> Result<LoginRequest, String> {
+    let value = serde_json::from_slice::<JsonValue>(body)
+        .map_err(|_| "Invalid authentication request".to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Invalid authentication request".to_string())?;
+
+    Ok(LoginRequest {
+        username: json_string_any(
+            object,
+            &[
+                "Username", "username", "UserName", "userName", "Name", "name", "User", "user",
+            ],
+        )
+        .unwrap_or_default(),
+        password: json_string_any(
+            object,
+            &["Pw", "pw", "Password", "password", "Pass", "pass"],
+        )
+        .unwrap_or_default(),
+        device_id: json_string_any(object, &["DeviceId", "deviceId", "DeviceID", "device_id"]),
+    })
+}
+
+fn json_string_any(object: &serde_json::Map<String, JsonValue>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(json_string_value))
+        .or_else(|| {
+            object.iter().find_map(|(candidate, value)| {
+                keys.iter()
+                    .any(|key| candidate.eq_ignore_ascii_case(key))
+                    .then(|| json_string_value(value))
+                    .flatten()
+            })
+        })
+}
+
+fn json_string_value(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(value) => Some(value.trim().to_string()),
+        JsonValue::Number(value) => Some(value.to_string()),
+        JsonValue::Bool(value) => Some(value.to_string()),
+        JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) => None,
+    }
+    .filter(|value| !value.is_empty())
 }
 
 fn fill_login_request_from_map(request: &mut LoginRequest, values: &HashMap<String, String>) {
@@ -3444,6 +3490,36 @@ mod tests {
         assert_eq!(request.username, "alice");
         assert_eq!(request.password, "secret");
         assert_eq!(request.device_id.as_deref(), Some("d1"));
+    }
+
+    #[test]
+    fn login_request_accepts_duplicate_password_json_shape() {
+        let request = login_request_from_parts(
+            &HashMap::new(),
+            br#"{"Username":"alice","Password":"secret","Pw":"secret","DeviceId":"d1"}"#,
+        )
+        .unwrap();
+        assert_eq!(request.username, "alice");
+        assert_eq!(request.password, "secret");
+        assert_eq!(request.device_id.as_deref(), Some("d1"));
+    }
+
+    #[test]
+    fn login_request_accepts_nullable_json_fields() {
+        let request = login_request_from_parts(
+            &HashMap::new(),
+            br#"{"Username":"alice","Password":null,"Pw":"secret","DeviceId":null}"#,
+        )
+        .unwrap();
+        assert_eq!(request.username, "alice");
+        assert_eq!(request.password, "secret");
+        assert_eq!(request.device_id, None);
+
+        let request =
+            login_request_from_parts(&HashMap::new(), br#"{"Username":"alice","Pw":null}"#)
+                .unwrap();
+        assert_eq!(request.username, "alice");
+        assert_eq!(request.password, "");
     }
 
     #[tokio::test]

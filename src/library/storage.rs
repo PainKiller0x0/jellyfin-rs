@@ -30,6 +30,7 @@ pub struct ScannedMediaItem {
 
 pub struct CachedMediaProbe {
     pub runtime_ticks: Option<i64>,
+    pub size_bytes: Option<i64>,
 }
 
 impl ScannedMediaItem {
@@ -72,15 +73,16 @@ pub async fn cached_media_probe_if_current(
     path: &str,
     modified_at: i64,
     size_bytes: Option<i64>,
+    allow_size_mismatch: bool,
 ) -> anyhow::Result<Option<CachedMediaProbe>> {
     let row = db
         .query_one(crate::db::helpers::pg_statement(
-            r#"SELECT mi.runtime_ticks
+            r#"SELECT mi.runtime_ticks, mi.size_bytes
                FROM media_items mi
                WHERE mi.path = ?
                  AND mi.is_folder = 0
                  AND mi.modified_at = ?
-                 AND COALESCE(mi.size_bytes, -1) = COALESCE(?, -1)
+                 AND (? = 1 OR COALESCE(mi.size_bytes, -1) = COALESCE(?, -1))
                  AND EXISTS (
                      SELECT 1
                      FROM media_streams ms
@@ -98,12 +100,18 @@ pub async fn cached_media_probe_if_current(
                        )
                  )
                LIMIT 1"#,
-            vec![path.into(), modified_at.into(), size_bytes.into()],
+            vec![
+                path.into(),
+                modified_at.into(),
+                (if allow_size_mismatch { 1i64 } else { 0i64 }).into(),
+                size_bytes.into(),
+            ],
         ))
         .await
         .with_context(|| format!("failed to check cached media probe: {path}"))?;
     Ok(row.map(|row| CachedMediaProbe {
         runtime_ticks: row.get_opt_i64("runtime_ticks").ok().flatten(),
+        size_bytes: row.get_opt_i64("size_bytes").ok().flatten(),
     }))
 }
 

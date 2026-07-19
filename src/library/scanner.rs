@@ -27,7 +27,7 @@ use crate::{
 };
 
 const MEDIA_PROBE_CACHE_VERSION_KEY: &str = "media_probe_cache_version";
-const MEDIA_PROBE_CACHE_VERSION: &str = "2";
+const MEDIA_PROBE_CACHE_VERSION: &str = "3";
 const DEFAULT_MEDIA_PROBE_CONCURRENCY: usize = 4;
 const DEFAULT_MEDIA_PROBE_QUEUE_CAPACITY: usize = 1024;
 
@@ -289,6 +289,7 @@ async fn scan_root(
                 &path_string,
                 resolved.modified_at,
                 resolved.size_bytes,
+                is_strm_file,
             )
             .await
             {
@@ -320,7 +321,10 @@ async fn scan_root(
                 .then(|| parsed_name.extended_video_types.join(",")),
             production_year: parsed_metadata.production_year,
             runtime_ticks: cached_probe.as_ref().and_then(|probe| probe.runtime_ticks),
-            size_bytes: resolved.size_bytes,
+            size_bytes: cached_probe
+                .as_ref()
+                .and_then(|probe| probe.size_bytes)
+                .or(resolved.size_bytes),
             season_number: parsed_name.season_number,
             episode_number: parsed_name.episode_number,
             modified_at: resolved.modified_at,
@@ -454,6 +458,7 @@ async fn run_media_probe_job(
 
     if let Some(probe) = probe {
         job.item.runtime_ticks = probe.runtime_ticks;
+        job.item.size_bytes = probe.size_bytes.or(job.item.size_bytes);
         upsert_media_item(&db, &job.item).await?;
         clear_sidecar_subtitles(&db, &job.item.id).await?;
         stream_probe_succeeded = match upsert_probed_media_streams(&db, &job.item, &probe).await {

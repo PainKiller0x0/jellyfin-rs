@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer};
 #[derive(Default)]
 pub struct MediaProbe {
     pub runtime_ticks: Option<i64>,
+    pub size_bytes: Option<i64>,
     pub streams: Vec<ProbedStream>,
 }
 
@@ -115,15 +116,22 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
         })?;
 
     let response = serde_json::from_slice::<FfprobeResponse>(&output).ok()?;
-    let frames_by_stream = response
-        .frames
+    Some(media_probe_from_ffprobe_response(response))
+}
+
+fn media_probe_from_ffprobe_response(response: FfprobeResponse) -> MediaProbe {
+    let FfprobeResponse {
+        streams,
+        frames,
+        format,
+    } = response;
+    let frames_by_stream = frames
         .as_deref()
         .unwrap_or_default()
         .iter()
         .filter_map(|frame| frame.stream_index.map(|index| (index, frame)))
         .collect::<HashMap<_, _>>();
-    let hdr10_plus_streams = response
-        .frames
+    let hdr10_plus_streams = frames
         .as_deref()
         .unwrap_or_default()
         .iter()
@@ -141,14 +149,21 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
         })
         .filter_map(|frame| frame.stream_index)
         .collect::<std::collections::HashSet<_>>();
-    Some(MediaProbe {
-        runtime_ticks: response
-            .format
-            .and_then(|format| format.duration)
-            .and_then(|duration| duration.parse::<f64>().ok())
-            .map(|seconds| (seconds * 10_000_000.0) as i64),
-        streams: response
-            .streams
+    let runtime_ticks = format
+        .as_ref()
+        .and_then(|format| format.duration.as_deref())
+        .and_then(|duration| duration.parse::<f64>().ok())
+        .map(|seconds| (seconds * 10_000_000.0) as i64);
+    let size_bytes = format
+        .as_ref()
+        .and_then(|format| format.size.as_deref())
+        .and_then(parse_i64)
+        .filter(|size| *size > 0);
+
+    MediaProbe {
+        runtime_ticks,
+        size_bytes,
+        streams: streams
             .into_iter()
             .filter_map(|stream| {
                 let frame = frames_by_stream.get(&stream.index).copied();
@@ -156,7 +171,7 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
                 ProbedStream::from_ffprobe(stream, frame, has_hdr10_plus)
             })
             .collect(),
-    })
+    }
 }
 
 impl ProbedStream {
@@ -318,6 +333,7 @@ struct FfprobeResponse {
 #[derive(Deserialize)]
 struct FfprobeFormat {
     duration: Option<String>,
+    size: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -598,4 +614,48 @@ fn video_range(
         return (Some("HDR".to_string()), Some("HLG".to_string()));
     }
     (Some("SDR".to_string()), Some("SDR".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_probe_extracts_format_size() {
+        let response: FfprobeResponse = serde_json::from_str(
+            r#"{
+                "format": {
+                    "duration": "12.500000",
+                    "size": "987654321"
+                },
+                "streams": []
+            }"#,
+        )
+        .unwrap();
+
+        let probe = media_probe_from_ffprobe_response(response);
+
+        assert_eq!(probe.runtime_ticks, Some(125_000_000));
+        assert_eq!(probe.size_bytes, Some(987_654_321));
+    }
+
+    #[test]
+    fn media_probe_ignores_missing_or_invalid_format_size() {
+        for size in ["", "0", "-1", "unknown"] {
+            let response: FfprobeResponse = serde_json::from_str(&format!(
+                r#"{{
+                    "format": {{
+                        "duration": "1.000000",
+                        "size": "{size}"
+                    }},
+                    "streams": []
+                }}"#
+            ))
+            .unwrap();
+
+            let probe = media_probe_from_ffprobe_response(response);
+
+            assert_eq!(probe.size_bytes, None);
+        }
+    }
 }

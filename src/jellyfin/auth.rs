@@ -125,6 +125,7 @@ const MAX_USER_SETTING_STRING_LEN: usize = 512;
 const MAX_USER_SETTING_ARRAY_ITEMS: usize = 256;
 const MAX_USER_SETTING_OBJECT_FIELDS: usize = 64;
 const MAX_USER_SETTING_DEPTH: usize = 3;
+const LAST_ENABLED_ADMIN_ERROR: &str = "At least one enabled administrator is required";
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -493,6 +494,11 @@ pub async fn update_user_policy(
         Err(error) if error.to_string().contains("not found") => (
             StatusCode::NOT_FOUND,
             Json(json!({ "Error": "User not found" })),
+        )
+            .into_response(),
+        Err(error) if user_policy_validation_error(&error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": error.to_string() })),
         )
             .into_response(),
         Err(error) => internal_error(error),
@@ -1410,17 +1416,25 @@ async fn update_user_policy_inner(
     };
     let current_is_admin = model.is_admin != 0;
     let current_is_disabled = model.is_disabled != 0;
+    let requested_is_admin = policy_bool(policy, "IsAdministrator");
+    let requested_is_disabled = policy_bool(policy, "IsDisabled");
+    let next_is_admin = requested_is_admin.unwrap_or(current_is_admin);
+    let next_is_disabled = requested_is_disabled.unwrap_or(current_is_disabled);
+    if current_is_admin && !current_is_disabled {
+        ensure_enabled_admin_remains(db, user_id, next_is_admin, next_is_disabled).await?;
+    }
+
     let mut active: users::ActiveModel = model.into();
     let mut disabled = None;
     let mut merged = merge_user_policy(
         user_policy(db, user_id, current_is_admin, current_is_disabled).await,
         policy,
     );
-    if let Some(is_admin) = policy_bool(policy, "IsAdministrator") {
+    if let Some(is_admin) = requested_is_admin {
         active.is_admin = Set(i64::from(is_admin));
         merged["IsAdministrator"] = json!(is_admin);
     }
-    if let Some(is_disabled) = policy_bool(policy, "IsDisabled") {
+    if let Some(is_disabled) = requested_is_disabled {
         active.is_disabled = Set(i64::from(is_disabled));
         merged["IsDisabled"] = json!(is_disabled);
         disabled = Some(is_disabled);
@@ -1435,8 +1449,40 @@ async fn update_user_policy_inner(
     Ok(())
 }
 
+async fn ensure_enabled_admin_remains(
+    db: &DatabaseConnection,
+    user_id: &str,
+    next_is_admin: bool,
+    next_is_disabled: bool,
+) -> anyhow::Result<()> {
+    if next_is_admin && !next_is_disabled {
+        return Ok(());
+    }
+
+    let row = db
+        .query_one(crate::db::helpers::pg_statement(
+            "SELECT COUNT(*) AS cnt FROM users WHERE id <> ? AND is_admin <> 0 AND is_disabled = 0",
+            vec![user_id.into()],
+        ))
+        .await
+        .context("failed to count enabled administrators")?;
+    let enabled_admin_count = row
+        .map(|row| row.get_i64("cnt"))
+        .transpose()
+        .context("failed to read enabled administrator count")?
+        .unwrap_or_default();
+    if enabled_admin_count == 0 {
+        bail!(LAST_ENABLED_ADMIN_ERROR);
+    }
+    Ok(())
+}
+
 fn policy_bool(policy: &JsonValue, key: &str) -> Option<bool> {
     policy.get(key).and_then(JsonValue::as_bool)
+}
+
+fn user_policy_validation_error(error: &anyhow::Error) -> bool {
+    error.to_string() == LAST_ENABLED_ADMIN_ERROR
 }
 
 fn user_write_validation_error(error: &anyhow::Error) -> bool {
@@ -3855,6 +3901,61 @@ mod tests {
         assert_eq!(users[0]["Policy"]["EnableAllFolders"], false);
     }
 
+    #[tokio::test]
+    async fn user_policy_rejects_disabling_last_enabled_admin() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        insert_test_user(&db, "u1", true, false).await;
+        let state = Arc::new(test_state(db));
+
+        let response = update_user_policy(
+            State(state.clone()),
+            Path("u1".to_string()),
+            Json(json!({ "IsDisabled": true })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let user = user_by_id_inner(&state.db, "u1").await.unwrap().unwrap();
+        assert!(user.is_admin);
+        assert!(!user.is_disabled);
+    }
+
+    #[tokio::test]
+    async fn user_policy_rejects_demoting_last_enabled_admin() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        insert_test_user(&db, "u1", true, false).await;
+
+        let error = update_user_policy_inner(&db, "u1", &json!({ "IsAdministrator": false }))
+            .await
+            .unwrap_err();
+
+        assert!(user_policy_validation_error(&error));
+        let user = user_by_id_inner(&db, "u1").await.unwrap().unwrap();
+        assert!(user.is_admin);
+        assert!(!user.is_disabled);
+    }
+
+    #[tokio::test]
+    async fn user_policy_allows_disabling_admin_when_another_enabled_admin_remains() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        insert_test_user(&db, "u1", true, false).await;
+        insert_test_user(&db, "u2", true, false).await;
+
+        update_user_policy_inner(&db, "u1", &json!({ "IsDisabled": true }))
+            .await
+            .unwrap();
+
+        let user = user_by_id_inner(&db, "u1").await.unwrap().unwrap();
+        assert!(user.is_admin);
+        assert!(user.is_disabled);
+    }
+
     #[test]
     fn user_configuration_merge_keeps_known_fields_only() {
         let merged = merge_user_configuration(
@@ -3909,6 +4010,26 @@ mod tests {
         let schedule = &policy["AccessSchedules"][0];
         assert_eq!(schedule["Name"], "MorningShift");
         assert_eq!(schedule["Level1"]["Level2"], json!({}));
+    }
+
+    async fn insert_test_user(
+        db: &DatabaseConnection,
+        id: &str,
+        is_admin: bool,
+        is_disabled: bool,
+    ) {
+        db.execute(crate::db::helpers::pg_statement(
+            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, 1)",
+            vec![
+                id.into(),
+                id.into(),
+                id.into(),
+                (if is_admin { 1i64 } else { 0i64 }).into(),
+                (if is_disabled { 1i64 } else { 0i64 }).into(),
+            ],
+        ))
+        .await
+        .unwrap();
     }
 
     fn test_state(db: DatabaseConnection) -> AppState {

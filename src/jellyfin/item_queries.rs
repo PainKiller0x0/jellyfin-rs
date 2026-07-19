@@ -4,7 +4,7 @@ use anyhow::Context;
 use sea_orm::{ConnectionTrait, DatabaseConnection};
 use serde_json::{Value, json};
 
-use crate::{db::row_ext::QueryResultExt, library::models::MediaItem};
+use crate::{db::row_ext::QueryResultExt, library::models::MediaItem, util::stable_text_id};
 
 fn visible_media_item_sql(alias: &str) -> String {
     format!(
@@ -24,7 +24,18 @@ pub async fn library_views(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>
         .context("failed to list libraries")?;
     rows.iter()
         .map(|row| -> anyhow::Result<Value> {
-            Ok(json!({ "Name": row.get_str("name")?, "Id": row.get_str("id")?, "CollectionType": row.get_str("collection_type")?, "Type": "CollectionFolder" }))
+            let id = row.get_str("id")?;
+            let image_tag = library_image_tag(&id, "Primary");
+            let image_tags = json!({"Primary": image_tag.clone()});
+            Ok(json!({
+                "Name": row.get_str("name")?,
+                "Id": id,
+                "CollectionType": row.get_str("collection_type")?,
+                "Type": "CollectionFolder",
+                "ImageTags": image_tags,
+                "PrimaryImageTag": image_tag,
+                "BackdropImageTags": [],
+            }))
         })
         .collect()
 }
@@ -51,7 +62,8 @@ pub async fn find_library_as_item(
             let collection_type: String = row.get_str("collection_type")?;
             let created_at: i64 = row.get_i64("created_at")?;
             let updated_at: i64 = row.get_i64("updated_at")?;
-            Ok(Some(json!({
+            let image_tag = library_image_tag(&id, "Primary");
+            let mut value = json!({
                 "Name": name,
                 "Id": id,
                 "CollectionType": collection_type,
@@ -99,10 +111,17 @@ pub async fn find_library_as_item(
                 "LockData": false,
                 "LockedFields": [],
                 "ExternalUrls": [],
-            })))
+            });
+            value["ImageTags"] = json!({"Primary": image_tag.clone()});
+            value["PrimaryImageTag"] = json!(image_tag);
+            Ok(Some(value))
         }
         None => Ok(None),
     }
+}
+
+fn library_image_tag(library_id: &str, image_type: &str) -> String {
+    stable_text_id(&format!("library-image:{library_id}:{image_type}"))
 }
 
 pub async fn list_media_items(
@@ -586,6 +605,11 @@ pub(super) async fn batch_item_image_tags(
                 obj.entry(m.image_type.clone())
                     .or_insert_with(|| json!(etag));
             }
+        }
+    }
+    for tags in map.values_mut() {
+        if let Some(obj) = tags.as_object_mut() {
+            crate::jellyfin::images::add_art_tag_fallback(obj);
         }
     }
     Ok(map)

@@ -146,12 +146,15 @@ async fn download_season_images(db: &sea_orm::DatabaseConnection, api_key: &str)
     let rows = db
         .query_all(crate::db::helpers::portable_statement(
             backend,
-            r#"SELECT s.id as season_id, s.title, p.provider_item_id as series_tmdb_id
+            r#"SELECT s.id as season_id, s.title, s.season_number, p.provider_item_id as series_tmdb_id
            FROM media_items s
            JOIN media_items series ON series.id = s.parent_id
            JOIN provider_ids p ON p.item_id = series.id AND p.provider = 'Tmdb'
            WHERE s.item_type = 'Season'
-           AND NOT EXISTS (SELECT 1 FROM image_assets ia WHERE ia.item_id = s.id)"#,
+           AND NOT EXISTS (
+               SELECT 1 FROM image_assets ia
+               WHERE ia.item_id = s.id AND ia.image_type = 'Primary'
+           )"#,
             vec![],
         ))
         .await;
@@ -178,9 +181,9 @@ async fn download_season_images(db: &sea_orm::DatabaseConnection, api_key: &str)
             async move {
                 let Ok(season_id) = row.get_str("season_id") else { return None };
                 let title: String = row.get_str("title").ok()?;
+                let stored_season_number = row.get_opt_i64("season_number").ok().flatten();
                 let Ok(series_tmdb) = row.get_str("series_tmdb_id") else { return None };
-                // Parse season number from title like "Season 1" or "第1季"
-                let sn = parse_season_number(&title).unwrap_or(0);
+                let sn = stored_season_number.or_else(|| parse_season_number(&title)).unwrap_or(0);
                 let url = format!("https://api.themoviedb.org/3/tv/{series_tmdb}/season/{sn}?api_key={api_key}&language=zh-CN");
                 let resp = client.get(&url).send().await.ok()?;
                 let resp = resp.error_for_status().ok()?;
@@ -231,28 +234,38 @@ async fn download_season_images(db: &sea_orm::DatabaseConnection, api_key: &str)
 fn parse_season_number(title: &str) -> Option<i64> {
     // "Season 1", "第1季", "S01", "season_1"
     let title_lower = title.to_ascii_lowercase();
-    // Try "season 1"
     if let Some(pos) = title_lower.find("season") {
         let rest = &title_lower[pos + 6..];
-        return rest
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse::<i64>().ok());
-    }
-    // Try "第1季"
-    if let Some(pos) = title.find("第") {
-        if let Some(end) = title[pos..].find("季") {
-            let num = &title[pos + 3..pos + end];
-            return num.parse::<i64>().ok();
+        if let Some(number) = first_ascii_number(rest) {
+            return Some(number);
         }
     }
-    // Try "S01" at start
+    if let Some(rest) = title.split_once('第').map(|(_, rest)| rest) {
+        if let Some((number, _)) = rest.split_once('季') {
+            if let Ok(number) = number.trim().parse::<i64>() {
+                return Some(number);
+            }
+        }
+    }
     if let Some(rest) = title_lower.strip_prefix('s') {
-        if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
-            return rest[..end].parse::<i64>().ok();
+        if let Some(number) = first_ascii_number(rest) {
+            return Some(number);
         }
     }
     None
+}
+
+fn first_ascii_number(value: &str) -> Option<i64> {
+    let digits: String = value
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<i64>().ok()
+    }
 }
 
 /// Batch fetch TMDb episode metadata for all episodes after scan completes
@@ -857,11 +870,12 @@ pub async fn fetch_and_apply_tmdb_metadata(
             "https://api.themoviedb.org/3/movie/{}/images?api_key={}",
             tmdb_id, api_key
         )
+                let _ = download_and_save_tmdb_image(db, &client, item_id, &url, "Art").await;
     };
     if let Ok(resp) = client.get(&images_url).send().await {
         if let Ok(images) = resp.json::<TmdbImagesResponse>().await {
             // Download logo (clearlogo)
-            if let Some(logo) = images.logos.first() {
+            if let Some(logo) = images.preferred_logo() {
                 let url = format!("https://image.tmdb.org/t/p/w500{}", logo.file_path);
                 let _ = download_and_save_tmdb_image(db, &client, item_id, &url, "Logo").await;
             }
@@ -934,7 +948,7 @@ async fn download_and_save_tmdb_image(
     let _ = db
         .execute(crate::db::helpers::portable_statement(
             backend,
-            r#"INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, width, height, size_bytes, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, NULL, NULL, ?, ?, ?) ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET path = excluded.path, size_bytes = excluded.size_bytes, updated_at = excluded.updated_at"#,
+            r#"INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, width, height, size_bytes, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, NULL, NULL, ?, ?, ?) ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET path = excluded.path, etag = excluded.etag, size_bytes = excluded.size_bytes, updated_at = excluded.updated_at"#,
             vec![
                 crate::util::stable_text_id(&format!("image-asset:{item_id}:{image_type}:0")).into(),
                 item_id.into(),
@@ -995,9 +1009,26 @@ struct TmdbImagesResponse {
     posters: Vec<TmdbImageEntry>,
 }
 
+impl TmdbImagesResponse {
+    fn preferred_logo(&self) -> Option<&TmdbImageEntry> {
+        self.logos
+            .iter()
+            .find(|entry| entry.iso_639_1.as_deref() == Some("zh"))
+            .or_else(|| {
+                self.logos
+                    .iter()
+                    .find(|entry| entry.iso_639_1.as_deref() == Some("en"))
+            })
+            .or_else(|| self.logos.iter().find(|entry| entry.iso_639_1.is_none()))
+            .or_else(|| self.logos.first())
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct TmdbImageEntry {
     file_path: String,
+    #[serde(default)]
+    iso_639_1: Option<String>,
 }
 
 async fn get_parent_series_tmdb_id(
@@ -1161,7 +1192,7 @@ pub async fn batch_fetch_person_tmdb(
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_title_with_year, tmdb_image_extension};
+    use super::{clean_title_with_year, parse_season_number, tmdb_image_extension};
 
     #[test]
     fn tmdb_image_extension_allows_known_image_types() {
@@ -1197,5 +1228,14 @@ mod tests {
             clean_title_with_year("Movie Name (2024) {tmdb-123}"),
             ("Movie Name".to_string(), Some(2024))
         );
+    }
+
+    #[test]
+    fn season_number_parser_handles_common_folder_names() {
+        assert_eq!(parse_season_number("Season 1"), Some(1));
+        assert_eq!(parse_season_number("season_2"), Some(2));
+        assert_eq!(parse_season_number("第3季"), Some(3));
+        assert_eq!(parse_season_number("S04"), Some(4));
+        assert_eq!(parse_season_number("Specials"), None);
     }
 }

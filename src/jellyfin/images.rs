@@ -18,7 +18,10 @@ use serde_json::{Value as JsonValue, json};
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
-    entities::image_assets::{self, Entity as ImageAssets},
+    entities::{
+        image_assets::{self, Entity as ImageAssets},
+        libraries::Entity as Libraries,
+    },
     jellyfin::common::{image as placeholder_image, internal_error},
     library::image_processing::{
         EncodedImageFormat, ImageRequestOptions, create_collage, create_placeholder, process_image,
@@ -58,14 +61,9 @@ pub async fn item_images(
     Path(item_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    match crate::jellyfin::user_extras::visible_item_from_request(
-        &state, &headers, &query, &item_id,
-    )
-    .await
+    if let Err(response) = ensure_visible_item_or_library(&state, &headers, &query, &item_id).await
     {
-        Ok(Some(_)) => {}
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return internal_error(error),
+        return response;
     }
     match item_images_inner(&state.db, &item_id).await {
         Ok(images) => Json(images).into_response(),
@@ -79,14 +77,9 @@ pub async fn get_item_image(
     Query(query): Query<HashMap<String, String>>,
     Path((item_id, image_type)): Path<(String, String)>,
 ) -> Response {
-    match crate::jellyfin::user_extras::visible_item_from_request(
-        &state, &headers, &query, &item_id,
-    )
-    .await
+    if let Err(response) = ensure_visible_item_or_library(&state, &headers, &query, &item_id).await
     {
-        Ok(Some(_)) => {}
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return internal_error(error),
+        return response;
     }
     serve_item_image(&state.db, &headers, &query, &item_id, &image_type, 0).await
 }
@@ -97,14 +90,9 @@ pub async fn get_item_image_with_index(
     Query(query): Query<HashMap<String, String>>,
     Path((item_id, first, second)): Path<(String, String, String)>,
 ) -> Response {
-    match crate::jellyfin::user_extras::visible_item_from_request(
-        &state, &headers, &query, &item_id,
-    )
-    .await
+    if let Err(response) = ensure_visible_item_or_library(&state, &headers, &query, &item_id).await
     {
-        Ok(Some(_)) => {}
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return internal_error(error),
+        return response;
     }
     let (image_type, image_index) = if let Ok(index) = second.parse::<i64>() {
         (first, index)
@@ -148,14 +136,9 @@ pub async fn get_item_image_legacy_path(
         String,
     )>,
 ) -> Response {
-    match crate::jellyfin::user_extras::visible_item_from_request(
-        &state, &headers, &query, &item_id,
-    )
-    .await
+    if let Err(response) = ensure_visible_item_or_library(&state, &headers, &query, &item_id).await
     {
-        Ok(Some(_)) => {}
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return internal_error(error),
+        return response;
     }
     query.entry("Format".to_string()).or_insert(format);
     query.entry("MaxWidth".to_string()).or_insert(max_width);
@@ -422,6 +405,10 @@ async fn serve_item_image(
     image_type: &str,
     image_index: i64,
 ) -> Response {
+    let image_type = match canonical_image_type(image_type) {
+        Some(image_type) => image_type,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
     let options = image_options_from_query(query, image_type);
     let model = match find_item_image_asset(db, item_id, image_type, image_index)
         .await
@@ -546,7 +533,47 @@ async fn serve_item_image(
     (response_headers, Body::from(bytes)).into_response()
 }
 
+async fn ensure_visible_item_or_library(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+    item_id: &str,
+) -> Result<(), Response> {
+    match crate::jellyfin::user_extras::visible_item_from_request(state, headers, query, item_id)
+        .await
+    {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(error) => return Err(internal_error(error)),
+    }
+
+    match Libraries::find_by_id(item_id.to_string())
+        .one(&state.db)
+        .await
+    {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(StatusCode::NOT_FOUND.into_response()),
+        Err(error) => Err(internal_error(error.into())),
+    }
+}
+
 async fn find_item_image_asset(
+    db: &DatabaseConnection,
+    item_id: &str,
+    image_type: &str,
+    image_index: i64,
+) -> anyhow::Result<Option<image_assets::Model>> {
+    if let Some(model) = find_item_image_asset_by_type(db, item_id, image_type, image_index).await?
+    {
+        return Ok(Some(model));
+    }
+    if image_type.eq_ignore_ascii_case("Art") {
+        return find_item_image_asset_by_type(db, item_id, "Backdrop", image_index).await;
+    }
+    Ok(None)
+}
+
+async fn find_item_image_asset_by_type(
     db: &DatabaseConnection,
     item_id: &str,
     image_type: &str,
@@ -1200,16 +1227,27 @@ pub async fn item_image_tags(db: &DatabaseConnection, item_id: &str) -> anyhow::
         tags.entry(m.image_type.clone())
             .or_insert_with(|| json!(etag));
     }
+    add_art_tag_fallback(&mut tags);
     Ok(JsonValue::Object(tags))
+}
+
+pub(crate) fn add_art_tag_fallback(tags: &mut serde_json::Map<String, JsonValue>) {
+    if !tags.contains_key("Art") {
+        if let Some(backdrop) = tags.get("Backdrop").cloned() {
+            tags.insert("Art".to_string(), backdrop);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_IMAGE_BYTES, canonical_image_type, collage_source_images, decode_image_body,
-        image_storage_path_allowed, image_type_and_index, is_image_too_large, item_images_inner,
+        MAX_IMAGE_BYTES, add_art_tag_fallback, canonical_image_type, collage_source_images,
+        decode_image_body, image_storage_path_allowed, image_type_and_index, is_image_too_large,
+        item_images_inner,
     };
     use sea_orm::{ConnectionTrait, Database};
+    use serde_json::json;
     use std::fs;
 
     #[test]
@@ -1258,6 +1296,14 @@ mod tests {
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#;
         let error = decode_image_body("image/svg+xml", svg).unwrap_err();
         assert!(error.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn art_tag_falls_back_to_backdrop_tag() {
+        let mut tags = serde_json::Map::new();
+        tags.insert("Backdrop".to_string(), json!("backdrop-tag"));
+        add_art_tag_fallback(&mut tags);
+        assert_eq!(tags.get("Art"), Some(&json!("backdrop-tag")));
     }
 
     #[tokio::test]

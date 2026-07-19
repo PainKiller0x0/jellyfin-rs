@@ -158,21 +158,53 @@ pub async fn item_image_head(
     Path((item_id, image_type)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    use crate::entities::image_assets::{Column, Entity as ImageAssets};
+    use crate::entities::{
+        image_assets::{Column, Entity as ImageAssets},
+        libraries::Entity as Libraries,
+    };
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
     match visible_item_from_request(&state, &headers, &query, &item_id).await {
         Ok(Some(_)) => {}
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => match Libraries::find_by_id(item_id.clone()).one(&state.db).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(error) => return internal_error(error.into()),
+        },
         Err(error) => return internal_error(error),
     }
 
+    let image_type = match canonical_head_image_type(&image_type) {
+        Some(image_type) => image_type,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let fallback_type = if image_type == "Art" {
+        Some("Backdrop")
+    } else {
+        None
+    };
     let model = ImageAssets::find()
         .filter(Column::ItemId.eq(&item_id))
-        .filter(Column::ImageType.eq(&image_type))
+        .filter(Column::ImageType.eq(image_type))
         .filter(Column::ImageIndex.eq(0))
         .one(&state.db)
         .await;
+
+    let model = match model {
+        Ok(None) => {
+            if let Some(fallback_type) = fallback_type {
+                ImageAssets::find()
+                    .filter(Column::ItemId.eq(&item_id))
+                    .filter(Column::ImageType.eq(fallback_type))
+                    .filter(Column::ImageIndex.eq(0))
+                    .one(&state.db)
+                    .await
+            } else {
+                Ok(None)
+            }
+        }
+        other => other,
+    };
 
     match model {
         Ok(Some(m)) => {
@@ -189,6 +221,12 @@ pub async fn item_image_head(
                 Ok(meta) => {
                     let mut resp_headers = axum::http::HeaderMap::new();
                     resp_headers.insert(
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::HeaderValue::from_static(
+                            crate::jellyfin::images::content_type_from_path(&path),
+                        ),
+                    );
+                    resp_headers.insert(
                         axum::http::header::CONTENT_LENGTH,
                         axum::http::HeaderValue::from_str(&meta.len().to_string()).unwrap(),
                     );
@@ -200,7 +238,27 @@ pub async fn item_image_head(
                 Err(_) => StatusCode::NOT_FOUND.into_response(),
             }
         }
-        _ => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => StatusCode::OK.into_response(),
+        Err(error) => internal_error(error.into()),
+    }
+}
+
+fn canonical_head_image_type(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "primary" => Some("Primary"),
+        "art" => Some("Art"),
+        "backdrop" => Some("Backdrop"),
+        "banner" => Some("Banner"),
+        "logo" => Some("Logo"),
+        "thumb" => Some("Thumb"),
+        "disc" => Some("Disc"),
+        "box" => Some("Box"),
+        "boxrear" | "box_rear" | "box-rear" => Some("BoxRear"),
+        "screenshot" => Some("Screenshot"),
+        "menu" => Some("Menu"),
+        "chapter" => Some("Chapter"),
+        "profile" => Some("Profile"),
+        _ => None,
     }
 }
 

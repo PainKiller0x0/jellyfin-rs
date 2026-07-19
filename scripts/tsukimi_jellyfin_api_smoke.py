@@ -25,7 +25,7 @@ class CheckResult:
 class JellyfinApi:
     def __init__(self, base_url: str, username: str, password: str) -> None:
         self.base_url = base_url.rstrip("/") + "/"
-        self.api_prefix = "emby/"
+        self.api_prefix = ""
         self.username = username
         self.password = password
         self.client = httpx.Client(timeout=30.0, follow_redirects=False)
@@ -164,8 +164,8 @@ def run(args: argparse.Namespace) -> int:
     public = api.client.get(api.root_url("System/Info/Public"), timeout=10.0)
     checks.append(expect_status("root public system info", public, 200))
 
-    prefixed_public = api.client.get(api.url("System/Info/Public"), timeout=10.0)
-    checks.append(expect_status("emby-prefixed public system info", prefixed_public, 200))
+    prefixed_public = api.client.get(api.root_url("emby/System/Info/Public"), timeout=10.0)
+    checks.append(expect_status("emby-prefixed public system info compatibility", prefixed_public, 200))
 
     login = api.login()
     session_info = login.get("SessionInfo", {})
@@ -243,6 +243,24 @@ def run(args: argparse.Namespace) -> int:
             200,
         )
         checks.append(detail_check)
+        if isinstance(detail, dict):
+            user_data = detail.get("UserData")
+            checks.append(
+                CheckResult(
+                    "item detail UserData.Played",
+                    isinstance(user_data, dict) and "Played" in user_data,
+                )
+            )
+            people = detail.get("People", [])
+            for person in people if isinstance(people, list) else []:
+                person_user_data = person.get("UserData") if isinstance(person, dict) else None
+                checks.append(
+                    CheckResult(
+                        "person UserData.Played",
+                        isinstance(person_user_data, dict) and "Played" in person_user_data,
+                        person.get("Name", "") if isinstance(person, dict) else "",
+                    )
+                )
         checks.append(expect_status("item images", api.get(f"Items/{item_id}/Images"), 200))
         checks.append(expect_status("similar items", api.get(f"Items/{item_id}/Similar", UserId=api.user_id, Limit=10), 200))
         checks.append(expect_status("external id infos", api.get(f"Items/{item_id}/ExternalIdInfos", IsSupportedAsIdentifier="true"), 200))
@@ -301,6 +319,59 @@ def run(args: argparse.Namespace) -> int:
         checks.append(expect_status("mark played", api.post(f"Users/{api.user_id}/PlayedItems/{item_id}"), 200, 204))
         checks.append(expect_status("mark unplayed", api.delete(f"Users/{api.user_id}/PlayedItems/{item_id}"), 200, 204))
         checks.append(expect_status("hide from resume", api.post(f"Users/{api.user_id}/Items/{item_id}/HideFromResume", Hide="true"), 200, 204))
+
+    if series:
+        for image_type in ("Primary", "Logo", "Art"):
+            checks.append(
+                expect_status(
+                    f"series {image_type.lower()} image",
+                    api.get(f"Items/{series['Id']}/Images/{image_type}", maxWidth=300, maxHeight=300),
+                    200,
+                )
+            )
+            checks.append(
+                expect_status(
+                    f"series {image_type.lower()} image HEAD",
+                    api.client.head(
+                        api.url(f"Items/{series['Id']}/Images/{image_type}"),
+                        headers=api.headers,
+                        params={"maxWidth": "300", "maxHeight": "300"},
+                    ),
+                    200,
+                )
+            )
+    if season:
+        checks.append(
+            expect_status(
+                "season primary image",
+                api.get(f"Items/{season['Id']}/Images/Primary", maxWidth=300, maxHeight=300),
+                200,
+            )
+        )
+    views_check, views = expect_json("library views payload", api.get(f"Users/{api.user_id}/Views"), 200)
+    checks.append(views_check)
+    if isinstance(views, dict):
+        for view in views.get("Items", []):
+            view_id = view.get("Id") if isinstance(view, dict) else None
+            if view_id:
+                checks.append(
+                    expect_status(
+                        "library primary image",
+                        api.get(f"Items/{view_id}/Images/Primary", maxWidth=300, maxHeight=300),
+                        200,
+                    )
+                )
+                checks.append(
+                    expect_status(
+                        "library primary image HEAD",
+                        api.client.head(
+                            api.url(f"Items/{view_id}/Images/Primary"),
+                            headers=api.headers,
+                            params={"maxWidth": "300", "maxHeight": "300"},
+                        ),
+                        200,
+                    )
+                )
 
     failed = [check for check in checks if not check.ok]
     for check in checks:

@@ -20,6 +20,7 @@ services:
     ports:
       - "8096:8096"
     environment:
+      JELLYFIN_RS_HOST: ${JELLYFIN_RS_HOST:-0.0.0.0}
       JELLYFIN_RS_DATABASE_URL: postgresql://jellyfin:jellyfin@db/jellyfin
       JELLYFIN_RS_MEDIA_DIRS: "/media"
       RUST_LOG: info

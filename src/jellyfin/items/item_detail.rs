@@ -203,6 +203,7 @@ async fn item_json_with_provider_ids(
             }
         }
     }
+    crate::jellyfin::images::add_art_tag_fallback(&mut image_map);
     value["ProviderIds"] = Value::Object(provider_ids);
     let image_tags: Value = image_map.into();
     let backdrop_tags: Vec<Value> = image_tags
@@ -515,7 +516,17 @@ async fn people_values(
                 "Role": row.get_opt_str("role")?,
                 "Type": row.get_opt_str("person_type")?,
                 "UserData": {
+                    "ItemId": id,
+                    "Key": id,
                     "IsFavorite": is_favorite,
+                    "Played": false,
+                    "PlayCount": 0,
+                    "PlaybackPositionTicks": 0,
+                    "PlayedPercentage": null,
+                    "Rating": null,
+                    "LastPlayedDate": null,
+                    "Likes": null,
+                    "UnplayedItemCount": null,
                 },
             });
             if let Some(tag) = row.get_opt_str("primary_image_tag")? {

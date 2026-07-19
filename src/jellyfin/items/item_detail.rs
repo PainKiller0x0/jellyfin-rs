@@ -862,10 +862,7 @@ pub async fn enrich_episode_list(
         }
     }
 
-    let episode_source_map =
-        crate::jellyfin::playback::batch_episode_version_sources(db, &items, false, false)
-            .await
-            .unwrap_or_default();
+    let media_source_map = list_media_source_map(db, &items).await;
 
     let mut enriched_items = Vec::with_capacity(items.len());
     for item in items {
@@ -885,9 +882,6 @@ pub async fn enrich_episode_list(
                     &item.parent_id,
                     &parent_image_tags,
                 );
-            }
-            if let Some(sources) = episode_source_map.get(&item.id) {
-                attach_media_sources(&mut val, sources.clone());
             }
         } else if item.item_type == "Season" {
             if let Some((series_id, series_name, _)) = season_map.get(&item.id) {
@@ -920,9 +914,77 @@ pub async fn enrich_episode_list(
             val["EpisodeCount"] = json!(episode_count);
             val["UserData"]["UnplayedItemCount"] = json!(unplayed_count);
         }
+        if let Some(sources) = media_source_map.get(&item.id) {
+            attach_media_sources(&mut val, sources.clone());
+        }
         enriched_items.push(strip_nulls(val));
     }
     enriched_items
+}
+
+async fn list_media_source_map(
+    db: &DatabaseConnection,
+    items: &[MediaItem],
+) -> HashMap<String, Vec<Value>> {
+    let mut source_map = HashMap::new();
+
+    let folder_media_ids = items
+        .iter()
+        .filter(|item| item.is_folder && matches!(item.item_type.as_str(), "Movie" | "Episode"))
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    if !folder_media_ids.is_empty() {
+        source_map.extend(
+            crate::jellyfin::playback::batch_child_video_sources(
+                db,
+                &folder_media_ids,
+                false,
+                true,
+            )
+            .await
+            .unwrap_or_default(),
+        );
+    }
+
+    source_map.extend(
+        crate::jellyfin::playback::batch_episode_version_sources(db, items, false, true)
+            .await
+            .unwrap_or_default(),
+    );
+
+    let direct_items = items
+        .iter()
+        .filter(|item| is_direct_playable_list_item(item))
+        .filter(|item| !source_map.contains_key(&item.id))
+        .collect::<Vec<_>>();
+    if direct_items.is_empty() {
+        return source_map;
+    }
+
+    let direct_ids = direct_items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let stream_map = crate::jellyfin::playback::media_streams_for_items(db, &direct_ids)
+        .await
+        .unwrap_or_default();
+    for item in direct_items {
+        let streams = stream_map.get(&item.id).cloned().unwrap_or_default();
+        source_map.insert(
+            item.id.clone(),
+            vec![media_source_json_with_streams(item, streams)],
+        );
+    }
+
+    source_map
+}
+
+fn is_direct_playable_list_item(item: &MediaItem) -> bool {
+    !item.is_folder
+        && matches!(
+            item.item_type.as_str(),
+            "Movie" | "Episode" | "Video" | "Audio" | "Trailer"
+        )
 }
 
 pub async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>) -> Vec<Value> {
@@ -1261,6 +1323,125 @@ mod tests {
 
         let enriched = enrich_episode_list(&db, "u1", vec![hidden_episode]).await;
         assert!(enriched[0].get("SeriesId").is_none());
+    }
+
+    #[tokio::test]
+    async fn media_library_list_exposes_external_subtitle_streams() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        for (id, name, collection_type) in [("movies", "Movies", "movies"), ("tv", "TV", "tvshows")]
+        {
+            db.execute(crate::db::helpers::pg_statement(
+                "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
+                vec![id.into(), name.into(), collection_type.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        db.execute(crate::db::helpers::pg_statement(
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('movie', 'Movie', '/tmp/movie', 'movies', 'movies', 'Movie', 1, 1, 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::pg_statement(
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES ('movie-video', 'Movie.mkv', '/tmp/movie/Movie.mkv', 'movies', 'movie', 'Video', 0, 1, 'mkv', 1, 1, 1)",
+            vec![],
+        ))
+        .await
+        .unwrap();
+        insert_item(&db, "series", "Series", "tv", "Series", 1, 1, None, None).await;
+        insert_item(
+            &db,
+            "season",
+            "Season 1",
+            "series",
+            "Season",
+            1,
+            1,
+            Some(1),
+            None,
+        )
+        .await;
+        insert_item(
+            &db,
+            "episode",
+            "Episode 1",
+            "season",
+            "Episode",
+            0,
+            1,
+            Some(1),
+            Some(1),
+        )
+        .await;
+
+        for (id, item_id, index, codec, path) in [
+            (
+                "movie-sub",
+                "movie-video",
+                2_i64,
+                "srt",
+                "/tmp/movie/Movie.zh.srt",
+            ),
+            (
+                "episode-sub",
+                "episode",
+                3_i64,
+                "ass",
+                "/tmp/show/Season 1/Episode.zh.ass",
+            ),
+        ] {
+            db.execute(crate::db::helpers::pg_statement(
+                "INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, title, path, is_external, created_at) VALUES (?, ?, ?, 'Subtitle', ?, 'zh-CN', ?, ?, 1, 1)",
+                vec![
+                    id.into(),
+                    item_id.into(),
+                    index.into(),
+                    codec.into(),
+                    format!("{item_id}.zh.{codec}").into(),
+                    path.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let movie = crate::jellyfin::item_queries::find_media_item_for_admin(&db, "u1", "movie")
+            .await
+            .unwrap()
+            .unwrap();
+        let episode =
+            crate::jellyfin::item_queries::find_media_item_for_admin(&db, "u1", "episode")
+                .await
+                .unwrap()
+                .unwrap();
+        let enriched = enrich_episode_list(&db, "u1", vec![movie, episode]).await;
+
+        for item in enriched {
+            assert_eq!(item["HasSubtitles"], true);
+            let streams = item["MediaStreams"].as_array().unwrap();
+            let subtitle = streams
+                .iter()
+                .find(|stream| stream["Type"] == "Subtitle" && stream["IsExternal"] == true)
+                .unwrap();
+            assert_eq!(subtitle["DeliveryMethod"], "External");
+            assert!(
+                subtitle["DeliveryUrl"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/Subtitles/")
+            );
+            assert!(
+                item["MediaSources"][0]["MediaStreams"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|stream| stream["Type"] == "Subtitle" && stream["IsExternal"] == true)
+            );
+        }
     }
 
     async fn insert_item(

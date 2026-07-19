@@ -4,8 +4,8 @@ mod user_data;
 
 pub use media_streams::subtitle_stream_path;
 pub(crate) use media_streams::{
-    batch_episode_version_sources, child_video_sources, episode_version_sources,
-    media_streams_for_item,
+    batch_child_video_sources, batch_episode_version_sources, child_video_sources,
+    episode_version_sources, media_streams_for_item, media_streams_for_items,
 };
 pub use session::{
     current_user_playing_item_progress, current_user_playing_item_start,

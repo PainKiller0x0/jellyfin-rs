@@ -13,7 +13,7 @@ use crate::{
 type EpisodeVersionKey = (String, Option<i64>, i64);
 
 #[derive(Clone)]
-struct EpisodeVersionSourceRow {
+struct VideoSourceRow {
     id: String,
     title: String,
     path: String,
@@ -44,7 +44,7 @@ pub(crate) async fn media_streams_for_item(
         .collect())
 }
 
-async fn media_streams_for_items(
+pub(crate) async fn media_streams_for_items(
     db: &sea_orm::DatabaseConnection,
     item_ids: &[String],
 ) -> anyhow::Result<HashMap<String, Vec<JsonValue>>> {
@@ -178,6 +178,90 @@ pub(crate) async fn child_video_sources(
     Ok(sources)
 }
 
+/// For Movie/Episode folders, batch load their child Video files as MediaSourceInfo entries.
+pub(crate) async fn batch_child_video_sources(
+    db: &sea_orm::DatabaseConnection,
+    parent_ids: &[String],
+    include_private: bool,
+    include_streams: bool,
+) -> anyhow::Result<HashMap<String, Vec<JsonValue>>> {
+    let mut source_map: HashMap<String, Vec<JsonValue>> = HashMap::new();
+    if parent_ids.is_empty() {
+        return Ok(source_map);
+    }
+
+    let mut source_rows: Vec<(String, VideoSourceRow)> = Vec::new();
+    for chunk in parent_ids.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let visibility = if include_private {
+            String::new()
+        } else {
+            format!(" AND {}", visible_media_item_sql("media_items"))
+        };
+        let sql = format!(
+            "SELECT media_items.parent_id, media_items.id, media_items.title, media_items.path, media_items.container, media_items.runtime_ticks, media_items.size_bytes \
+             FROM media_items \
+             WHERE media_items.parent_id IN ({placeholders}) AND media_items.item_type = 'Video'{visibility} \
+             ORDER BY media_items.parent_id ASC, media_items.title ASC"
+        );
+        let values = chunk
+            .iter()
+            .map(|id| id.as_str().into())
+            .collect::<Vec<sea_orm::Value>>();
+        let rows = db
+            .query_all(crate::db::helpers::pg_statement(&sql, values))
+            .await
+            .with_context(|| "failed to batch find child video sources")?;
+        for row in &rows {
+            source_rows.push((
+                row.get_str("parent_id")?,
+                VideoSourceRow {
+                    id: row.get_str("id")?,
+                    title: row.get_str("title")?,
+                    path: row.get_str("path")?,
+                    container: row
+                        .get_opt_str("container")?
+                        .unwrap_or_else(|| "bin".to_string()),
+                    runtime_ticks: row.get_opt_i64("runtime_ticks")?,
+                    size_bytes: row.get_opt_i64("size_bytes")?,
+                },
+            ));
+        }
+    }
+
+    let stream_map = if include_streams {
+        let mut source_ids = source_rows
+            .iter()
+            .map(|(_, row)| row.id.clone())
+            .collect::<Vec<_>>();
+        source_ids.sort();
+        source_ids.dedup();
+        media_streams_for_items(db, &source_ids)
+            .await
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    for (parent_id, row) in source_rows {
+        source_map
+            .entry(parent_id.clone())
+            .or_default()
+            .push(child_video_source_json_for_item(
+                &parent_id,
+                &row.id,
+                &media_source_file_name(&row.path, &row.title),
+                &row.path,
+                &row.container,
+                row.size_bytes,
+                row.runtime_ticks,
+                stream_map.get(&row.id).cloned().unwrap_or_default(),
+            ));
+    }
+
+    Ok(source_map)
+}
+
 /// For episode rows that represent one file/version, return all sibling files
 /// for the same season/episode as MediaSourceInfo entries.
 pub(crate) async fn episode_version_sources(
@@ -308,26 +392,23 @@ pub(crate) async fn batch_episode_version_sources(
         .await
         .with_context(|| "failed to batch find episode versions")?;
 
-    let mut grouped: HashMap<EpisodeVersionKey, Vec<EpisodeVersionSourceRow>> = HashMap::new();
+    let mut grouped: HashMap<EpisodeVersionKey, Vec<VideoSourceRow>> = HashMap::new();
     for row in &rows {
         let parent_id = row.get_str("parent_id")?;
         let Some(episode_number) = row.get_opt_i64("episode_number")? else {
             continue;
         };
         let key = (parent_id, row.get_opt_i64("season_number")?, episode_number);
-        grouped
-            .entry(key)
-            .or_default()
-            .push(EpisodeVersionSourceRow {
-                id: row.get_str("id")?,
-                title: row.get_str("title")?,
-                path: row.get_str("path")?,
-                container: row
-                    .get_opt_str("container")?
-                    .unwrap_or_else(|| "bin".to_string()),
-                runtime_ticks: row.get_opt_i64("runtime_ticks")?,
-                size_bytes: row.get_opt_i64("size_bytes")?,
-            });
+        grouped.entry(key).or_default().push(VideoSourceRow {
+            id: row.get_str("id")?,
+            title: row.get_str("title")?,
+            path: row.get_str("path")?,
+            container: row
+                .get_opt_str("container")?
+                .unwrap_or_else(|| "bin".to_string()),
+            runtime_ticks: row.get_opt_i64("runtime_ticks")?,
+            size_bytes: row.get_opt_i64("size_bytes")?,
+        });
     }
 
     let stream_map = if include_streams {
@@ -387,7 +468,7 @@ fn episode_version_key(item: &MediaItem) -> Option<EpisodeVersionKey> {
     ))
 }
 
-fn sort_episode_version_sources_for_item(rows: &mut [EpisodeVersionSourceRow], item_id: &str) {
+fn sort_episode_version_sources_for_item(rows: &mut [VideoSourceRow], item_id: &str) {
     rows.sort_by(|a, b| {
         let a_rank = if a.id == item_id { 0 } else { 1 };
         let b_rank = if b.id == item_id { 0 } else { 1 };

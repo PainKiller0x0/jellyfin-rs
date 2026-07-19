@@ -1476,9 +1476,7 @@ async fn revoke_user_tokens(
     user_id: &str,
     now: i64,
 ) -> anyhow::Result<()> {
-    let backend = db.get_database_backend();
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
+    db.execute(crate::db::helpers::pg_statement(
         "UPDATE access_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
         vec![now.into(), user_id.into()],
     ))
@@ -1533,10 +1531,8 @@ pub async fn authenticated_user_id(
         return Ok(None);
     };
     let now = now_unix();
-    let backend = db.get_database_backend();
     let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
+        .query_one(crate::db::helpers::pg_statement(
             r#"SELECT access_tokens.user_id FROM access_tokens JOIN users ON users.id = access_tokens.user_id WHERE access_tokens.token_hash = ? AND access_tokens.revoked_at IS NULL AND users.is_disabled = 0 AND (access_tokens.expires_at IS NULL OR access_tokens.expires_at > ?)"#,
             vec![stable_text_id(&token).into(), now.into()],
         ))
@@ -1548,16 +1544,14 @@ pub async fn authenticated_user_id(
     };
     let user_id: String = row.get_str("user_id")?;
 
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
+    db.execute(crate::db::helpers::pg_statement(
         "UPDATE access_tokens SET last_used_at = ? WHERE token_hash = ?",
         vec![now.into(), stable_text_id(&token).into()],
     ))
     .await
     .context("failed to update access token usage")?;
 
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
+    db.execute(crate::db::helpers::pg_statement(
         "UPDATE api_keys SET last_used_at = ? WHERE access_token = ?",
         vec![now.into(), token.into()],
     ))
@@ -1682,6 +1676,7 @@ fn is_public_request(method: &Method, path: &str) -> bool {
     matches!(method, &Method::GET | &Method::HEAD)
         && (PUBLIC_PATHS.contains(&path)
             || dlna_discovery_path(path)
+            || item_image_read_path(path)
             || unauthenticated_media_stream_path(path))
 }
 
@@ -1730,6 +1725,13 @@ fn usage_stats_admin_read(path: &str) -> bool {
 }
 
 fn item_image_write(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/Items/") else {
+        return false;
+    };
+    rest.split('/').nth(1) == Some("Images")
+}
+
+fn item_image_read_path(path: &str) -> bool {
     let Some(rest) = path.strip_prefix("/Items/") else {
         return false;
     };
@@ -2240,23 +2242,41 @@ pub async fn request_user_id_and_admin_or_default(
 }
 
 pub fn request_token(headers: &HeaderMap, query: &HashMap<String, String>) -> Option<String> {
-    query
-        .get("api_key")
-        .or_else(|| query.get("ApiKey"))
-        .or_else(|| query.get("apiKey"))
-        .filter(|token| !token.trim().is_empty())
-        .cloned()
-        .or_else(|| {
-            [
-                header::AUTHORIZATION.as_str(),
-                "X-Emby-Token",
-                "X-MediaBrowser-Token",
-                "X-Emby-Authorization",
-                "X-MediaBrowser-Authorization",
-            ]
-            .iter()
-            .find_map(|name| header_token(headers, name))
+    query_token(
+        query,
+        &[
+            "api_key",
+            "ApiKey",
+            "apiKey",
+            "X-Emby-Token",
+            "X-MediaBrowser-Token",
+            "X-Emby-Authorization",
+            "X-MediaBrowser-Authorization",
+        ],
+    )
+    .or_else(|| {
+        [
+            header::AUTHORIZATION.as_str(),
+            "X-Emby-Token",
+            "X-MediaBrowser-Token",
+            "X-Emby-Authorization",
+            "X-MediaBrowser-Authorization",
+        ]
+        .iter()
+        .find_map(|name| header_token(headers, name))
+    })
+}
+
+fn query_token(query: &HashMap<String, String>, names: &[&str]) -> Option<String> {
+    let value = query
+        .iter()
+        .find(|(key, value)| {
+            names.iter().any(|name| key.eq_ignore_ascii_case(name)) && !value.trim().is_empty()
         })
+        .map(|(_, value)| value.trim())?;
+    auth_header_value_token(value)
+        .or_else(|| bearer_token(value))
+        .or_else(|| (!value.contains('=')).then(|| value.to_string()))
 }
 
 pub fn header_token(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -2745,7 +2765,7 @@ enum AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::ConnectionTrait;
     use tokio::sync::{RwLock, broadcast};
 
     #[test]
@@ -2816,6 +2836,28 @@ mod tests {
         assert!(!is_public_request(&Method::GET, "/Videos/ActiveEncodings"));
         assert!(!is_public_request(&Method::POST, "/Videos/MergeVersions"));
         assert!(!is_public_request(&Method::GET, "/Items/File"));
+    }
+
+    #[test]
+    fn auth_rules_allow_readonly_item_images_for_client_loaders() {
+        assert!(is_public_request(&Method::GET, "/Items/i1/Images/Primary"));
+        assert!(is_public_request(
+            &Method::HEAD,
+            "/emby/Items/i1/Images/Backdrop/0"
+        ));
+        assert!(is_public_request(
+            &Method::GET,
+            "/Items/i1/Images/Primary/0/tag/jpg/640/360/0/0"
+        ));
+        assert!(!is_public_request(
+            &Method::POST,
+            "/Items/i1/Images/Primary"
+        ));
+        assert!(!is_public_request(
+            &Method::DELETE,
+            "/Items/i1/Images/Primary"
+        ));
+        assert!(!is_public_request(&Method::GET, "/Items/i1/RemoteImages"));
     }
 
     #[test]
@@ -3062,7 +3104,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_control_allowed_requires_control_user() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let state = test_state(db);
         state
             .playback_sessions
@@ -3087,7 +3131,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_read_allowed_requires_session_user() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let state = test_state(db);
         let mut session = test_playback_session();
         session.supports_remote_control = false;
@@ -3108,7 +3154,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_control_allowed_requires_remote_control_support() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let state = test_state(db);
         let mut session = test_playback_session();
         session.supports_remote_control = false;
@@ -3208,6 +3256,24 @@ mod tests {
             request_token(&HeaderMap::new(), &query).as_deref(),
             Some("camel")
         );
+
+        let query = query_map("X-Emby-Token=query-token");
+        assert_eq!(
+            request_token(&HeaderMap::new(), &query).as_deref(),
+            Some("query-token")
+        );
+
+        let query = query_map("x-mediabrowser-token=lowercase-token");
+        assert_eq!(
+            request_token(&HeaderMap::new(), &query).as_deref(),
+            Some("lowercase-token")
+        );
+
+        let query = query_map("X-Emby-Authorization=MediaBrowser%20Token%3D%22quoted-token%22");
+        assert_eq!(
+            request_token(&HeaderMap::new(), &query).as_deref(),
+            Some("quoted-token")
+        );
     }
 
     #[test]
@@ -3303,11 +3369,11 @@ mod tests {
 
     #[tokio::test]
     async fn api_key_create_and_delete_manage_tokens() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let state = test_state(db);
-        let statement = crate::db::helpers::portable_statement(
-            state.db.get_database_backend(),
+        let statement = crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, 'admin', 'admin', 1, 0, 1, 1)",
             vec![state.user_id.to_string().into()],
         );
@@ -3524,10 +3590,10 @@ mod tests {
 
     #[tokio::test]
     async fn authenticate_result_includes_session_info() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, password_hash, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'alice', 'alice', ?, 0, 0, 1, 1)",
             vec![hash_password("secret").unwrap().into()],
         ))
@@ -3582,10 +3648,10 @@ mod tests {
 
     #[tokio::test]
     async fn quick_connect_authorizes_and_logs_in_once() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, password_hash, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'alice', 'alice', ?, 0, 0, 1, 1)",
             vec![hash_password("secret").unwrap().into()],
         ))
@@ -3700,10 +3766,10 @@ mod tests {
 
     #[tokio::test]
     async fn update_user_response_changes_name() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'old', 'old', 0, 0, 1, 1)",
             vec![],
         ))
@@ -3719,10 +3785,10 @@ mod tests {
 
     #[tokio::test]
     async fn update_user_response_rejects_invalid_name() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'old', 'old', 0, 0, 1, 1)",
             vec![],
         ))
@@ -3738,10 +3804,10 @@ mod tests {
 
     #[tokio::test]
     async fn user_policy_round_trips_saved_fields() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'alice', 'alice', 0, 0, 1, 1)",
             vec![],
         ))
@@ -3771,10 +3837,10 @@ mod tests {
 
     #[tokio::test]
     async fn user_list_includes_saved_policy() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'alice', 'alice', 0, 0, 1, 1)",
             vec![],
         ))
@@ -3854,8 +3920,13 @@ mod tests {
             media_dirs: Vec::new(),
             http_client: reqwest::Client::new(),
             tmdb_api_key: RwLock::new(None),
+            douban_cookie: RwLock::new(None),
+            scan_lock: tokio::sync::Mutex::new(()),
             playback_sessions: RwLock::new(HashMap::<String, PlaybackSession>::new()),
             session_capabilities: RwLock::new(HashMap::new()),
+            admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),
+            admin_http_logs: RwLock::new(std::collections::VecDeque::new()),
+            playback_distribution: RwLock::new(crate::app::state::PlaybackDistribution::default()),
             ws_event_tx,
             sa_config: crate::config::StrmAssistantConfig::default(),
             intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),

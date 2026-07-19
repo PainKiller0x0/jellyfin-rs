@@ -43,7 +43,7 @@ pub fn migrations() -> Vec<Migration> {
             "failed to create library paths library index",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS media_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, path TEXT NOT NULL UNIQUE, library_id TEXT NOT NULL, parent_id TEXT NOT NULL, item_type TEXT NOT NULL, is_folder BIGINT NOT NULL DEFAULT 0, is_public BIGINT NOT NULL DEFAULT 1, container TEXT, overview TEXT, official_rating TEXT, extended_video_type TEXT, production_year BIGINT, runtime_ticks BIGINT, size_bytes BIGINT, season_number BIGINT, episode_number BIGINT, modified_at BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL DEFAULT 0)"#,
+            r#"CREATE TABLE IF NOT EXISTS media_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, path TEXT NOT NULL UNIQUE, library_id TEXT NOT NULL, parent_id TEXT NOT NULL, item_type TEXT NOT NULL, is_folder BIGINT NOT NULL DEFAULT 0, is_public BIGINT NOT NULL DEFAULT 1, container TEXT, overview TEXT, official_rating TEXT, extended_video_type TEXT, production_year BIGINT, premiere_date TEXT, runtime_ticks BIGINT, size_bytes BIGINT, season_number BIGINT, episode_number BIGINT, modified_at BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL DEFAULT 0)"#,
             "failed to migrate media_items",
         ),
         (
@@ -55,7 +55,7 @@ pub fn migrations() -> Vec<Migration> {
             "failed to create media item type index",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS media_streams (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, stream_index BIGINT NOT NULL, stream_type TEXT NOT NULL, codec TEXT, language TEXT, title TEXT, bit_rate BIGINT, width BIGINT, height BIGINT, channels BIGINT, sample_rate BIGINT, path TEXT, is_external BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, UNIQUE(item_id, stream_index))"#,
+            r#"CREATE TABLE IF NOT EXISTS media_streams (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, stream_index BIGINT NOT NULL, stream_type TEXT NOT NULL, codec TEXT, profile TEXT, codec_tag TEXT, language TEXT, title TEXT, comment TEXT, bit_rate BIGINT, width BIGINT, height BIGINT, aspect_ratio TEXT, average_frame_rate DOUBLE PRECISION, real_frame_rate DOUBLE PRECISION, reference_frame_rate DOUBLE PRECISION, channels BIGINT, channel_layout TEXT, sample_rate BIGINT, bit_depth BIGINT, ref_frames BIGINT, is_interlaced BIGINT NOT NULL DEFAULT 0, is_avc BIGINT, is_anamorphic BIGINT, pixel_format TEXT, level BIGINT, color_range TEXT, color_space TEXT, color_transfer TEXT, color_primaries TEXT, time_base TEXT, codec_time_base TEXT, nal_length_size TEXT, rotation BIGINT, video_range TEXT, video_range_type TEXT, hdr10_plus_present_flag BIGINT, is_default BIGINT NOT NULL DEFAULT 0, is_forced BIGINT NOT NULL DEFAULT 0, is_hearing_impaired BIGINT NOT NULL DEFAULT 0, is_original BIGINT, path TEXT, is_external BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, UNIQUE(item_id, stream_index))"#,
             "failed to migrate media_streams",
         ),
         (
@@ -152,6 +152,10 @@ pub fn optional_migrations() -> Vec<Migration> {
             "add media_items.production_year",
         ),
         (
+            "ALTER TABLE media_items ADD COLUMN premiere_date TEXT",
+            "add media_items.premiere_date",
+        ),
+        (
             "ALTER TABLE media_items ADD COLUMN official_rating TEXT",
             "add media_items.official_rating",
         ),
@@ -182,6 +186,126 @@ pub fn optional_migrations() -> Vec<Migration> {
         (
             "ALTER TABLE media_streams ADD COLUMN sample_rate BIGINT",
             "add media_streams.sample_rate",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN profile TEXT",
+            "add media_streams.profile",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN codec_tag TEXT",
+            "add media_streams.codec_tag",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN comment TEXT",
+            "add media_streams.comment",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN aspect_ratio TEXT",
+            "add media_streams.aspect_ratio",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN average_frame_rate DOUBLE PRECISION",
+            "add media_streams.average_frame_rate",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN real_frame_rate DOUBLE PRECISION",
+            "add media_streams.real_frame_rate",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN reference_frame_rate DOUBLE PRECISION",
+            "add media_streams.reference_frame_rate",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN channel_layout TEXT",
+            "add media_streams.channel_layout",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN bit_depth BIGINT",
+            "add media_streams.bit_depth",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN ref_frames BIGINT",
+            "add media_streams.ref_frames",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN is_interlaced BIGINT NOT NULL DEFAULT 0",
+            "add media_streams.is_interlaced",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN is_avc BIGINT",
+            "add media_streams.is_avc",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN is_anamorphic BIGINT",
+            "add media_streams.is_anamorphic",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN pixel_format TEXT",
+            "add media_streams.pixel_format",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN level BIGINT",
+            "add media_streams.level",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN color_range TEXT",
+            "add media_streams.color_range",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN color_space TEXT",
+            "add media_streams.color_space",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN color_transfer TEXT",
+            "add media_streams.color_transfer",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN color_primaries TEXT",
+            "add media_streams.color_primaries",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN time_base TEXT",
+            "add media_streams.time_base",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN codec_time_base TEXT",
+            "add media_streams.codec_time_base",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN nal_length_size TEXT",
+            "add media_streams.nal_length_size",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN rotation BIGINT",
+            "add media_streams.rotation",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN video_range TEXT",
+            "add media_streams.video_range",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN video_range_type TEXT",
+            "add media_streams.video_range_type",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN hdr10_plus_present_flag BIGINT",
+            "add media_streams.hdr10_plus_present_flag",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN is_default BIGINT NOT NULL DEFAULT 0",
+            "add media_streams.is_default",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN is_forced BIGINT NOT NULL DEFAULT 0",
+            "add media_streams.is_forced",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN is_hearing_impaired BIGINT NOT NULL DEFAULT 0",
+            "add media_streams.is_hearing_impaired",
+        ),
+        (
+            "ALTER TABLE media_streams ADD COLUMN is_original BIGINT",
+            "add media_streams.is_original",
         ),
         (
             "ALTER TABLE media_items ADD COLUMN updated_at BIGINT NOT NULL DEFAULT 0",
@@ -312,7 +436,7 @@ pub fn optional_migrations() -> Vec<Migration> {
             "create chapters.item_id index",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS audio_fingerprints (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, fingerprint BLOB NOT NULL, duration_seconds REAL, created_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, UNIQUE(item_id))"#,
+            r#"CREATE TABLE IF NOT EXISTS audio_fingerprints (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, fingerprint BYTEA NOT NULL, duration_seconds DOUBLE PRECISION, created_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, UNIQUE(item_id))"#,
             "create audio_fingerprints table",
         ),
         (

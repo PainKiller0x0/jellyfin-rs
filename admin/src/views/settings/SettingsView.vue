@@ -3,9 +3,10 @@ import dayjs from 'dayjs';
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus';
 import { computed, onMounted, reactive, ref } from 'vue';
 
+import * as serverApi from '@/services/server';
 import * as settingsApi from '@/services/settings';
 import { useAuthStore } from '@/stores/auth';
-import type { ApiKey, TmdbClientConfiguration } from '@/types/settings';
+import type { ApiKey, DoubanClientConfiguration, TmdbClientConfiguration } from '@/types/settings';
 
 type ApiKeyForm = {
   appName: string;
@@ -13,11 +14,16 @@ type ApiKeyForm = {
 
 const authStore = useAuthStore();
 const loading = ref(false);
+const savingServerName = ref(false);
 const savingTmdb = ref(false);
+const savingDouban = ref(false);
 const savingApiKey = ref(false);
 const apiKeyDialogVisible = ref(false);
+const serverName = ref('');
 const tmdbApiKey = ref('');
+const doubanCookie = ref('');
 const tmdbConfig = ref<TmdbClientConfiguration | null>(null);
+const doubanConfig = ref<DoubanClientConfiguration | null>(null);
 const keys = ref<ApiKey[]>([]);
 const apiKeyFormRef = ref<FormInstance>();
 
@@ -30,6 +36,7 @@ const apiKeyRules: FormRules<ApiKeyForm> = {
 };
 
 const tmdbEnabled = computed(() => Boolean(tmdbConfig.value?.HasApiKey || tmdbConfig.value?.IsTmdbEnabled));
+const doubanHasCookie = computed(() => Boolean(doubanConfig.value?.HasCookie));
 
 async function loadSettings() {
   if (!authStore.token) {
@@ -38,16 +45,37 @@ async function loadSettings() {
 
   loading.value = true;
   try {
-    const [tmdb, apiKeys] = await Promise.all([
+    const [system, tmdb, douban, apiKeys] = await Promise.all([
+      serverApi.systemInfo(authStore.token),
       settingsApi.tmdbClientConfiguration(authStore.token),
+      settingsApi.doubanClientConfiguration(authStore.token),
       settingsApi.apiKeys(authStore.token)
     ]);
+    serverName.value = system.ServerName;
     tmdbConfig.value = tmdb;
+    doubanConfig.value = douban;
     keys.value = apiKeys.Items;
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '加载配置失败');
   } finally {
     loading.value = false;
+  }
+}
+
+async function saveServerName() {
+  if (!authStore.token) {
+    return;
+  }
+
+  savingServerName.value = true;
+  try {
+    const result = await serverApi.updateServerName(authStore.token, serverName.value);
+    serverName.value = result.ServerName;
+    ElMessage.success('服务器名称已保存');
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存服务器名称失败');
+  } finally {
+    savingServerName.value = false;
   }
 }
 
@@ -66,6 +94,24 @@ async function saveTmdbApiKey() {
     ElMessage.error(error instanceof Error ? error.message : '保存 TMDb API Key 失败');
   } finally {
     savingTmdb.value = false;
+  }
+}
+
+async function saveDoubanCookie() {
+  if (!authStore.token) {
+    return;
+  }
+
+  savingDouban.value = true;
+  try {
+    await settingsApi.updateDoubanCookie(authStore.token, doubanCookie.value);
+    ElMessage.success('豆瓣 Cookie 已保存');
+    doubanCookie.value = '';
+    await loadSettings();
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存豆瓣 Cookie 失败');
+  } finally {
+    savingDouban.value = false;
   }
 }
 
@@ -148,7 +194,7 @@ onMounted(loadSettings);
     <div class="settings-page__heading">
       <div>
         <h1>设置</h1>
-        <p>TMDb 与服务器访问密钥。</p>
+        <p>服务器基础信息、元数据源与访问密钥。</p>
       </div>
       <ElButton :loading="loading" type="primary" @click="loadSettings">
         <ElIcon>
@@ -159,6 +205,52 @@ onMounted(loadSettings);
     </div>
 
     <div class="settings-page__grid">
+      <ElCard shadow="never">
+        <template #header>
+          <div class="settings-page__card-title">
+            <ElIcon>
+              <Monitor />
+            </ElIcon>
+            <span>服务器</span>
+          </div>
+        </template>
+
+        <ElForm label-position="top">
+          <ElFormItem label="名称">
+            <ElInput v-model.trim="serverName" maxlength="128" show-word-limit />
+          </ElFormItem>
+          <ElButton :loading="savingServerName" type="primary" @click="saveServerName">保存</ElButton>
+        </ElForm>
+      </ElCard>
+
+      <ElCard shadow="never">
+        <template #header>
+          <div class="settings-page__card-title">
+            <ElIcon>
+              <SetUp />
+            </ElIcon>
+            <span>豆瓣</span>
+            <ElTag :type="doubanHasCookie ? 'success' : 'info'" effect="plain">
+              {{ doubanHasCookie ? '已配置 Cookie' : '匿名模式' }}
+            </ElTag>
+          </div>
+        </template>
+
+        <ElForm label-position="top">
+          <ElFormItem label="Cookie">
+            <ElInput
+              v-model="doubanCookie"
+              maxlength="16384"
+              placeholder="dbcl2=...; ck=..."
+              show-password
+              type="textarea"
+              :autosize="{ minRows: 2, maxRows: 4 }"
+            />
+          </ElFormItem>
+          <ElButton :loading="savingDouban" type="primary" @click="saveDoubanCookie">保存</ElButton>
+        </ElForm>
+      </ElCard>
+
       <ElCard shadow="never">
         <template #header>
           <div class="settings-page__card-title">
@@ -269,7 +361,7 @@ onMounted(loadSettings);
 
 .settings-page__grid {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 16px;
 }
 

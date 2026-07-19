@@ -409,10 +409,8 @@ pub async fn refresh_library(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn virtual_folders_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>> {
-    let backend = db.get_database_backend();
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             r#"SELECT libraries.id, libraries.name, libraries.collection_type, library_paths.path FROM libraries LEFT JOIN library_paths ON library_paths.library_id = libraries.id ORDER BY libraries.name ASC, library_paths.path ASC"#,
             vec![],
         ))
@@ -539,14 +537,12 @@ async fn upsert_library_path(
 async fn delete_virtual_folder_inner(db: &DatabaseConnection, name: &str) -> anyhow::Result<bool> {
     let name = normalize_library_name(name)?;
     let library_id = library_id_for_name(&name);
-    let backend = db.get_database_backend();
     if Libraries::find_by_id(&library_id).one(db).await?.is_none() {
         return Ok(false);
     }
 
     let item_rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             "SELECT id FROM media_items WHERE library_id = ?",
             vec![library_id.clone().into()],
         ))
@@ -573,8 +569,7 @@ async fn delete_virtual_folder_inner(db: &DatabaseConnection, name: &str) -> any
             "chapters",
             "trickplay_images",
         ] {
-            db.execute(crate::db::helpers::portable_statement(
-                backend,
+            db.execute(crate::db::helpers::pg_statement(
                 &format!("DELETE FROM {table} WHERE item_id IN ({placeholders})"),
                 params.clone(),
             ))
@@ -582,16 +577,14 @@ async fn delete_virtual_folder_inner(db: &DatabaseConnection, name: &str) -> any
             .with_context(|| format!("failed to delete {table} for library: {name}"))?;
         }
         for column in ["item_id", "parent_id"] {
-            db.execute(crate::db::helpers::portable_statement(
-                backend,
+            db.execute(crate::db::helpers::pg_statement(
                 &format!("DELETE FROM linked_children WHERE {column} IN ({placeholders})"),
                 params.clone(),
             ))
             .await
             .context("failed to delete linked children for library")?;
         }
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             &format!("DELETE FROM media_items WHERE id IN ({placeholders})"),
             params,
         ))
@@ -599,15 +592,13 @@ async fn delete_virtual_folder_inner(db: &DatabaseConnection, name: &str) -> any
         .context("failed to delete library media items")?;
     }
 
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
+    db.execute(crate::db::helpers::pg_statement(
         "DELETE FROM library_paths WHERE library_id = ?",
         vec![library_id.clone().into()],
     ))
     .await
     .context("failed to delete library paths")?;
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
+    db.execute(crate::db::helpers::pg_statement(
         "DELETE FROM libraries WHERE id = ?",
         vec![library_id.into()],
     ))
@@ -639,8 +630,7 @@ async fn rename_virtual_folder_inner(
     let name = normalize_library_name(name)?;
     let new_name = normalize_library_name(new_name)?;
     let result = db
-        .execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        .execute(crate::db::helpers::pg_statement(
             "UPDATE libraries SET name = ?, updated_at = ? WHERE id = ?",
             vec![
                 new_name.into(),
@@ -663,8 +653,7 @@ async fn update_virtual_folder_path_inner(
     let target_path =
         path_utils::validate_library_path(&normalize_library_path_text(target_path)?)?;
     let result = db
-        .execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        .execute(crate::db::helpers::pg_statement(
             "UPDATE library_paths SET path = ?, library_id = ? WHERE library_id = ? AND path = ?",
             vec![
                 target_path.into(),
@@ -912,7 +901,7 @@ mod tests {
     };
     use crate::db::row_ext::QueryResultExt;
     use axum::body::Bytes;
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use sea_orm::{ConnectionTrait, DatabaseConnection};
     use std::collections::HashMap;
 
     #[test]
@@ -1019,7 +1008,9 @@ mod tests {
 
     #[tokio::test]
     async fn virtual_folder_changes_report_missing_targets() {
-        let db = test_db().await;
+        let Some(db) = test_db().await else {
+            return;
+        };
         let dir = temp_media_dir("missing-targets");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1040,7 +1031,9 @@ mod tests {
 
     #[tokio::test]
     async fn library_options_are_persisted_for_existing_library() {
-        let db = test_db().await;
+        let Some(db) = test_db().await else {
+            return;
+        };
         insert_library(&db, "movies", "Movies").await;
 
         assert!(
@@ -1055,8 +1048,7 @@ mod tests {
             .unwrap()
         );
         let saved = db
-            .query_one(crate::db::helpers::portable_statement(
-                db.get_database_backend(),
+            .query_one(crate::db::helpers::pg_statement(
                 "SELECT value FROM app_settings WHERE key = ?",
                 vec!["LibraryOptions.movies".into()],
             ))
@@ -1107,7 +1099,9 @@ mod tests {
 
     #[tokio::test]
     async fn virtual_folder_path_update_validates_and_updates_path() {
-        let db = test_db().await;
+        let Some(db) = test_db().await else {
+            return;
+        };
         let old_dir = temp_media_dir("old");
         let new_dir = temp_media_dir("new");
         std::fs::create_dir_all(&old_dir).unwrap();
@@ -1142,13 +1136,14 @@ mod tests {
 
     #[tokio::test]
     async fn delete_virtual_folder_removes_items_and_library() {
-        let db = test_db().await;
+        let Some(db) = test_db().await else {
+            return;
+        };
         let dir = temp_media_dir("delete");
         std::fs::create_dir_all(&dir).unwrap();
         insert_library(&db, "movies", "Movies").await;
         insert_library_path(&db, "movies", &dir.to_string_lossy()).await;
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', '', 'Movie', 0, 1, 1, 1)",
             vec![
                 "m1".into(),
@@ -1161,8 +1156,7 @@ mod tests {
 
         assert!(delete_virtual_folder_inner(&db, "Movies").await.unwrap());
         let remaining = db
-            .query_one(crate::db::helpers::portable_statement(
-                db.get_database_backend(),
+            .query_one(crate::db::helpers::pg_statement(
                 "SELECT id FROM media_items WHERE id = ?",
                 vec!["m1".into()],
             ))
@@ -1172,15 +1166,12 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
-    async fn test_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db
+    async fn test_db() -> Option<DatabaseConnection> {
+        crate::db::test_db().await
     }
 
     async fn insert_library(db: &DatabaseConnection, id: &str, name: &str) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, 'movies', 1, 1)",
             vec![id.into(), name.into()],
         ))
@@ -1189,8 +1180,7 @@ mod tests {
     }
 
     async fn insert_library_path(db: &DatabaseConnection, library_id: &str, path: &str) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO library_paths (id, library_id, path, created_at) VALUES (?, ?, ?, 1)",
             vec![
                 crate::util::stable_text_id(&format!("library-path:{path}")).into(),

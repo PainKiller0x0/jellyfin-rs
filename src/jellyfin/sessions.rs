@@ -106,11 +106,9 @@ pub async fn logout(
     };
 
     let now = now_unix();
-    let backend = state.db.get_database_backend();
     if let Err(error) = state
         .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
+        .execute(crate::db::helpers::pg_statement(
             "UPDATE access_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
             vec![now.into(), stable_text_id(&token).into()],
         ))
@@ -702,7 +700,7 @@ mod tests {
         extract::State,
         http::{HeaderMap, HeaderValue, StatusCode},
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use sea_orm::{ConnectionTrait, DatabaseConnection};
     use serde_json::json;
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
@@ -925,10 +923,10 @@ mod tests {
 
     #[tokio::test]
     async fn session_user_routes_add_dedupe_and_remove_users() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u2', 'guest', 'guest', 0, 0, 1, 1)",
             vec![],
         ))
@@ -995,10 +993,10 @@ mod tests {
 
     #[tokio::test]
     async fn session_user_routes_validate_and_limit_inputs() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('new-user', 'new-user', 'new-user', 0, 0, 1, 1)",
             vec![],
         ))
@@ -1087,8 +1085,13 @@ mod tests {
             media_dirs: Vec::new(),
             http_client: reqwest::Client::new(),
             tmdb_api_key: RwLock::new(None),
+            douban_cookie: RwLock::new(None),
+            scan_lock: tokio::sync::Mutex::new(()),
             playback_sessions: RwLock::new(HashMap::<String, PlaybackSession>::new()),
             session_capabilities: RwLock::new(HashMap::new()),
+            admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),
+            admin_http_logs: RwLock::new(std::collections::VecDeque::new()),
+            playback_distribution: RwLock::new(crate::app::state::PlaybackDistribution::default()),
             ws_event_tx,
             sa_config: crate::config::StrmAssistantConfig::default(),
             intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),

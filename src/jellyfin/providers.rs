@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::util::normalize_yyyy_mm_dd;
+
 pub async fn tmdb_movie_search(
     client: &reqwest::Client,
     api_key: &str,
@@ -37,6 +39,7 @@ pub async fn tmdb_movie_search(
                 "Name": movie.title,
                 "Type": "Movie",
                 "ProductionYear": year,
+                "PremiereDate": movie.release_date.as_deref().and_then(normalize_yyyy_mm_dd),
                 "SearchProviderName": "TheMovieDb",
                 "ProviderIds": { "Tmdb": movie.id.to_string() },
                 "ImageUrl": movie.poster_path.map(|path| format!("https://image.tmdb.org/t/p/w342{path}")),
@@ -118,6 +121,7 @@ pub async fn tmdb_movie_details(
         "Type": "Movie",
         "Overview": response.overview,
         "ProductionYear": year,
+        "PremiereDate": response.release_date.as_deref().and_then(normalize_yyyy_mm_dd),
         "CommunityRating": response.vote_average,
         "OfficialRating": official_rating,
         "Tagline": response.tagline,
@@ -174,6 +178,7 @@ pub async fn tmdb_tv_search(
                 "Name": show.name,
                 "Type": "Series",
                 "ProductionYear": year,
+                "PremiereDate": show.first_air_date.as_deref().and_then(normalize_yyyy_mm_dd),
                 "SearchProviderName": "TheMovieDb",
                 "ProviderIds": { "Tmdb": show.id.to_string() },
                 "ImageUrl": show.poster_path.map(|path| format!("https://image.tmdb.org/t/p/w342{path}")),
@@ -256,6 +261,7 @@ pub async fn tmdb_tv_details(
         "Type": "Series",
         "Overview": response.overview,
         "ProductionYear": year,
+        "PremiereDate": response.first_air_date.as_deref().and_then(normalize_yyyy_mm_dd),
         "CommunityRating": response.vote_average,
         "OfficialRating": official_rating,
         "Tagline": response.tagline,
@@ -658,6 +664,8 @@ pub async fn tmdb_movie_images(
         backdrops: Vec<TmdbImage>,
         #[serde(default)]
         posters: Vec<TmdbImage>,
+        #[serde(default)]
+        logos: Vec<TmdbImage>,
     }
     #[derive(Deserialize)]
     struct TmdbImage {
@@ -717,6 +725,27 @@ pub async fn tmdb_movie_images(
             "Type": "Backdrop",
         });
         if let Some(ref lang) = backdrop.iso_639_1 {
+            if !lang.is_empty() {
+                image["Language"] = json!(lang);
+            }
+        }
+        images.push(image);
+    }
+
+    for logo in &response.logos {
+        let thumbnail_url = format!("https://image.tmdb.org/t/p/w500{}", logo.file_path);
+        let full_url = format!("https://image.tmdb.org/t/p/original{}", logo.file_path);
+        let mut image = json!({
+            "ProviderName": "TheMovieDb",
+            "Url": full_url,
+            "ThumbnailUrl": thumbnail_url,
+            "Height": logo.height,
+            "Width": logo.width,
+            "CommunityRating": logo.vote_average,
+            "VoteCount": logo.vote_count,
+            "Type": "Logo",
+        });
+        if let Some(ref lang) = logo.iso_639_1 {
             if !lang.is_empty() {
                 image["Language"] = json!(lang);
             }

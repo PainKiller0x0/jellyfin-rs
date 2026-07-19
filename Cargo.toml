@@ -17,8 +17,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sea-orm = { version = "1.1", features = ["runtime-tokio", "sqlx-postgres", "sqlx-sqlite", "macros"] }
-sqlx = { version = "0.8", features = ["migrate", "sqlite"] }
+sea-orm = { version = "1.1", default-features = false, features = ["runtime-tokio", "sqlx-postgres", "macros"] }
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
@@ -30,8 +29,6 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 dashmap = "6"
-cron = "0.13"
-lru = "0.12"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

@@ -77,3 +77,56 @@ export type PlaybackSession = {
   LastActivityDate: string;
   NowPlayingItemName?: string | null;
 };
+
+export type AdminHttpLogEntry = {
+  Id: number;
+  Date: string;
+  UnixTime: number;
+  Method: string;
+  Path: string;
+  Query: string;
+  StatusCode: number;
+  ElapsedMs: number;
+  RemoteAddress: string;
+  Host: string;
+  UserAgent: string;
+  Client: string;
+  Device: string;
+  DeviceId: string;
+};
+
+export type AdminHttpLogResult = QueryResult<AdminHttpLogEntry> & {
+  LastId: number;
+};
+
+export type PlaybackRegion = {
+  Region: string;
+  RegionCode: string;
+  IsPrivate: boolean;
+  PlayCount: number;
+  UserCount: number;
+  IpCount: number;
+  SampleIps: string[];
+  LastSeenDate: string;
+  X: number;
+  Y: number;
+};
+
+export type PlaybackRecentEvent = {
+  Date: string;
+  UnixTime: number;
+  UserId: string;
+  Ip: string;
+  Region: string;
+  Client: string;
+  DeviceName: string;
+  ItemId: string;
+  ItemName?: string | null;
+};
+
+export type PlaybackMap = {
+  TotalPlayCount: number;
+  RegionCount: number;
+  Regions: PlaybackRegion[];
+  RecentEvents: PlaybackRecentEvent[];
+};

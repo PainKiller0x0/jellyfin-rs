@@ -26,9 +26,12 @@ fn visible_media_item_sql(alias: &str) -> String {
 }
 
 /// Deduplicate episodes by (parent_id, season_number, episode_number).
-/// When multiple video files exist for the same episode (multi-version),
-/// keep the one with the largest size_bytes (highest quality).
-fn deduplicate_episodes(items: Vec<MediaItem>) -> Vec<MediaItem> {
+/// When multiple video files exist for the same episode, keep the best
+/// display representative first, then fall back to the largest source.
+fn deduplicate_episodes(
+    items: Vec<MediaItem>,
+    provider_map: &HashMap<String, Value>,
+) -> Vec<MediaItem> {
     let mut map: HashMap<(String, i64, i64), MediaItem> = HashMap::new();
     for item in items {
         let key = (
@@ -37,7 +40,10 @@ fn deduplicate_episodes(items: Vec<MediaItem>) -> Vec<MediaItem> {
             item.episode_number.unwrap_or(0),
         );
         let should_replace = match map.get(&key) {
-            Some(existing) => item.size_bytes > existing.size_bytes,
+            Some(existing) => {
+                episode_representative_score(&item, provider_map)
+                    > episode_representative_score(existing, provider_map)
+            }
             None => true,
         };
         if should_replace {
@@ -57,6 +63,33 @@ fn deduplicate_episodes(items: Vec<MediaItem>) -> Vec<MediaItem> {
             .then_with(|| a.title.cmp(&b.title))
     });
     result
+}
+
+fn episode_representative_score<'a>(
+    item: &'a MediaItem,
+    provider_map: &HashMap<String, Value>,
+) -> (u8, i64, &'a str) {
+    let has_provider = provider_map
+        .get(&item.id)
+        .and_then(Value::as_object)
+        .is_some_and(|providers| !providers.is_empty());
+    let has_primary_image = item
+        .image_tags
+        .as_ref()
+        .and_then(|tags| tags.get("Primary"))
+        .and_then(Value::as_str)
+        .is_some_and(|tag| !tag.is_empty());
+    let has_overview = item
+        .overview
+        .as_deref()
+        .is_some_and(|overview| !overview.trim().is_empty());
+    let metadata_score =
+        (has_provider as u8) * 4 + (has_primary_image as u8) * 2 + (has_overview as u8);
+    (
+        metadata_score,
+        item.size_bytes.unwrap_or(0),
+        item.id.as_str(),
+    )
 }
 
 pub async fn show_seasons(
@@ -106,7 +139,7 @@ pub async fn show_episodes(
                 .skip(start_index)
                 .take(limit)
                 .collect::<Vec<_>>();
-            let json_items = super::enrich_episode_list(&state.db, page).await;
+            let json_items = super::enrich_episode_list(&state.db, &user_id, page).await;
             Json(json!({ "Items": json_items, "TotalRecordCount": total, "StartIndex": start_index }))
                 .into_response()
         }
@@ -154,16 +187,13 @@ async fn enrich_season_list(
     // Batch query: series id -> title
     let mut series_map: HashMap<String, String> = HashMap::new();
     if !series_ids.is_empty() {
-        let backend = db.get_database_backend();
         let placeholders = series_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let visible = visible_media_item_sql("media_items");
         let sql =
             format!("SELECT id, title FROM media_items WHERE id IN ({placeholders}) AND {visible}");
         let values: Vec<sea_orm::Value> = series_ids.iter().map(|id| id.as_str().into()).collect();
         if let Ok(rows) = db
-            .query_all(crate::db::helpers::portable_statement(
-                backend, &sql, values,
-            ))
+            .query_all(crate::db::helpers::pg_statement(&sql, values))
             .await
         {
             for row in &rows {
@@ -177,17 +207,14 @@ async fn enrich_season_list(
     // Batch query: count episodes per season
     let mut count_map: HashMap<String, i64> = HashMap::new();
     if !season_ids.is_empty() {
-        let backend = db.get_database_backend();
         let placeholders = season_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let visible = visible_media_item_sql("media_items");
         let sql = format!(
-            "SELECT parent_id, COUNT(*) AS cnt FROM media_items WHERE parent_id IN ({placeholders}) AND item_type = 'Episode' AND {visible} GROUP BY parent_id"
+            "SELECT parent_id, COUNT(DISTINCT (COALESCE(season_number, 0), COALESCE(episode_number, 0))) AS cnt FROM media_items WHERE parent_id IN ({placeholders}) AND item_type = 'Episode' AND {visible} GROUP BY parent_id"
         );
         let values: Vec<sea_orm::Value> = season_ids.iter().map(|id| id.as_str().into()).collect();
         if let Ok(rows) = db
-            .query_all(crate::db::helpers::portable_statement(
-                backend, &sql, values,
-            ))
+            .query_all(crate::db::helpers::pg_statement(&sql, values))
             .await
         {
             for row in &rows {
@@ -201,19 +228,16 @@ async fn enrich_season_list(
     // Batch query: count played episodes per season for user
     let mut played_map: HashMap<String, i64> = HashMap::new();
     if !season_ids.is_empty() {
-        let backend = db.get_database_backend();
         let placeholders = season_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let visible = visible_media_item_sql("mi");
         let sql = format!(
-            "SELECT mi.parent_id, COUNT(*) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id IN ({placeholders}) AND mi.item_type = 'Episode' AND {visible} AND ud.user_id = ? AND ud.played = 1 GROUP BY mi.parent_id"
+            "SELECT mi.parent_id, COUNT(DISTINCT (COALESCE(mi.season_number, 0), COALESCE(mi.episode_number, 0))) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id IN ({placeholders}) AND mi.item_type = 'Episode' AND {visible} AND ud.user_id = ? AND ud.played = 1 GROUP BY mi.parent_id"
         );
         let mut values: Vec<sea_orm::Value> =
             season_ids.iter().map(|id| id.as_str().into()).collect();
         values.push(user_id.into());
         if let Ok(rows) = db
-            .query_all(crate::db::helpers::portable_statement(
-                backend, &sql, values,
-            ))
+            .query_all(crate::db::helpers::pg_statement(&sql, values))
             .await
         {
             for row in &rows {
@@ -224,13 +248,22 @@ async fn enrich_season_list(
         }
     }
 
+    let provider_map = crate::jellyfin::item_queries::batch_item_provider_ids(db, &season_ids)
+        .await
+        .unwrap_or_default();
+
     items
         .into_iter()
         .map(|item| {
             let mut val = item.to_jellyfin_json();
             let total = count_map.get(&item.id).copied().unwrap_or(0);
             let played = played_map.get(&item.id).copied().unwrap_or(0);
+            if let Some(provider_ids) = provider_map.get(&item.id) {
+                val["ProviderIds"] = provider_ids.clone();
+            }
+            val["ChildCount"] = json!(total);
             val["RecursiveItemCount"] = json!(total);
+            val["EpisodeCount"] = json!(total);
             val["UserData"]["UnplayedItemCount"] = json!(total - played);
             // Add SeriesId and SeriesName
             val["SeriesId"] = json!(item.parent_id);
@@ -248,15 +281,15 @@ async fn child_items_by_type(
     parent_id: &str,
     item_type: &str,
 ) -> anyhow::Result<Vec<MediaItem>> {
-    let backend = db.get_database_backend();
     let order = if item_type == "Episode" {
         "ORDER BY media_items.season_number ASC, media_items.episode_number ASC"
+    } else if item_type == "Season" {
+        "ORDER BY media_items.season_number ASC NULLS LAST, media_items.title ASC"
     } else {
         "ORDER BY media_items.title ASC"
     };
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             &crate::jellyfin::item_queries::media_item_select_sql(&format!(
                 "WHERE media_items.parent_id = ? AND media_items.item_type = ? AND {} {order}",
                 visible_media_item_sql("media_items")
@@ -270,12 +303,28 @@ async fn child_items_by_type(
         .map(MediaItem::from_query_result)
         .collect::<Result<Vec<_>, _>>()
         .context("failed to decode show child items")?;
-    // Deduplicate episodes by (parent_id, season_number, episode_number), keep largest file
-    if item_type == "Episode" && items.len() > 1 {
-        items = deduplicate_episodes(items);
-    }
-    // Batch load image tags
+    let mut provider_map = HashMap::new();
+    let mut image_tags_loaded = false;
     if !items.is_empty() {
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        if let Ok(tags_map) = crate::jellyfin::item_queries::batch_item_image_tags(db, &ids).await {
+            for item in &mut items {
+                if let Some(tags) = tags_map.get(&item.id) {
+                    item.image_tags = Some(tags.clone());
+                }
+            }
+            image_tags_loaded = true;
+        }
+        if item_type == "Episode" {
+            provider_map = crate::jellyfin::item_queries::batch_item_provider_ids(db, &ids)
+                .await
+                .unwrap_or_default();
+        }
+    }
+    if item_type == "Episode" && items.len() > 1 {
+        items = deduplicate_episodes(items, &provider_map);
+    }
+    if !image_tags_loaded && !items.is_empty() {
         let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
         if let Ok(tags_map) = crate::jellyfin::item_queries::batch_item_image_tags(db, &ids).await {
             for item in &mut items {
@@ -293,10 +342,8 @@ async fn descendant_episodes(
     user_id: &str,
     show_id: &str,
 ) -> anyhow::Result<Vec<MediaItem>> {
-    let backend = db.get_database_backend();
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             &format!(
                 r#"WITH RECURSIVE tree(id) AS (SELECT media_items.id FROM media_items WHERE media_items.id = ? AND {} UNION ALL SELECT media_items.id FROM media_items JOIN tree ON media_items.parent_id = tree.id WHERE {}) {} WHERE media_items.id IN (SELECT id FROM tree WHERE id <> ?) AND media_items.item_type = 'Episode' AND {} ORDER BY media_items.title ASC"#,
                 visible_media_item_sql("media_items"),
@@ -314,12 +361,26 @@ async fn descendant_episodes(
         .map(MediaItem::from_query_result)
         .collect::<Result<Vec<_>, _>>()
         .context("failed to decode show episodes")?;
-    // Deduplicate episodes by (parent_id, season_number, episode_number), keep largest file
-    if items.len() > 1 {
-        items = deduplicate_episodes(items);
-    }
-    // Batch load image tags
+    let mut provider_map = HashMap::new();
+    let mut image_tags_loaded = false;
     if !items.is_empty() {
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        if let Ok(tags_map) = crate::jellyfin::item_queries::batch_item_image_tags(db, &ids).await {
+            for item in &mut items {
+                if let Some(tags) = tags_map.get(&item.id) {
+                    item.image_tags = Some(tags.clone());
+                }
+            }
+            image_tags_loaded = true;
+        }
+        provider_map = crate::jellyfin::item_queries::batch_item_provider_ids(db, &ids)
+            .await
+            .unwrap_or_default();
+    }
+    if items.len() > 1 {
+        items = deduplicate_episodes(items, &provider_map);
+    }
+    if !image_tags_loaded && !items.is_empty() {
         let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
         if let Ok(tags_map) = crate::jellyfin::item_queries::batch_item_image_tags(db, &ids).await {
             for item in &mut items {
@@ -342,18 +403,18 @@ mod tests {
         extract::{Extension, Path, Query, State},
         response::IntoResponse,
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
-    use serde_json::Value;
+    use sea_orm::{ConnectionTrait, DatabaseConnection};
+    use serde_json::{Value, json};
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
     use uuid::Uuid;
 
     #[tokio::test]
     async fn show_child_queries_hide_private_tree_members() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
             vec!["tv".into(), "TV".into(), "tvshows".into()],
         ))
@@ -447,10 +508,10 @@ mod tests {
 
     #[tokio::test]
     async fn show_episodes_returns_paged_query_result() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
             vec!["tv".into(), "TV".into(), "tvshows".into()],
         ))
@@ -507,11 +568,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn show_episodes_prefers_metadata_rich_duplicate_over_larger_file() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
+            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
+            vec!["tv".into(), "TV".into(), "tvshows".into()],
+        ))
+        .await
+        .unwrap();
+        insert_item(&db, "series", "Series", "tv", "Series", 1, 1, None, None).await;
+        insert_item(&db, "season", "S1", "series", "Season", 1, 1, None, None).await;
+        insert_episode_with_size(
+            &db,
+            "large-generic",
+            "Series 2023",
+            "season",
+            Some(1),
+            Some(2),
+            10_000,
+            None,
+        )
+        .await;
+        insert_episode_with_size(
+            &db,
+            "smaller-scraped",
+            "Real Episode",
+            "season",
+            Some(1),
+            Some(2),
+            8_000,
+            Some("scraped overview"),
+        )
+        .await;
+        db.execute(crate::db::helpers::pg_statement(
+            "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', 'episode-tmdb')",
+            vec!["smaller-scraped".into()],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::pg_statement(
+            "INSERT INTO image_assets (id, item_id, image_type, image_index, etag, created_at, updated_at) VALUES ('image-1', ?, 'Primary', 0, 'etag-1', 1, 1)",
+            vec!["smaller-scraped".into()],
+        ))
+        .await
+        .unwrap();
+
+        let episodes = child_items_by_type(&db, "u1", "season", "Episode")
+            .await
+            .unwrap();
+
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].id, "smaller-scraped");
+        assert_eq!(episodes[0].image_tags, Some(json!({"Primary": "etag-1"})));
+    }
+
+    #[tokio::test]
+    async fn enrich_season_list_counts_duplicate_episode_versions_once() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
+            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
+            vec!["tv".into(), "TV".into(), "tvshows".into()],
+        ))
+        .await
+        .unwrap();
+        insert_item(&db, "series", "Series", "tv", "Series", 1, 1, None, None).await;
+        insert_item(&db, "season", "S1", "series", "Season", 1, 1, None, None).await;
+        insert_item(
+            &db,
+            "episode-1080p",
+            "Episode",
+            "season",
+            "Episode",
+            0,
+            1,
+            Some(1),
+            Some(1),
+        )
+        .await;
+        insert_item(
+            &db,
+            "episode-2160p",
+            "Episode",
+            "season",
+            "Episode",
+            0,
+            1,
+            Some(1),
+            Some(1),
+        )
+        .await;
+
+        let seasons = child_items_by_type(&db, "u1", "series", "Season")
+            .await
+            .unwrap();
+        let enriched = enrich_season_list(&db, "u1", seasons).await;
+
+        assert_eq!(enriched[0]["ChildCount"], 1);
+        assert_eq!(enriched[0]["RecursiveItemCount"], 1);
+    }
+
+    #[tokio::test]
     async fn show_seasons_returns_start_index() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
             vec!["tv".into(), "TV".into(), "tvshows".into()],
         ))
@@ -549,8 +714,7 @@ mod tests {
         season_number: Option<i64>,
         episode_number: Option<i64>,
     ) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, season_number, episode_number, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'tv', ?, ?, ?, ?, ?, ?, 1, 1, 1)",
             vec![
                 id.into(),
@@ -568,6 +732,33 @@ mod tests {
         .unwrap();
     }
 
+    async fn insert_episode_with_size(
+        db: &sea_orm::DatabaseConnection,
+        id: &str,
+        title: &str,
+        parent_id: &str,
+        season_number: Option<i64>,
+        episode_number: Option<i64>,
+        size_bytes: i64,
+        overview: Option<&str>,
+    ) {
+        db.execute(crate::db::helpers::pg_statement(
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, overview, season_number, episode_number, size_bytes, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'tv', ?, 'Episode', 0, 1, ?, ?, ?, ?, 1, 1, 1)",
+            vec![
+                id.into(),
+                title.into(),
+                id.into(),
+                parent_id.into(),
+                overview.into(),
+                season_number.into(),
+                episode_number.into(),
+                size_bytes.into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+
     fn test_state(db: DatabaseConnection) -> crate::app::state::AppState {
         let (ws_event_tx, _) = broadcast::channel(4);
         crate::app::state::AppState {
@@ -577,8 +768,13 @@ mod tests {
             media_dirs: Vec::new(),
             http_client: reqwest::Client::new(),
             tmdb_api_key: RwLock::new(None),
+            douban_cookie: RwLock::new(None),
+            scan_lock: tokio::sync::Mutex::new(()),
             playback_sessions: RwLock::new(HashMap::new()),
             session_capabilities: RwLock::new(HashMap::new()),
+            admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),
+            admin_http_logs: RwLock::new(std::collections::VecDeque::new()),
+            playback_distribution: RwLock::new(crate::app::state::PlaybackDistribution::default()),
             ws_event_tx,
             sa_config: crate::config::StrmAssistantConfig::default(),
             intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),

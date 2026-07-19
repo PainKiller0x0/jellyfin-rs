@@ -109,10 +109,8 @@ impl StrmAssistantConfig {
         let mut cfg = Self::default();
 
         // Load all sa.* settings from DB in one query
-        let backend = db.get_database_backend();
         let db_settings: std::collections::HashMap<String, String> = match db
-            .query_all(crate::db::helpers::portable_statement(
-                backend,
+            .query_all(crate::db::helpers::pg_statement(
                 "SELECT key, value FROM app_settings WHERE key LIKE 'sa.%'",
                 vec![],
             ))

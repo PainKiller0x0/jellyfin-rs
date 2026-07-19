@@ -1,8 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -11,10 +11,11 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::{
     app::state::{AppState, PlaybackSession, PlaybackState, SessionCapabilities},
+    db::row_ext::QueryResultExt,
     entities::user_data::{self, Entity as UserData},
     jellyfin::{
         auth::{
-            query_user_id_or_request, request_user_id_and_admin_or_default,
+            query_user_id_or_request, request_token, request_user_id_and_admin_or_default,
             request_user_id_or_default,
         },
         common::{internal_error, strip_nulls},
@@ -24,6 +25,8 @@ use crate::{
     library::models::media_source_json_with_streams,
     util::{now_unix, unix_to_jellyfin_date},
 };
+
+const PLAYED_PERCENT_THRESHOLD: f64 = 0.9;
 
 pub async fn playback_info(
     State(state): State<Arc<AppState>>,
@@ -49,9 +52,12 @@ pub async fn playback_info(
             let profile = dlna::request_device_profile(body.as_ref().map(|Json(value)| value));
 
             // For Movie/Episode folders with child Video files (multi-version), return their media sources
-            let media_sources = if item.is_folder && (item.item_type == "Movie" || item.item_type == "Episode") {
+            let mut media_sources = if item.is_folder && (item.item_type == "Movie" || item.item_type == "Episode") {
                 match super::child_video_sources(&state.db, &item.id, is_admin).await {
-                    Ok(sources) if !sources.is_empty() => sources,
+                    Ok(mut sources) if !sources.is_empty() => {
+                        apply_playback_profile_to_sources(&mut sources, &profile, &query);
+                        sources
+                    }
                     Ok(_) => {
                         // No child videos, return the item itself (e.g. Episode folder is the video)
                         match super::media_streams_for_item(&state.db, &item.id).await {
@@ -69,6 +75,29 @@ pub async fn playback_info(
             } else if item.is_folder {
                 // Season/Series/other folders: return empty sources, client should pick a specific item
                 vec![]
+            } else if item.item_type == "Episode" {
+                match super::episode_version_sources(&state.db, &item, is_admin).await {
+                    Ok(mut sources) if !sources.is_empty() => {
+                        apply_playback_profile_to_sources(&mut sources, &profile, &query);
+                        sources
+                    }
+                    Ok(_) => match super::media_streams_for_item(&state.db, &item.id).await {
+                        Ok(streams) => {
+                            let mut media_source =
+                                media_source_json_with_streams(&item, streams.clone());
+                            let playback_streams = media_source_streams(&media_source);
+                            dlna::apply_playback_profile(
+                                &mut media_source,
+                                &profile,
+                                &playback_streams,
+                                &query,
+                            );
+                            vec![media_source]
+                        }
+                        Err(error) => return internal_error(error),
+                    },
+                    Err(error) => return internal_error(error),
+                }
             } else {
                 match super::media_streams_for_item(&state.db, &item.id).await {
                     Ok(streams) => {
@@ -80,6 +109,9 @@ pub async fn playback_info(
                     Err(error) => return internal_error(error),
                 }
             };
+            if let Some(token) = request_token(&headers, &query) {
+                append_access_token_to_media_sources(&mut media_sources, &token);
+            }
 
             Json(strip_nulls(json!({ "MediaSources": media_sources, "PlaySessionId": uuid::Uuid::new_v4().simple().to_string(), "ErrorCode": null }))).into_response()
         }
@@ -91,6 +123,17 @@ pub async fn playback_info(
     }
 }
 
+fn apply_playback_profile_to_sources(
+    media_sources: &mut [JsonValue],
+    profile: &JsonValue,
+    query: &HashMap<String, String>,
+) {
+    for media_source in media_sources {
+        let playback_streams = media_source_streams(media_source);
+        dlna::apply_playback_profile(media_source, profile, &playback_streams, query);
+    }
+}
+
 fn media_source_streams(media_source: &JsonValue) -> Vec<JsonValue> {
     media_source
         .get("MediaStreams")
@@ -99,13 +142,106 @@ fn media_source_streams(media_source: &JsonValue) -> Vec<JsonValue> {
         .unwrap_or_default()
 }
 
+fn append_access_token_to_media_sources(media_sources: &mut [JsonValue], token: &str) {
+    if token.trim().is_empty() {
+        return;
+    }
+    for source in media_sources {
+        append_access_token_to_value(source, token);
+    }
+}
+
+fn append_access_token_to_value(value: &mut JsonValue, token: &str) {
+    match value {
+        JsonValue::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if matches!(
+                    key.as_str(),
+                    "DirectStreamUrl" | "TranscodingUrl" | "DeliveryUrl"
+                ) {
+                    if let Some(url) = value
+                        .as_str()
+                        .and_then(|url| stream_url_with_token(url, token))
+                    {
+                        *value = JsonValue::String(url);
+                    }
+                } else {
+                    append_access_token_to_value(value, token);
+                }
+            }
+        }
+        JsonValue::Array(values) => {
+            for value in values {
+                append_access_token_to_value(value, token);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn stream_url_with_token(url: &str, token: &str) -> Option<String> {
+    if !url.starts_with('/') || stream_url_has_token(url) {
+        return None;
+    }
+    let (url_without_fragment, fragment) = url.split_once('#').unwrap_or((url, ""));
+    let separator = if url_without_fragment.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    let mut updated = format!(
+        "{url_without_fragment}{separator}api_key={}",
+        percent_encode_query_value(token)
+    );
+    if !fragment.is_empty() {
+        updated.push('#');
+        updated.push_str(fragment);
+    }
+    Some(updated)
+}
+
+fn stream_url_has_token(url: &str) -> bool {
+    let query = url
+        .split_once('?')
+        .map(|(_, query)| query.split('#').next().unwrap_or_default())
+        .unwrap_or_default();
+    query.split('&').any(|part| {
+        let key = part.split_once('=').map(|(key, _)| key).unwrap_or(part);
+        matches!(
+            key.to_ascii_lowercase().as_str(),
+            "api_key" | "apikey" | "token" | "access_token" | "accesstoken"
+        )
+    })
+}
+
+fn percent_encode_query_value(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 pub async fn playback_start(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
     Json(body): Json<JsonValue>,
 ) -> Response {
-    playback_progress_inner(state, headers, query, body, PlaybackEvent::Start).await
+    playback_progress_inner(
+        state,
+        Some(remote_addr),
+        headers,
+        query,
+        body,
+        PlaybackEvent::Start,
+    )
+    .await
 }
 
 pub async fn playback_progress(
@@ -114,7 +250,7 @@ pub async fn playback_progress(
     Query(query): Query<HashMap<String, String>>,
     Json(body): Json<JsonValue>,
 ) -> Response {
-    playback_progress_inner(state, headers, query, body, PlaybackEvent::Progress).await
+    playback_progress_inner(state, None, headers, query, body, PlaybackEvent::Progress).await
 }
 
 pub async fn playback_stopped(
@@ -123,27 +259,81 @@ pub async fn playback_stopped(
     Query(query): Query<HashMap<String, String>>,
     Json(body): Json<JsonValue>,
 ) -> Response {
-    playback_progress_inner(state, headers, query, body, PlaybackEvent::Stopped).await
+    playback_progress_inner(state, None, headers, query, body, PlaybackEvent::Stopped).await
 }
 
 async fn playback_progress_inner(
     state: Arc<AppState>,
+    remote_addr: Option<SocketAddr>,
     headers: HeaderMap,
     query: HashMap<String, String>,
     body: JsonValue,
     event: PlaybackEvent,
 ) -> Response {
-    let Some(item_id) = body.get("ItemId").and_then(JsonValue::as_str) else {
+    let Some(item_id) = playback_body_item_id(&body) else {
         return StatusCode::NO_CONTENT.into_response();
     };
-    let position_ticks = body
-        .get("PositionTicks")
-        .and_then(JsonValue::as_i64)
-        .unwrap_or_default();
+    let position_ticks = body.get("PositionTicks").and_then(JsonValue::as_i64);
     let user_id = request_user_id_or_default(&state, &headers, &query).await;
-    let result = upsert_playback_position(&state.db, &user_id, item_id, position_ticks).await;
+    let persistence_item_id = playback_body_persistence_item_id(&body).unwrap_or(item_id);
+    let result = match event {
+        PlaybackEvent::Start => {
+            if position_ticks.is_some_and(|value| value > 0) {
+                upsert_playback_position(
+                    &state.db,
+                    &user_id,
+                    persistence_item_id,
+                    position_ticks.unwrap(),
+                )
+                .await
+            } else {
+                Ok(())
+            }
+        }
+        PlaybackEvent::Progress => match position_ticks {
+            Some(position_ticks) => {
+                upsert_playback_position(&state.db, &user_id, persistence_item_id, position_ticks)
+                    .await
+            }
+            None => Ok(()),
+        },
+        PlaybackEvent::Stopped => {
+            finish_playback_position(
+                &state.db,
+                &user_id,
+                persistence_item_id,
+                position_ticks,
+                body.get("RunTimeTicks").and_then(JsonValue::as_i64),
+            )
+            .await
+        }
+    };
     if let Err(error) = result {
         return internal_error(error);
+    }
+
+    if event == PlaybackEvent::Start {
+        let session_info = crate::jellyfin::sessions::session_info(&state, &headers, &query).await;
+        let item_name = find_media_item(&state.db, &user_id, item_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|item| item.title);
+        let device_name = body
+            .get("DeviceName")
+            .and_then(JsonValue::as_str)
+            .unwrap_or(&session_info.device_name);
+        let remote_address = playback_remote_address(&headers, remote_addr);
+        state
+            .record_playback_start(
+                remote_address.as_deref(),
+                &user_id,
+                &session_info.client,
+                device_name,
+                item_id,
+                item_name,
+            )
+            .await;
     }
 
     // Save RunTimeTicks from client report if media_items doesn't have it yet
@@ -154,12 +344,20 @@ async fn playback_progress_inner(
     {
         let _ = state
             .db
-            .execute(crate::db::helpers::portable_statement(
-                state.db.get_database_backend(),
+            .execute(crate::db::helpers::pg_statement(
                 "UPDATE media_items SET runtime_ticks = ? WHERE id = ? AND runtime_ticks IS NULL",
                 vec![runtime_ticks.into(), item_id.into()],
             ))
             .await;
+        if let Some(media_source_id) = body.get("MediaSourceId").and_then(JsonValue::as_str) {
+            let _ = state
+                .db
+                .execute(crate::db::helpers::pg_statement(
+                    "UPDATE media_items SET runtime_ticks = ? WHERE id = ? AND runtime_ticks IS NULL",
+                    vec![runtime_ticks.into(), media_source_id.into()],
+                ))
+                .await;
+        }
     }
 
     // Hook intro_skip behavior detection
@@ -197,21 +395,21 @@ async fn playback_progress_inner(
                             &user_id,
                             client,
                             runtime_ticks,
-                            position_ticks,
+                            position_ticks.unwrap_or_default(),
                         );
                     }
                 }
 
                 state.intro_detector.on_playback_progress(
                     play_session_id,
-                    position_ticks,
+                    position_ticks.unwrap_or_default(),
                     is_paused,
                 );
             }
             PlaybackEvent::Stopped => {
                 state
                     .intro_detector
-                    .on_playback_stopped(play_session_id, position_ticks);
+                    .on_playback_stopped(play_session_id, position_ticks.unwrap_or_default());
             }
             _ => {}
         }
@@ -223,7 +421,7 @@ async fn playback_progress_inner(
         &query,
         &user_id,
         item_id,
-        position_ticks,
+        position_ticks.unwrap_or_default(),
         &body,
         event,
     )
@@ -232,6 +430,28 @@ async fn playback_progress_inner(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error),
     }
+}
+
+fn playback_body_item_id(body: &JsonValue) -> Option<&str> {
+    body.get("ItemId")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            body.get("MediaSourceId")
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn playback_body_persistence_item_id(body: &JsonValue) -> Option<&str> {
+    body.get("ItemId")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            body.get("MediaSourceId")
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.is_empty())
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -355,46 +575,114 @@ pub(crate) async fn upsert_playback_position(
     item_id: &str,
     position_ticks: i64,
 ) -> anyhow::Result<()> {
+    if position_ticks <= 0 {
+        return Ok(());
+    }
+    let item_ids = super::user_data::playback_user_data_item_ids(db, item_id).await?;
     let now = now_unix();
-    let existing = UserData::find_by_id((user_id.to_string(), item_id.to_string()))
-        .one(db)
-        .await?;
-    if let Some(model) = existing {
-        let mut active: user_data::ActiveModel = model.into();
-        active.playback_position_ticks = Set(position_ticks.max(0));
-        active.updated_at = Set(now);
-        active.last_played_at = Set(Some(now));
-        active.update(db).await?;
-    } else {
-        let active = user_data::ActiveModel {
-            user_id: Set(user_id.to_string()),
-            item_id: Set(item_id.to_string()),
-            playback_position_ticks: Set(position_ticks.max(0)),
-            updated_at: Set(now),
-            last_played_at: Set(Some(now)),
-            ..Default::default()
-        };
-        UserData::insert(active).exec(db).await?;
+    for target_id in item_ids {
+        let existing = UserData::find_by_id((user_id.to_string(), target_id.clone()))
+            .one(db)
+            .await?;
+        if let Some(model) = existing {
+            let mut active: user_data::ActiveModel = model.into();
+            active.played = Set(0);
+            active.playback_position_ticks = Set(position_ticks.max(0));
+            active.played_percentage = Set(None);
+            active.updated_at = Set(now);
+            active.last_played_at = Set(Some(now));
+            active.update(db).await?;
+        } else {
+            let active = user_data::ActiveModel {
+                user_id: Set(user_id.to_string()),
+                item_id: Set(target_id),
+                played: Set(0),
+                playback_position_ticks: Set(position_ticks.max(0)),
+                updated_at: Set(now),
+                last_played_at: Set(Some(now)),
+                ..Default::default()
+            };
+            UserData::insert(active).exec(db).await?;
+        }
     }
     Ok(())
+}
+
+async fn finish_playback_position(
+    db: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    item_id: &str,
+    position_ticks: Option<i64>,
+    runtime_ticks: Option<i64>,
+) -> anyhow::Result<()> {
+    let Some(position_ticks) = position_ticks.filter(|value| *value > 0) else {
+        return Ok(());
+    };
+    let runtime_ticks = match runtime_ticks.filter(|value| *value > 0) {
+        Some(runtime_ticks) => Some(runtime_ticks),
+        None => playback_runtime_ticks(db, item_id).await?,
+    };
+    if should_mark_played(position_ticks, runtime_ticks) {
+        super::user_data::upsert_played_flag(db, user_id, item_id, true).await
+    } else {
+        upsert_playback_position(db, user_id, item_id, position_ticks).await
+    }
+}
+
+async fn playback_runtime_ticks(
+    db: &sea_orm::DatabaseConnection,
+    item_id: &str,
+) -> anyhow::Result<Option<i64>> {
+    let item_ids = super::user_data::playback_user_data_item_ids(db, item_id).await?;
+    let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT MAX(runtime_ticks) AS runtime_ticks FROM media_items WHERE id IN ({placeholders})"
+    );
+    let values: Vec<sea_orm::Value> = item_ids.iter().map(|id| id.as_str().into()).collect();
+    Ok(db
+        .query_one(crate::db::helpers::pg_statement(&sql, values))
+        .await?
+        .and_then(|row| row.get_opt_i64("runtime_ticks").ok().flatten()))
+}
+
+fn should_mark_played(position_ticks: i64, runtime_ticks: Option<i64>) -> bool {
+    let Some(runtime_ticks) = runtime_ticks.filter(|value| *value > 0) else {
+        return false;
+    };
+    (position_ticks as f64 / runtime_ticks as f64) >= PLAYED_PERCENT_THRESHOLD
+}
+
+fn playback_remote_address(headers: &HeaderMap, remote_addr: Option<SocketAddr>) -> Option<String> {
+    playback_forwarded_for(headers).or_else(|| remote_addr.map(|addr| addr.to_string()))
+}
+
+fn playback_forwarded_for(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("X-Forwarded-For")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 /// POST /Users/{user_id}/PlayingItems/{item_id} — report playback start
 pub async fn playing_item_start(
     State(state): State<Arc<AppState>>,
     Path((user_id, item_id)): Path<(String, String)>,
-    _headers: HeaderMap,
-    Query(_query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     body: Option<Json<JsonValue>>,
 ) -> Response {
     let position_ticks = body
         .as_ref()
         .and_then(|b| b.get("PositionTicks").and_then(JsonValue::as_i64))
-        .unwrap_or(0);
+        .filter(|value| *value > 0);
 
-    let result = upsert_playback_position(&state.db, &user_id, &item_id, position_ticks).await;
-    if let Err(error) = result {
-        return internal_error(error);
+    if let Some(position_ticks) = position_ticks {
+        let result = upsert_playback_position(&state.db, &user_id, &item_id, position_ticks).await;
+        if let Err(error) = result {
+            return internal_error(error);
+        }
     }
 
     // Save RunTimeTicks if provided
@@ -405,13 +693,29 @@ pub async fn playing_item_start(
     {
         let _ = state
             .db
-            .execute(crate::db::helpers::portable_statement(
-                state.db.get_database_backend(),
+            .execute(crate::db::helpers::pg_statement(
                 "UPDATE media_items SET runtime_ticks = ? WHERE id = ? AND runtime_ticks IS NULL",
-                vec![rt.into(), item_id.into()],
+                vec![rt.into(), item_id.clone().into()],
             ))
             .await;
     }
+
+    let session_info = crate::jellyfin::sessions::session_info(&state, &headers, &query).await;
+    let item_name = find_media_item(&state.db, &user_id, &item_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|item| item.title);
+    state
+        .record_playback_start(
+            playback_forwarded_for(&headers).as_deref(),
+            &user_id,
+            &session_info.client,
+            &session_info.device_name,
+            &item_id,
+            item_name,
+        )
+        .await;
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -424,22 +728,16 @@ pub async fn playing_item_stop(
 ) -> Response {
     let position_ticks = query
         .get("PositionTicks")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0);
+        .and_then(|v| v.parse::<i64>().ok());
+    let runtime_ticks = query
+        .get("RunTimeTicks")
+        .and_then(|v| v.parse::<i64>().ok());
 
-    let result = upsert_playback_position(&state.db, &user_id, &item_id, position_ticks).await;
-    if let Err(error) = result {
+    if let Err(error) =
+        finish_playback_position(&state.db, &user_id, &item_id, position_ticks, runtime_ticks).await
+    {
         return internal_error(error);
     }
-
-    // Update play count and mark as played if near the end
-    let now = now_unix();
-    let backend = state.db.get_database_backend();
-    let _ = state.db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "UPDATE user_data SET play_count = play_count + 1, played = 1, updated_at = ? WHERE user_id = ? AND item_id = ?",
-        vec![now.into(), user_id.into(), item_id.into()],
-    )).await;
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -457,12 +755,13 @@ pub async fn playing_item_progress(
         .or_else(|| {
             body.as_ref()
                 .and_then(|b| b.get("PositionTicks").and_then(JsonValue::as_i64))
-        })
-        .unwrap_or(0);
+        });
 
-    let result = upsert_playback_position(&state.db, &user_id, &item_id, position_ticks).await;
-    if let Err(error) = result {
-        return internal_error(error);
+    if let Some(position_ticks) = position_ticks.filter(|value| *value > 0) {
+        let result = upsert_playback_position(&state.db, &user_id, &item_id, position_ticks).await;
+        if let Err(error) = result {
+            return internal_error(error);
+        }
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -509,7 +808,7 @@ pub async fn current_user_playing_item_progress(
 
 #[cfg(test)]
 mod tests {
-    use super::current_user_playing_item_start;
+    use super::{append_access_token_to_media_sources, current_user_playing_item_start};
     use crate::app::state::{AppState, PlaybackSession};
     use crate::db::row_ext::QueryResultExt;
     use axum::{
@@ -518,15 +817,38 @@ mod tests {
         http::{HeaderMap, StatusCode},
         response::IntoResponse,
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use sea_orm::{ConnectionTrait, DatabaseConnection};
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
     use uuid::Uuid;
 
+    #[test]
+    fn playback_info_urls_include_access_token_for_clients_that_drop_auth_headers() {
+        let mut sources = vec![serde_json::json!({
+            "DirectStreamUrl": "/Videos/video/stream.mkv",
+            "TranscodingUrl": null,
+            "MediaAttachments": [
+                { "DeliveryUrl": "/Videos/video/video/Attachments/5" }
+            ],
+        })];
+
+        append_access_token_to_media_sources(&mut sources, "token 1");
+
+        assert_eq!(
+            sources[0]["DirectStreamUrl"],
+            "/Videos/video/stream.mkv?api_key=token%201"
+        );
+        assert_eq!(
+            sources[0]["MediaAttachments"][0]["DeliveryUrl"],
+            "/Videos/video/video/Attachments/5?api_key=token%201"
+        );
+    }
+
     #[tokio::test]
     async fn current_user_playing_item_start_uses_single_path_item_id() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let state = Arc::new(test_state(db));
         seed_user_and_item(&state.db, &state.user_id.to_string(), "m1").await;
 
@@ -543,8 +865,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let row = state
             .db
-            .query_one(crate::db::helpers::portable_statement(
-                state.db.get_database_backend(),
+            .query_one(crate::db::helpers::pg_statement(
                 "SELECT playback_position_ticks FROM user_data WHERE user_id = ? AND item_id = ?",
                 vec![state.user_id.to_string().into(), "m1".into()],
             ))
@@ -555,16 +876,13 @@ mod tests {
     }
 
     async fn seed_user_and_item(db: &DatabaseConnection, user_id: &str, item_id: &str) {
-        let backend = db.get_database_backend();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, 'test', 'Test', 0, 0, 1, 1)",
             vec![user_id.into()],
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, 'Movie', 'D:/movie.mkv', '', '', 'Movie', 0, 1, 1, 1, 1)",
             vec![item_id.into()],
         ))
@@ -581,8 +899,13 @@ mod tests {
             media_dirs: Vec::new(),
             http_client: reqwest::Client::new(),
             tmdb_api_key: RwLock::new(None),
+            douban_cookie: RwLock::new(None),
+            scan_lock: tokio::sync::Mutex::new(()),
             playback_sessions: RwLock::new(HashMap::<String, PlaybackSession>::new()),
             session_capabilities: RwLock::new(HashMap::new()),
+            admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),
+            admin_http_logs: RwLock::new(std::collections::VecDeque::new()),
+            playback_distribution: RwLock::new(crate::app::state::PlaybackDistribution::default()),
             ws_event_tx,
             sa_config: crate::config::StrmAssistantConfig::default(),
             intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),

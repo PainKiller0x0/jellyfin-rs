@@ -1,0 +1,17 @@
+[project]
+name = "jellyfin-rs-openapi-contract-tests"
+version = "0.1.0"
+description = "OpenAPI contract tests for a local Emby-compatible Jellyfin server."
+requires-python = ">=3.11"
+dependencies = [
+  "jsonschema>=4.23.0",
+  "pytest>=8.3.0",
+  "requests>=2.32.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra --tb=short"
+testpaths = ["."]
+filterwarnings = [
+  "ignore:jsonschema.RefResolver is deprecated:DeprecationWarning",
+]

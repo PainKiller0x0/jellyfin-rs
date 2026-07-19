@@ -16,6 +16,7 @@ pub struct Model {
     pub official_rating: Option<String>,
     pub extended_video_type: Option<String>,
     pub production_year: Option<i64>,
+    pub premiere_date: Option<String>,
     pub runtime_ticks: Option<i64>,
     pub size_bytes: Option<i64>,
     pub modified_at: i64,

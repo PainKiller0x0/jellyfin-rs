@@ -16,7 +16,7 @@ use crate::{
     jellyfin::common::internal_error,
     library::path_utils,
     playback::streaming::readable_media_path,
-    util::{now_unix, stable_text_id},
+    util::{normalize_yyyy_mm_dd, now_unix, stable_text_id, year_from_yyyy_mm_dd},
 };
 
 const MAX_ITEM_METADATA_NAME_LEN: usize = 512;
@@ -155,10 +155,8 @@ async fn descendant_item_rows(
     db: &DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let backend = db.get_database_backend();
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             r#"WITH RECURSIVE tree(id, path) AS (SELECT id, path FROM media_items WHERE id = ? UNION ALL SELECT media_items.id, media_items.path FROM media_items JOIN tree ON media_items.parent_id = tree.id) SELECT id, path FROM tree"#,
             vec![item_id.into()],
         ))
@@ -170,7 +168,6 @@ async fn descendant_item_rows(
 }
 
 async fn delete_item_records(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<()> {
-    let backend = db.get_database_backend();
     for table in [
         "media_streams",
         "user_data",
@@ -181,16 +178,14 @@ async fn delete_item_records(db: &DatabaseConnection, item_id: &str) -> anyhow::
         "provider_ids",
         "image_assets",
     ] {
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             &format!("DELETE FROM {table} WHERE item_id = ?"),
             vec![item_id.into()],
         ))
         .await
         .with_context(|| format!("failed to delete {table} for item: {item_id}"))?;
     }
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
+    db.execute(crate::db::helpers::pg_statement(
         "DELETE FROM media_items WHERE id = ?",
         vec![item_id.into()],
     ))
@@ -201,8 +196,7 @@ async fn delete_item_records(db: &DatabaseConnection, item_id: &str) -> anyhow::
 
 async fn media_item_exists(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<bool> {
     Ok(db
-        .query_one(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        .query_one(crate::db::helpers::pg_statement(
             "SELECT id FROM media_items WHERE id = ?",
             vec![item_id.into()],
         ))
@@ -218,11 +212,9 @@ pub(crate) async fn update_item_inner(
 ) -> anyhow::Result<bool> {
     let body = normalize_item_update_body(body).map_err(|(_, message)| anyhow::anyhow!(message))?;
     let now = now_unix();
-    let backend = db.get_database_backend();
     let existing = db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
-            "SELECT title, overview, production_year FROM media_items WHERE id = ?",
+        .query_one(crate::db::helpers::pg_statement(
+            "SELECT title, overview, production_year, premiere_date, community_rating, runtime_ticks FROM media_items WHERE id = ?",
             vec![item_id.into()],
         ))
         .await
@@ -246,12 +238,38 @@ pub(crate) async fn update_item_inner(
     let production_year = body
         .get("ProductionYear")
         .and_then(Value::as_i64)
+        .or_else(|| {
+            body.get("PremiereDate")
+                .and_then(Value::as_str)
+                .and_then(year_from_yyyy_mm_dd)
+        })
         .or(existing.get_opt_i64("production_year")?);
+    let premiere_date = body
+        .get("PremiereDate")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or(existing.get_opt_str("premiere_date")?);
+    let community_rating = body
+        .get("CommunityRating")
+        .and_then(Value::as_f64)
+        .or(existing.get_f64("community_rating")?);
+    let runtime_ticks = body
+        .get("RuntimeTicks")
+        .and_then(Value::as_i64)
+        .or(existing.get_opt_i64("runtime_ticks")?);
 
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
-        "UPDATE media_items SET title = ?, overview = ?, production_year = ?, updated_at = ? WHERE id = ?",
-        vec![title.into(), overview.into(), production_year.into(), now.into(), item_id.into()],
+    db.execute(crate::db::helpers::pg_statement(
+        "UPDATE media_items SET title = ?, overview = ?, production_year = ?, premiere_date = ?, community_rating = ?, runtime_ticks = ?, updated_at = ? WHERE id = ?",
+        vec![
+            title.into(),
+            overview.into(),
+            production_year.into(),
+            premiere_date.into(),
+            community_rating.into(),
+            runtime_ticks.into(),
+            now.into(),
+            item_id.into(),
+        ],
     ))
     .await
     .with_context(|| format!("failed to update item metadata: {item_id}"))?;
@@ -263,8 +281,7 @@ pub(crate) async fn update_item_inner(
             else {
                 continue;
             };
-            db.execute(crate::db::helpers::portable_statement(
-                backend,
+            db.execute(crate::db::helpers::pg_statement(
                 r#"INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, ?, ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id"#,
                 vec![item_id.into(), provider.as_str().into(), provider_item_id.into()],
             ))
@@ -334,6 +351,37 @@ pub(crate) fn normalize_item_update_body(body: Value) -> Result<Value, (StatusCo
                 return Err((StatusCode::BAD_REQUEST, "Invalid production year"));
             }
             normalized.insert("ProductionYear".to_string(), Value::from(year));
+        }
+    }
+    if let Some(value) = input.get("PremiereDate") {
+        if !value.is_null() {
+            let date = value
+                .as_str()
+                .and_then(normalize_yyyy_mm_dd)
+                .ok_or((StatusCode::BAD_REQUEST, "Invalid premiere date"))?;
+            normalized.insert("PremiereDate".to_string(), Value::String(date));
+        }
+    }
+    if let Some(value) = input.get("CommunityRating") {
+        if !value.is_null() {
+            let rating = value
+                .as_f64()
+                .ok_or((StatusCode::BAD_REQUEST, "Invalid community rating"))?;
+            if !(0.0..=10.0).contains(&rating) {
+                return Err((StatusCode::BAD_REQUEST, "Invalid community rating"));
+            }
+            normalized.insert("CommunityRating".to_string(), Value::from(rating));
+        }
+    }
+    if let Some(value) = input.get("RuntimeTicks") {
+        if !value.is_null() {
+            let runtime_ticks = value
+                .as_i64()
+                .ok_or((StatusCode::BAD_REQUEST, "Invalid runtime ticks"))?;
+            if runtime_ticks < 0 {
+                return Err((StatusCode::BAD_REQUEST, "Invalid runtime ticks"));
+            }
+            normalized.insert("RuntimeTicks".to_string(), Value::from(runtime_ticks));
         }
     }
     if let Some(provider_ids) = input.get("ProviderIds") {
@@ -548,8 +596,7 @@ async fn item_content_type_path(
     item_id: &str,
 ) -> anyhow::Result<Option<String>> {
     let Some(row) = db
-        .query_one(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        .query_one(crate::db::helpers::pg_statement(
             "SELECT path, is_folder FROM media_items WHERE id = ?",
             vec![item_id.into()],
         ))
@@ -580,9 +627,7 @@ async fn update_named_relations(
     let Some(values) = body.get(body_key).and_then(Value::as_array) else {
         return Ok(());
     };
-    let backend = db.get_database_backend();
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
+    db.execute(crate::db::helpers::pg_statement(
         &format!("DELETE FROM {relation_table} WHERE item_id = ?"),
         vec![item_id.into()],
     ))
@@ -593,15 +638,13 @@ async fn update_named_relations(
             continue;
         };
         let id = stable_text_id(&format!("{table}:{}", name.trim().to_ascii_lowercase()));
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             &format!("INSERT INTO {table} (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING"),
             vec![id.clone().into(), name.trim().into(), now_unix().into()],
         ))
         .await
         .with_context(|| format!("failed to upsert {table}: {name}"))?;
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             &format!("INSERT INTO {relation_table} (item_id, {relation_column}) VALUES (?, ?) ON CONFLICT(item_id, {relation_column}) DO NOTHING"),
             vec![item_id.into(), id.into()],
         ))
@@ -615,9 +658,7 @@ async fn update_people(db: &DatabaseConnection, item_id: &str, body: &Value) -> 
     let Some(values) = body.get("People").and_then(Value::as_array) else {
         return Ok(());
     };
-    let backend = db.get_database_backend();
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
+    db.execute(crate::db::helpers::pg_statement(
         "DELETE FROM media_people WHERE item_id = ?",
         vec![item_id.into()],
     ))
@@ -634,15 +675,13 @@ async fn update_people(db: &DatabaseConnection, item_id: &str, body: &Value) -> 
         let id = stable_text_id(&format!("people:{}", name.trim().to_ascii_lowercase()));
         let role = value.get("Role").and_then(Value::as_str);
         let person_type = value.get("Type").and_then(Value::as_str).unwrap_or("Actor");
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO people (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING",
             vec![id.clone().into(), name.trim().into(), now_unix().into()],
         ))
         .await
         .with_context(|| format!("failed to upsert person: {name}"))?;
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_people (item_id, person_id, role, person_type, sort_order) VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id, person_id, person_type) DO UPDATE SET role = excluded.role, sort_order = excluded.sort_order",
             vec![item_id.into(), id.into(), role.into(), person_type.into(), i64::try_from(sort_order).unwrap_or(i64::MAX).into()],
         ))
@@ -674,12 +713,10 @@ pub async fn add_item_tag(
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return internal_error(e),
     }
-    let backend = state.db.get_database_backend();
     let id = stable_text_id(&format!("tags:{}", name.trim().to_ascii_lowercase()));
     if let Err(e) = state
         .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
+        .execute(crate::db::helpers::pg_statement(
             "INSERT INTO tags (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING",
             vec![id.clone().into(), name.trim().into(), now_unix().into()],
         ))
@@ -687,8 +724,7 @@ pub async fn add_item_tag(
     {
         return internal_error(e.into());
     }
-    if let Err(e) = state.db.execute(crate::db::helpers::portable_statement(
-        backend,
+    if let Err(e) = state.db.execute(crate::db::helpers::pg_statement(
         "INSERT INTO media_tags (item_id, tag_id) VALUES (?, ?) ON CONFLICT(item_id, tag_id) DO NOTHING",
         vec![item_id.into(), id.into()],
     )).await {
@@ -719,12 +755,10 @@ pub async fn delete_item_tag(
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return internal_error(e),
     }
-    let backend = state.db.get_database_backend();
     let id = stable_text_id(&format!("tags:{}", name.trim().to_ascii_lowercase()));
     if let Err(e) = state
         .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
+        .execute(crate::db::helpers::pg_statement(
             "DELETE FROM media_tags WHERE item_id = ? AND tag_id = ?",
             vec![item_id.into(), id.into()],
         ))
@@ -740,10 +774,8 @@ pub async fn delete_item_subtitle(
     State(state): State<Arc<AppState>>,
     Path((item_id, index)): Path<(String, i64)>,
 ) -> Response {
-    let backend = state.db.get_database_backend();
     // Find the subtitle stream to get its file path
-    let row = state.db.query_one(crate::db::helpers::portable_statement(
-        backend,
+    let row = state.db.query_one(crate::db::helpers::pg_statement(
         "SELECT path FROM media_streams WHERE item_id = ? AND stream_index = ? AND stream_type = 'Subtitle' AND is_external = 1",
         vec![item_id.clone().into(), index.into()],
     )).await;
@@ -761,8 +793,7 @@ pub async fn delete_item_subtitle(
                 }
             }
             // Remove from media_streams
-            if let Err(error) = state.db.execute(crate::db::helpers::portable_statement(
-                backend,
+            if let Err(error) = state.db.execute(crate::db::helpers::pg_statement(
                 "DELETE FROM media_streams WHERE item_id = ? AND stream_index = ? AND stream_type = 'Subtitle'",
                 vec![item_id.into(), index.into()],
             )).await {
@@ -779,12 +810,10 @@ pub async fn make_item_private(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
 ) -> Response {
-    let backend = state.db.get_database_backend();
     let now = now_unix();
     match state
         .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
+        .execute(crate::db::helpers::pg_statement(
             "UPDATE media_items SET is_public = 0, updated_at = ? WHERE id = ?",
             vec![now.into(), item_id.into()],
         ))
@@ -801,12 +830,10 @@ pub async fn make_item_public(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
 ) -> Response {
-    let backend = state.db.get_database_backend();
     let now = now_unix();
     match state
         .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
+        .execute(crate::db::helpers::pg_statement(
             "UPDATE media_items SET is_public = 1, updated_at = ? WHERE id = ?",
             vec![now.into(), item_id.into()],
         ))
@@ -825,12 +852,14 @@ mod tests {
         MAX_ITEM_RELATION_NAMES, delete_item_records_for_ids, media_item_exists,
         normalize_item_update_body, update_item_content_type_inner, update_item_inner,
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use sea_orm::{ConnectionTrait, DatabaseConnection};
     use serde_json::json;
 
     #[tokio::test]
     async fn item_missing_checks_report_false() {
-        let db = test_db().await;
+        let Some(db) = test_db().await else {
+            return;
+        };
         assert!(!media_item_exists(&db, "missing").await.unwrap());
         assert!(
             !update_item_inner(&db, "missing", json!({ "Name": "Nope" }))
@@ -901,7 +930,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_item_records_removes_descendants() {
-        let db = test_db().await;
+        let Some(db) = test_db().await else {
+            return;
+        };
         insert_media_item(&db, "parent", "", 1).await;
         insert_media_item(&db, "child", "parent", 0).await;
 
@@ -915,11 +946,12 @@ mod tests {
 
     #[tokio::test]
     async fn is_public_column_is_migrated() {
-        let db = test_db().await;
+        let Some(db) = test_db().await else {
+            return;
+        };
         insert_media_item(&db, "movie", "", 0).await;
         let result = db
-            .execute(crate::db::helpers::portable_statement(
-                db.get_database_backend(),
+            .execute(crate::db::helpers::pg_statement(
                 "UPDATE media_items SET is_public = 0 WHERE id = ?",
                 vec!["movie".into()],
             ))
@@ -930,7 +962,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_item_content_type_stores_folder_override() {
-        let db = test_db().await;
+        let Some(db) = test_db().await else {
+            return;
+        };
         insert_media_item(&db, "file", "", 0).await;
 
         assert!(
@@ -947,7 +981,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_item_content_type_empty_value_clears_override() {
-        let db = test_db().await;
+        let Some(db) = test_db().await else {
+            return;
+        };
         insert_media_item(&db, "folder", "", 1).await;
 
         update_item_content_type_inner(&db, "folder", "movies")
@@ -964,7 +1000,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_item_content_type_reports_missing_item() {
-        let db = test_db().await;
+        let Some(db) = test_db().await else {
+            return;
+        };
         assert!(
             !update_item_content_type_inner(&db, "missing", "movies")
                 .await
@@ -972,15 +1010,12 @@ mod tests {
         );
     }
 
-    async fn test_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db
+    async fn test_db() -> Option<DatabaseConnection> {
+        crate::db::test_db().await
     }
 
     async fn insert_media_item(db: &DatabaseConnection, id: &str, parent_id: &str, is_folder: i64) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', ?, 1, 1, 1)",
             vec![
                 id.into(),

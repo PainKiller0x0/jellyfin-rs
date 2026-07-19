@@ -24,7 +24,7 @@ This project is deeply inspired by and grateful to:
 - **图片管理** — 上传/获取/删除封面海报，ETag/304 缓存
 - **播放会话** — 活跃会话追踪，可配超时清理
 - **活动日志** — 登录/扫描/编辑操作审计
-- **SQLite 默认** — 通过 `JELLYFIN_RS_DATABASE_URL` 可切换 PostgreSQL
+- **PostgreSQL 存储** — 使用 `JELLYFIN_RS_DATABASE_URL` 配置数据库连接
 
 ## 快速开始 / Quick Start
 
@@ -59,7 +59,7 @@ cargo run --release
 |----------|--------|------|
 | `JELLYFIN_RS_HOST` | `127.0.0.1` | 监听地址 |
 | `JELLYFIN_RS_PORT` | `8096` | 监听端口 |
-| `JELLYFIN_RS_DATABASE_URL` | `sqlite://jellyfin-rs.db` | 数据库连接 |
+| `JELLYFIN_RS_DATABASE_URL` | `postgresql://postgres:postgres@127.0.0.1:5432/jellyfin_rs` | PostgreSQL 数据库连接 |
 | `JELLYFIN_RS_MEDIA_DIRS` | (无) | 媒体目录，分号分隔 |
 | `JELLYFIN_RS_SCAN_ON_STARTUP` | `true` | 启动时扫描媒体库 |
 | `JELLYFIN_RS_USER` | `tsukimi` | 默认管理员用户名 |

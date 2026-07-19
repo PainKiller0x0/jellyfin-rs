@@ -1,4 +1,5 @@
 pub mod classify;
+pub mod douban_metadata;
 pub mod image_processing;
 pub mod images;
 pub mod metadata;

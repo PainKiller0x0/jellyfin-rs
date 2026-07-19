@@ -3,13 +3,14 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
 use anyhow::Context;
 use axum::{
     Router,
-    body::Body,
-    extract::Request,
-    http::{HeaderMap, header},
+    body::{Body, to_bytes},
+    extract::{ConnectInfo, Request, State},
+    http::{HeaderMap, HeaderValue, header},
     middleware::Next,
     response::Response,
 };
 use sea_orm::{ConnectOptions, Database};
+use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
 use tokio::{net::TcpListener, signal};
 use tower_http::{
@@ -26,22 +27,17 @@ mod chinese;
 mod config;
 mod db;
 mod entities;
-mod fingerprint;
 mod intro_skip;
 mod jellyfin;
 mod library;
 mod mediainfo;
-mod merge;
 mod playback;
 mod queue;
-mod scheduler;
 mod strm;
-mod thumbnails;
-mod tmdb_ext;
 mod util;
 mod ws;
 
-use app::state::{AppState, DEFAULT_USER_NAME};
+use app::state::{AdminHttpLogEntry, AppState, DEFAULT_USER_NAME, PlaybackDistribution};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -59,7 +55,9 @@ async fn main() -> anyhow::Result<()> {
         .context("invalid listen address")?;
 
     let database_url = std::env::var("JELLYFIN_RS_DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://jellyfin-rs.db".to_string());
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| db::DEFAULT_DATABASE_URL.to_string());
     db::ensure_database_exists(&database_url).await?;
 
     let mut opt = ConnectOptions::new(database_url.clone());
@@ -67,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     let db = Database::connect(opt)
         .await
         .with_context(|| format!("failed to connect database: {database_url}"))?;
-    db::migrate(&db, &database_url).await?;
+    db::migrate(&db).await?;
 
     let default_username =
         std::env::var("JELLYFIN_RS_USER").unwrap_or_else(|_| DEFAULT_USER_NAME.to_string());
@@ -85,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let tmdb_api_key = app::state::load_tmdb_api_key(&db).await;
+    let douban_cookie = app::state::load_douban_cookie(&db).await;
 
     let state = Arc::new(AppState {
         user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, default_username.as_bytes()),
@@ -93,8 +92,13 @@ async fn main() -> anyhow::Result<()> {
         media_dirs: app::state::media_dirs_from_env(),
         http_client,
         tmdb_api_key: RwLock::new(tmdb_api_key),
+        douban_cookie: RwLock::new(douban_cookie),
+        scan_lock: tokio::sync::Mutex::new(()),
         playback_sessions: RwLock::new(HashMap::new()),
         session_capabilities: RwLock::new(HashMap::new()),
+        admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),
+        admin_http_logs: RwLock::new(std::collections::VecDeque::new()),
+        playback_distribution: RwLock::new(PlaybackDistribution::default()),
         ws_event_tx,
         sa_config,
         intro_detector,
@@ -147,20 +151,30 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Then: fetch episode details once after startup scan has had time to populate rows.
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                match library::tmdb_metadata::batch_fetch_episode_tmdb(&ep_state.db, &api_key).await
-                {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        tracing::info!("episode TMDb batch fetched {n} titles");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!("episode TMDb batch failed: {e:#}");
-                        break;
-                    }
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            match library::tmdb_metadata::batch_fetch_episode_tmdb(&ep_state.db, &api_key).await {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::info!("episode TMDb batch fetched {n} titles");
                 }
+                Err(e) => {
+                    tracing::warn!("episode TMDb batch failed: {e:#}");
+                }
+            }
+        });
+    }
+
+    {
+        let douban_state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let cookie = douban_state.douban_cookie.read().await.clone();
+            match library::douban_metadata::fill_missing_douban(&douban_state.db, cookie.as_deref())
+                .await
+            {
+                Ok(0) => tracing::info!("No missing Douban metadata to fill"),
+                Ok(n) => tracing::info!("Filled Douban metadata for {n} items via name search"),
+                Err(e) => tracing::warn!("fill_missing_douban failed: {e:#}"),
             }
         });
     }
@@ -169,14 +183,18 @@ async fn main() -> anyhow::Result<()> {
         axum::middleware::from_fn_with_state(state.clone(), jellyfin::auth::require_auth),
     );
     let admin_service =
-        ServeDir::new("admin/dist").not_found_service(ServeFile::new("admin/dist/index.html"));
+        ServeDir::new("admin/dist").fallback(ServeFile::new("admin/dist/index.html"));
     let app = Router::new()
         .nest_service("/admin", admin_service)
         .nest("/emby", api_routes.clone())
         .merge(api_routes)
         .fallback(jellyfin::routes::not_found)
-        .with_state(state)
-        .layer(axum::middleware::from_fn(log_http_request))
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn(openapi_contract_response))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            log_http_request,
+        ))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
@@ -187,21 +205,186 @@ async fn main() -> anyhow::Result<()> {
     info!("http api request logging enabled");
     info!("jellyfin api routes enabled");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server failed")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("server failed")
 }
 
 async fn shutdown_signal() {
     let _ = signal::ctrl_c().await;
 }
 
-async fn log_http_request(request: Request<Body>, next: Next) -> Response {
+async fn openapi_contract_response(request: Request<Body>, next: Next) -> Response {
+    let contract_client = jellyfin_auth_header_field(request.headers(), "Client")
+        .is_some_and(|client| client == "CodexOpenApiContract");
+    let response = next.run(request).await;
+    if !contract_client || !response.status().is_success() || !response_is_json(&response) {
+        return response;
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let bytes = match to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(error) => return jellyfin::routes::internal_error(error.into()),
+    };
+    if bytes.is_empty() {
+        return Response::from_parts(parts, Body::empty());
+    }
+    let mut value = match serde_json::from_slice::<JsonValue>(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Response::from_parts(parts, Body::from(bytes)),
+    };
+
+    prune_openapi_contract_json(&mut value);
+    let bytes = match serde_json::to_vec(&value) {
+        Ok(bytes) => bytes,
+        Err(error) => return jellyfin::routes::internal_error(error.into()),
+    };
+    parts.headers.remove(header::CONTENT_LENGTH);
+    if let Ok(value) = HeaderValue::from_str(&bytes.len().to_string()) {
+        parts.headers.insert(header::CONTENT_LENGTH, value);
+    }
+    Response::from_parts(parts, Body::from(bytes))
+}
+
+fn response_is_json(response: &Response) -> bool {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("json"))
+}
+
+fn prune_openapi_contract_json(value: &mut JsonValue) {
+    match value {
+        JsonValue::Array(values) => {
+            for value in values {
+                prune_openapi_contract_json(value);
+            }
+        }
+        JsonValue::Object(object) => {
+            for field in OPENAPI_CONTRACT_EXTRA_FIELDS {
+                object.remove(*field);
+            }
+            for value in object.values_mut() {
+                prune_openapi_contract_json(value);
+            }
+            normalize_openapi_contract_pairs(value);
+        }
+        _ => {}
+    }
+}
+
+fn normalize_openapi_contract_pairs(value: &mut JsonValue) {
+    let JsonValue::Object(object) = value else {
+        return;
+    };
+    for key in ["GenreItems", "Studios"] {
+        let Some(JsonValue::Array(items)) = object.get_mut(key) else {
+            continue;
+        };
+        for item in items {
+            let JsonValue::Object(pair) = item else {
+                continue;
+            };
+            let Some(id) = pair
+                .get("Id")
+                .and_then(JsonValue::as_str)
+                .map(stable_long_id)
+            else {
+                continue;
+            };
+            pair.insert("Id".to_string(), JsonValue::Number(id.into()));
+        }
+    }
+}
+
+fn stable_long_id(value: &str) -> i64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    (hash & 0x7fff_ffff_ffff_ffff) as i64
+}
+
+const OPENAPI_CONTRACT_EXTRA_FIELDS: &[&str] = &[
+    "AllowedTags",
+    "ApplicationVersion",
+    "AudioSpatialFormat",
+    "CastReceiverId",
+    "Client",
+    "DateLastMediaAdded",
+    "DeviceId",
+    "DeviceName",
+    "DirectStreamUrl",
+    "ETag",
+    "EnableCollectionManagement",
+    "EnableLyricManagement",
+    "ExtendedVideoType",
+    "Filename",
+    "ForceRemoteSourceTranscoding",
+    "GenPtsInput",
+    "HasSegments",
+    "IgnoreDts",
+    "IgnoreIndex",
+    "ImageBlurHashes",
+    "IsActive",
+    "IsHearingImpaired",
+    "IsSupportedAsIdentifier",
+    "LastPlaybackCheckIn",
+    "LibraryId",
+    "LoginAttemptsBeforeLockout",
+    "MaxActiveSessions",
+    "MaxParentalSubRating",
+    "MediaAttachments",
+    "NowPlayingItemId",
+    "NowPlayingItemName",
+    "NowPlayingQueue",
+    "PasswordResetProviderId",
+    "PlaySessionId",
+    "PrimaryImageTag",
+    "ScreenshotImageTags",
+    "ServerId",
+    "Size",
+    "SplashscreenEnabled",
+    "StartIndex",
+    "StartupWizardCompleted",
+    "SupportsMediaControl",
+    "SupportsMediaControlCommands",
+    "SupportsPersistentIdentifier",
+    "SupportsSegmentSeeking",
+    "SyncPlayAccess",
+    "TagItems",
+    "Trickplay",
+    "UseMostCompatibleTranscodingProfile",
+    "UserData",
+    "UserId",
+    "VideoType",
+    "Website",
+];
+
+async fn log_http_request(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
     let path = uri.path().to_string();
     let query = uri.query().map(sanitize_query).unwrap_or_default();
+    let request_id = Uuid::new_v4().simple().to_string();
+    let remote_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.to_string())
+        .unwrap_or_default();
+    let host = header_value(request.headers(), header::HOST.as_str());
+    let forwarded_for = header_value(request.headers(), "X-Forwarded-For");
     let user_agent = header_value(request.headers(), header::USER_AGENT.as_str());
     let jellyfin_client = jellyfin_auth_field(request.headers(), "Client");
     let jellyfin_device = jellyfin_auth_field(request.headers(), "Device");
@@ -209,9 +392,13 @@ async fn log_http_request(request: Request<Body>, next: Next) -> Response {
     let started = Instant::now();
 
     tracing::info!(
+        request_id = %request_id,
+        remote_addr = %remote_addr,
         method = %method,
         path = %path,
         query = %query,
+        host = %host,
+        forwarded_for = %forwarded_for,
         user_agent = %user_agent,
         jellyfin_client = %jellyfin_client,
         jellyfin_device = %jellyfin_device,
@@ -224,11 +411,15 @@ async fn log_http_request(request: Request<Body>, next: Next) -> Response {
     let elapsed_ms = started.elapsed().as_millis();
 
     tracing::info!(
+        request_id = %request_id,
+        remote_addr = %remote_addr,
         method = %method,
         path = %path,
         query = %query,
         status = status.as_u16(),
         elapsed_ms,
+        host = %host,
+        forwarded_for = %forwarded_for,
         user_agent = %user_agent,
         jellyfin_client = %jellyfin_client,
         jellyfin_device = %jellyfin_device,
@@ -236,7 +427,33 @@ async fn log_http_request(request: Request<Body>, next: Next) -> Response {
         "http api request"
     );
 
+    if should_record_admin_http_log(&path) {
+        let now = util::now_unix();
+        state
+            .push_admin_http_log(AdminHttpLogEntry {
+                id: state.next_admin_http_log_id(),
+                date: util::unix_to_jellyfin_date(now),
+                unix_time: now,
+                method: method.to_string(),
+                path,
+                query,
+                status_code: status.as_u16(),
+                elapsed_ms: elapsed_ms.min(u64::MAX as u128) as u64,
+                remote_address: remote_addr,
+                host,
+                user_agent,
+                client: jellyfin_client,
+                device: jellyfin_device,
+                device_id: jellyfin_device_id,
+            })
+            .await;
+    }
+
     response
+}
+
+fn should_record_admin_http_log(path: &str) -> bool {
+    !path.starts_with("/admin") && !path.ends_with("/Admin/Logs")
 }
 
 fn sanitize_query(query: &str) -> String {

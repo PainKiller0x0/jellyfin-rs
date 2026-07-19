@@ -248,8 +248,7 @@ pub fn default_device_profile() -> Value {
 async fn profile_infos_inner(db: &sea_orm::DatabaseConnection) -> anyhow::Result<Vec<Value>> {
     let mut profiles = vec![profile_info(&default_device_profile(), "System")];
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        .query_all(crate::db::helpers::pg_statement(
             "SELECT value FROM app_settings WHERE key LIKE 'dlna_profile:%' ORDER BY key ASC",
             vec![],
         ))
@@ -320,8 +319,7 @@ async fn delete_profile_inner(
         return Ok(false);
     };
     let result = db
-        .execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        .execute(crate::db::helpers::pg_statement(
             "DELETE FROM app_settings WHERE key = ?",
             vec![profile_key(profile_id).into()],
         ))
@@ -402,10 +400,10 @@ pub fn apply_playback_profile(
         "Audio"
     };
     let direct_play = supports_direct_play(profile, media_type, container, media_streams);
-    let bitrate = profile_bitrate(profile, media_type);
+    let fallback_bitrate = profile_bitrate(profile, media_type);
 
     object.insert("SupportsDirectPlay".to_string(), json!(direct_play));
-    object.insert("SupportsDirectStream".to_string(), json!(direct_play));
+    object.insert("SupportsDirectStream".to_string(), json!(true));
     object.insert("SupportsTranscoding".to_string(), json!(false));
     object.insert(
         "DefaultAudioStreamIndex".to_string(),
@@ -430,10 +428,12 @@ pub fn apply_playback_profile(
     object.insert("EncoderProtocol".to_string(), Value::Null);
     object.insert("Type".to_string(), json!("Default"));
     object.insert("IsRemote".to_string(), json!(false));
-    object.insert(
-        "Bitrate".to_string(),
-        bitrate.map_or(Value::Null, Value::from),
-    );
+    if let Some(bitrate) = fallback_bitrate {
+        object.insert(
+            "FallbackMaxStreamingBitrate".to_string(),
+            Value::from(bitrate),
+        );
+    }
     object.insert(
         "DeviceProfileId".to_string(),
         query
@@ -644,13 +644,13 @@ fn soap_xml(status: StatusCode, xml: String) -> Response {
 mod tests {
     use super::{
         DEFAULT_PROFILE_ID, MAX_DLNA_PROFILE_ID_LEN, MAX_DLNA_PROFILE_JSON_BYTES,
-        connection_manager_control, connection_manager_description, content_directory_control,
-        content_directory_description, delete_profile_inner, profile_by_id_inner,
-        profile_infos_inner, save_profile_inner,
+        apply_playback_profile, connection_manager_control, connection_manager_description,
+        content_directory_control, content_directory_description, delete_profile_inner,
+        profile_by_id_inner, profile_infos_inner, save_profile_inner,
     };
     use axum::body::Bytes;
     use axum::http::{HeaderMap, HeaderValue};
-    use sea_orm::{Database, DatabaseConnection};
+    use sea_orm::DatabaseConnection;
     use serde_json::json;
 
     #[tokio::test]
@@ -709,9 +709,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn playback_profile_keeps_http_direct_stream_when_direct_play_profile_misses_container() {
+        let mut media_source = json!({
+            "Container": "mkv",
+            "MediaStreams": [
+                { "Type": "Video", "Codec": "hevc", "Index": 0 },
+                { "Type": "Audio", "Codec": "aac", "Index": 1 }
+            ],
+        });
+        let profile = json!({
+            "DirectPlayProfiles": [
+                { "Container": "mp4", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac" }
+            ]
+        });
+        let streams = media_source["MediaStreams"].as_array().unwrap().clone();
+
+        apply_playback_profile(
+            &mut media_source,
+            &profile,
+            &streams,
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(media_source["SupportsDirectPlay"], false);
+        assert_eq!(media_source["SupportsDirectStream"], true);
+        assert_eq!(media_source["SupportsTranscoding"], false);
+    }
+
+    #[test]
+    fn playback_profile_preserves_media_bitrate_and_sets_fallback_limit() {
+        let mut media_source = json!({
+            "Container": "mkv",
+            "Bitrate": 18_000_000,
+            "MediaStreams": [
+                { "Type": "Video", "Codec": "hevc", "Index": 0 },
+                { "Type": "Audio", "Codec": "aac", "Index": 1 }
+            ],
+        });
+        let profile = json!({
+            "MaxStaticBitrate": 200_000_000,
+            "DirectPlayProfiles": [
+                { "Container": "mkv", "Type": "Video", "VideoCodec": "hevc", "AudioCodec": "aac" }
+            ]
+        });
+        let streams = media_source["MediaStreams"].as_array().unwrap().clone();
+
+        apply_playback_profile(
+            &mut media_source,
+            &profile,
+            &streams,
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(media_source["Bitrate"], 18_000_000);
+        assert_eq!(media_source["FallbackMaxStreamingBitrate"], 200_000_000);
+    }
+
     #[tokio::test]
     async fn dlna_profiles_can_be_saved_listed_and_deleted() {
-        let db = test_db().await;
+        let Some(db) = test_db().await else {
+            return;
+        };
         let profile = json!({ "Id": "living-room", "Name": "Living Room" });
 
         assert!(save_profile_inner(&db, profile).await.unwrap());
@@ -740,7 +799,9 @@ mod tests {
 
     #[tokio::test]
     async fn default_dlna_profile_is_read_only() {
-        let db = test_db().await;
+        let Some(db) = test_db().await else {
+            return;
+        };
         assert!(
             !save_profile_inner(&db, json!({ "Id": DEFAULT_PROFILE_ID, "Name": "Changed" }))
                 .await
@@ -758,7 +819,9 @@ mod tests {
 
     #[tokio::test]
     async fn dlna_profile_writes_are_limited() {
-        let db = test_db().await;
+        let Some(db) = test_db().await else {
+            return;
+        };
         assert!(!save_profile_inner(&db, json!(["bad"])).await.unwrap());
         assert!(
             !save_profile_inner(&db, json!({ "Id": "../bad", "Name": "Bad" }))
@@ -798,9 +861,7 @@ mod tests {
         );
     }
 
-    async fn test_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db
+    async fn test_db() -> Option<DatabaseConnection> {
+        crate::db::test_db().await
     }
 }

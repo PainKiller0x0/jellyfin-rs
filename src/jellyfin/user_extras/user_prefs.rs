@@ -29,11 +29,9 @@ pub async fn get_user_settings(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<String>,
 ) -> Response {
-    let backend = state.db.get_database_backend();
     let rows = state
         .db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             "SELECT key, value FROM app_settings WHERE key LIKE ?",
             vec![format!("user_settings:{}:%", user_id).into()],
         ))
@@ -62,7 +60,6 @@ pub async fn update_user_settings(
     Path(user_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let backend = state.db.get_database_backend();
     let Some(obj) = body.as_object() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -85,8 +82,7 @@ pub async fn update_user_settings(
         let now = crate::util::now_unix();
         if let Err(error) = state
             .db
-            .execute(crate::db::helpers::portable_statement(
-                backend,
+            .execute(crate::db::helpers::pg_statement(
                 "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 vec![full_key.into(), value_str.as_str().into(), now.into()],
             ))
@@ -105,11 +101,9 @@ pub async fn get_typed_setting(
     if !setting_key_allowed(&key, MAX_TYPED_SETTING_KEY_LEN) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let backend = state.db.get_database_backend();
     match state
         .db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
+        .query_one(crate::db::helpers::pg_statement(
             "SELECT value FROM app_settings WHERE key = ?",
             vec![typed_setting_key(&user_id, &key).into()],
         ))
@@ -139,12 +133,10 @@ pub async fn update_typed_setting(
     let Ok(value) = serialize_json_value(&body, MAX_TYPED_SETTING_VALUE_BYTES) else {
         return validation_error_response(StatusCode::PAYLOAD_TOO_LARGE, "Setting is too large");
     };
-    let backend = state.db.get_database_backend();
     let now = crate::util::now_unix();
     match state
         .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
+        .execute(crate::db::helpers::pg_statement(
             "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             vec![
                 typed_setting_key(&user_id, &key).into(),
@@ -258,10 +250,8 @@ async fn move_playlist_item_inner(
     item_id: &str,
     new_index: usize,
 ) -> anyhow::Result<bool> {
-    let backend = db.get_database_backend();
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             r#"SELECT lc.item_id FROM linked_children lc JOIN media_items mi ON mi.id = lc.parent_id WHERE lc.parent_id = ? AND mi.item_type = 'Playlist' ORDER BY lc.sort_order ASC"#,
             vec![playlist_id.into()],
         ))
@@ -276,8 +266,7 @@ async fn move_playlist_item_inner(
     let moved = ids.remove(index);
     ids.insert(new_index.min(ids.len()), moved);
     for (index, id) in ids.iter().enumerate() {
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "UPDATE linked_children SET sort_order = ? WHERE parent_id = ? AND item_id = ?",
             vec![
                 i64::try_from(index).unwrap_or(i64::MAX).into(),
@@ -312,7 +301,7 @@ pub async fn add_to_playlist_info(
 mod tests {
     use super::*;
     use crate::app::state::PlaybackSession;
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use sea_orm::{ConnectionTrait, DatabaseConnection};
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
     use uuid::Uuid;
@@ -358,8 +347,9 @@ mod tests {
 
     #[tokio::test]
     async fn user_settings_trim_keys_before_saving() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let state = Arc::new(test_state(db));
 
         let response = update_user_settings(
@@ -373,8 +363,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let row = state
             .db
-            .query_one(crate::db::helpers::portable_statement(
-                state.db.get_database_backend(),
+            .query_one(crate::db::helpers::pg_statement(
                 "SELECT value FROM app_settings WHERE key = 'user_settings:u1:theme'",
                 vec![],
             ))
@@ -386,17 +375,16 @@ mod tests {
 
     #[tokio::test]
     async fn playlist_move_item_reorders_linked_children() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        let backend = db.get_database_backend();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         for (id, item_type) in [
             ("playlist", "Playlist"),
             ("a", "Audio"),
             ("b", "Audio"),
             ("c", "Audio"),
         ] {
-            db.execute(crate::db::helpers::portable_statement(
-                backend,
+            db.execute(crate::db::helpers::pg_statement(
                 "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', ?, 0, 1, 1, 1, 1)",
                 vec![id.into(), id.into(), id.into(), item_type.into()],
             ))
@@ -404,8 +392,7 @@ mod tests {
             .unwrap();
         }
         for (index, id) in ["a", "b", "c"].iter().enumerate() {
-            db.execute(crate::db::helpers::portable_statement(
-                backend,
+            db.execute(crate::db::helpers::pg_statement(
                 "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES ('playlist', ?, ?)",
                 vec![(*id).into(), i64::try_from(index).unwrap().into()],
             ))
@@ -425,8 +412,7 @@ mod tests {
         );
 
         let rows = db
-            .query_all(crate::db::helpers::portable_statement(
-                backend,
+            .query_all(crate::db::helpers::pg_statement(
                 "SELECT item_id FROM linked_children WHERE parent_id = 'playlist' ORDER BY sort_order ASC",
                 vec![],
             ))
@@ -448,8 +434,13 @@ mod tests {
             media_dirs: Vec::new(),
             http_client: reqwest::Client::new(),
             tmdb_api_key: RwLock::new(None),
+            douban_cookie: RwLock::new(None),
+            scan_lock: tokio::sync::Mutex::new(()),
             playback_sessions: RwLock::new(HashMap::<String, PlaybackSession>::new()),
             session_capabilities: RwLock::new(HashMap::new()),
+            admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),
+            admin_http_logs: RwLock::new(std::collections::VecDeque::new()),
+            playback_distribution: RwLock::new(crate::app::state::PlaybackDistribution::default()),
             ws_event_tx,
             sa_config: crate::config::StrmAssistantConfig::default(),
             intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),

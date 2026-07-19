@@ -13,6 +13,7 @@ use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
     jellyfin::{common::internal_error, providers},
+    library::douban_metadata,
 };
 
 pub async fn remote_search(
@@ -39,6 +40,43 @@ pub async fn remote_search(
         .cloned()
         .unwrap_or_else(|| "jellyfin-rs".to_string());
 
+    if let Some(douban_id) = provider_ids
+        .as_object()
+        .and_then(|providers| providers.get("Douban"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        let cookie = state.douban_cookie.read().await.clone();
+        match douban_metadata::douban_details(
+            &state.http_client,
+            cookie.as_deref(),
+            douban_id,
+            item_type,
+        )
+        .await
+        {
+            Ok(result) => return Json(json!([result])).into_response(),
+            Err(error) => tracing::warn!("Douban details failed for {douban_id}: {error:#}"),
+        }
+    }
+
+    let mut combined_results = Vec::new();
+    if item_type.eq_ignore_ascii_case("Movie") || item_type.eq_ignore_ascii_case("Series") {
+        let cookie = state.douban_cookie.read().await.clone();
+        match douban_metadata::douban_search(
+            &state.http_client,
+            cookie.as_deref(),
+            name,
+            production_year,
+            item_type,
+        )
+        .await
+        {
+            Ok(results) => combined_results.extend(results),
+            Err(error) => tracing::warn!("Douban search failed for {item_type}: {error:#}"),
+        }
+    }
+
     if let Some(api_key) = state
         .tmdb_api_key
         .read()
@@ -57,10 +95,13 @@ pub async fn remote_search(
         };
 
         match search_result {
-            Ok(results) if !results.is_empty() => return Json(results).into_response(),
-            Ok(_) => {}
+            Ok(results) => combined_results.extend(results),
             Err(error) => tracing::warn!("TMDb search failed for {item_type}: {error:#}"),
         }
+    }
+
+    if !combined_results.is_empty() {
+        return Json(combined_results).into_response();
     }
 
     Json(json!([{
@@ -94,8 +135,17 @@ pub async fn apply_remote_search(
     if let Some(year) = body.get("ProductionYear").cloned() {
         update["ProductionYear"] = year;
     }
+    if let Some(premiere_date) = body.get("PremiereDate").cloned() {
+        update["PremiereDate"] = premiere_date;
+    }
     if let Some(overview) = body.get("Overview").cloned() {
         update["Overview"] = overview;
+    }
+    if let Some(rating) = body.get("CommunityRating").cloned() {
+        update["CommunityRating"] = rating;
+    }
+    if let Some(runtime_ticks) = body.get("RuntimeTicks").cloned() {
+        update["RuntimeTicks"] = runtime_ticks;
     }
     if let Some(provider_ids) = body.get("ProviderIds").cloned() {
         update["ProviderIds"] = provider_ids;
@@ -118,6 +168,30 @@ pub async fn apply_remote_search(
 }
 
 async fn enrich_remote_search_result(state: &AppState, item_id: &str, body: Value) -> Value {
+    if let Some(douban_id) = body
+        .get("ProviderIds")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get("Douban"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        let item_type = remote_result_type_or_item_type(state, &body, item_id)
+            .await
+            .unwrap_or_else(|| "Movie".to_string());
+        let cookie = state.douban_cookie.read().await.clone();
+        match douban_metadata::douban_details(
+            &state.http_client,
+            cookie.as_deref(),
+            douban_id,
+            &item_type,
+        )
+        .await
+        {
+            Ok(details) => return merge_remote_search_values(body, details),
+            Err(error) => tracing::warn!("Douban details failed: {error:#}"),
+        }
+    }
+
     let Some(api_key) = state
         .tmdb_api_key
         .read()
@@ -179,8 +253,7 @@ async fn item_type_for_id(
     item_id: &str,
 ) -> anyhow::Result<Option<String>> {
     let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        .query_one(crate::db::helpers::pg_statement(
             "SELECT item_type FROM media_items WHERE id = ?",
             vec![item_id.into()],
         ))
@@ -194,9 +267,16 @@ fn merge_remote_search_values(mut base: Value, details: Value) -> Value {
         "Type",
         "Overview",
         "ProductionYear",
+        "PremiereDate",
+        "CommunityRating",
+        "RuntimeTicks",
+        "EpisodeCount",
+        "Countries",
         "Genres",
         "Studios",
         "People",
+        "ImageUrl",
+        "BackdropUrl",
     ] {
         if let Some(value) = details.get(key).filter(|value| !value.is_null()) {
             base[key] = value.clone();
@@ -221,7 +301,7 @@ fn merge_remote_search_values(mut base: Value, details: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::ConnectionTrait;
 
     #[test]
     fn remote_search_item_type_uses_last_path_segment() {
@@ -257,10 +337,10 @@ mod tests {
 
     #[tokio::test]
     async fn remote_result_type_falls_back_to_item_type() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Series', 1, 1, 1, 1)",
             vec!["series1".into(), "Series".into(), "/tmp/series".into()],
         ))

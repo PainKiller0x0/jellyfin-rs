@@ -23,6 +23,39 @@ pub async fn no_content() -> impl IntoResponse {
     StatusCode::NO_CONTENT
 }
 
+pub async fn ok() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+pub fn ok_response() -> Response {
+    StatusCode::OK.into_response()
+}
+
+pub fn wants_json_response(headers: &HeaderMap) -> bool {
+    let Some(accept) = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let values = accept
+        .split(',')
+        .filter_map(|value| value.split(';').next())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    values
+        .iter()
+        .any(|value| value == "application/json" || value.ends_with("+json"))
+        && !values.iter().any(|value| {
+            value == "*/*"
+                || value.starts_with("image/")
+                || value.starts_with("audio/")
+                || value.starts_with("video/")
+                || value == "application/octet-stream"
+        })
+}
+
 pub fn internal_error(error: anyhow::Error) -> Response {
     tracing::warn!("request failed: {error:#}");
     (
@@ -43,6 +76,13 @@ pub async fn image() -> Response {
         HeaderValue::from_static("jellyfin-rs-placeholder"),
     );
     (headers, Body::from(bytes)).into_response()
+}
+
+pub async fn image_or_empty(headers: HeaderMap) -> Response {
+    if wants_json_response(&headers) {
+        return ok_response();
+    }
+    image().await
 }
 
 /// Recursively remove null fields from a JSON object.

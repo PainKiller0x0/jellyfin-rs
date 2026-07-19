@@ -1,6 +1,9 @@
 use serde_json::{Map, Value as JsonValue, json};
 
-use crate::{db::row_ext::QueryResultExt, util::unix_to_jellyfin_date};
+use crate::{
+    db::row_ext::QueryResultExt,
+    util::{unix_to_jellyfin_date, yyyy_mm_dd_to_jellyfin_date},
+};
 
 #[derive(Clone, Debug)]
 pub struct MediaItem {
@@ -17,6 +20,7 @@ pub struct MediaItem {
     pub official_rating: Option<String>,
     pub extended_video_type: Option<String>,
     pub production_year: Option<i64>,
+    pub premiere_date: Option<String>,
     pub runtime_ticks: Option<i64>,
     pub size_bytes: Option<i64>,
     pub season_number: Option<i64>,
@@ -51,6 +55,7 @@ impl MediaItem {
             official_rating: row.get_opt_str("official_rating")?,
             extended_video_type: row.get_opt_str("extended_video_type")?,
             production_year: row.get_opt_i64("production_year")?,
+            premiere_date: row.get_opt_str("premiere_date").ok().flatten(),
             runtime_ticks: row.get_opt_i64("runtime_ticks")?,
             size_bytes: row.get_opt_i64("size_bytes")?,
             season_number: row.get_opt_i64("season_number").ok().flatten(),
@@ -79,7 +84,8 @@ impl MediaItem {
 
         let media_type = match self.item_type.as_str() {
             "Audio" => Some("Audio"),
-            "Movie" | "Episode" | "Series" | "Season" | "Video" => Some("Video"),
+            "Movie" | "Episode" | "Video" => Some("Video"),
+            "Series" | "Season" => Some("Unknown"),
             _ => None,
         };
 
@@ -116,12 +122,23 @@ impl MediaItem {
         map.insert("OriginalTitle".into(), JsonValue::Null);
         map.insert("ProductionYear".into(), opt_i64(self.production_year));
         let premiere_date = self
-            .production_year
-            .map(|y| format!("{y}-01-01T00:00:00.0000000Z"));
+            .premiere_date
+            .as_deref()
+            .and_then(yyyy_mm_dd_to_jellyfin_date);
         map.insert("PremiereDate".into(), opt_str(&premiere_date));
         map.insert("EndDate".into(), JsonValue::Null);
-        map.insert("IndexNumber".into(), opt_i64(self.episode_number));
-        map.insert("ParentIndexNumber".into(), opt_i64(self.season_number));
+        let index_number = if self.item_type == "Season" {
+            self.season_number
+        } else {
+            self.episode_number
+        };
+        let parent_index_number = if self.item_type == "Episode" {
+            self.season_number
+        } else {
+            None
+        };
+        map.insert("IndexNumber".into(), opt_i64(index_number));
+        map.insert("ParentIndexNumber".into(), opt_i64(parent_index_number));
         map.insert("IndexNumberEnd".into(), JsonValue::Null);
         map.insert("Number".into(), JsonValue::Null);
         map.insert("SortName".into(), JsonValue::String(self.title.clone()));
@@ -263,6 +280,10 @@ fn opt_f64(val: Option<f64>) -> JsonValue {
         .unwrap_or(JsonValue::Null)
 }
 
+fn opt_bool(val: Option<bool>) -> JsonValue {
+    val.map(JsonValue::Bool).unwrap_or(JsonValue::Null)
+}
+
 fn opt_str(val: &Option<String>) -> JsonValue {
     val.as_ref()
         .map(|s| JsonValue::String(s.clone()))
@@ -290,14 +311,26 @@ fn build_user_data(item: &MediaItem) -> JsonValue {
             .map(|ts| JsonValue::String(unix_to_jellyfin_date(ts)))
             .unwrap_or(JsonValue::Null),
     );
+    let playback_position_ticks = if item.played {
+        0
+    } else {
+        item.playback_position_ticks.max(0)
+    };
     map.insert(
         "PlaybackPositionTicks".into(),
-        JsonValue::Number(serde_json::Number::from(item.playback_position_ticks)),
+        JsonValue::Number(serde_json::Number::from(playback_position_ticks)),
     );
     let played_pct = if item.played {
-        JsonValue::Number(serde_json::Number::from_f64(100.0).unwrap())
+        JsonValue::Null
     } else {
         item.played_percentage
+            .or_else(|| {
+                item.runtime_ticks
+                    .filter(|runtime| *runtime > 0 && playback_position_ticks > 0)
+                    .map(|runtime| {
+                        (playback_position_ticks as f64 / runtime as f64 * 100.0).min(100.0)
+                    })
+            })
             .and_then(|f| serde_json::Number::from_f64(f).map(JsonValue::Number))
             .unwrap_or(JsonValue::Null)
     };
@@ -317,7 +350,8 @@ pub fn media_source_json_with_streams(
     media_streams: Vec<JsonValue>,
 ) -> JsonValue {
     let (media_streams, media_attachments) =
-        split_media_streams_and_attachments(&item.id, media_streams);
+        split_media_streams_and_attachments(&item.id, &item.id, media_streams);
+    let bitrate = media_source_bitrate(item.size_bytes, item.runtime_ticks, &media_streams);
     let container = item.container.as_deref().unwrap_or("bin");
     let stream_path = match item.item_type.as_str() {
         "Audio" => format!("/Audio/{}/universal", item.id),
@@ -344,7 +378,7 @@ pub fn media_source_json_with_streams(
     map.insert("IsoType".into(), JsonValue::Null);
     map.insert("Video3DFormat".into(), JsonValue::Null);
     map.insert("Timestamp".into(), JsonValue::Null);
-    map.insert("Bitrate".into(), JsonValue::Null);
+    map.insert("Bitrate".into(), opt_i64(bitrate));
     map.insert("FallbackMaxStreamingBitrate".into(), JsonValue::Null);
     map.insert("SupportsDirectPlay".into(), JsonValue::Bool(true));
     map.insert("SupportsDirectStream".into(), JsonValue::Bool(true));
@@ -390,6 +424,7 @@ pub fn media_source_json_with_streams(
 
 fn split_media_streams_and_attachments(
     item_id: &str,
+    media_source_id: &str,
     streams: Vec<JsonValue>,
 ) -> (Vec<JsonValue>, Vec<JsonValue>) {
     let mut media_streams = Vec::new();
@@ -400,7 +435,7 @@ fn split_media_streams_and_attachments(
             .and_then(JsonValue::as_str)
             .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Attachment"))
         {
-            if let Some(attachment) = media_attachment_json(item_id, &stream) {
+            if let Some(attachment) = media_attachment_json(item_id, media_source_id, &stream) {
                 attachments.push(attachment);
             }
         } else {
@@ -410,7 +445,44 @@ fn split_media_streams_and_attachments(
     (media_streams, attachments)
 }
 
-fn media_attachment_json(item_id: &str, stream: &JsonValue) -> Option<JsonValue> {
+fn media_source_bitrate(
+    size_bytes: Option<i64>,
+    runtime_ticks: Option<i64>,
+    media_streams: &[JsonValue],
+) -> Option<i64> {
+    if let (Some(size_bytes), Some(runtime_ticks)) = (size_bytes, runtime_ticks) {
+        if size_bytes > 0 && runtime_ticks > 0 {
+            return size_bytes
+                .checked_mul(8)
+                .and_then(|bits| bits.checked_mul(10_000_000))
+                .map(|bits_per_ticks| bits_per_ticks / runtime_ticks)
+                .filter(|bitrate| *bitrate > 0);
+        }
+    }
+
+    let stream_bitrate = media_streams
+        .iter()
+        .filter(|stream| {
+            stream
+                .get("Type")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|stream_type| {
+                    stream_type.eq_ignore_ascii_case("Video")
+                        || stream_type.eq_ignore_ascii_case("Audio")
+                })
+        })
+        .filter_map(|stream| stream.get("BitRate").and_then(JsonValue::as_i64))
+        .filter(|bitrate| *bitrate > 0)
+        .sum::<i64>();
+
+    (stream_bitrate > 0).then_some(stream_bitrate)
+}
+
+fn media_attachment_json(
+    item_id: &str,
+    media_source_id: &str,
+    stream: &JsonValue,
+) -> Option<JsonValue> {
     stream
         .get("Path")
         .and_then(JsonValue::as_str)
@@ -428,7 +500,7 @@ fn media_attachment_json(item_id: &str, stream: &JsonValue) -> Option<JsonValue>
         "Index": index,
         "FileName": stream.get("Title").cloned().unwrap_or(JsonValue::Null),
         "MimeType": mime_type,
-        "DeliveryUrl": format!("/Videos/{item_id}/{item_id}/Attachments/{index}")
+        "DeliveryUrl": format!("/Videos/{item_id}/{media_source_id}/Attachments/{index}")
     }))
 }
 
@@ -446,13 +518,43 @@ pub struct MediaStreamRow {
     pub stream_index: i64,
     pub stream_type: String,
     pub codec: Option<String>,
+    pub profile: Option<String>,
+    pub codec_tag: Option<String>,
     pub language: Option<String>,
     pub title: Option<String>,
+    pub comment: Option<String>,
     pub bit_rate: Option<i64>,
     pub width: Option<i64>,
     pub height: Option<i64>,
+    pub aspect_ratio: Option<String>,
+    pub average_frame_rate: Option<f64>,
+    pub real_frame_rate: Option<f64>,
+    pub reference_frame_rate: Option<f64>,
     pub channels: Option<i64>,
+    pub channel_layout: Option<String>,
     pub sample_rate: Option<i64>,
+    pub bit_depth: Option<i64>,
+    pub ref_frames: Option<i64>,
+    pub is_interlaced: bool,
+    pub is_avc: Option<bool>,
+    pub is_anamorphic: Option<bool>,
+    pub pixel_format: Option<String>,
+    pub level: Option<i64>,
+    pub color_range: Option<String>,
+    pub color_space: Option<String>,
+    pub color_transfer: Option<String>,
+    pub color_primaries: Option<String>,
+    pub time_base: Option<String>,
+    pub codec_time_base: Option<String>,
+    pub nal_length_size: Option<String>,
+    pub rotation: Option<i64>,
+    pub video_range: Option<String>,
+    pub video_range_type: Option<String>,
+    pub hdr10_plus_present_flag: Option<bool>,
+    pub is_default: bool,
+    pub is_forced: bool,
+    pub is_hearing_impaired: bool,
+    pub is_original: Option<bool>,
     pub path: Option<String>,
     pub is_external: bool,
 }
@@ -460,6 +562,9 @@ pub struct MediaStreamRow {
 impl MediaStreamRow {
     pub fn to_jellyfin_json(&self, item_id: &str) -> JsonValue {
         let codec = self.codec.as_deref().unwrap_or_default();
+        let is_subtitle = self.stream_type == "Subtitle";
+        let is_text_subtitle = is_subtitle && is_text_subtitle_codec(codec);
+        let is_pgs_subtitle = is_subtitle && is_pgs_subtitle_codec(codec);
         let delivery_url = if self.stream_type == "Subtitle" && self.is_external {
             Some(format!(
                 "/Videos/{item_id}/{item_id}/Subtitles/{}/Stream.{}",
@@ -489,10 +594,10 @@ impl MediaStreamRow {
         );
         map.insert("Type".into(), JsonValue::String(self.stream_type.clone()));
         map.insert("Codec".into(), opt_str(&self.codec));
-        map.insert("CodecTag".into(), JsonValue::Null);
+        map.insert("CodecTag".into(), opt_str(&self.codec_tag));
         map.insert("Language".into(), opt_str(&self.language));
         map.insert("Title".into(), opt_str(&self.title));
-        map.insert("Comment".into(), JsonValue::Null);
+        map.insert("Comment".into(), opt_str(&self.comment));
         map.insert("DisplayTitle".into(), JsonValue::String(display_title));
         map.insert(
             "Path".into(),
@@ -505,25 +610,28 @@ impl MediaStreamRow {
         map.insert("BitRate".into(), opt_i64(self.bit_rate));
         map.insert("Width".into(), opt_i64(self.width));
         map.insert("Height".into(), opt_i64(self.height));
-        map.insert("AspectRatio".into(), JsonValue::Null);
-        map.insert("AverageFrameRate".into(), JsonValue::Null);
-        map.insert("RealFrameRate".into(), JsonValue::Null);
-        map.insert("ReferenceFrameRate".into(), JsonValue::Null);
-        map.insert("BitDepth".into(), JsonValue::Null);
-        map.insert("RefFrames".into(), JsonValue::Null);
-        map.insert("IsInterlaced".into(), JsonValue::Bool(false));
-        map.insert("IsAVC".into(), JsonValue::Null);
-        map.insert("IsAnamorphic".into(), JsonValue::Null);
-        map.insert("Rotation".into(), JsonValue::Null);
-        map.insert("VideoRange".into(), JsonValue::Null);
-        map.insert("VideoRangeType".into(), JsonValue::Null);
-        map.insert("Profile".into(), JsonValue::Null);
-        map.insert("Level".into(), JsonValue::Null);
-        map.insert("PixelFormat".into(), JsonValue::Null);
-        map.insert("ColorRange".into(), JsonValue::Null);
-        map.insert("ColorSpace".into(), JsonValue::Null);
-        map.insert("ColorTransfer".into(), JsonValue::Null);
-        map.insert("ColorPrimaries".into(), JsonValue::Null);
+        map.insert("AspectRatio".into(), opt_str(&self.aspect_ratio));
+        map.insert("AverageFrameRate".into(), opt_f64(self.average_frame_rate));
+        map.insert("RealFrameRate".into(), opt_f64(self.real_frame_rate));
+        map.insert(
+            "ReferenceFrameRate".into(),
+            opt_f64(self.reference_frame_rate),
+        );
+        map.insert("BitDepth".into(), opt_i64(self.bit_depth));
+        map.insert("RefFrames".into(), opt_i64(self.ref_frames));
+        map.insert("IsInterlaced".into(), JsonValue::Bool(self.is_interlaced));
+        map.insert("IsAVC".into(), opt_bool(self.is_avc));
+        map.insert("IsAnamorphic".into(), opt_bool(self.is_anamorphic));
+        map.insert("Rotation".into(), opt_i64(self.rotation));
+        map.insert("VideoRange".into(), opt_str(&self.video_range));
+        map.insert("VideoRangeType".into(), opt_str(&self.video_range_type));
+        map.insert("Profile".into(), opt_str(&self.profile));
+        map.insert("Level".into(), opt_i64(self.level));
+        map.insert("PixelFormat".into(), opt_str(&self.pixel_format));
+        map.insert("ColorRange".into(), opt_str(&self.color_range));
+        map.insert("ColorSpace".into(), opt_str(&self.color_space));
+        map.insert("ColorTransfer".into(), opt_str(&self.color_transfer));
+        map.insert("ColorPrimaries".into(), opt_str(&self.color_primaries));
         map.insert("DvVersionMajor".into(), JsonValue::Null);
         map.insert("DvVersionMinor".into(), JsonValue::Null);
         map.insert("DvProfile".into(), JsonValue::Null);
@@ -533,29 +641,44 @@ impl MediaStreamRow {
         map.insert("BlPresentFlag".into(), JsonValue::Null);
         map.insert("DvBlSignalCompatibilityId".into(), JsonValue::Null);
         map.insert("VideoDoViTitle".into(), JsonValue::Null);
-        map.insert("Hdr10PlusPresentFlag".into(), JsonValue::Null);
+        map.insert(
+            "Hdr10PlusPresentFlag".into(),
+            opt_bool(self.hdr10_plus_present_flag),
+        );
         map.insert("Channels".into(), opt_i64(self.channels));
-        map.insert("ChannelLayout".into(), JsonValue::Null);
+        map.insert("ChannelLayout".into(), opt_str(&self.channel_layout));
         map.insert("SampleRate".into(), opt_i64(self.sample_rate));
         map.insert(
             "AudioSpatialFormat".into(),
-            JsonValue::String("None".to_string()),
+            JsonValue::String(audio_spatial_format(self.profile.as_deref()).to_string()),
         );
         map.insert("DeliveryMethod".into(), opt_str_val(delivery_method));
         map.insert("DeliveryUrl".into(), opt_str_val(delivery_url.as_deref()));
         map.insert("IsExternal".into(), JsonValue::Bool(self.is_external));
         map.insert("IsExternalUrl".into(), JsonValue::Null);
-        map.insert("IsDefault".into(), JsonValue::Bool(false));
-        map.insert("IsForced".into(), JsonValue::Bool(false));
-        map.insert("IsHearingImpaired".into(), JsonValue::Bool(false));
-        map.insert("IsOriginal".into(), JsonValue::Null);
+        map.insert("IsDefault".into(), JsonValue::Bool(self.is_default));
+        map.insert("IsForced".into(), JsonValue::Bool(self.is_forced));
+        map.insert(
+            "IsHearingImpaired".into(),
+            JsonValue::Bool(self.is_hearing_impaired),
+        );
+        map.insert("IsOriginal".into(), opt_bool(self.is_original));
         map.insert("SupportsExternalStream".into(), JsonValue::Bool(true));
-        map.insert("IsTextSubtitleStream".into(), JsonValue::Null);
-        map.insert("IsPgsSubtitleStream".into(), JsonValue::Null);
-        map.insert("IsExtractableSubtitleStream".into(), JsonValue::Null);
-        map.insert("TimeBase".into(), JsonValue::Null);
-        map.insert("CodecTimeBase".into(), JsonValue::Null);
-        map.insert("NalLengthSize".into(), JsonValue::Null);
+        map.insert(
+            "IsTextSubtitleStream".into(),
+            subtitle_flag(is_subtitle, is_text_subtitle),
+        );
+        map.insert(
+            "IsPgsSubtitleStream".into(),
+            subtitle_flag(is_subtitle, is_pgs_subtitle),
+        );
+        map.insert(
+            "IsExtractableSubtitleStream".into(),
+            subtitle_flag(is_subtitle, !self.is_external),
+        );
+        map.insert("TimeBase".into(), opt_str(&self.time_base));
+        map.insert("CodecTimeBase".into(), opt_str(&self.codec_time_base));
+        map.insert("NalLengthSize".into(), opt_str(&self.nal_length_size));
         map.insert("PacketLength".into(), JsonValue::Null);
         map.insert("Score".into(), JsonValue::Null);
         map.insert("LocalizedUndefined".into(), JsonValue::Null);
@@ -569,12 +692,29 @@ impl MediaStreamRow {
     }
 }
 
+fn subtitle_flag(is_subtitle: bool, value: bool) -> JsonValue {
+    if is_subtitle {
+        JsonValue::Bool(value)
+    } else {
+        JsonValue::Null
+    }
+}
+
+fn is_text_subtitle_codec(codec: &str) -> bool {
+    matches!(
+        codec.to_ascii_lowercase().as_str(),
+        "ass" | "ssa" | "srt" | "subrip" | "text" | "mov_text" | "webvtt" | "vtt" | "smi" | "sami"
+    )
+}
+
+fn is_pgs_subtitle_codec(codec: &str) -> bool {
+    let codec = codec.to_ascii_lowercase();
+    codec == "pgs" || codec == "hdmv_pgs_subtitle" || codec.contains("pgs")
+}
+
 fn compute_stream_display_title(stream: &MediaStreamRow) -> String {
     if stream.stream_type == "Video" {
-        let mut parts = Vec::new();
-        if let Some(ref title) = stream.title {
-            parts.push(title.clone());
-        }
+        let mut attrs = Vec::new();
         if let (Some(_w), Some(h)) = (stream.width, stream.height) {
             let label = if h >= 2160 {
                 "4K"
@@ -585,25 +725,41 @@ fn compute_stream_display_title(stream: &MediaStreamRow) -> String {
             } else {
                 "SD"
             };
-            parts.push(label.to_string());
+            attrs.push(label.to_string());
         }
         if let Some(ref codec) = stream.codec {
-            parts.push(codec.to_uppercase());
+            attrs.push(codec.to_uppercase());
         }
-        if parts.is_empty() {
-            "Unknown".to_string()
-        } else {
-            parts.join(" - ")
+        if stream
+            .video_range
+            .as_deref()
+            .is_some_and(|range| !range.eq_ignore_ascii_case("SDR"))
+        {
+            if let Some(ref range_type) = stream.video_range_type {
+                attrs.push(range_type.clone());
+            } else if let Some(ref range) = stream.video_range {
+                attrs.push(range.clone());
+            }
         }
+        titled_display(stream.title.as_deref(), &attrs, " ")
     } else if stream.stream_type == "Audio" {
-        let mut parts = Vec::new();
-        if let Some(ref title) = stream.title {
-            parts.push(title.clone());
+        let mut attrs = Vec::new();
+        if let Some(ref lang) = stream.language {
+            attrs.push(lang.to_string());
         }
-        if let Some(ref codec) = stream.codec {
-            parts.push(codec.to_uppercase());
+        if let Some(ref profile) = stream.profile {
+            if !profile.eq_ignore_ascii_case("lc") {
+                attrs.push(profile.clone());
+            }
         }
-        if let Some(channels) = stream.channels {
+        if attrs.is_empty() {
+            if let Some(ref codec) = stream.codec {
+                attrs.push(codec.to_uppercase());
+            }
+        }
+        if let Some(ref layout) = stream.channel_layout {
+            attrs.push(layout.clone());
+        } else if let Some(channels) = stream.channels {
             let ch_label = match channels {
                 8 => "7.1",
                 6 => "5.1",
@@ -611,40 +767,80 @@ fn compute_stream_display_title(stream: &MediaStreamRow) -> String {
                 1 => "Mono",
                 _ => &format!("{channels} ch"),
             };
-            parts.push(ch_label.to_string());
+            attrs.push(ch_label.to_string());
         }
-        if let Some(ref lang) = stream.language {
-            parts.push(lang.to_string());
+        if stream.is_default {
+            attrs.push("Default".to_string());
         }
-        if parts.is_empty() {
-            "Unknown".to_string()
-        } else {
-            parts.join(" - ")
-        }
-    } else if stream.stream_type == "Subtitle" {
-        let mut parts = Vec::new();
-        if let Some(ref title) = stream.title {
-            parts.push(title.clone());
-        }
-        if let Some(ref lang) = stream.language {
-            parts.push(lang.to_string());
-        }
-        let codec = stream.codec.as_deref().unwrap_or("");
         if stream.is_external {
-            parts.push(format!("({} External)", codec));
-        } else {
-            parts.push(format!("({} Embedded)", codec));
+            attrs.push("External".to_string());
         }
-        if parts.is_empty() {
-            "Unknown".to_string()
-        } else {
-            parts.join(" - ")
+        if stream.is_original == Some(true) {
+            attrs.push("Original".to_string());
         }
+        titled_display(stream.title.as_deref(), &attrs, " - ")
+    } else if stream.stream_type == "Subtitle" {
+        let mut attrs = Vec::new();
+        if let Some(ref lang) = stream.language {
+            attrs.push(lang.to_string());
+        } else {
+            attrs.push("Und".to_string());
+        }
+        if stream.is_hearing_impaired {
+            attrs.push("Hearing Impaired".to_string());
+        }
+        if stream.is_default {
+            attrs.push("Default".to_string());
+        }
+        if stream.is_forced {
+            attrs.push("Forced".to_string());
+        }
+        if let Some(ref codec) = stream.codec {
+            attrs.push(codec.to_uppercase());
+        }
+        if stream.is_external {
+            attrs.push("External".to_string());
+        }
+        titled_display(stream.title.as_deref(), &attrs, " - ")
     } else {
         stream
             .title
             .clone()
             .unwrap_or_else(|| "Unknown".to_string())
+    }
+}
+
+fn titled_display(title: Option<&str>, attrs: &[String], separator: &str) -> String {
+    if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
+        let mut result = title.to_string();
+        for attr in attrs {
+            if !result
+                .to_ascii_lowercase()
+                .contains(&attr.to_ascii_lowercase())
+            {
+                result.push_str(" - ");
+                result.push_str(attr);
+            }
+        }
+        return result;
+    }
+    if attrs.is_empty() {
+        "Unknown".to_string()
+    } else {
+        attrs.join(separator)
+    }
+}
+
+fn audio_spatial_format(profile: Option<&str>) -> &'static str {
+    let Some(profile) = profile else {
+        return "None";
+    };
+    if profile.to_ascii_lowercase().contains("dolby atmos") {
+        "DolbyAtmos"
+    } else if profile.to_ascii_lowercase().contains("dts:x") {
+        "DTSX"
+    } else {
+        "None"
     }
 }
 
@@ -659,9 +855,33 @@ pub fn child_video_source_json(
     runtime_ticks: Option<i64>,
     media_streams: Vec<JsonValue>,
 ) -> JsonValue {
-    let (media_streams, media_attachments) = split_media_streams_and_attachments(id, media_streams);
+    child_video_source_json_for_item(
+        id,
+        id,
+        title,
+        path,
+        container,
+        size,
+        runtime_ticks,
+        media_streams,
+    )
+}
+
+pub fn child_video_source_json_for_item(
+    item_id: &str,
+    media_source_id: &str,
+    title: &str,
+    path: &str,
+    container: &str,
+    size: Option<i64>,
+    runtime_ticks: Option<i64>,
+    media_streams: Vec<JsonValue>,
+) -> JsonValue {
+    let (media_streams, media_attachments) =
+        split_media_streams_and_attachments(item_id, media_source_id, media_streams);
+    let bitrate = media_source_bitrate(size, runtime_ticks, &media_streams);
     let mut map = Map::new();
-    map.insert("Id".into(), JsonValue::String(id.to_string()));
+    map.insert("Id".into(), JsonValue::String(media_source_id.to_string()));
     map.insert("Name".into(), JsonValue::String(title.to_string()));
     map.insert("Type".into(), JsonValue::String("Default".to_string()));
     map.insert("Protocol".into(), JsonValue::String("File".to_string()));
@@ -676,7 +896,7 @@ pub fn child_video_source_json(
     map.insert("IsoType".into(), JsonValue::Null);
     map.insert("Video3DFormat".into(), JsonValue::Null);
     map.insert("Timestamp".into(), JsonValue::Null);
-    map.insert("Bitrate".into(), JsonValue::Null);
+    map.insert("Bitrate".into(), opt_i64(bitrate));
     map.insert("FallbackMaxStreamingBitrate".into(), JsonValue::Null);
     map.insert("SupportsDirectPlay".into(), JsonValue::Bool(true));
     map.insert("SupportsDirectStream".into(), JsonValue::Bool(true));
@@ -707,7 +927,9 @@ pub fn child_video_source_json(
     map.insert("TranscodingSubProtocol".into(), JsonValue::Null);
     map.insert(
         "DirectStreamUrl".into(),
-        JsonValue::String(format!("/Videos/{id}/stream.{container}")),
+        JsonValue::String(format!(
+            "/Videos/{item_id}/{media_source_id}/stream.{container}"
+        )),
     );
     map.insert("EncoderPath".into(), JsonValue::Null);
     map.insert("EncoderProtocol".into(), JsonValue::Null);
@@ -719,13 +941,18 @@ pub fn child_video_source_json(
     );
     map.insert("LiveStreamId".into(), JsonValue::Null);
     map.insert("OpenToken".into(), JsonValue::Null);
-    map.insert("ETag".into(), JsonValue::String(id.to_string()));
+    map.insert(
+        "ETag".into(),
+        JsonValue::String(media_source_id.to_string()),
+    );
     JsonValue::Object(map)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MediaItem, child_video_source_json, media_source_json_with_streams};
+    use super::{
+        MediaItem, MediaStreamRow, child_video_source_json, media_source_json_with_streams,
+    };
     use serde_json::json;
 
     #[test]
@@ -764,6 +991,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn media_sources_report_bitrate_from_file_size_and_runtime() {
+        let source = child_video_source_json(
+            "part1",
+            "Part 1",
+            "D:/Movies/part1.mkv",
+            "mkv",
+            Some(1_000),
+            Some(10_000_000),
+            vec![json!({ "Index": 0, "Type": "Video", "BitRate": 1_000 })],
+        );
+
+        assert_eq!(source["Bitrate"], 8_000);
+    }
+
+    #[test]
+    fn media_sources_fall_back_to_stream_bitrate() {
+        let source = child_video_source_json(
+            "part1",
+            "Part 1",
+            "D:/Movies/part1.mkv",
+            "mkv",
+            None,
+            None,
+            vec![
+                json!({ "Index": 0, "Type": "Video", "BitRate": 5_000 }),
+                json!({ "Index": 1, "Type": "Audio", "BitRate": 1_000 }),
+                json!({ "Index": 2, "Type": "Subtitle", "BitRate": 500 }),
+            ],
+        );
+
+        assert_eq!(source["Bitrate"], 6_000);
+    }
+
+    #[test]
+    fn subtitle_streams_report_codec_flags() {
+        let text = subtitle_stream("subrip", false).to_jellyfin_json("movie");
+        assert_eq!(text["IsTextSubtitleStream"], true);
+        assert_eq!(text["IsPgsSubtitleStream"], false);
+        assert_eq!(text["IsExtractableSubtitleStream"], true);
+
+        let pgs = subtitle_stream("hdmv_pgs_subtitle", false).to_jellyfin_json("movie");
+        assert_eq!(pgs["IsTextSubtitleStream"], false);
+        assert_eq!(pgs["IsPgsSubtitleStream"], true);
+        assert_eq!(pgs["IsExtractableSubtitleStream"], true);
+
+        let external = subtitle_stream("srt", true).to_jellyfin_json("movie");
+        assert_eq!(external["DeliveryMethod"], "External");
+        assert_eq!(external["IsTextSubtitleStream"], true);
+        assert_eq!(external["IsExtractableSubtitleStream"], false);
+    }
+
     fn sample_streams() -> Vec<serde_json::Value> {
         vec![
             json!({ "Index": 0, "Type": "Video", "Codec": "h264" }),
@@ -784,6 +1063,53 @@ mod tests {
         ]
     }
 
+    fn subtitle_stream(codec: &str, is_external: bool) -> MediaStreamRow {
+        MediaStreamRow {
+            stream_index: 2,
+            stream_type: "Subtitle".to_string(),
+            codec: Some(codec.to_string()),
+            profile: None,
+            codec_tag: None,
+            language: Some("eng".to_string()),
+            title: None,
+            comment: None,
+            bit_rate: None,
+            width: None,
+            height: None,
+            aspect_ratio: None,
+            average_frame_rate: None,
+            real_frame_rate: None,
+            reference_frame_rate: None,
+            channels: None,
+            channel_layout: None,
+            sample_rate: None,
+            bit_depth: None,
+            ref_frames: None,
+            is_interlaced: false,
+            is_avc: None,
+            is_anamorphic: None,
+            pixel_format: None,
+            level: None,
+            color_range: None,
+            color_space: None,
+            color_transfer: None,
+            color_primaries: None,
+            time_base: None,
+            codec_time_base: None,
+            nal_length_size: None,
+            rotation: None,
+            video_range: None,
+            video_range_type: None,
+            hdr10_plus_present_flag: None,
+            is_default: false,
+            is_forced: false,
+            is_hearing_impaired: false,
+            is_original: None,
+            path: is_external.then(|| "D:/Movie/movie.eng.srt".to_string()),
+            is_external,
+        }
+    }
+
     fn video_item() -> MediaItem {
         MediaItem {
             id: "movie".to_string(),
@@ -799,6 +1125,7 @@ mod tests {
             official_rating: None,
             extended_video_type: None,
             production_year: None,
+            premiere_date: None,
             runtime_ticks: Some(456),
             size_bytes: Some(123),
             season_number: None,

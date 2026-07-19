@@ -36,6 +36,12 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/GetUtcTime", get(system::utc_time))
         .route("/System/Info", get(system::system_info))
         .route("/System/Info/Public", get(system::public_system_info))
+        .route(
+            "/Admin/ServerName",
+            get(system::admin_server_name).post(system::update_admin_server_name),
+        )
+        .route("/Admin/Logs", get(system::admin_http_logs))
+        .route("/Admin/PlaybackMap", get(system::admin_playback_map))
         .route("/System/Endpoint", get(system::system_endpoint))
         .route(
             "/System/Ping",
@@ -199,8 +205,16 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(system::tmdb_client_configuration),
         )
         .route(
+            "/Douban/ClientConfiguration",
+            get(system::douban_client_configuration),
+        )
+        .route(
             "/System/Configuration/TmdbApiKey",
             post(system::update_tmdb_api_key),
+        )
+        .route(
+            "/System/Configuration/DoubanCookie",
+            post(system::update_douban_cookie),
         )
         .route("/Devices/Info", get(system::device_info))
         .route("/Auth/Providers", get(auth::auth_providers))
@@ -617,11 +631,11 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/Artists/{name}/Images/{image_type}",
-            get(persons::person_image).head(common::no_content),
+            get(persons::person_image).head(common::ok),
         )
         .route(
             "/Artists/{name}/Images/{image_type}/{index}",
-            get(persons::person_image_with_index).head(common::no_content),
+            get(persons::person_image_with_index).head(common::ok),
         )
         .route("/Movies/Recommendations", get(items::movie_recommendations))
         .route("/Movies/{item_id}/Similar", get(items::similar_items))
@@ -698,11 +712,11 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Genres/{name}", get(super::user_extras::genre_by_name))
         .route(
             "/Genres/{name}/Images/{image_type}",
-            get(super::user_extras::genre_image).head(common::no_content),
+            get(common::image_or_empty).head(common::ok),
         )
         .route(
             "/Genres/{name}/Images/{image_type}/{index}",
-            get(super::user_extras::genre_image_with_index).head(common::no_content),
+            get(common::image_or_empty).head(common::ok),
         )
         .route("/GameGenres", get(filters::game_genres))
         .route("/Games/SystemSummaries", get(system::game_system_summaries))
@@ -712,11 +726,11 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/GameGenres/{name}/Images/{image_type}",
-            get(super::user_extras::genre_image).head(common::no_content),
+            get(common::image_or_empty).head(common::ok),
         )
         .route(
             "/GameGenres/{name}/Images/{image_type}/{index}",
-            get(super::user_extras::genre_image_with_index).head(common::no_content),
+            get(common::image_or_empty).head(common::ok),
         )
         .route(
             "/MusicGenres/InstantMix",
@@ -731,21 +745,21 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Persons/{name}/Items", get(persons::person_items))
         .route(
             "/Persons/{name}/Images/{image_type}",
-            get(persons::person_image).head(common::no_content),
+            get(persons::person_image).head(common::ok),
         )
         .route(
             "/Persons/{name}/Images/{first}/{second}",
-            get(persons::person_image_with_index).head(common::no_content),
+            get(persons::person_image_with_index).head(common::ok),
         )
         .route("/Studios", get(filters::studios))
         .route("/Studios/{name}", get(super::user_extras::studio_by_name))
         .route(
             "/Studios/{name}/Images/{image_type}",
-            get(super::user_extras::studio_image).head(common::no_content),
+            get(common::image_or_empty).head(common::ok),
         )
         .route(
             "/Studios/{name}/Images/{image_type}/{index}",
-            get(super::user_extras::studio_image_with_index).head(common::no_content),
+            get(common::image_or_empty).head(common::ok),
         )
         .route("/Tags", get(filters::tags))
         .route("/Years", get(filters::years))
@@ -1152,11 +1166,11 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/MusicGenres/{name}/Images/{image_type}",
-            get(super::user_extras::genre_image).head(common::no_content),
+            get(common::image_or_empty).head(common::ok),
         )
         .route(
             "/MusicGenres/{name}/Images/{image_type}/{index}",
-            get(super::user_extras::genre_image_with_index).head(common::no_content),
+            get(common::image_or_empty).head(common::ok),
         )
         // ── Notifications ──
         .route("/Notifications/Types", get(system::notification_types))
@@ -1198,11 +1212,20 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Reports/Items/Download", get(system::reports_items_download))
         // Image-by-name compatibility
         .route("/Images/General", get(system::image_by_name_general))
-        .route("/Images/General/{name}/{image_type}", get(common::image))
+        .route(
+            "/Images/General/{name}/{image_type}",
+            get(common::image_or_empty),
+        )
         .route("/Images/MediaInfo", get(system::image_by_name_media_info))
-        .route("/Images/MediaInfo/{theme}/{name}", get(common::image))
+        .route(
+            "/Images/MediaInfo/{theme}/{name}",
+            get(common::image_or_empty),
+        )
         .route("/Images/Ratings", get(system::image_by_name_ratings))
-        .route("/Images/Ratings/{theme}/{name}", get(common::image))
+        .route(
+            "/Images/Ratings/{theme}/{name}",
+            get(common::image_or_empty),
+        )
         .route("/Images/Remote", get(images::image_by_name_remote))
         // ── OpenApi / Swagger ──
         .route("/openapi", get(system::openapi_json))
@@ -1435,8 +1458,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         // ── DlnaServer ──
         .route("/Dlna/{id}/description", get(dlna::device_description))
         .route("/Dlna/{id}/description.xml", get(dlna::device_description))
-        .route("/Dlna/{id}/icons/{filename}", get(common::image))
-        .route("/Dlna/icons/{filename}", get(common::image))
+        .route("/Dlna/{id}/icons/{filename}", get(common::image_or_empty))
+        .route("/Dlna/icons/{filename}", get(common::image_or_empty))
         .route(
             "/Dlna/{id}/connectionmanager/connectionmanager",
             get(dlna::connection_manager_description),

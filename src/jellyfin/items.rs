@@ -8,7 +8,9 @@ mod recommendations;
 mod remote_metadata;
 mod tv_shows;
 
-pub use crate::jellyfin::item_queries::{find_media_item, find_media_item_for_admin};
+pub use crate::jellyfin::item_queries::{
+    find_first_playable_child, find_media_item, find_media_item_for_admin,
+};
 pub use discovery::{search_hints, shows_missing, shows_next_up, similar_items};
 pub use display_prefs::{get_display_preferences, update_display_preferences};
 pub use item_detail::{enrich_episode_list, enrich_resume_items, item_by_id, item_by_id_public};

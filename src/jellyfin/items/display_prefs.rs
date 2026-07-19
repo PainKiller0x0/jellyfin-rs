@@ -49,11 +49,9 @@ pub async fn update_display_preferences(
         Err(error) => return validation_error_response(error.0, error.1),
     };
     let id = display_preferences_key(&prefs_id, &user_id, &client);
-    let backend = state.db.get_database_backend();
     match state
         .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
+        .execute(crate::db::helpers::pg_statement(
             r#"INSERT INTO display_preferences (id, user_id, preferences_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET preferences_json = excluded.preferences_json, user_id = excluded.user_id, updated_at = excluded.updated_at"#,
             vec![id.into(), user_id.into(), prefs_json.into(), now.into(), now.into()],
         ))
@@ -71,10 +69,8 @@ async fn display_preferences_inner(
     client: &str,
 ) -> anyhow::Result<Option<Value>> {
     let id = display_preferences_key(prefs_id, user_id, client);
-    let backend = db.get_database_backend();
     let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
+        .query_one(crate::db::helpers::pg_statement(
             "SELECT preferences_json FROM display_preferences WHERE id IN (?, ?) ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END LIMIT 1",
             vec![
                 id.clone().into(),

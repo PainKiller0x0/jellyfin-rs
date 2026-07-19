@@ -6,7 +6,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{app::state::AppState, jellyfin::common::internal_error};
@@ -17,40 +17,22 @@ fn backup_dir() -> PathBuf {
 
 fn database_url() -> String {
     std::env::var("JELLYFIN_RS_DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://jellyfin-rs.db".to_string())
-}
-
-fn is_postgres() -> bool {
-    let url = database_url();
-    url.starts_with("postgres://") || url.starts_with("postgresql://")
-}
-
-fn sqlite_file_path() -> Option<PathBuf> {
-    let url = database_url();
-    let path = url.strip_prefix("sqlite://").unwrap_or(&url);
-    let path = path.trim_start_matches("./");
-    Some(PathBuf::from(path))
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| crate::db::DEFAULT_DATABASE_URL.to_string())
 }
 
 /// GET /BackupRestore/BackupInfo
 pub async fn backup_info(State(_state): State<Arc<AppState>>) -> Response {
     let backup_dir = backup_dir();
-    let backup_ext = if is_postgres() { "sql" } else { "db" };
-    let backup_filename = format!("jellyfin-rs-backup.{backup_ext}");
+    let backup_filename = "jellyfin-rs-backup.sql";
     let backup_path = backup_dir.join(&backup_filename);
 
-    let (db_size, db_location) = if is_postgres() {
-        let location = database_url()
-            .split('@')
-            .next_back()
-            .unwrap_or("PostgreSQL")
-            .to_string();
-        (0u64, location)
-    } else {
-        let path = sqlite_file_path().unwrap_or_else(|| PathBuf::from("jellyfin-rs.db"));
-        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        (size, path.to_string_lossy().to_string())
-    };
+    let db_location = database_url()
+        .split('@')
+        .next_back()
+        .unwrap_or("PostgreSQL")
+        .to_string();
 
     let (last_backup, backup_size) = if backup_path.exists() {
         let meta = std::fs::metadata(&backup_path).ok();
@@ -66,9 +48,9 @@ pub async fn backup_info(State(_state): State<Arc<AppState>>) -> Response {
 
     Json(json!({
         "IsFileBackup": true,
-        "DatabaseType": if is_postgres() { "PostgreSQL" } else { "SQLite" },
+        "DatabaseType": "PostgreSQL",
         "DatabaseLocation": db_location,
-        "DatabaseSize": db_size,
+        "DatabaseSize": 0,
         "BackupPath": backup_path.to_string_lossy(),
         "LastBackupDate": last_backup,
         "BackupSize": backup_size,
@@ -85,7 +67,7 @@ pub async fn backup_manifest() -> Response {
     Json(json!({
         "Name": "jellyfin-rs",
         "ServerVersion": env!("CARGO_PKG_VERSION"),
-        "DatabaseType": if is_postgres() { "PostgreSQL" } else { "SQLite" },
+        "DatabaseType": "PostgreSQL",
         "Files": list_backup_files()
     }))
     .into_response()
@@ -99,7 +81,7 @@ fn list_backup_files() -> Vec<serde_json::Value> {
         .filter_map(|entry| {
             let path = entry.path();
             let name = path.file_name()?.to_str()?;
-            if !name.ends_with(".db") && !name.ends_with(".sql") {
+            if !name.ends_with(".sql") {
                 return None;
             }
             let meta = entry.metadata().ok();
@@ -124,81 +106,16 @@ pub async fn create_backup(State(state): State<Arc<AppState>>) -> Response {
         return internal_error(error.into());
     }
 
-    if is_postgres() {
-        create_pg_backup(&state, &backup_dir).await
-    } else {
-        create_sqlite_backup(&state, &backup_dir).await
-    }
-}
-
-async fn create_sqlite_backup(state: &AppState, backup_dir: &Path) -> Response {
-    let Some(db_path) = sqlite_file_path() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": "Cannot determine SQLite file path" })),
-        )
-            .into_response();
-    };
-
-    if !db_path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "Error": "Database file not found" })),
-        )
-            .into_response();
-    }
-
-    let backup_path = backup_dir.join("jellyfin-rs-backup.db");
-
-    let backend = state.db.get_database_backend();
-    let vacuum_sql = format!(
-        "VACUUM INTO '{}'",
-        backup_path.to_string_lossy().replace('\'', "''")
-    );
-
-    match state
-        .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
-            &vacuum_sql,
-            vec![],
-        ))
-        .await
-    {
-        Ok(_) => {
-            let size = std::fs::metadata(&backup_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            Json(json!({
-                "Success": true,
-                "Method": "vacuum_into",
-                "BackupPath": backup_path.to_string_lossy(),
-                "BackupSize": size,
-            }))
-            .into_response()
-        }
-        Err(_) => match tokio::fs::copy(&db_path, &backup_path).await {
-            Ok(size) => Json(json!({
-                "Success": true,
-                "Method": "file_copy",
-                "BackupPath": backup_path.to_string_lossy(),
-                "BackupSize": size,
-            }))
-            .into_response(),
-            Err(error) => internal_error(error.into()),
-        },
-    }
+    create_pg_backup(&state, &backup_dir).await
 }
 
 async fn create_pg_backup(state: &AppState, backup_dir: &Path) -> Response {
     let backup_path = backup_dir.join("jellyfin-rs-backup.sql");
 
     // Get all user tables from information_schema
-    let backend = state.db.get_database_backend();
     let tables = match state
         .db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name",
             vec![],
         ))
@@ -223,8 +140,7 @@ async fn create_pg_backup(state: &AppState, backup_dir: &Path) -> Response {
         // Get column names
         let columns = match state
             .db
-            .query_all(crate::db::helpers::portable_statement(
-                backend,
+            .query_all(crate::db::helpers::pg_statement(
                 "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position",
                 vec![table_name.clone().into()],
             ))
@@ -250,11 +166,7 @@ async fn create_pg_backup(state: &AppState, backup_dir: &Path) -> Response {
         );
         let count = match state
             .db
-            .query_one(crate::db::helpers::portable_statement(
-                backend,
-                &count_sql,
-                vec![],
-            ))
+            .query_one(crate::db::helpers::pg_statement(&count_sql, vec![]))
             .await
         {
             Ok(Some(row)) => crate::db::row_ext::QueryResultExt::get_i64(&row, "cnt").unwrap_or(0),
@@ -281,11 +193,7 @@ async fn create_pg_backup(state: &AppState, backup_dir: &Path) -> Response {
 
         let rows = match state
             .db
-            .query_all(crate::db::helpers::portable_statement(
-                backend,
-                &select_sql,
-                vec![],
-            ))
+            .query_all(crate::db::helpers::pg_statement(&select_sql, vec![]))
             .await
         {
             Ok(r) => r,
@@ -357,57 +265,15 @@ pub async fn restore_backup(
     let backup_name = body
         .as_ref()
         .and_then(|Json(body)| requested_backup_name(body));
-    let backup_file = match safe_backup_file_name(
-        backup_name.as_deref(),
-        if is_postgres() {
-            "jellyfin-rs-backup.sql"
-        } else {
-            "jellyfin-rs-backup.db"
-        },
-    ) {
+    let backup_file = match safe_backup_file_name(backup_name.as_deref(), "jellyfin-rs-backup.sql")
+    {
         Ok(name) => name,
         Err(message) => {
             return (StatusCode::BAD_REQUEST, Json(json!({ "Error": message }))).into_response();
         }
     };
 
-    if is_postgres() {
-        restore_pg_backup(&state, &backup_dir, &backup_file).await
-    } else {
-        restore_sqlite_backup(&backup_dir, &backup_file).await
-    }
-}
-
-async fn restore_sqlite_backup(backup_dir: &Path, backup_file: &str) -> Response {
-    let Some(db_path) = sqlite_file_path() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": "Cannot determine SQLite file path" })),
-        )
-            .into_response();
-    };
-
-    let backup_path = backup_dir.join(backup_file);
-    if !backup_path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "Error": "No backup file found" })),
-        )
-            .into_response();
-    }
-
-    match tokio::fs::copy(&backup_path, &db_path).await {
-        Ok(_) => {
-            tracing::info!("SQLite database restored from backup; server restart required");
-            Json(json!({
-                "Success": true,
-                "Message": "Database restored. Server restart required to apply changes.",
-                "RequiresRestart": true,
-            }))
-            .into_response()
-        }
-        Err(error) => internal_error(error.into()),
-    }
+    restore_pg_backup(&state, &backup_dir, &backup_file).await
 }
 
 async fn restore_pg_backup(state: &AppState, backup_dir: &Path, backup_file: &str) -> Response {
@@ -456,7 +322,6 @@ async fn apply_pg_restore(
     db: &sea_orm::DatabaseConnection,
     statements: &[PgRestoreStatement],
 ) -> anyhow::Result<Vec<String>> {
-    let backend = db.get_database_backend();
     let txn = db.begin().await?;
     let mut tables = Vec::new();
     for statement in statements {
@@ -471,14 +336,17 @@ async fn apply_pg_restore(
             .collect::<Vec<_>>()
             .join(", ");
         txn.execute(Statement::from_string(
-            backend,
+            DbBackend::Postgres,
             format!("TRUNCATE TABLE {table_list} RESTART IDENTITY CASCADE"),
         ))
         .await?;
     }
     for statement in sorted_pg_restore_statements(statements) {
-        txn.execute(Statement::from_string(backend, statement.sql.clone()))
-            .await?;
+        txn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            statement.sql.clone(),
+        ))
+        .await?;
     }
     txn.commit().await?;
     Ok(tables)
@@ -658,8 +526,8 @@ fn safe_backup_file_name(
     {
         return Err("Backup file name must not contain a path");
     }
-    if !name.ends_with(".db") && !name.ends_with(".sql") {
-        return Err("Backup file must end with .db or .sql");
+    if !name.ends_with(".sql") {
+        return Err("Backup file must end with .sql");
     }
     Ok(name.to_string())
 }
@@ -675,27 +543,27 @@ mod tests {
     #[test]
     fn backup_file_name_rejects_paths() {
         assert_eq!(
-            safe_backup_file_name(None, "jellyfin-rs-backup.db").unwrap(),
-            "jellyfin-rs-backup.db"
+            safe_backup_file_name(None, "jellyfin-rs-backup.sql").unwrap(),
+            "jellyfin-rs-backup.sql"
         );
-        assert!(safe_backup_file_name(Some("../backup.db"), "x.db").is_err());
-        assert!(safe_backup_file_name(Some(r"dir\backup.db"), "x.db").is_err());
-        assert!(safe_backup_file_name(Some("backup.txt"), "x.db").is_err());
+        assert!(safe_backup_file_name(Some("../backup.sql"), "x.sql").is_err());
+        assert!(safe_backup_file_name(Some(r"dir\backup.sql"), "x.sql").is_err());
+        assert!(safe_backup_file_name(Some("backup.db"), "x.sql").is_err());
     }
 
     #[test]
     fn restore_request_accepts_backup_name_aliases() {
         assert_eq!(
-            requested_backup_name(&json!({ "ArchiveFileName": "a.db" })).as_deref(),
-            Some("a.db")
+            requested_backup_name(&json!({ "ArchiveFileName": "a.sql" })).as_deref(),
+            Some("a.sql")
         );
         assert_eq!(
-            requested_backup_name(&json!({ "BackupName": "b.db" })).as_deref(),
-            Some("b.db")
+            requested_backup_name(&json!({ "BackupName": "b.sql" })).as_deref(),
+            Some("b.sql")
         );
         assert_eq!(
-            requested_backup_name(&json!({ "Name": "c.db" })).as_deref(),
-            Some("c.db")
+            requested_backup_name(&json!({ "Name": "c.sql" })).as_deref(),
+            Some("c.sql")
         );
     }
 

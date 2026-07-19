@@ -40,6 +40,21 @@ pub fn unix_to_jellyfin_date(timestamp: i64) -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
+pub fn normalize_yyyy_mm_dd(value: &str) -> Option<String> {
+    let candidate = value.trim().get(..10)?;
+    chrono::NaiveDate::parse_from_str(candidate, "%Y-%m-%d")
+        .ok()
+        .map(|date| date.format("%Y-%m-%d").to_string())
+}
+
+pub fn year_from_yyyy_mm_dd(value: &str) -> Option<i64> {
+    normalize_yyyy_mm_dd(value)?.get(..4)?.parse::<i64>().ok()
+}
+
+pub fn yyyy_mm_dd_to_jellyfin_date(value: &str) -> Option<String> {
+    normalize_yyyy_mm_dd(value).map(|date| format!("{date}T00:00:00.0000000Z"))
+}
+
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     Ok(Argon2::default()

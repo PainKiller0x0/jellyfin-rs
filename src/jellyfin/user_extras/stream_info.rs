@@ -134,13 +134,9 @@ async fn public_stream_rows(
     let sql = format!(
         "SELECT DISTINCT {select_expr} FROM media_streams JOIN media_items ON media_items.id = media_streams.item_id WHERE {visible} AND {filter} ORDER BY {order_by}"
     );
-    db.query_all(crate::db::helpers::portable_statement(
-        db.get_database_backend(),
-        &sql,
-        vec![],
-    ))
-    .await
-    .unwrap_or_default()
+    db.query_all(crate::db::helpers::pg_statement(&sql, vec![]))
+        .await
+        .unwrap_or_default()
 }
 
 /// GET /ItemTypes — list item types
@@ -161,12 +157,13 @@ pub async fn item_types() -> Response {
 mod tests {
     use super::public_stream_rows;
     use crate::db::row_ext::QueryResultExt;
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::ConnectionTrait;
 
     #[tokio::test]
     async fn stream_filters_hide_private_media_values() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         for (id, parent_id, item_type, is_folder, public, codec, lang, channels) in [
             ("public", "", "Movie", 0_i64, 1_i64, "aac", "eng", 2_i64),
             ("private", "", "Movie", 0_i64, 0_i64, "dts", "jpn", 8_i64),
@@ -191,8 +188,7 @@ mod tests {
                 1_i64,
             ),
         ] {
-            db.execute(crate::db::helpers::portable_statement(
-                db.get_database_backend(),
+            db.execute(crate::db::helpers::pg_statement(
                 "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?, ?, ?, 1, 1, 1)",
                 vec![
                     id.into(),
@@ -206,8 +202,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            db.execute(crate::db::helpers::portable_statement(
-                db.get_database_backend(),
+            db.execute(crate::db::helpers::pg_statement(
                 "INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, channels, is_external, created_at) VALUES (?, ?, 0, 'Audio', ?, ?, ?, 0, 1)",
                 vec![
                     format!("{id}-audio").into(),

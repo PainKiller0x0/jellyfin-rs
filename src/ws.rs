@@ -346,11 +346,9 @@ async fn build_sessions_data(state: &AppState) -> Value {
 }
 
 async fn build_activity_data(state: &AppState) -> Value {
-    let backend = state.db.get_database_backend();
     let rows = state
         .db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             "SELECT name, log_type, created_at, user_id FROM activity_log ORDER BY created_at DESC LIMIT 15",
             vec![],
         ))

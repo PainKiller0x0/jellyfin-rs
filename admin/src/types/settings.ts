@@ -7,6 +7,13 @@ export type TmdbClientConfiguration = {
   HasApiKey: boolean;
 };
 
+export type DoubanClientConfiguration = {
+  IsDoubanEnabled: boolean;
+  IsEnabled: boolean;
+  Enabled: boolean;
+  HasCookie: boolean;
+};
+
 export type ApiKey = {
   Id: string;
   AccessToken: string;

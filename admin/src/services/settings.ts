@@ -1,5 +1,5 @@
 import { request } from '@/services/http';
-import type { ApiKeyQueryResult, TmdbClientConfiguration } from '@/types/settings';
+import type { ApiKeyQueryResult, DoubanClientConfiguration, TmdbClientConfiguration } from '@/types/settings';
 
 export function tmdbClientConfiguration(token: string) {
   return request<TmdbClientConfiguration>('/Tmdb/ClientConfiguration', { token });
@@ -11,6 +11,20 @@ export function updateTmdbApiKey(token: string, apiKey: string) {
     token,
     body: {
       TmdbApiKey: apiKey
+    }
+  });
+}
+
+export function doubanClientConfiguration(token: string) {
+  return request<DoubanClientConfiguration>('/Douban/ClientConfiguration', { token });
+}
+
+export function updateDoubanCookie(token: string, cookie: string) {
+  return request<void>('/System/Configuration/DoubanCookie', {
+    method: 'POST',
+    token,
+    body: {
+      DoubanCookie: cookie
     }
   });
 }

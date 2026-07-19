@@ -30,7 +30,7 @@ function apiBaseUrl() {
   return configured;
 }
 
-function requestUrl(path: string) {
+export function requestUrl(path: string) {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
   return `${apiBaseUrl()}${normalizedPath}`;
 }

@@ -50,8 +50,7 @@ pub async fn parental_ratings() -> impl IntoResponse {
             .map(|rating| {
                 json!({
                     "Name": rating.name,
-                    "Value": rating.score,
-                    "RatingScore": rating.score.map(|score| json!({ "Score": score, "SubScore": null })),
+                    "Value": rating.score.unwrap_or(-1),
                 })
             })
             .collect::<Vec<Value>>(),

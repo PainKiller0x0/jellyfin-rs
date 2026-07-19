@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::{Extension, Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use sea_orm::ConnectionTrait;
@@ -15,11 +15,11 @@ use crate::{
     db::row_ext::QueryResultExt,
     jellyfin::{
         auth::{query_user_id_or_request, request_user_id_and_admin_or_default},
-        common::{internal_error, strip_nulls},
+        common::{internal_error, ok_response, strip_nulls, wants_json_response},
         item_queries,
     },
     library::{models::MediaItem, naming::parse_media_name},
-    playback::streaming::readable_media_path,
+    playback::streaming::{readable_media_path, stream_item_file},
 };
 
 /// GET /Videos/{item_id}/{media_source_id}/Attachments/{index}/Stream — font attachments
@@ -35,6 +35,9 @@ pub async fn item_by_file(
         .map(str::trim)
         .filter(|path| !path.is_empty())
     else {
+        if wants_json_response(&headers) {
+            return ok_response();
+        }
         return StatusCode::BAD_REQUEST.into_response();
     };
     let (user_id, is_admin) = request_user_id_and_admin_or_default(&state, &headers, &query).await;
@@ -60,8 +63,7 @@ async fn item_by_file_inner(
         "WHERE media_items.path = ? AND media_items.is_public = 1 AND (media_items.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = media_items.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = media_items.parent_id AND parent.is_public = 1))"
     };
     let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        .query_one(crate::db::helpers::pg_statement(
             &item_queries::media_item_select_sql(where_clause),
             vec![user_id.into(), path.into()],
         ))
@@ -140,8 +142,7 @@ async fn attachment_path(
         .parse::<i64>()
         .unwrap_or(-1);
     let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        .query_one(crate::db::helpers::pg_statement(
             "SELECT path FROM media_streams WHERE item_id = ? AND stream_index = ? AND path IS NOT NULL AND path <> '' AND (stream_type = 'Attachment' OR (stream_type = 'Subtitle' AND is_external = 1))",
             vec![item_id.into(), index.into()],
         ))
@@ -285,32 +286,31 @@ pub async fn download_item(
     Path(item_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    download_item_response(state, headers, item_id, query, Method::GET).await
+}
+
+/// HEAD /Items/{item_id}/Download — download item file metadata
+pub async fn download_item_head(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    download_item_response(state, headers, item_id, query, Method::HEAD).await
+}
+
+async fn download_item_response(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    item_id: String,
+    query: HashMap<String, String>,
+    method: Method,
+) -> Response {
     match visible_item_from_request(&state, &headers, &query, &item_id).await {
         Ok(Some(item)) => {
-            if !readable_media_path(&state.db, &item.path).await {
-                return StatusCode::NOT_FOUND.into_response();
-            }
-            let container = item.container.unwrap_or_default();
-            match tokio::fs::read(&item.path).await {
-                Ok(bytes) => {
-                    let filename = safe_download_filename(&item.title, &container);
-                    (
-                        [
-                            (
-                                axum::http::header::CONTENT_TYPE,
-                                "application/octet-stream".to_string(),
-                            ),
-                            (
-                                axum::http::header::CONTENT_DISPOSITION,
-                                format!("attachment; filename=\"{}\"", filename),
-                            ),
-                        ],
-                        bytes,
-                    )
-                        .into_response()
-                }
-                Err(_) => StatusCode::NOT_FOUND.into_response(),
-            }
+            let filename =
+                safe_download_filename(&item.title, item.container.as_deref().unwrap_or_default());
+            stream_item_file(state, item_id, headers, query, method, Some(filename)).await
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => internal_error(error),
@@ -339,26 +339,24 @@ fn sanitize_download_part(value: &str) -> String {
         .to_string()
 }
 
-/// GET /Items/{item_id}/File — get item file info
+/// GET /Items/{item_id}/File — stream the original item file
 pub async fn item_file_info(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(item_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    match visible_item_from_request(&state, &headers, &query, &item_id).await {
-        Ok(Some(item)) => {
-            let container = item.container.unwrap_or_default();
-            Json(json!({
-                "Path": item.path,
-                "Name": format!("{}.{}", item.title, container),
-                "Size": item.size_bytes,
-            }))
-            .into_response()
-        }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => internal_error(error),
-    }
+    stream_item_file(state, item_id, headers, query, Method::GET, None).await
+}
+
+/// HEAD /Items/{item_id}/File — original item file metadata
+pub async fn item_file_info_head(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    stream_item_file(state, item_id, headers, query, Method::HEAD, None).await
 }
 
 pub(crate) async fn visible_item_from_request(
@@ -402,7 +400,6 @@ async fn additional_parts(
     user_id: &str,
     item_id: &str,
 ) -> anyhow::Result<Vec<MediaItem>> {
-    let backend = db.get_database_backend();
     let Some(item) = item_queries::find_media_item(db, user_id, item_id).await? else {
         return Ok(Vec::new());
     };
@@ -411,8 +408,7 @@ async fn additional_parts(
     };
 
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             &item_queries::media_item_select_sql(
                 "WHERE media_items.parent_id = ? AND media_items.item_type = ? AND media_items.id <> ? AND media_items.is_public = 1 AND (EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = ?) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = ? AND parent.is_public = 1)) ORDER BY media_items.title ASC",
             ),
@@ -446,7 +442,7 @@ fn stack_info(item: &MediaItem) -> Option<(String, i64)> {
 #[cfg(test)]
 mod tests {
     use super::{additional_parts, attachment_path, item_by_file_inner, safe_download_filename};
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::ConnectionTrait;
 
     #[test]
     fn download_filename_rejects_header_breaking_characters() {
@@ -460,18 +456,16 @@ mod tests {
 
     #[tokio::test]
     async fn additional_parts_returns_only_later_stack_parts() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        let backend = db.get_database_backend();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
             vec!["movies".into(), "Movies".into(), "movies".into()],
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES ('movie1', 'Movie', 'D:/Movie', 'movies', 'movies', 'Movie', 1, 1, 'mkv', 1, 1, 1)",
             vec![],
         ))
@@ -483,8 +477,7 @@ mod tests {
             ("p3", "Movie", "D:/Movie/Movie CD3.mkv", 0),
             ("trailer", "Trailer", "D:/Movie/trailers/Trailer.mkv", 1),
         ] {
-            db.execute(crate::db::helpers::portable_statement(
-                backend,
+            db.execute(crate::db::helpers::pg_statement(
                 "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', 'movie1', 'Video', 0, ?, 'mkv', 1, 1, 1)",
                 vec![id.into(), title.into(), path.into(), is_public.into()],
             ))
@@ -498,8 +491,7 @@ mod tests {
         assert!(additional_parts(&db, "u1", "p2").await.unwrap().is_empty());
         assert!(additional_parts(&db, "u1", "p3").await.unwrap().is_empty());
 
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES ('private-parent', 'Private Parent', 'D:/Hidden', 'movies', 'movies', 'Movie', 1, 0, 'mkv', 1, 1, 1)",
             vec![],
         ))
@@ -509,8 +501,7 @@ mod tests {
             ("hidden-p1", "D:/Hidden/Hidden CD1.mkv"),
             ("hidden-p2", "D:/Hidden/Hidden CD2.mkv"),
         ] {
-            db.execute(crate::db::helpers::portable_statement(
-                backend,
+            db.execute(crate::db::helpers::pg_statement(
                 "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES (?, 'Hidden', ?, 'movies', 'private-parent', 'Video', 0, 1, 'mkv', 1, 1, 1)",
                 vec![id.into(), path.into()],
             ))
@@ -527,11 +518,10 @@ mod tests {
 
     #[tokio::test]
     async fn attachment_path_accepts_attachments_and_external_subtitles_only() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        let backend = db.get_database_backend();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES ('movie', 'Movie', 'D:/Movie/movie.mkv', '', '', 'Video', 0, 1, 'mkv', 1, 1, 1)",
             vec![],
         ))
@@ -549,8 +539,7 @@ mod tests {
             ),
             ("missing-path", 4_i64, "Attachment", "", 0_i64),
         ] {
-            db.execute(crate::db::helpers::portable_statement(
-                backend,
+            db.execute(crate::db::helpers::pg_statement(
                 "INSERT INTO media_streams (id, item_id, stream_index, stream_type, path, is_external, created_at) VALUES (?, 'movie', ?, ?, ?, ?, 1)",
                 vec![
                     id.into(),
@@ -587,8 +576,9 @@ mod tests {
 
     #[tokio::test]
     async fn item_by_file_requires_known_library_path() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let dir = std::env::temp_dir().join(format!(
             "jellyfin-rs-item-file-{}",
             uuid::Uuid::new_v4().simple()
@@ -601,16 +591,13 @@ mod tests {
         ));
         std::fs::write(&media_path, b"movie").unwrap();
         std::fs::write(&other_path, b"other").unwrap();
-        let backend = db.get_database_backend();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
             vec!["movies".into(), "Movies".into(), "movies".into()],
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO library_paths (id, library_id, path, created_at) VALUES (?, ?, ?, 1)",
             vec![
                 "lp1".into(),
@@ -620,8 +607,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, container, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', '', 'Movie', 0, 'mkv', 1, 1, 1)",
             vec![
                 "movie".into(),
@@ -650,8 +636,9 @@ mod tests {
 
     #[tokio::test]
     async fn item_by_file_hides_private_items_unless_admin() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let dir = std::env::temp_dir().join(format!(
             "jellyfin-rs-private-file-{}",
             uuid::Uuid::new_v4().simple()
@@ -659,16 +646,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let media_path = dir.join("private.mkv");
         std::fs::write(&media_path, b"private").unwrap();
-        let backend = db.get_database_backend();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
             vec!["movies".into(), "Movies".into(), "movies".into()],
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO library_paths (id, library_id, path, created_at) VALUES (?, ?, ?, 1)",
             vec![
                 "lp1".into(),
@@ -678,8 +662,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', '', 'Movie', 0, 0, 'mkv', 1, 1, 1)",
             vec![
                 "private".into(),
@@ -710,8 +693,9 @@ mod tests {
 
     #[tokio::test]
     async fn item_by_file_hides_items_under_private_parent() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let dir = std::env::temp_dir().join(format!(
             "jellyfin-rs-private-parent-file-{}",
             uuid::Uuid::new_v4().simple()
@@ -719,16 +703,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let media_path = dir.join("child.mkv");
         std::fs::write(&media_path, b"child").unwrap();
-        let backend = db.get_database_backend();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
             vec!["movies".into(), "Movies".into(), "movies".into()],
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO library_paths (id, library_id, path, created_at) VALUES (?, ?, ?, 1)",
             vec![
                 "lp1".into(),
@@ -738,15 +719,13 @@ mod tests {
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES ('private-parent', 'Private Parent', 'D:/hidden', 'movies', '', 'Movie', 1, 0, 'mkv', 1, 1, 1)",
             vec![],
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES ('public-child', 'Public Child', ?, 'movies', 'private-parent', 'Video', 0, 1, 'mkv', 1, 1, 1)",
             vec![media_path.to_string_lossy().to_string().into()],
         ))

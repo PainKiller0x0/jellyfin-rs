@@ -1,3 +1,11 @@
+FROM node:24-bookworm-slim AS admin-builder
+WORKDIR /app/admin
+RUN npm install -g pnpm@11.3.0
+COPY admin/package.json admin/pnpm-lock.yaml admin/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY admin/ ./
+RUN pnpm build
+
 FROM rust:1.85 AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
@@ -7,8 +15,10 @@ COPY src src
 RUN cargo build --release
 
 FROM debian:bookworm-slim
+WORKDIR /
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/jellyfin-rs /usr/local/bin/jellyfin-rs
+COPY --from=admin-builder /app/admin/dist /admin/dist
 ENV JELLYFIN_RS_HOST=0.0.0.0
 ENV JELLYFIN_RS_PORT=8096
 EXPOSE 8096

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus';
+import { ElMessage, ElMessageBox, type FormInstance, type FormRules, type UploadFile } from 'element-plus';
 import { computed, onMounted, reactive, ref } from 'vue';
 
 import DirectoryPicker from '@/components/DirectoryPicker.vue';
@@ -21,6 +21,9 @@ type PathForm = {
 const authStore = useAuthStore();
 const loading = ref(false);
 const saving = ref(false);
+const imageVersion = ref(Date.now());
+const uploadingImageId = ref('');
+const deletingImageId = ref('');
 const folders = ref<VirtualFolder[]>([]);
 const createDialogVisible = ref(false);
 const pathDialogVisible = ref(false);
@@ -211,6 +214,63 @@ async function scanLibrary() {
   }
 }
 
+function folderImageUrl(folder: VirtualFolder) {
+  if (!authStore.token) {
+    return '';
+  }
+  return libraryApi.libraryPrimaryImageUrl(folder.ItemId, authStore.token, imageVersion.value);
+}
+
+function showFolderImage(event: Event) {
+  const image = event.target as HTMLImageElement;
+  image.style.display = 'block';
+}
+
+function hideFolderImage(event: Event) {
+  const image = event.target as HTMLImageElement;
+  image.style.display = 'none';
+}
+
+async function uploadFolderImage(folder: VirtualFolder, uploadFile: UploadFile) {
+  if (!authStore.token || !uploadFile.raw) {
+    return;
+  }
+
+  uploadingImageId.value = folder.ItemId;
+  try {
+    await libraryApi.uploadLibraryPrimaryImage(authStore.token, folder.ItemId, uploadFile.raw);
+    imageVersion.value = Date.now();
+    ElMessage.success('媒体库图片已保存');
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存媒体库图片失败');
+  } finally {
+    uploadingImageId.value = '';
+  }
+}
+
+function folderImageChangeHandler(folder: VirtualFolder) {
+  return (uploadFile: UploadFile) => {
+    void uploadFolderImage(folder, uploadFile);
+  };
+}
+
+async function deleteFolderImage(folder: VirtualFolder) {
+  if (!authStore.token) {
+    return;
+  }
+
+  deletingImageId.value = folder.ItemId;
+  try {
+    await libraryApi.deleteLibraryPrimaryImage(authStore.token, folder.ItemId);
+    imageVersion.value = Date.now();
+    ElMessage.success('媒体库图片已删除');
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '删除媒体库图片失败');
+  } finally {
+    deletingImageId.value = '';
+  }
+}
+
 function openCreateDialog() {
   resetForm();
   createDialogVisible.value = true;
@@ -269,6 +329,19 @@ onMounted(loadFolders);
     <ElCard shadow="never">
       <ElTable v-loading="loading" :data="folders" empty-text="暂无媒体库">
         <ElTableColumn label="名称" min-width="180" prop="Name" />
+        <ElTableColumn label="图片" width="104">
+          <template #default="{ row }">
+            <div class="library-page__cover">
+              <span>{{ row.Name.slice(0, 1).toUpperCase() }}</span>
+              <img
+                :alt="row.Name"
+                :src="folderImageUrl(row)"
+                @error="hideFolderImage"
+                @load="showFolderImage"
+              />
+            </div>
+          </template>
+        </ElTableColumn>
         <ElTableColumn label="类型" width="120" prop="CollectionType" />
         <ElTableColumn label="路径" min-width="320">
           <template #default="{ row }">
@@ -285,8 +358,19 @@ onMounted(loadFolders);
             </div>
           </template>
         </ElTableColumn>
-        <ElTableColumn align="right" label="操作" width="120">
+        <ElTableColumn align="right" label="操作" width="220">
           <template #default="{ row }">
+            <ElUpload
+              accept="image/jpeg,image/png,image/webp"
+              :auto-upload="false"
+              :on-change="folderImageChangeHandler(row)"
+              :show-file-list="false"
+            >
+              <ElButton :loading="uploadingImageId === row.ItemId" link type="primary">上传图片</ElButton>
+            </ElUpload>
+            <ElButton :loading="deletingImageId === row.ItemId" link type="danger" @click="deleteFolderImage(row)">
+              删除图片
+            </ElButton>
             <ElButton link type="danger" @click="removeFolder(row)">删除</ElButton>
           </template>
         </ElTableColumn>
@@ -385,6 +469,29 @@ onMounted(loadFolders);
   gap: 8px;
   min-height: 32px;
   align-items: center;
+}
+
+.library-page__cover {
+  position: relative;
+  display: grid;
+  width: 64px;
+  height: 40px;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--admin-border);
+  border-radius: 8px;
+  background: #f1f5f9;
+  color: #64748b;
+  font-weight: 700;
+
+  img {
+    position: absolute;
+    inset: 0;
+    display: none;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
 }
 
 .library-page__control {

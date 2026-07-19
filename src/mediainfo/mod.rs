@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use sea_orm::{ConnectionTrait, DatabaseConnection};
 use serde::{Deserialize, Serialize};
 
-use crate::db::helpers::portable_statement;
+use crate::db::helpers::pg_statement;
 use crate::db::row_ext::QueryResultExt;
 use crate::util::{now_unix, stable_item_id};
 
@@ -65,12 +65,9 @@ pub async fn serialize_mediainfo(
     media_path: &Path,
     root_folder: Option<&str>,
 ) -> anyhow::Result<()> {
-    let backend = db.get_database_backend();
-
     // Get media streams via raw SQL
     let stream_rows = db
-        .query_all(portable_statement(
-            backend,
+        .query_all(pg_statement(
             "SELECT stream_index, stream_type, codec, language, title, bit_rate, width, height, channels, sample_rate, is_external FROM media_streams WHERE item_id = ? ORDER BY stream_index ASC",
             vec![item_id.into()],
         ))
@@ -78,8 +75,7 @@ pub async fn serialize_mediainfo(
 
     // Get runtime and container
     let item_row = db
-        .query_one(portable_statement(
-            backend,
+        .query_one(pg_statement(
             "SELECT runtime_ticks, container, size_bytes FROM media_items WHERE id = ?",
             vec![item_id.into()],
         ))
@@ -155,9 +151,7 @@ pub async fn deserialize_mediainfo(
 
     // Restore media streams
     if !sidecar.media_streams.is_empty() {
-        let backend = db.get_database_backend();
-        db.execute(portable_statement(
-            backend,
+        db.execute(pg_statement(
             "DELETE FROM media_streams WHERE item_id = ?",
             vec![item_id.into()],
         ))
@@ -169,8 +163,7 @@ pub async fn deserialize_mediainfo(
                 "{item_id}:{}:{}",
                 stream.stream_index, stream.stream_type
             )));
-            db.execute(portable_statement(
-                backend,
+            db.execute(pg_statement(
                 "INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, title, bit_rate, width, height, channels, sample_rate, is_external, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 vec![
                     id.into(),
@@ -194,7 +187,6 @@ pub async fn deserialize_mediainfo(
     }
 
     // Restore item properties
-    let backend = db.get_database_backend();
     let mut updates = Vec::new();
     let mut params: Vec<sea_orm::Value> = Vec::new();
 
@@ -214,8 +206,7 @@ pub async fn deserialize_mediainfo(
     if !updates.is_empty() {
         params.push(item_id.into());
         let sql = format!("UPDATE media_items SET {} WHERE id = ?", updates.join(", "));
-        db.execute(portable_statement(backend, &sql, params))
-            .await?;
+        db.execute(pg_statement(&sql, params)).await?;
     }
 
     // Restore chapters

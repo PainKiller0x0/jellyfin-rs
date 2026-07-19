@@ -1,36 +1,21 @@
 services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: jellyfin
-      POSTGRES_USER: jellyfin
-      POSTGRES_PASSWORD: jellyfin
-    ports:
-      - "5433:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U jellyfin"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   app:
     build: .
-    ports:
-      - "8096:8096"
+    network_mode: host
     environment:
       JELLYFIN_RS_HOST: ${JELLYFIN_RS_HOST:-0.0.0.0}
-      JELLYFIN_RS_DATABASE_URL: postgresql://jellyfin:jellyfin@db/jellyfin
-      JELLYFIN_RS_MEDIA_DIRS: "/media"
-      RUST_LOG: info
+      JELLYFIN_RS_DATABASE_URL: ${JELLYFIN_RS_DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/jellyfin_rs}
+      JELLYFIN_RS_USER: ${JELLYFIN_RS_USER:-admin}
+      JELLYFIN_RS_PASSWORD: ${JELLYFIN_RS_PASSWORD:-123456}
+      JELLYFIN_RS_PROXY: ${JELLYFIN_RS_PROXY:-http://127.0.0.1:7890}
+      JELLYFIN_RS_MEDIA_PROBE_CONCURRENCY: ${JELLYFIN_RS_MEDIA_PROBE_CONCURRENCY:-4}
+      JELLYFIN_RS_MEDIA_PROBE_QUEUE_CAPACITY: ${JELLYFIN_RS_MEDIA_PROBE_QUEUE_CAPACITY:-1024}
+      JELLYFIN_RS_WATCH_POLL_SECONDS: ${JELLYFIN_RS_WATCH_POLL_SECONDS:-60}
+      JELLYFIN_RS_WATCH_DEBOUNCE_SECONDS: ${JELLYFIN_RS_WATCH_DEBOUNCE_SECONDS:-10}
+      RUST_LOG: ${JELLYFIN_RS_RUST_LOG:-info}
     volumes:
-      - media_data:/data
-      - "./data/test_media:/media:ro"
-    depends_on:
-      db:
-        condition: service_healthy
+      - app_data:/data
+      - ${JELLYFIN_RS_MEDIA_ROOT:-./media}:/media:ro
 
 volumes:
-  pgdata:
-  media_data:
+  app_data:

@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::UNIX_EPOCH,
 };
 
@@ -196,7 +196,19 @@ fn strip_windows_extended_prefix(path: &str) -> String {
 }
 
 fn canonical_existing_path(path: &str) -> Option<PathBuf> {
-    fs::canonicalize(normalize_path(path)).ok()
+    let normalized = PathBuf::from(normalize_path(path));
+    match fs::canonicalize(&normalized) {
+        Ok(canonical) => Some(canonical),
+        Err(_) if normalized.try_exists().unwrap_or(false) && !contains_parent_dir(&normalized) => {
+            Some(normalized)
+        }
+        Err(_) => None,
+    }
+}
+
+fn contains_parent_dir(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir))
 }
 
 #[cfg(test)]
@@ -227,5 +239,11 @@ mod tests {
         assert!(!path_within_roots(&media_file.to_string_lossy(), &[]));
 
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn contains_parent_dir_detects_parent_components() {
+        assert!(contains_parent_dir(Path::new("/media/../secret")));
+        assert!(!contains_parent_dir(Path::new("/media/movie.mkv")));
     }
 }

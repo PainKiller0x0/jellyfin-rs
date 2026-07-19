@@ -54,15 +54,13 @@ async fn movie_recommendations_inner(
     category_limit: usize,
     item_limit: usize,
 ) -> anyhow::Result<Vec<Value>> {
-    let backend = db.get_database_backend();
     let mut category_counter: i64 = 1;
     let media_visible = visible_media_item_sql("media_items");
     let related_visible = visible_media_item_sql("mi_rel");
 
     // Get recently played Movie folders (is_folder=1, item_type='Movie')
     let recent_movies = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             &format!(
                 "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' AND {media_visible} AND COALESCE(user_data.played, 0) = 1 AND COALESCE(user_data.play_count, 0) > 0 {} ORDER BY user_data.last_played_at DESC LIMIT 12",
                 crate::jellyfin::item_queries::media_item_select_sql(""),
@@ -97,11 +95,7 @@ async fn movie_recommendations_inner(
         }
         vals.push((item_limit as i64).into());
         if let Ok(rows) = db
-            .query_all(crate::db::helpers::portable_statement(
-                backend,
-                &top_rated_sql,
-                vals,
-            ))
+            .query_all(crate::db::helpers::pg_statement(&top_rated_sql, vals))
             .await
         {
             let items = crate::jellyfin::item_queries::decode_media_items(&rows)?;
@@ -133,11 +127,7 @@ async fn movie_recommendations_inner(
         }
         vals.push((item_limit as i64).into());
         if let Ok(rows) = db
-            .query_all(crate::db::helpers::portable_statement(
-                backend,
-                &recent_sql,
-                vals,
-            ))
+            .query_all(crate::db::helpers::pg_statement(&recent_sql, vals))
             .await
         {
             let items = crate::jellyfin::item_queries::decode_media_items(&rows)?;
@@ -157,8 +147,7 @@ async fn movie_recommendations_inner(
     let mut similar_items = Vec::new();
     for movie in &recent_movies[..recent_movies.len().min(4)] {
         let rows = db
-            .query_all(crate::db::helpers::portable_statement(
-                backend,
+            .query_all(crate::db::helpers::pg_statement(
                 &format!(
                     "SELECT mg_rel.item_id FROM media_genres mg_src JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id AND mg_src.item_id <> mg_rel.item_id JOIN media_items mi_rel ON mi_rel.id = mg_rel.item_id WHERE mg_src.item_id = ? AND {related_visible} GROUP BY mg_rel.item_id ORDER BY COUNT(*) DESC LIMIT 8"
                 ),
@@ -181,8 +170,7 @@ async fn movie_recommendations_inner(
             .collect::<Vec<_>>()
             .join(",");
         let items = db
-            .query_all(crate::db::helpers::portable_statement(
-                backend,
+            .query_all(crate::db::helpers::pg_statement(
                 &format!("{} WHERE media_items.id IN ({}) AND {media_visible} ORDER BY media_items.production_year DESC LIMIT {item_limit}", crate::jellyfin::item_queries::media_item_select_sql(""), ph),
                 {
                     let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
@@ -210,8 +198,7 @@ async fn movie_recommendations_inner(
     let mut actor_items = Vec::new();
     for movie in &recent_movies[..recent_movies.len().min(3)] {
         let rows = db
-            .query_all(crate::db::helpers::portable_statement(
-                backend,
+            .query_all(crate::db::helpers::pg_statement(
                 &format!(
                     "SELECT mp2.item_id FROM media_people mp1 JOIN media_people mp2 ON mp1.person_id = mp2.person_id AND mp1.item_id <> mp2.item_id JOIN media_items mi_rel ON mi_rel.id = mp2.item_id WHERE mp1.item_id = ? AND {related_visible} AND mi_rel.item_type NOT IN ('Video', 'Episode') GROUP BY mp2.item_id LIMIT 4"
                 ),
@@ -234,8 +221,7 @@ async fn movie_recommendations_inner(
             .collect::<Vec<_>>()
             .join(",");
         let items = db
-            .query_all(crate::db::helpers::portable_statement(
-                backend,
+            .query_all(crate::db::helpers::pg_statement(
                 &format!(
                     "{} WHERE media_items.id IN ({}) AND {media_visible} LIMIT {item_limit}",
                     crate::jellyfin::item_queries::media_item_select_sql(""),
@@ -283,7 +269,6 @@ pub async fn user_suggestions(
     let parent_id = query.get("ParentId").map(String::as_str);
 
     // Return recently added unplayed items as suggestions
-    let backend = state.db.get_database_backend();
     let visible = visible_media_item_sql("media_items");
     let (sql, vals) = if let Some(pid) = parent_id {
         (
@@ -307,7 +292,7 @@ pub async fn user_suggestions(
 
     match state
         .db
-        .query_all(crate::db::helpers::portable_statement(backend, &sql, vals))
+        .query_all(crate::db::helpers::pg_statement(&sql, vals))
         .await
     {
         Ok(rows) => {
@@ -403,12 +388,10 @@ pub async fn home_section_items(
             } else {
                 "tvshows"
             };
-            let backend = state.db.get_database_backend();
             // Find libraries matching the collection type
             let lib_rows = state
                 .db
-                .query_all(crate::db::helpers::portable_statement(
-                    backend,
+                .query_all(crate::db::helpers::pg_statement(
                     "SELECT id FROM libraries WHERE collection_type = ?",
                     vec![collection_type.into()],
                 ))
@@ -445,13 +428,9 @@ pub async fn home_section_items(
                 }
             }
 
-            Json(json!(
-                all_items
-                    .into_iter()
-                    .map(|i| strip_nulls(i.to_jellyfin_json()))
-                    .collect::<Vec<_>>()
-            ))
-            .into_response()
+            let json_items =
+                crate::jellyfin::items::enrich_episode_list(&state.db, &user_id, all_items).await;
+            Json(json_items).into_response()
         }
         "suggestions" => user_suggestions(State(state), Path(user_id), Query(query)).await,
         _ => Json(json!([])).into_response(),
@@ -461,14 +440,14 @@ pub async fn home_section_items(
 #[cfg(test)]
 mod tests {
     use super::movie_recommendations_inner;
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::ConnectionTrait;
 
     #[tokio::test]
     async fn movie_recommendations_ignore_private_candidates_before_limit() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES ('movies', 'Movies', 'movies', 1, 1)",
             vec![],
         ))
@@ -480,8 +459,7 @@ mod tests {
             ("hidden-child", "Hidden Child", "hidden-parent", 1, 9.0),
             ("public", "Public", "", 1, 8.0),
         ] {
-            db.execute(crate::db::helpers::portable_statement(
-                db.get_database_backend(),
+            db.execute(crate::db::helpers::pg_statement(
                 "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, community_rating, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', ?, 'Movie', 1, ?, ?, 1, 1, 1)",
                 vec![
                     id.into(),

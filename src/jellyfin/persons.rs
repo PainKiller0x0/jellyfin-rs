@@ -19,7 +19,10 @@ use crate::{
         image_assets::{self, Entity as ImageAssets},
         people::Entity as People,
     },
-    jellyfin::{auth::request_user_id_and_admin_or_default, common::internal_error},
+    jellyfin::{
+        auth::request_user_id_and_admin_or_default,
+        common::{image as placeholder_image, internal_error, ok_response, wants_json_response},
+    },
 };
 
 fn visible_media_item_sql(alias: &str) -> String {
@@ -123,11 +126,9 @@ async fn person_detail(
         .or_else(|| query.get("userId"))
         .map(String::as_str);
     let is_favorite = if let Some(uid) = user_id {
-        let backend = state.db.get_database_backend();
         state
             .db
-            .query_one(crate::db::helpers::portable_statement(
-                backend,
+            .query_one(crate::db::helpers::pg_statement(
                 "SELECT is_favorite FROM user_data WHERE user_id = ? AND item_id = ?",
                 vec![uid.into(), person.id.clone().into()],
             ))
@@ -143,9 +144,9 @@ async fn person_detail(
         "Id": person.id,
         "ServerId": "jellyfin-rs",
         "Type": item_type,
-        "Etag": null,
-        "Path": null,
-        "Overview": person.overview,
+        "Etag": person.id,
+        "Path": "",
+        "Overview": person.overview.unwrap_or_default(),
         "ProductionYear": null,
         "PremiereDate": null,
         "EndDate": null,
@@ -155,11 +156,10 @@ async fn person_detail(
         "CanDownload": false,
         "PlayAccess": "Full",
         "IsFolder": item_type == "MusicArtist",
-        "LocationType": null,
+        "LocationType": "Virtual",
         "MediaSources": [],
         "ImageTags": image_tags,
         "BackdropImageTags": [],
-        "ImageBlurHashes": {},
         "Genres": [],
         "GenreItems": [],
         "Tags": [],
@@ -237,11 +237,7 @@ async fn artist_list(
 
     let rows = state
         .db
-        .query_all(crate::db::helpers::portable_statement(
-            state.db.get_database_backend(),
-            &sql,
-            values,
-        ))
+        .query_all(crate::db::helpers::pg_statement(&sql, values))
         .await?;
 
     let person_ids = rows
@@ -338,8 +334,7 @@ async fn has_artist_relation(
     values.extend(person_types.iter().map(|value| (*value).into()));
 
     let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        .query_one(crate::db::helpers::pg_statement(
             &format!(
                 "SELECT COUNT(*) AS cnt FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id WHERE mp.person_id = ? AND LOWER(mp.person_type) IN ({placeholders}){}",
                 if include_private {
@@ -356,14 +351,13 @@ async fn has_artist_relation(
         .unwrap_or(false))
 }
 
-async fn has_person_relation(
+pub(crate) async fn has_person_relation(
     db: &DatabaseConnection,
     person_id: &str,
     include_private: bool,
 ) -> anyhow::Result<bool> {
     let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        .query_one(crate::db::helpers::pg_statement(
             &format!(
                 "SELECT COUNT(*) AS cnt FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id WHERE mp.person_id = ?{}",
                 if include_private {
@@ -504,7 +498,7 @@ async fn fetch_tagged_items(
     include_private: bool,
 ) -> anyhow::Result<Vec<JsonValue>> {
     let mut sql = String::from(
-        r#"SELECT mi.id, mi.title, mi.path, mi.library_id, mi.parent_id, mi.item_type, mi.is_folder, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.runtime_ticks, mi.size_bytes, mi.created_at, mi.modified_at"#,
+        r#"SELECT mi.id, mi.title, mi.path, mi.library_id, mi.parent_id, mi.item_type, mi.is_folder, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.premiere_date, mi.runtime_ticks, mi.size_bytes, mi.created_at, mi.modified_at"#,
     );
 
     let has_user_data = user_id.is_some();
@@ -561,12 +555,8 @@ async fn fetch_tagged_items(
     }
     values.push(limit.into());
     values.push(start_index.into());
-
-    let backend = db.get_database_backend();
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend, &sql, values,
-        ))
+        .query_all(crate::db::helpers::pg_statement(&sql, values))
         .await?;
 
     let item_ids: Vec<String> = rows
@@ -607,6 +597,7 @@ async fn fetch_tagged_items(
                 "Type": item_type,
                 "IsFolder": is_folder != 0,
                 "ProductionYear": row.get_opt_i64("production_year").unwrap_or_default(),
+                "PremiereDate": row.get_opt_str("premiere_date").ok().flatten().and_then(|date| crate::util::yyyy_mm_dd_to_jellyfin_date(&date)),
                 "RunTimeTicks": row.get_opt_i64("runtime_ticks").unwrap_or_default(),
                 "Overview": row.get_opt_str("overview").unwrap_or_default(),
                 "Path": row.get_str("path").unwrap_or_default(),
@@ -662,12 +653,8 @@ async fn count_tagged_items(
             values.push((*person_type).into());
         }
     }
-
-    let backend = db.get_database_backend();
     let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            backend, &sql, values,
-        ))
+        .query_one(crate::db::helpers::pg_statement(&sql, values))
         .await?;
     Ok(row.map(|row| row.get_i64("cnt").unwrap_or(0)).unwrap_or(0))
 }
@@ -702,7 +689,7 @@ mod tests {
     };
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::ConnectionTrait;
     use std::path::PathBuf;
 
     #[test]
@@ -727,8 +714,9 @@ mod tests {
 
     #[tokio::test]
     async fn person_item_queries_hide_private_media_unless_requested() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         insert_person(&db, "p1", "Actor").await;
         insert_media_item(&db, "public", "Public", 1).await;
         insert_media_item(&db, "private", "Private", 0).await;
@@ -786,8 +774,9 @@ mod tests {
 
     #[tokio::test]
     async fn private_only_person_is_hidden_without_admin_bypass() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         insert_person(&db, "p1", "Actor").await;
         insert_media_item(&db, "private", "Private", 0).await;
         insert_media_person(&db, "private", "p1", "Actor").await;
@@ -798,8 +787,9 @@ mod tests {
 
     #[tokio::test]
     async fn public_child_under_private_parent_does_not_expose_person() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         insert_person(&db, "p1", "Actor").await;
         insert_media_item_with_parent(&db, "hidden-parent", "Hidden Parent", "", 0).await;
         insert_media_item_with_parent(&db, "hidden-child", "Hidden Child", "hidden-parent", 1)
@@ -835,8 +825,9 @@ mod tests {
 
     #[tokio::test]
     async fn person_image_requires_visible_person_relation() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         insert_person(&db, "p1", "Actor").await;
         insert_media_item_with_parent(&db, "hidden-parent", "Hidden Parent", "", 0).await;
         insert_media_item_with_parent(&db, "hidden-child", "Hidden Child", "hidden-parent", 1)
@@ -850,8 +841,7 @@ mod tests {
         ));
         std::fs::create_dir_all(image_path.parent().unwrap()).unwrap();
         std::fs::write(&image_path, b"png").unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, created_at, updated_at) VALUES (?, 'p1', 'Primary', 0, ?, 'tag', 1, 1)",
             vec![
                 format!("img-{}", uuid::Uuid::new_v4().simple()).into(),
@@ -880,8 +870,7 @@ mod tests {
     }
 
     async fn insert_person(db: &sea_orm::DatabaseConnection, id: &str, name: &str) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO people (id, name, created_at) VALUES (?, ?, 1)",
             vec![id.into(), name.into()],
         ))
@@ -905,8 +894,7 @@ mod tests {
         parent_id: &str,
         is_public: i64,
     ) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', 0, ?, 1, 1, 1)",
             vec![
                 id.into(),
@@ -926,8 +914,7 @@ mod tests {
         person_id: &str,
         person_type: &str,
     ) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_people (item_id, person_id, person_type, sort_order) VALUES (?, ?, ?, 0)",
             vec![item_id.into(), person_id.into(), person_type.into()],
         ))
@@ -990,6 +977,9 @@ async fn serve_person_image(
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return internal_error(error),
     }
+    if wants_json_response(headers) {
+        return ok_response();
+    }
 
     // Find image asset
     let model = match find_person_image_asset(db, &person.id, image_type, image_index).await {
@@ -998,7 +988,7 @@ async fn serve_person_image(
     };
 
     let Some(model) = model else {
-        return StatusCode::NOT_FOUND.into_response();
+        return placeholder_image().await;
     };
 
     let etag = model.etag.as_deref().unwrap_or_default();
@@ -1016,7 +1006,7 @@ async fn serve_person_image(
     }
     let bytes = match tokio::fs::read(path).await {
         Ok(b) => b,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return placeholder_image().await,
     };
 
     let content_type = crate::jellyfin::images::content_type_from_path(path);
@@ -1039,10 +1029,8 @@ async fn find_person_image_asset(
     image_type: &str,
     image_index: i64,
 ) -> anyhow::Result<Option<image_assets::Model>> {
-    let backend = db.get_database_backend();
     let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            backend,
+        .query_one(crate::db::helpers::pg_statement(
             "SELECT id, item_id, image_type, image_index, path, etag, width, height, size_bytes, created_at, updated_at FROM image_assets WHERE item_id = ? AND image_type = ? AND CAST(image_index AS TEXT) = ? LIMIT 1",
             vec![person_id.into(), image_type.into(), image_index.to_string().into()],
         ))

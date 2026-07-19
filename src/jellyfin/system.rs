@@ -9,8 +9,8 @@ use axum::{
     response::IntoResponse,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement,
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -48,12 +48,14 @@ const MAX_CAMERA_UPLOAD_FIELD_LEN: usize = 256;
 const MAX_PLUGIN_REPOSITORIES: usize = 32;
 const MAX_PLUGIN_REPOSITORY_NAME_LEN: usize = 128;
 const MAX_PLUGIN_REPOSITORY_URL_LEN: usize = 2048;
+const MAX_DOUBAN_COOKIE_LEN: usize = 16 * 1024;
 const MAX_SCHEDULED_TASK_TRIGGERS: usize = 32;
 const MAX_SCHEDULED_TASK_TRIGGERS_JSON_BYTES: usize = 32 * 1024;
 const MAX_NOTIFICATION_NAME_LEN: usize = 256;
 const MAX_NOTIFICATION_DESCRIPTION_LEN: usize = 4096;
 const MAX_NOTIFICATION_IDS: usize = 512;
 const MAX_NOTIFICATION_ID_LEN: usize = 128;
+const MAX_ADMIN_SERVER_NAME_LEN: usize = 128;
 const CAMERA_UPLOADS_PATH: &str = "data/camera_uploads";
 const USER_USAGE_BACKUP_PATH: &str = "data/user_usage_stats";
 const FALLBACK_FONTS_PATH: &str = "data/fonts";
@@ -81,6 +83,73 @@ pub async fn public_system_info(State(state): State<Arc<AppState>>) -> Response 
     let server_name = app_setting(&state.db, "ServerName", SERVER_NAME).await;
     let startup_completed = app_setting_bool(&state.db, "StartupWizardCompleted", false).await;
     Json(system_info_value(server_name, startup_completed, false)).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct AdminServerNameRequest {
+    #[serde(rename = "ServerName", alias = "serverName", alias = "Name")]
+    server_name: String,
+}
+
+pub async fn admin_server_name(State(state): State<Arc<AppState>>) -> Response {
+    let server_name = app_setting(&state.db, "ServerName", SERVER_NAME).await;
+    Json(json!({ "ServerName": server_name })).into_response()
+}
+
+pub async fn update_admin_server_name(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AdminServerNameRequest>,
+) -> Response {
+    let server_name = match normalize_admin_server_name(&request.server_name) {
+        Some(value) => value,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "Error": "ServerName must be 1-128 characters" })),
+            )
+                .into_response();
+        }
+    };
+    match set_app_setting(&state.db, "ServerName", &server_name).await {
+        Ok(()) => Json(json!({ "ServerName": server_name })).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn admin_http_logs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let after_id = query
+        .get("AfterId")
+        .or_else(|| query.get("afterId"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    let limit = query
+        .get("Limit")
+        .or_else(|| query.get("limit"))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(200)
+        .clamp(1, 1_000);
+    let items = state.admin_http_logs(after_id, limit).await;
+    let last_id = items.last().map(|entry| entry.id).unwrap_or(after_id);
+    Json(json!({
+        "Items": items,
+        "TotalRecordCount": items.len(),
+        "StartIndex": 0,
+        "LastId": last_id,
+    }))
+    .into_response()
+}
+
+pub async fn admin_playback_map(State(state): State<Arc<AppState>>) -> Response {
+    Json(state.playback_distribution_json().await).into_response()
+}
+
+fn normalize_admin_server_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.chars().count() <= MAX_ADMIN_SERVER_NAME_LEN)
+        .then(|| value.to_string())
 }
 
 fn system_info_value(
@@ -146,9 +215,6 @@ pub async fn branding_css(State(state): State<Arc<AppState>>) -> Response {
         .and_then(JsonValue::as_str)
         .unwrap_or_default()
         .to_string();
-    if css.trim().is_empty() {
-        return StatusCode::NO_CONTENT.into_response();
-    }
 
     (
         StatusCode::OK,
@@ -730,6 +796,58 @@ pub async fn update_tmdb_api_key(
     }
 }
 
+pub async fn douban_client_configuration(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let has_cookie = state
+        .douban_cookie
+        .read()
+        .await
+        .as_deref()
+        .is_some_and(|cookie| !cookie.is_empty());
+    Json(douban_client_configuration_value(has_cookie))
+}
+
+fn douban_client_configuration_value(has_cookie: bool) -> JsonValue {
+    json!({
+        "IsDoubanEnabled": true,
+        "IsEnabled": true,
+        "Enabled": true,
+        "HasCookie": has_cookie
+    })
+}
+
+#[derive(Deserialize)]
+pub struct DoubanCookieRequest {
+    #[serde(
+        rename = "DoubanCookie",
+        alias = "Cookie",
+        alias = "cookie",
+        alias = "doubanCookie"
+    )]
+    douban_cookie: String,
+}
+
+pub async fn update_douban_cookie(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<DoubanCookieRequest>,
+) -> Response {
+    let cookie = request.douban_cookie.trim();
+    if cookie.len() > MAX_DOUBAN_COOKIE_LEN
+        || cookie.contains('\0')
+        || cookie.chars().any(|ch| ch.is_control() && ch != '\t')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "Invalid Douban cookie" })),
+        )
+            .into_response();
+    }
+
+    match state.set_douban_cookie(cookie).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
 pub async fn system_logs() -> impl IntoResponse {
     Json(log_files())
 }
@@ -951,11 +1069,9 @@ pub async fn user_usage_stats_user_list(State(state): State<Arc<AppState>>) -> R
 }
 
 pub async fn user_usage_stats_type_filter_list(State(state): State<Arc<AppState>>) -> Response {
-    let backend = state.db.get_database_backend();
     match state
         .db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             "SELECT item_type, COUNT(*) AS cnt FROM media_items GROUP BY item_type ORDER BY item_type",
             vec![],
         ))
@@ -1968,10 +2084,8 @@ fn image_by_name_info(name: &str, theme: &str, context: &str) -> JsonValue {
 }
 
 async fn game_system_summary_rows(db: &DatabaseConnection) -> anyhow::Result<Vec<JsonValue>> {
-    let backend = db.get_database_backend();
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             "SELECT COALESCE(NULLIF(container, ''), 'unknown') AS system, COUNT(*) AS game_count FROM media_items WHERE item_type = 'Game' GROUP BY COALESCE(NULLIF(container, ''), 'unknown') ORDER BY system",
             vec![],
         ))
@@ -2035,7 +2149,6 @@ async fn play_activity_rows(
     user_id: Option<&str>,
     day: Option<(i64, i64)>,
 ) -> anyhow::Result<Vec<JsonValue>> {
-    let backend = db.get_database_backend();
     let mut values: Vec<sea_orm::Value> = Vec::new();
     let type_filter = if item_types.is_empty() {
         String::new()
@@ -2071,9 +2184,7 @@ async fn play_activity_rows(
            LIMIT 200"#
     );
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend, &sql, values,
-        ))
+        .query_all(crate::db::helpers::pg_statement(&sql, values))
         .await
         .context("failed to load playback activity")?;
     rows.iter()
@@ -2110,11 +2221,12 @@ async fn run_user_usage_custom_query(
     request: &CustomQueryRequest,
 ) -> anyhow::Result<JsonValue> {
     let sql = validate_user_usage_custom_query(&request.custom_query_string)?;
-    let backend = db.get_database_backend();
-    let wrapped = format!("SELECT * FROM ({sql}) AS custom_query LIMIT 500");
+    let wrapped = format!(
+        "SELECT row_to_json(custom_query)::text AS value FROM ({sql}) AS custom_query LIMIT 500"
+    );
     let rows = db
         .query_all(Statement::from_sql_and_values(
-            backend,
+            DbBackend::Postgres,
             &wrapped,
             Vec::<sea_orm::Value>::new(),
         ))
@@ -2122,7 +2234,10 @@ async fn run_user_usage_custom_query(
         .context("failed to run custom usage query")?;
     let items = rows
         .iter()
-        .map(|row| serde_json::Value::from_query_result(row, ""))
+        .map(|row| -> anyhow::Result<JsonValue> {
+            let value: String = row.try_get("", "value")?;
+            Ok(serde_json::from_str(&value)?)
+        })
         .collect::<Result<Vec<_>, _>>()
         .context("failed to encode custom usage query")?;
     Ok(json!({
@@ -2157,7 +2272,6 @@ fn validate_user_usage_custom_query(sql: &str) -> anyhow::Result<String> {
         .any(|keyword| words.iter().any(|word| word == keyword))
         || words.iter().any(|word| {
             word.starts_with("pg_")
-                || word.starts_with("sqlite_")
                 || matches!(
                     word.as_str(),
                     "access_tokens"
@@ -3008,11 +3122,9 @@ fn normalize_device_custom_name(value: Option<&str>) -> anyhow::Result<Option<St
 }
 
 async fn revoke_device(state: &AppState, device_id: &str, now: i64) -> anyhow::Result<()> {
-    let backend = state.db.get_database_backend();
     state
         .db
-        .execute(crate::db::helpers::portable_statement(
-            backend,
+        .execute(crate::db::helpers::pg_statement(
             "UPDATE access_tokens SET revoked_at = ? WHERE device_id = ? AND revoked_at IS NULL",
             vec![now.into(), device_id.into()],
         ))
@@ -3575,11 +3687,7 @@ async fn visible_notification_ids(
     let mut values = vec![user_id.into()];
     values.extend(ids.iter().map(|id| id.as_str().into()));
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
-            &sql,
-            values,
-        ))
+        .query_all(crate::db::helpers::pg_statement(&sql, values))
         .await?;
     Ok(rows
         .iter()
@@ -3857,10 +3965,8 @@ async fn reports_activity_result(
     } else {
         format!(" WHERE {}", where_parts.join(" AND "))
     };
-    let backend = db.get_database_backend();
     let count_rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             &format!(
                 "SELECT COUNT(*) AS cnt FROM activity_log al LEFT JOIN media_items mi ON mi.id = al.item_id{where_sql}"
             ),
@@ -3877,8 +3983,7 @@ async fn reports_activity_result(
     row_values.push((limit as i64).into());
     row_values.push((start_index as i64).into());
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             &format!(
                 r#"SELECT al.id, al.name, al.log_type, al.user_id, al.item_id, al.severity, al.created_at, users.username, mi.title AS item_name
                    FROM activity_log al
@@ -3932,10 +4037,8 @@ async fn reports_items_result(
     let start_index = report_start_index(query);
     let (where_sql, values) = report_item_where(query);
     let order_sql = report_item_order(query);
-    let backend = db.get_database_backend();
     let count_rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             &format!("SELECT COUNT(*) AS cnt FROM media_items mi{where_sql}"),
             values.clone(),
         ))
@@ -3950,10 +4053,9 @@ async fn reports_items_result(
     row_values.push((limit as i64).into());
     row_values.push((start_index as i64).into());
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+        .query_all(crate::db::helpers::pg_statement(
             &format!(
-                r#"SELECT mi.id, mi.title, mi.path, mi.item_type, mi.overview, mi.official_rating, mi.production_year,
+                r#"SELECT mi.id, mi.title, mi.path, mi.item_type, mi.overview, mi.official_rating, mi.production_year, mi.premiere_date,
                           mi.runtime_ticks, mi.size_bytes, mi.season_number, mi.episode_number,
                           mi.community_rating, mi.critic_rating, mi.created_at,
                           (SELECT COUNT(*) FROM media_streams ms WHERE ms.item_id = mi.id AND ms.stream_type = 'Subtitle') AS subtitle_count
@@ -4070,7 +4172,8 @@ fn report_item_order(query: &HashMap<String, String>) -> String {
         "path" => "mi.path",
         "datecreated" | "dateadded" => "mi.created_at",
         "runtime" => "COALESCE(mi.runtime_ticks, 0)",
-        "productionyear" | "premieredate" | "year" => "COALESCE(mi.production_year, 0)",
+        "productionyear" | "year" => "COALESCE(mi.production_year, 0)",
+        "premieredate" => "COALESCE(mi.premiere_date, '9999-12-31')",
         "communityrating" => "COALESCE(mi.community_rating, 0)",
         "criticrating" => "COALESCE(mi.critic_rating, 0)",
         _ => "LOWER(mi.title)",
@@ -4594,9 +4697,7 @@ mod tests {
         http::HeaderMap,
         response::IntoResponse,
     };
-    use sea_orm::{
-        ConnectionTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait, Set,
-    };
+    use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, Set};
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
     use uuid::Uuid;
@@ -4666,8 +4767,9 @@ mod tests {
 
     #[tokio::test]
     async fn activity_log_query_count_uses_user_filter() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         for (id, user_id) in [("global", None), ("user", Some("u1"))] {
             activity_log::Entity::insert(activity_log::ActiveModel {
                 id: Set(id.to_string()),
@@ -4870,8 +4972,9 @@ mod tests {
 
     #[tokio::test]
     async fn device_info_reports_saved_custom_name() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         users::Entity::insert(users::ActiveModel {
             id: Set("u1".to_string()),
             username: Set("alice".to_string()),
@@ -4922,8 +5025,9 @@ mod tests {
 
     #[tokio::test]
     async fn camera_upload_history_has_emby_shape() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let history = camera_upload_history_value(&db, "device-1").await.unwrap();
         assert_eq!(history["DeviceId"], "device-1");
         assert!(history["FilesUploaded"].as_array().unwrap().is_empty());
@@ -4931,8 +5035,9 @@ mod tests {
 
     #[tokio::test]
     async fn camera_upload_persists_history() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let upload_root =
             std::env::temp_dir().join(format!("jellyfin-rs-camera-test-{}", uuid::Uuid::new_v4()));
         let mut headers = axum::http::HeaderMap::new();
@@ -5182,8 +5287,9 @@ mod tests {
 
     #[tokio::test]
     async fn scheduled_task_has_jellyfin_shape() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
 
         let task = scan_library_task(&db).await;
         assert_eq!(task["Id"], "scan-library");
@@ -5196,10 +5302,10 @@ mod tests {
 
     #[tokio::test]
     async fn task_result_uses_jellyfin_error_fields() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO task_results (task_id, status, start_time, end_time, message) VALUES ('scan-library', 'Failed', 1, 2, 'boom')",
             vec![],
         ))
@@ -5217,8 +5323,9 @@ mod tests {
 
     #[tokio::test]
     async fn stop_scheduled_task_records_cancelled_result() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let state = Arc::new(test_state(db));
 
         let response =
@@ -5353,8 +5460,9 @@ mod tests {
 
     #[tokio::test]
     async fn items_access_rejects_body_user_for_non_admin() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         users::Entity::insert(users::ActiveModel {
             id: Set("u1".to_string()),
             username: Set("alice".to_string()),
@@ -5385,8 +5493,9 @@ mod tests {
 
     #[tokio::test]
     async fn items_access_allows_body_user_for_admin() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         users::Entity::insert(users::ActiveModel {
             id: Set("admin".to_string()),
             username: Set("admin".to_string()),
@@ -5497,46 +5606,40 @@ mod tests {
 
     #[tokio::test]
     async fn play_activity_uses_user_data() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        let backend = db.get_database_backend();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, ?, ?, 0, 0, 1, 1)",
             vec!["u1".into(), "alice".into(), "Alice".into()],
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, ?, ?, 0, 0, 1, 1)",
             vec!["u2".into(), "bob".into(), "Bob".into()],
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, 1, 1, 1)",
             vec!["m1".into(), "Movie".into(), "D:/movie.mkv".into()],
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO user_data (user_id, item_id, played, playback_position_ticks, play_count, last_played_at, updated_at) VALUES (?, ?, 1, 123, 2, 10, 10)",
             vec!["u1".into(), "m1".into()],
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Episode', 0, 1, 1, 1)",
             vec!["e1".into(), "Episode".into(), "D:/episode.mkv".into()],
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO user_data (user_id, item_id, played, playback_position_ticks, play_count, last_played_at, updated_at) VALUES (?, ?, 1, 456, 1, 90010, 90010)",
             vec!["u2".into(), "e1".into()],
         ))
@@ -5595,8 +5698,9 @@ mod tests {
 
     #[tokio::test]
     async fn usage_stats_backup_round_trips_json_safely() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let root =
             std::env::temp_dir().join(format!("jellyfin-rs-usage-test-{}", uuid::Uuid::new_v4()));
 
@@ -5648,10 +5752,10 @@ mod tests {
 
     #[tokio::test]
     async fn custom_usage_query_is_read_only_and_scoped() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES ('m1', 'Movie', 'D:/movie.mkv', '', '', 'Movie', 0, 1, 1, 1)",
             vec![],
         ))
@@ -5692,10 +5796,10 @@ mod tests {
 
     #[tokio::test]
     async fn usage_user_manage_returns_safe_user_shape() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, password_hash, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'alice', 'Alice', 'secret-hash', 1, 0, 1, 1)",
             vec![],
         ))
@@ -5713,18 +5817,16 @@ mod tests {
 
     #[tokio::test]
     async fn reports_items_use_media_rows_and_filters() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        let backend = db.get_database_backend();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, overview, production_year, runtime_ticks, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, 'overview', 2024, 1200000000, 1, 2, 3)",
             vec!["m1".into(), "Movie".into(), "D:/movie.mkv".into()],
         ))
         .await
         .unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            backend,
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Episode', 0, 1, 2, 3)",
             vec!["e1".into(), "Episode".into(), "D:/episode.mkv".into()],
         ))
@@ -5751,8 +5853,9 @@ mod tests {
 
     #[tokio::test]
     async fn reports_activities_use_activity_log_rows() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         activity_log::Entity::insert(activity_log::ActiveModel {
             id: Set("a1".to_string()),
             name: Set("Scanned".to_string()),
@@ -5781,8 +5884,9 @@ mod tests {
 
     #[tokio::test]
     async fn notification_read_state_ignores_invisible_ids() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         activity_log::Entity::insert(activity_log::ActiveModel {
             id: Set("n1".to_string()),
             name: Set("Visible".to_string()),
@@ -5883,8 +5987,9 @@ mod tests {
 
     #[tokio::test]
     async fn notification_service_test_records_global_notification() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         let state = Arc::new(test_state(db));
 
         assert_eq!(
@@ -5909,10 +6014,10 @@ mod tests {
 
     #[tokio::test]
     async fn smtp_notification_test_records_user_notification() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'alice', 'Alice', 0, 0, 1, 1)",
             vec![],
         ))
@@ -6083,8 +6188,13 @@ mod tests {
             media_dirs: Vec::new(),
             http_client: reqwest::Client::new(),
             tmdb_api_key: RwLock::new(None),
+            douban_cookie: RwLock::new(None),
+            scan_lock: tokio::sync::Mutex::new(()),
             playback_sessions: RwLock::new(HashMap::new()),
             session_capabilities: RwLock::new(HashMap::new()),
+            admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),
+            admin_http_logs: RwLock::new(std::collections::VecDeque::new()),
+            playback_distribution: RwLock::new(crate::app::state::PlaybackDistribution::default()),
             ws_event_tx,
             sa_config: crate::config::StrmAssistantConfig::default(),
             intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),

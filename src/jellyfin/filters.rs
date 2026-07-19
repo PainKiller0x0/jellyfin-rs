@@ -114,17 +114,12 @@ async fn list_extended_video_types_inner(
     db: &DatabaseConnection,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
-    let backend = db.get_database_backend();
     let visible = visible_media_item_sql("mi");
     let sql = format!(
         "SELECT mi.extended_video_type FROM media_items mi WHERE {visible} AND mi.extended_video_type IS NOT NULL AND mi.extended_video_type <> ''"
     );
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            &sql,
-            vec![],
-        ))
+        .query_all(crate::db::helpers::pg_statement(&sql, vec![]))
         .await
         .context("failed to list extended video types")?;
 
@@ -191,17 +186,12 @@ async fn list_prefixes(
     table: &str,
     column: &str,
 ) -> anyhow::Result<Vec<Value>> {
-    let backend = db.get_database_backend();
     let sql = format!(
         "SELECT DISTINCT UPPER(SUBSTR({}, 1, 1)) AS prefix FROM {} WHERE {} IS NOT NULL AND {} <> '' ORDER BY prefix ASC",
         column, table, column, column
     );
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            &sql,
-            vec![],
-        ))
+        .query_all(crate::db::helpers::pg_statement(&sql, vec![]))
         .await
         .context("failed to list prefixes")?;
     Ok(rows
@@ -222,17 +212,12 @@ async fn list_years_inner(
     db: &DatabaseConnection,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
-    let backend = db.get_database_backend();
     let visible = visible_media_item_sql("mi");
     let sql = format!(
         "SELECT DISTINCT mi.production_year FROM media_items mi WHERE {visible} AND mi.production_year IS NOT NULL AND mi.production_year > 0 ORDER BY mi.production_year DESC"
     );
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            &sql,
-            vec![],
-        ))
+        .query_all(crate::db::helpers::pg_statement(&sql, vec![]))
         .await
         .context("failed to list years")?;
 
@@ -259,11 +244,7 @@ async fn year_exists(db: &DatabaseConnection, year: i64) -> anyhow::Result<bool>
         "SELECT COUNT(*) AS cnt FROM media_items mi WHERE {visible} AND mi.production_year = ?"
     );
     let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
-            &sql,
-            vec![year.into()],
-        ))
+        .query_one(crate::db::helpers::pg_statement(&sql, vec![year.into()]))
         .await
         .context("failed to check year")?;
     Ok(row
@@ -317,13 +298,8 @@ async fn list_distinct_values_inner(
     let sql = format!(
         "SELECT DISTINCT mi.{column} FROM {table} mi WHERE {visible} AND mi.{column} IS NOT NULL AND mi.{column} <> '' ORDER BY mi.{column} ASC"
     );
-    let backend = db.get_database_backend();
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            &sql,
-            vec![],
-        ))
+        .query_all(crate::db::helpers::pg_statement(&sql, vec![]))
         .await
         .with_context(|| format!("failed to list distinct {column} from {table}"))?;
 
@@ -364,11 +340,7 @@ async fn list_media_stream_values_inner(
         "SELECT DISTINCT media_streams.{column} FROM media_streams JOIN media_items mi ON mi.id = media_streams.item_id WHERE {visible} AND media_streams.{column} IS NOT NULL AND media_streams.{column} <> '' ORDER BY media_streams.{column} ASC"
     );
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
-            &sql,
-            vec![],
-        ))
+        .query_all(crate::db::helpers::pg_statement(&sql, vec![]))
         .await
         .with_context(|| format!("failed to list distinct {column} from media_streams"))?;
 
@@ -494,8 +466,7 @@ async fn list_filter_items_inner(
                         "SELECT DISTINCT p.id, p.name, ia.etag AS primary_image_tag FROM people p JOIN user_data ud ON ud.item_id = p.id JOIN media_people mp ON mp.person_id = p.id JOIN media_items mi ON mi.id = mp.item_id LEFT JOIN image_assets ia ON ia.item_id = p.id AND ia.image_type = 'Primary' WHERE {visible} AND ud.user_id = ? AND ud.is_favorite = 1 ORDER BY p.name ASC"
                     );
                     let models = db
-                        .query_all(crate::db::helpers::portable_statement(
-                            db.get_database_backend(),
+                        .query_all(crate::db::helpers::pg_statement(
                             &sql,
                             vec![uid.as_str().into()],
                         ))
@@ -590,8 +561,7 @@ async fn list_public_related_items(
         "SELECT DISTINCT named.id, named.name FROM {table} named JOIN {relation_table} rel ON rel.{relation_column} = named.id JOIN media_items mi ON mi.id = rel.item_id WHERE {visible} ORDER BY named.name ASC"
     );
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        .query_all(crate::db::helpers::pg_statement(
             &sql,
             Vec::<DbValue>::new(),
         ))
@@ -630,11 +600,7 @@ async fn list_prefixes_sql(
     values: Vec<DbValue>,
 ) -> anyhow::Result<Vec<Value>> {
     let rows = db
-        .query_all(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
-            sql,
-            values,
-        ))
+        .query_all(crate::db::helpers::pg_statement(sql, values))
         .await
         .context("failed to list prefixes")?;
     Ok(rows
@@ -675,7 +641,7 @@ mod tests {
         list_media_stream_values_inner, list_years_inner, paged_query_result, year_exists,
         year_item,
     };
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::ConnectionTrait;
     use serde_json::{Value, json};
     use std::collections::HashMap;
 
@@ -711,8 +677,9 @@ mod tests {
 
     #[tokio::test]
     async fn media_filter_lists_hide_private_only_values() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
 
         insert_user(&db, "u1").await;
         insert_media_item(&db, "public", "Alpha Public", 1, 2001, "PG", "mkv", "Dvd").await;
@@ -936,8 +903,7 @@ mod tests {
         container: &str,
         extended_video_type: &str,
     ) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, production_year, official_rating, container, extended_video_type, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', 0, ?, ?, ?, ?, ?, 1, 1, 1)",
             vec![
                 id.into(),
@@ -956,8 +922,7 @@ mod tests {
     }
 
     async fn insert_user(db: &sea_orm::DatabaseConnection, user_id: &str) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, ?, ?, 0, 0, 1, 1)",
             vec![user_id.into(), user_id.into(), user_id.into()],
         ))
@@ -966,8 +931,7 @@ mod tests {
     }
 
     async fn favorite_item(db: &sea_orm::DatabaseConnection, user_id: &str, item_id: &str) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO user_data (user_id, item_id, is_favorite, played, playback_position_ticks, play_count, updated_at) VALUES (?, ?, 1, 0, 0, 0, 1)",
             vec![user_id.into(), item_id.into()],
         ))
@@ -976,8 +940,7 @@ mod tests {
     }
 
     async fn insert_stream(db: &sea_orm::DatabaseConnection, item_id: &str, codec: &str) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, created_at) VALUES (?, ?, 0, 'Video', ?, 1)",
             vec![format!("stream-{item_id}").into(), item_id.into(), codec.into()],
         ))
@@ -986,8 +949,7 @@ mod tests {
     }
 
     async fn insert_named(db: &sea_orm::DatabaseConnection, table: &str, id: &str, name: &str) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             &format!("INSERT INTO {table} (id, name, created_at) VALUES (?, ?, 1)"),
             vec![id.into(), name.into()],
         ))
@@ -1002,8 +964,17 @@ mod tests {
         item_id: &str,
         value_id: &str,
     ) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        if table == "media_people" && column == "person_id" {
+            db.execute(crate::db::helpers::pg_statement(
+                "INSERT INTO media_people (item_id, person_id, person_type, sort_order) VALUES (?, ?, 'Actor', 0)",
+                vec![item_id.into(), value_id.into()],
+            ))
+            .await
+            .unwrap();
+            return;
+        }
+
+        db.execute(crate::db::helpers::pg_statement(
             &format!("INSERT INTO {table} (item_id, {column}) VALUES (?, ?)"),
             vec![item_id.into(), value_id.into()],
         ))

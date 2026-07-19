@@ -6,3 +6,8 @@ mod seed;
 
 pub use migrate::{ensure_database_exists, migrate};
 pub use seed::seed_default_data;
+
+#[cfg(test)]
+pub use migrate::test_db;
+
+pub const DEFAULT_DATABASE_URL: &str = "postgresql://postgres:postgres@127.0.0.1:5432/jellyfin_rs";

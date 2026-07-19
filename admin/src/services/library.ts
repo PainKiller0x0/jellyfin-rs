@@ -1,4 +1,4 @@
-import { request } from '@/services/http';
+import { request, requestUrl } from '@/services/http';
 import type {
   CreateVirtualFolderPayload,
   DefaultDirectoryBrowser,
@@ -56,6 +56,32 @@ export function refreshLibrary(token: string) {
     method: 'POST',
     token
   });
+}
+
+export function uploadLibraryPrimaryImage(token: string, itemId: string, file: Blob) {
+  return request<void>(`/Items/${encodeURIComponent(itemId)}/Images/Primary`, {
+    method: 'POST',
+    token,
+    headers: {
+      'Content-Type': file.type || 'application/octet-stream'
+    },
+    body: file
+  });
+}
+
+export function deleteLibraryPrimaryImage(token: string, itemId: string) {
+  return request<void>(`/Items/${encodeURIComponent(itemId)}/Images/Primary`, {
+    method: 'DELETE',
+    token
+  });
+}
+
+export function libraryPrimaryImageUrl(itemId: string, token: string, version: number) {
+  const params = new URLSearchParams({
+    api_key: token,
+    tag: String(version)
+  });
+  return requestUrl(`/Items/${encodeURIComponent(itemId)}/Images/Primary?${params.toString()}`);
 }
 
 export function defaultDirectoryBrowser(token: string) {

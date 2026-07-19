@@ -26,7 +26,7 @@ pub async fn filters2(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    match filters2_inner(&state.db, &query).await {
+    match filters2_emby_inner(&state.db, &query).await {
         Ok(result) => Json(result).into_response(),
         Err(error) => internal_error(error),
     }
@@ -36,7 +36,35 @@ async fn filters2_inner(
     db: &sea_orm::DatabaseConnection,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Value> {
-    let backend = db.get_database_backend();
+    filter_values(db, query).await.map(filters2_jellyfin_json)
+}
+
+async fn filters2_emby_inner(
+    db: &sea_orm::DatabaseConnection,
+    query: &HashMap<String, String>,
+) -> anyhow::Result<Value> {
+    filter_values(db, query).await.map(filters2_emby_json)
+}
+
+async fn filters_legacy_inner(
+    db: &sea_orm::DatabaseConnection,
+    query: &HashMap<String, String>,
+) -> anyhow::Result<Value> {
+    filter_values(db, query).await.map(filters_legacy_json)
+}
+
+struct FilterValues {
+    genres: Vec<String>,
+    years: Vec<i64>,
+    tags: Vec<String>,
+    studios: Vec<String>,
+    ratings: Vec<String>,
+}
+
+async fn filter_values(
+    db: &sea_orm::DatabaseConnection,
+    query: &HashMap<String, String>,
+) -> anyhow::Result<FilterValues> {
     let parent_id = query.get("ParentId").map(String::as_str);
     let include_types = query
         .get("IncludeItemTypes")
@@ -71,20 +99,14 @@ async fn filters2_inner(
         "SELECT DISTINCT g.name FROM genres g JOIN media_genres mg ON mg.genre_id = g.id JOIN media_items ON media_items.id = mg.item_id WHERE {} ORDER BY g.name ASC",
         where_clause
     );
-    let genres: Vec<Value> = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+    let genres: Vec<String> = db
+        .query_all(crate::db::helpers::pg_statement(
             &genres_sql,
             values.clone(),
         ))
         .await?
         .iter()
-        .filter_map(|r| {
-            r.get_opt_str("name")
-                .ok()
-                .flatten()
-                .map(|n| json!({"Name": n, "Id": n}))
-        })
+        .filter_map(|r| r.get_opt_str("name").ok().flatten())
         .collect();
 
     // Get years
@@ -92,20 +114,11 @@ async fn filters2_inner(
         "SELECT DISTINCT media_items.production_year FROM media_items WHERE {} AND media_items.production_year IS NOT NULL ORDER BY media_items.production_year DESC",
         where_clause
     );
-    let years: Vec<Value> = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            &years_sql,
-            values.clone(),
-        ))
+    let years: Vec<i64> = db
+        .query_all(crate::db::helpers::pg_statement(&years_sql, values.clone()))
         .await?
         .iter()
-        .filter_map(|r| {
-            r.get_opt_i64("production_year")
-                .ok()
-                .flatten()
-                .map(|y| json!(y))
-        })
+        .filter_map(|r| r.get_opt_i64("production_year").ok().flatten())
         .collect();
 
     // Get tags
@@ -113,20 +126,11 @@ async fn filters2_inner(
         "SELECT DISTINCT t.name FROM tags t JOIN media_tags mt ON mt.tag_id = t.id JOIN media_items ON media_items.id = mt.item_id WHERE {} ORDER BY t.name ASC",
         where_clause
     );
-    let tags: Vec<Value> = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            &tags_sql,
-            values.clone(),
-        ))
+    let tags: Vec<String> = db
+        .query_all(crate::db::helpers::pg_statement(&tags_sql, values.clone()))
         .await?
         .iter()
-        .filter_map(|r| {
-            r.get_opt_str("name")
-                .ok()
-                .flatten()
-                .map(|n| json!({"Name": n, "Id": n}))
-        })
+        .filter_map(|r| r.get_opt_str("name").ok().flatten())
         .collect();
 
     // Get studios
@@ -134,20 +138,14 @@ async fn filters2_inner(
         "SELECT DISTINCT s.name FROM studios s JOIN media_studios ms ON ms.studio_id = s.id JOIN media_items ON media_items.id = ms.item_id WHERE {} ORDER BY s.name ASC",
         where_clause
     );
-    let studios: Vec<Value> = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+    let studios: Vec<String> = db
+        .query_all(crate::db::helpers::pg_statement(
             &studios_sql,
             values.clone(),
         ))
         .await?
         .iter()
-        .filter_map(|r| {
-            r.get_opt_str("name")
-                .ok()
-                .flatten()
-                .map(|n| json!({"Name": n, "Id": n}))
-        })
+        .filter_map(|r| r.get_opt_str("name").ok().flatten())
         .collect();
 
     // Get official ratings
@@ -155,30 +153,74 @@ async fn filters2_inner(
         "SELECT DISTINCT media_items.official_rating FROM media_items WHERE {} AND media_items.official_rating IS NOT NULL AND media_items.official_rating <> '' ORDER BY media_items.official_rating ASC",
         where_clause
     );
-    let ratings: Vec<Value> = db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
+    let ratings: Vec<String> = db
+        .query_all(crate::db::helpers::pg_statement(
             &ratings_sql,
             values.clone(),
         ))
         .await?
         .iter()
-        .filter_map(|r| {
-            r.get_opt_str("official_rating")
-                .ok()
-                .flatten()
-                .map(|n| json!(n))
-        })
+        .filter_map(|r| r.get_opt_str("official_rating").ok().flatten())
         .collect();
 
-    Ok(json!({
-        "Genres": genres,
-        "Years": years,
-        "Tags": tags,
-        "Studios": studios,
-        "OfficialRatings": ratings,
+    Ok(FilterValues {
+        genres,
+        years,
+        tags,
+        studios,
+        ratings,
+    })
+}
+
+fn filters2_jellyfin_json(values: FilterValues) -> Value {
+    json!({
+        "Genres": name_id_pairs(&values.genres),
+        "Years": values.years,
+        "Tags": name_id_pairs(&values.tags),
+        "Studios": name_id_pairs(&values.studios),
+        "OfficialRatings": values.ratings,
         "VideoTypes": ["VideoFile", "Iso", "Dvd", "BluRay"],
-    }))
+    })
+}
+
+fn filters2_emby_json(values: FilterValues) -> Value {
+    json!({
+        "Genres": name_long_id_pairs(&values.genres),
+        "Studios": name_long_id_pairs(&values.studios),
+        "Tags": values.tags,
+    })
+}
+
+fn filters_legacy_json(values: FilterValues) -> Value {
+    json!({
+        "Genres": values.genres,
+        "Tags": values.tags,
+        "OfficialRatings": values.ratings,
+        "Years": values.years,
+    })
+}
+
+fn name_id_pairs(values: &[String]) -> Vec<Value> {
+    values
+        .iter()
+        .map(|name| json!({"Name": name, "Id": name}))
+        .collect()
+}
+
+fn name_long_id_pairs(values: &[String]) -> Vec<Value> {
+    values
+        .iter()
+        .map(|name| json!({"Name": name, "Id": stable_long_id(name)}))
+        .collect()
+}
+
+fn stable_long_id(value: &str) -> i64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    (hash & 0x7fff_ffff_ffff_ffff) as i64
 }
 
 /// GET /Items/{item_id}/Ancestors — breadcrumb navigation
@@ -200,15 +242,13 @@ async fn item_ancestors_inner(
     user_id: &str,
     item_id: &str,
 ) -> anyhow::Result<Vec<Value>> {
-    let backend = db.get_database_backend();
     let mut ancestors = Vec::new();
     let mut current_id = Some(item_id.to_string());
 
     // Walk up the parent chain
     while let Some(id) = current_id {
         let row = db
-            .query_one(crate::db::helpers::portable_statement(
-                backend,
+            .query_one(crate::db::helpers::pg_statement(
                 &item_queries::media_item_select_sql(
                     "WHERE media_items.id = ? AND media_items.is_public = 1 AND (media_items.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = media_items.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = media_items.parent_id AND parent.is_public = 1))",
                 ),
@@ -265,7 +305,10 @@ pub async fn items_filters(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    filters2(State(state), Query(query)).await
+    match filters_legacy_inner(&state.db, &query).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => internal_error(error),
+    }
 }
 
 /// GET /Shows/Upcoming — upcoming episodes (recently aired)
@@ -277,8 +320,6 @@ pub async fn shows_upcoming(
     let user_id = query_user_id_or_request(&query, &request_user_id);
     let start_index = query_usize(&query, &["StartIndex", "startIndex"], 0);
     let limit = query_usize(&query, &["Limit", "limit"], 16).min(200);
-
-    let backend = state.db.get_database_backend();
     let visible = visible_media_item_sql("media_items");
     let sql = format!(
         "{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND {visible} ORDER BY media_items.created_at DESC",
@@ -286,11 +327,7 @@ pub async fn shows_upcoming(
     );
     let rows = state
         .db
-        .query_all(crate::db::helpers::portable_statement(
-            backend,
-            &sql,
-            vec![user_id.into()],
-        ))
+        .query_all(crate::db::helpers::pg_statement(&sql, vec![user_id.into()]))
         .await
         .unwrap_or_default();
 
@@ -419,11 +456,7 @@ async fn named_item_by_name_inner(
         relation.table, relation.relation_table, relation.relation_column
     );
     let row = db
-        .query_one(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
-            &sql,
-            vec![name.into()],
-        ))
+        .query_one(crate::db::helpers::pg_statement(&sql, vec![name.into()]))
         .await?;
 
     Ok(row.map(|r| {
@@ -447,7 +480,7 @@ mod tests {
         extract::{Extension, Query, State},
         response::IntoResponse,
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use sea_orm::{ConnectionTrait, DatabaseConnection};
     use serde_json::Value;
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
@@ -466,8 +499,9 @@ mod tests {
 
     #[tokio::test]
     async fn filters2_hides_values_from_private_items() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         insert_media_item(&db, "public", "Public", 1, 2001, "PG").await;
         insert_media_item(&db, "private", "Private", 0, 2002, "R").await;
         insert_media_item_with_parent(&db, "hidden-parent", "Hidden Parent", "", 0, 2003, "NC-17")
@@ -498,8 +532,9 @@ mod tests {
 
     #[tokio::test]
     async fn named_filter_items_require_public_media_relation() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         insert_media_item(&db, "public", "Public", 1, 2001, "PG").await;
         insert_media_item(&db, "private", "Private", 0, 2002, "R").await;
         insert_media_item_with_parent(&db, "hidden-parent", "Hidden Parent", "", 0, 2003, "NC-17")
@@ -602,8 +637,9 @@ mod tests {
 
     #[tokio::test]
     async fn shows_upcoming_returns_paged_query_result() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::db::migrate(&db, "sqlite::memory:").await.unwrap();
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
         insert_episode(&db, "episode-1", "E1", 1, 10).await;
         insert_episode(&db, "episode-2", "E2", 1, 20).await;
         insert_episode(&db, "private", "Private", 0, 30).await;
@@ -649,8 +685,7 @@ mod tests {
         year: i64,
         rating: &str,
     ) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, production_year, official_rating, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', 0, ?, ?, ?, 1, 1, 1)",
             vec![
                 id.into(),
@@ -684,8 +719,7 @@ mod tests {
         is_public: i64,
         created_at: i64,
     ) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Episode', 0, ?, 1, ?, 1)",
             vec![
                 id.into(),
@@ -701,8 +735,7 @@ mod tests {
     }
 
     async fn insert_named(db: &sea_orm::DatabaseConnection, table: &str, id: &str, name: &str) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             &format!("INSERT INTO {table} (id, name, created_at) VALUES (?, ?, 1)"),
             vec![id.into(), name.into()],
         ))
@@ -717,8 +750,7 @@ mod tests {
         item_id: &str,
         value_id: &str,
     ) {
-        db.execute(crate::db::helpers::portable_statement(
-            db.get_database_backend(),
+        db.execute(crate::db::helpers::pg_statement(
             &format!("INSERT INTO {table} (item_id, {column}) VALUES (?, ?)"),
             vec![item_id.into(), value_id.into()],
         ))
@@ -735,8 +767,13 @@ mod tests {
             media_dirs: Vec::new(),
             http_client: reqwest::Client::new(),
             tmdb_api_key: RwLock::new(None),
+            douban_cookie: RwLock::new(None),
+            scan_lock: tokio::sync::Mutex::new(()),
             playback_sessions: RwLock::new(HashMap::new()),
             session_capabilities: RwLock::new(HashMap::new()),
+            admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),
+            admin_http_logs: RwLock::new(std::collections::VecDeque::new()),
+            playback_distribution: RwLock::new(crate::app::state::PlaybackDistribution::default()),
             ws_event_tx,
             sa_config: crate::config::StrmAssistantConfig::default(),
             intro_detector: Arc::new(crate::intro_skip::detector::IntroDetector::default()),

@@ -43,9 +43,7 @@ pub async fn upsert_image_asset(
     let etag = stable_text_id(&format!(
         "image:{item_id}:{image_type}:{image_index}:{path}"
     ));
-    let backend = db.get_database_backend();
-    db.execute(crate::db::helpers::portable_statement(
-        backend,
+    db.execute(crate::db::helpers::pg_statement(
         r#"INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, size_bytes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET path = excluded.path, etag = excluded.etag, size_bytes = excluded.size_bytes, updated_at = excluded.updated_at"#,
         vec![
             stable_text_id(&format!("image-asset:{item_id}:{image_type}:{image_index}")).into(),

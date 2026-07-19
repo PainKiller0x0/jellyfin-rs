@@ -54,7 +54,7 @@ async fn list_items_response(
 ) -> Response {
     match list_media_items(&state.db, &user_id, &query).await {
         Ok((items, total)) => {
-            let json_items = super::enrich_episode_list(&state.db, items).await;
+            let json_items = super::enrich_episode_list(&state.db, &user_id, items).await;
             Json(base_item_query_result_with_total(
                 json_items,
                 total,
@@ -71,15 +71,12 @@ pub async fn latest_items(
     Path(user_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let parent_id = query.get("ParentId").map(String::as_str);
+    let parent_id = query_value(&query, &["ParentId", "parentId"]);
     match latest_media_items(&state.db, &user_id, parent_id).await {
-        Ok(items) => Json(
-            items
-                .into_iter()
-                .map(|item| strip_nulls(item.to_jellyfin_json()))
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+        Ok(items) => {
+            let json_items = super::enrich_episode_list(&state.db, &user_id, items).await;
+            Json(json_items).into_response()
+        }
         Err(error) => internal_error(error),
     }
 }
@@ -90,15 +87,12 @@ pub async fn latest_items_root(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let user_id = query_user_id_or_request(&query, &request_user_id);
-    let parent_id = query.get("ParentId").map(String::as_str);
+    let parent_id = query_value(&query, &["ParentId", "parentId"]);
     match latest_media_items(&state.db, &user_id, parent_id).await {
-        Ok(items) => Json(
-            items
-                .into_iter()
-                .map(|item| strip_nulls(item.to_jellyfin_json()))
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+        Ok(items) => {
+            let json_items = super::enrich_episode_list(&state.db, &user_id, items).await;
+            Json(json_items).into_response()
+        }
         Err(error) => internal_error(error),
     }
 }
@@ -126,11 +120,11 @@ pub async fn items_root(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let user_id = query_user_id_or_request(&query, &request_user_id);
-    Json(root_folder_value(&user_id)).into_response()
+    Json(root_folder_emby_value(&user_id)).into_response()
 }
 
 pub async fn user_items_root(Path(user_id): Path<String>) -> Response {
-    Json(root_folder_value(&user_id)).into_response()
+    Json(root_folder_emby_value(&user_id)).into_response()
 }
 
 pub async fn trailers(
@@ -200,6 +194,14 @@ fn query_usize(query: &HashMap<String, String>, key: &str, default: usize) -> us
         .unwrap_or(default)
 }
 
+fn query_value<'a>(query: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
+    query
+        .iter()
+        .find(|(key, _)| keys.iter().any(|wanted| key.eq_ignore_ascii_case(wanted)))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
 fn root_folder_value(user_id: &str) -> Value {
     let id = stable_text_id(&format!("user-root:{user_id}"));
     json!({
@@ -208,10 +210,10 @@ fn root_folder_value(user_id: &str) -> Value {
         "Type": "UserRootFolder",
         "UserId": user_id,
         "IsFolder": true,
-        "ParentId": null,
-        "Path": null,
+        "ParentId": "",
+        "Path": "",
         "ServerId": "jellyfin-rs",
-        "CollectionType": null,
+        "CollectionType": "",
         "LocationType": "Virtual",
         "PlayAccess": "Full",
         "CanDelete": false,
@@ -240,6 +242,14 @@ fn root_folder_value(user_id: &str) -> Value {
         "LockData": false,
         "ExternalUrls": [],
     })
+}
+
+fn root_folder_emby_value(user_id: &str) -> Value {
+    let mut value = root_folder_value(user_id);
+    if let Some(object) = value.as_object_mut() {
+        object.remove("UserId");
+    }
+    value
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use axum::{
     Json,
     body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection};
@@ -274,9 +274,8 @@ pub(super) async fn download_and_cache_image(
     image_url: &str,
 ) -> anyhow::Result<()> {
     let image_url = validate_remote_image_url(image_url)?;
-    let response = state
-        .http_client
-        .get(image_url.clone())
+    let response = remote_image_request(state, image_url.clone())
+        .await
         .send()
         .await?
         .error_for_status()?;
@@ -330,9 +329,8 @@ async fn fetch_remote_image(
     image_url: &str,
 ) -> anyhow::Result<(Bytes, &'static str)> {
     let image_url = validate_remote_image_url(image_url)?;
-    let response = state
-        .http_client
-        .get(image_url)
+    let response = remote_image_request(state, image_url)
+        .await
         .send()
         .await?
         .error_for_status()?;
@@ -381,14 +379,60 @@ fn remote_image_content_type(headers: &HeaderMap) -> &'static str {
 fn validate_remote_image_url(image_url: &str) -> anyhow::Result<reqwest::Url> {
     let url = reqwest::Url::parse(image_url.trim()).context("invalid remote image url")?;
     let allowed = url.scheme() == "https"
-        && url
-            .host_str()
-            .is_some_and(|host| host.eq_ignore_ascii_case("image.tmdb.org"))
-        && url.path().starts_with("/t/");
+        && url.host_str().is_some_and(|host| {
+            (host.eq_ignore_ascii_case("image.tmdb.org") && url.path().starts_with("/t/"))
+                || is_douban_image_host(host)
+        });
     if !allowed {
         bail!("remote image url is not allowed");
     }
     Ok(url)
+}
+
+async fn remote_image_request(
+    state: &AppState,
+    image_url: reqwest::Url,
+) -> reqwest::RequestBuilder {
+    let request = state.http_client.get(image_url.clone());
+    let Some(host) = image_url
+        .host_str()
+        .filter(|host| is_douban_image_host(host))
+    else {
+        return request;
+    };
+
+    let mut request = request
+        .header(
+            header::USER_AGENT,
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        )
+        .header(header::ACCEPT, "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+        .header(header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.6")
+        .header(header::REFERER, "https://movie.douban.com/");
+    if let Some(cookie) = state.douban_cookie.read().await.as_deref() {
+        request = request.header(header::COOKIE, cookie);
+    }
+    request.header(
+        HeaderName::from_static("sec-fetch-site"),
+        if host.ends_with("doubanio.com") {
+            HeaderValue::from_static("cross-site")
+        } else {
+            HeaderValue::from_static("same-origin")
+        },
+    )
+}
+
+fn is_douban_image_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "img1.doubanio.com"
+        || host == "img2.doubanio.com"
+        || host == "img3.doubanio.com"
+        || host == "img9.doubanio.com"
+        || host == "qnmob3.doubanio.com"
+        || host == "img1.douban.com"
+        || host == "img2.douban.com"
+        || host == "img3.douban.com"
+        || host == "img9.douban.com"
 }
 
 pub(super) fn is_rejected_remote_image_url(error: &anyhow::Error) -> bool {
@@ -705,10 +749,27 @@ mod tests {
     }
 
     #[test]
+    fn remote_image_url_allows_douban_image_cdn() {
+        assert!(
+            validate_remote_image_url(
+                "https://img9.doubanio.com/view/photo/s_ratio_poster/public/p2916595576.jpg"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_remote_image_url(
+                "https://qnmob3.doubanio.com/view/photo/large/public/p2916595576.jpg"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn remote_image_url_rejects_private_or_unexpected_hosts() {
         assert!(validate_remote_image_url("http://127.0.0.1/admin.png").is_err());
         assert!(validate_remote_image_url("https://example.com/poster.jpg").is_err());
         assert!(validate_remote_image_url("https://image.tmdb.org/metadata").is_err());
+        assert!(validate_remote_image_url("https://evil-doubanio.com/poster.jpg").is_err());
     }
 
     #[test]

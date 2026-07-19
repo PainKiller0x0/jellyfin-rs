@@ -19,7 +19,18 @@ pub fn classify_media_path(path: &Path, collection_type: &str) -> Option<String>
     }
     if matches!(
         extension.as_str(),
-        "mkv" | "mp4" | "m4v" | "mov" | "avi" | "wmv" | "webm" | "ts" | "m2ts" | "flv"
+        "mkv"
+            | "mp4"
+            | "m4v"
+            | "mov"
+            | "avi"
+            | "wmv"
+            | "webm"
+            | "ts"
+            | "m2ts"
+            | "flv"
+            | "m3u8"
+            | "m3u"
     ) {
         return Some(
             match collection_type {

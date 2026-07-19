@@ -32,6 +32,9 @@ pub async fn library_views(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>
         .filter_map(|row| row.get_opt_str("id").ok().flatten())
         .collect::<Vec<_>>();
     let counts = library_item_counts(db, &library_ids).await?;
+    let image_tags_by_id = batch_item_image_tags(db, &library_ids)
+        .await
+        .unwrap_or_default();
     rows.iter()
         .map(|row| -> anyhow::Result<Value> {
             let id = row.get_str("id")?;
@@ -39,8 +42,9 @@ pub async fn library_views(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>
             let item_counts = counts.get(&id).copied().unwrap_or_default();
             let child_count = library_child_count(&collection_type, item_counts);
             let recursive_count = library_recursive_count(&collection_type, item_counts);
-            let image_tag = library_image_tag(&id, "Primary");
-            let image_tags = json!({"Primary": image_tag.clone()});
+            let image_tags = library_image_tags(&id, image_tags_by_id.get(&id).cloned());
+            let primary_image_tag = image_tag(&image_tags, "Primary").unwrap_or_default();
+            let backdrop_tags = backdrop_image_tags(&image_tags);
             Ok(json!({
                 "Name": row.get_str("name")?,
                 "Id": id,
@@ -54,8 +58,8 @@ pub async fn library_views(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>
                 "SeriesCount": item_counts.series_count,
                 "EpisodeCount": item_counts.episode_count,
                 "ImageTags": image_tags,
-                "PrimaryImageTag": image_tag,
-                "BackdropImageTags": [],
+                "PrimaryImageTag": primary_image_tag,
+                "BackdropImageTags": backdrop_tags,
             }))
         })
         .collect()
@@ -85,7 +89,12 @@ pub async fn find_library_as_item(
             let item_counts = counts.get(&id).copied().unwrap_or_default();
             let child_count = library_child_count(&collection_type, item_counts);
             let recursive_count = library_recursive_count(&collection_type, item_counts);
-            let image_tag = library_image_tag(&id, "Primary");
+            let image_tags_by_id = batch_item_image_tags(db, std::slice::from_ref(&id))
+                .await
+                .unwrap_or_default();
+            let image_tags = library_image_tags(&id, image_tags_by_id.get(&id).cloned());
+            let primary_image_tag = image_tag(&image_tags, "Primary").unwrap_or_default();
+            let backdrop_tags = backdrop_image_tags(&image_tags);
             let mut value = json!({
                 "Name": name,
                 "Id": id,
@@ -102,8 +111,8 @@ pub async fn find_library_as_item(
                 "SeriesCount": item_counts.series_count,
                 "EpisodeCount": item_counts.episode_count,
                 "MediaSources": [],
-                "ImageTags": {},
-                "BackdropImageTags": [],
+                "ImageTags": image_tags,
+                "BackdropImageTags": backdrop_tags,
                 "Genres": [],
                 "GenreItems": [],
                 "Tags": [],
@@ -141,8 +150,7 @@ pub async fn find_library_as_item(
                 "Likes": null,
                 "UnplayedItemCount": null,
             });
-            value["ImageTags"] = json!({"Primary": image_tag.clone()});
-            value["PrimaryImageTag"] = json!(image_tag);
+            value["PrimaryImageTag"] = json!(primary_image_tag);
             Ok(Some(value))
         }
         None => Ok(None),
@@ -151,6 +159,30 @@ pub async fn find_library_as_item(
 
 fn library_image_tag(library_id: &str, image_type: &str) -> String {
     stable_text_id(&format!("library-image:{library_id}:{image_type}"))
+}
+
+fn library_image_tags(library_id: &str, tags: Option<Value>) -> Value {
+    let mut object = tags
+        .and_then(|tags| tags.as_object().cloned())
+        .unwrap_or_default();
+    object
+        .entry("Primary".to_string())
+        .or_insert_with(|| json!(library_image_tag(library_id, "Primary")));
+    crate::jellyfin::images::add_art_tag_fallback(&mut object);
+    Value::Object(object)
+}
+
+fn image_tag(tags: &Value, image_type: &str) -> Option<String> {
+    tags.get(image_type)
+        .and_then(Value::as_str)
+        .filter(|tag| !tag.is_empty())
+        .map(ToString::to_string)
+}
+
+fn backdrop_image_tags(tags: &Value) -> Vec<Value> {
+    image_tag(tags, "Backdrop")
+        .map(|tag| vec![json!(tag)])
+        .unwrap_or_default()
 }
 
 async fn library_item_counts(
@@ -684,7 +716,7 @@ pub fn decode_media_items(rows: &[sea_orm::QueryResult]) -> anyhow::Result<Vec<M
         .collect())
 }
 
-pub(super) async fn batch_item_image_tags(
+pub(crate) async fn batch_item_image_tags(
     db: &DatabaseConnection,
     item_ids: &[String],
 ) -> anyhow::Result<HashMap<String, serde_json::Value>> {
@@ -1237,8 +1269,8 @@ fn sort_media_items(items: &mut [MediaItem], query: &HashMap<String, String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        find_first_playable_child, find_media_item, find_media_item_for_admin, query_u32_any,
-        resume_media_items,
+        find_first_playable_child, find_library_as_item, find_media_item,
+        find_media_item_for_admin, library_views, query_u32_any, resume_media_items,
     };
     use sea_orm::ConnectionTrait;
     use std::collections::HashMap;
@@ -1346,6 +1378,33 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(child.id, "public-video");
+    }
+
+    #[tokio::test]
+    async fn library_views_use_uploaded_library_image_tags() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        db.execute(crate::db::helpers::pg_statement(
+            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, 'movies', 1, 1)",
+            vec!["movies".into(), "Movies".into()],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::pg_statement(
+            "INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, created_at, updated_at) VALUES (?, ?, 'Primary', 0, 'data/images/movies_primary.png', 'uploaded-tag', 1, 1)",
+            vec!["image-1".into(), "movies".into()],
+        ))
+        .await
+        .unwrap();
+
+        let views = library_views(&db).await.unwrap();
+        assert_eq!(views[0]["ImageTags"]["Primary"], "uploaded-tag");
+        assert_eq!(views[0]["PrimaryImageTag"], "uploaded-tag");
+
+        let item = find_library_as_item(&db, "movies").await.unwrap().unwrap();
+        assert_eq!(item["ImageTags"]["Primary"], "uploaded-tag");
+        assert_eq!(item["PrimaryImageTag"], "uploaded-tag");
     }
 
     #[tokio::test]

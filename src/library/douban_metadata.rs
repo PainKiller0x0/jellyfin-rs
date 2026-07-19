@@ -201,7 +201,7 @@ pub async fn fill_missing_douban(
         if let Ok(Some(douban_id)) = row.get_opt_str("douban_id") {
             match fetch_subject_details(&client, cookie, &douban_id, &item_type).await {
                 Ok(details) => {
-                    apply_subject_metadata(db, &item_id, &details).await?;
+                    apply_subject_metadata(db, &item_id, &details, cookie).await?;
                     filled += 1;
                     tracing::info!(
                         "fill_missing_douban: refreshed '{}' from douban-{}",
@@ -245,7 +245,7 @@ pub async fn fill_missing_douban(
                             best
                         }
                     };
-                apply_subject_metadata(db, &item_id, &details).await?;
+                apply_subject_metadata(db, &item_id, &details, cookie).await?;
                 filled += 1;
                 tracing::info!(
                     "fill_missing_douban: matched '{name}' -> douban-{}",
@@ -321,6 +321,8 @@ async fn suggest_subjects(
     item_type: &str,
 ) -> anyhow::Result<Vec<DoubanSubject>> {
     let items = douban_request(client.get(SUGGEST_URL), cookie, false)
+        .header(ACCEPT, "application/json,text/javascript,*/*;q=0.8")
+        .header("X-Requested-With", "XMLHttpRequest")
         .query(&[("q", name)])
         .send()
         .await?
@@ -472,6 +474,7 @@ async fn apply_subject_metadata(
     db: &DatabaseConnection,
     item_id: &str,
     subject: &DoubanSubject,
+    cookie: Option<&str>,
 ) -> anyhow::Result<()> {
     db.execute(crate::db::helpers::pg_statement(
         r#"INSERT INTO provider_ids (item_id, provider, provider_item_id)
@@ -521,7 +524,8 @@ async fn apply_subject_metadata(
         .as_deref()
         .filter(|value| !value.is_empty())
     {
-        let _ = download_and_save_douban_image(db, &client, item_id, image_url, "Primary").await;
+        let _ = download_and_save_douban_image(db, &client, item_id, image_url, "Primary", cookie)
+            .await;
     }
     if let Some(backdrop_url) = subject
         .backdrop_url
@@ -529,8 +533,10 @@ async fn apply_subject_metadata(
         .filter(|value| !value.is_empty())
     {
         let _ =
-            download_and_save_douban_image(db, &client, item_id, backdrop_url, "Backdrop").await;
-        let _ = download_and_save_douban_image(db, &client, item_id, backdrop_url, "Art").await;
+            download_and_save_douban_image(db, &client, item_id, backdrop_url, "Backdrop", cookie)
+                .await;
+        let _ =
+            download_and_save_douban_image(db, &client, item_id, backdrop_url, "Art", cookie).await;
     }
     Ok(())
 }
@@ -626,8 +632,9 @@ async fn download_and_save_douban_image(
     item_id: &str,
     url: &str,
     image_type: &str,
+    cookie: Option<&str>,
 ) -> anyhow::Result<()> {
-    let response = douban_request(client.get(url), None, true)
+    let response = douban_request(client.get(url), cookie, true)
         .send()
         .await?
         .error_for_status()?;
@@ -684,7 +691,10 @@ fn douban_request(
         )
         .header(REFERER, "https://movie.douban.com/");
     if let Some(cookie) = cookie.map(str::trim).filter(|value| !value.is_empty()) {
-        request = request.header(COOKIE, cookie);
+        let cookie = crate::app::state::normalize_douban_cookie_value(cookie);
+        if !cookie.is_empty() {
+            request = request.header(COOKIE, cookie);
+        }
     }
     request
 }

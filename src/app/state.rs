@@ -269,13 +269,26 @@ pub async fn load_douban_cookie(db: &sea_orm::DatabaseConnection) -> Option<Stri
         .await
     {
         if let Ok(val) = row.get_str("value") {
-            let val = val.trim();
+            let val = normalize_douban_cookie_value(&val);
             if !val.is_empty() {
-                return Some(val.to_string());
+                return Some(val);
             }
         }
     }
     None
+}
+
+pub fn normalize_douban_cookie_value(cookie: &str) -> String {
+    let cookie = cookie.trim();
+    cookie
+        .split_once(':')
+        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("cookie"))
+        .map(|(_, value)| value)
+        .unwrap_or(cookie)
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_string()
 }
 
 impl AppState {
@@ -298,17 +311,18 @@ impl AppState {
     /// Update the Douban cookie in both database and runtime state.
     pub async fn set_douban_cookie(&self, cookie: &str) -> anyhow::Result<()> {
         use sea_orm::ConnectionTrait;
+        let cookie = normalize_douban_cookie_value(cookie);
         let now = crate::util::now_unix();
         self.db
             .execute(crate::db::helpers::pg_statement(
                 "INSERT INTO app_settings (key, value, updated_at) VALUES ('douban_cookie', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-                vec![cookie.to_string().into(), now.into()],
+                vec![cookie.clone().into(), now.into()],
             ))
             .await?;
         *self.douban_cookie.write().await = if cookie.is_empty() {
             None
         } else {
-            Some(cookie.to_string())
+            Some(cookie)
         };
         Ok(())
     }
@@ -574,7 +588,7 @@ fn stable_hash(value: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_remote_ip, playback_region_for_ip};
+    use super::{normalize_douban_cookie_value, normalize_remote_ip, playback_region_for_ip};
 
     #[test]
     fn remote_ip_normalization_accepts_socket_addresses_and_forwarded_for() {
@@ -593,5 +607,14 @@ mod tests {
         let region = playback_region_for_ip("192.168.1.16");
         assert_eq!(region.region, "局域网 192.168.1.0/24");
         assert!(region.is_private);
+    }
+
+    #[test]
+    fn douban_cookie_normalization_accepts_pasted_header_value() {
+        assert_eq!(
+            normalize_douban_cookie_value(" Cookie: bid=abc; ll=\"108288\"; "),
+            "bid=abc; ll=\"108288\""
+        );
+        assert_eq!(normalize_douban_cookie_value("COOKIE: bid=abc;"), "bid=abc");
     }
 }

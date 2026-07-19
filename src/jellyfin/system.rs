@@ -830,7 +830,7 @@ pub async fn update_douban_cookie(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DoubanCookieRequest>,
 ) -> Response {
-    let cookie = request.douban_cookie.trim();
+    let cookie = crate::app::state::normalize_douban_cookie_value(&request.douban_cookie);
     if cookie.len() > MAX_DOUBAN_COOKIE_LEN
         || cookie.contains('\0')
         || cookie.chars().any(|ch| ch.is_control() && ch != '\t')
@@ -842,7 +842,7 @@ pub async fn update_douban_cookie(
             .into_response();
     }
 
-    match state.set_douban_cookie(cookie).await {
+    match state.set_douban_cookie(&cookie).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error),
     }

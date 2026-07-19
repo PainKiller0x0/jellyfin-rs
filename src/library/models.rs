@@ -353,11 +353,14 @@ pub fn media_source_json_with_streams(
         split_media_streams_and_attachments(&item.id, &item.id, media_streams);
     let bitrate = media_source_bitrate(item.size_bytes, item.runtime_ticks, &media_streams);
     let container = item.container.as_deref().unwrap_or("bin");
-    let stream_path = match item.item_type.as_str() {
-        "Audio" => format!("/Audio/{}/universal", item.id),
-        _ => format!("/Videos/{}/stream.{container}", item.id),
+    let direct_stream_url = match remote_strm_target(&item.path) {
+        Some(target) => target,
+        None => match item.item_type.as_str() {
+            "Audio" => format!("/Audio/{}/universal", item.id),
+            _ => format!("/Videos/{}/stream.{container}", item.id),
+        },
     };
-
+    let (protocol, path, is_remote) = media_source_protocol_path(&item.path);
     let video_type =
         if item.item_type == "Video" || item.item_type == "Movie" || item.item_type == "Episode" {
             JsonValue::String("VideoFile".to_string())
@@ -369,8 +372,8 @@ pub fn media_source_json_with_streams(
     map.insert("Id".into(), JsonValue::String(item.id.clone()));
     map.insert("Name".into(), JsonValue::String(item.title.clone()));
     map.insert("Type".into(), JsonValue::String("Default".to_string()));
-    map.insert("Protocol".into(), JsonValue::String("File".to_string()));
-    map.insert("Path".into(), JsonValue::String(item.path.clone()));
+    map.insert("Protocol".into(), JsonValue::String(protocol));
+    map.insert("Path".into(), JsonValue::String(path));
     map.insert("Container".into(), opt_str(&item.container));
     map.insert("Size".into(), opt_i64(item.size_bytes));
     map.insert("RunTimeTicks".into(), opt_i64(item.runtime_ticks));
@@ -385,7 +388,7 @@ pub fn media_source_json_with_streams(
     map.insert("SupportsTranscoding".into(), JsonValue::Bool(false));
     map.insert("SupportsProbing".into(), JsonValue::Bool(true));
     map.insert("IsInfiniteStream".into(), JsonValue::Bool(false));
-    map.insert("IsRemote".into(), JsonValue::Bool(false));
+    map.insert("IsRemote".into(), JsonValue::Bool(is_remote));
     map.insert("RequiresOpening".into(), JsonValue::Bool(false));
     map.insert("RequiresClosing".into(), JsonValue::Bool(false));
     map.insert("RequiresLooping".into(), JsonValue::Bool(false));
@@ -407,7 +410,10 @@ pub fn media_source_json_with_streams(
     map.insert("TranscodingUrl".into(), JsonValue::Null);
     map.insert("TranscodingContainer".into(), JsonValue::Null);
     map.insert("TranscodingSubProtocol".into(), JsonValue::Null);
-    map.insert("DirectStreamUrl".into(), JsonValue::String(stream_path));
+    map.insert(
+        "DirectStreamUrl".into(),
+        JsonValue::String(direct_stream_url),
+    );
     map.insert("EncoderPath".into(), JsonValue::Null);
     map.insert("EncoderProtocol".into(), JsonValue::Null);
     map.insert("BufferMs".into(), JsonValue::Null);
@@ -420,6 +426,21 @@ pub fn media_source_json_with_streams(
     map.insert("OpenToken".into(), JsonValue::Null);
     map.insert("ETag".into(), JsonValue::String(item.id.clone()));
     JsonValue::Object(map)
+}
+
+fn media_source_protocol_path(path: &str) -> (String, String, bool) {
+    match remote_strm_target(path) {
+        Some(target) => ("Http".to_string(), target, true),
+        None => ("File".to_string(), path.to_string(), false),
+    }
+}
+
+fn remote_strm_target(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    crate::strm::is_strm_path(path)
+        .then(|| crate::strm::read_strm_target(path).ok())
+        .flatten()
+        .filter(|target| crate::strm::is_remote_url(target))
 }
 
 fn split_media_streams_and_attachments(
@@ -880,12 +901,15 @@ pub fn child_video_source_json_for_item(
     let (media_streams, media_attachments) =
         split_media_streams_and_attachments(item_id, media_source_id, media_streams);
     let bitrate = media_source_bitrate(size, runtime_ticks, &media_streams);
+    let direct_stream_url = remote_strm_target(path)
+        .unwrap_or_else(|| format!("/Videos/{item_id}/{media_source_id}/stream.{container}"));
+    let (protocol, path, is_remote) = media_source_protocol_path(path);
     let mut map = Map::new();
     map.insert("Id".into(), JsonValue::String(media_source_id.to_string()));
     map.insert("Name".into(), JsonValue::String(title.to_string()));
     map.insert("Type".into(), JsonValue::String("Default".to_string()));
-    map.insert("Protocol".into(), JsonValue::String("File".to_string()));
-    map.insert("Path".into(), JsonValue::String(path.to_string()));
+    map.insert("Protocol".into(), JsonValue::String(protocol));
+    map.insert("Path".into(), JsonValue::String(path));
     map.insert("Container".into(), JsonValue::String(container.to_string()));
     map.insert("Size".into(), opt_i64(size));
     map.insert("RunTimeTicks".into(), opt_i64(runtime_ticks));
@@ -903,7 +927,7 @@ pub fn child_video_source_json_for_item(
     map.insert("SupportsTranscoding".into(), JsonValue::Bool(false));
     map.insert("SupportsProbing".into(), JsonValue::Bool(true));
     map.insert("IsInfiniteStream".into(), JsonValue::Bool(false));
-    map.insert("IsRemote".into(), JsonValue::Bool(false));
+    map.insert("IsRemote".into(), JsonValue::Bool(is_remote));
     map.insert("RequiresOpening".into(), JsonValue::Bool(false));
     map.insert("RequiresClosing".into(), JsonValue::Bool(false));
     map.insert("RequiresLooping".into(), JsonValue::Bool(false));
@@ -927,9 +951,7 @@ pub fn child_video_source_json_for_item(
     map.insert("TranscodingSubProtocol".into(), JsonValue::Null);
     map.insert(
         "DirectStreamUrl".into(),
-        JsonValue::String(format!(
-            "/Videos/{item_id}/{media_source_id}/stream.{container}"
-        )),
+        JsonValue::String(direct_stream_url),
     );
     map.insert("EncoderPath".into(), JsonValue::Null);
     map.insert("EncoderProtocol".into(), JsonValue::Null);
@@ -1023,6 +1045,56 @@ mod tests {
         );
 
         assert_eq!(source["Bitrate"], 6_000);
+    }
+
+    #[test]
+    fn remote_strm_media_source_uses_http_protocol_and_direct_url() {
+        let root =
+            std::env::temp_dir().join(format!("jellyfin-rs-strm-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("movie.strm");
+        std::fs::write(&path, "https://example.test/movie.mp4?token=1").unwrap();
+        let mut item = video_item();
+        item.path = path.to_string_lossy().to_string();
+        item.container = Some("mp4".to_string());
+
+        let source = media_source_json_with_streams(&item, sample_streams());
+
+        assert_eq!(source["Protocol"], "Http");
+        assert_eq!(source["Path"], "https://example.test/movie.mp4?token=1");
+        assert_eq!(source["IsRemote"], true);
+        assert_eq!(
+            source["DirectStreamUrl"],
+            "https://example.test/movie.mp4?token=1"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn child_remote_strm_media_source_uses_http_protocol_and_direct_url() {
+        let root =
+            std::env::temp_dir().join(format!("jellyfin-rs-strm-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("part.strm");
+        std::fs::write(&path, "https://example.test/part.mkv").unwrap();
+
+        let source = child_video_source_json(
+            "part1",
+            "Part 1",
+            &path.to_string_lossy(),
+            "mkv",
+            None,
+            None,
+            vec![],
+        );
+
+        assert_eq!(source["Protocol"], "Http");
+        assert_eq!(source["Path"], "https://example.test/part.mkv");
+        assert_eq!(source["IsRemote"], true);
+        assert_eq!(source["DirectStreamUrl"], "https://example.test/part.mkv");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

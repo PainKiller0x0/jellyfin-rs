@@ -230,14 +230,11 @@ async fn scan_root(
         }
 
         // Handle STRM files: classify based on the resolved target's extension
-        let (classify_path, probe_path) = if strm::is_strm_path(path) {
+        let is_strm_file = strm::is_strm_path(path);
+        let (classify_path, probe_path) = if is_strm_file {
             match strm::resolve_strm_path(path) {
                 Ok(resolved_target) => {
-                    let ext_path = if resolved_target.extension().is_some() {
-                        resolved_target.clone()
-                    } else {
-                        path.to_path_buf()
-                    };
+                    let ext_path = strm::classification_path_for_target(&resolved_target, path);
                     (ext_path, Some(resolved_target))
                 }
                 Err(e) => {
@@ -251,6 +248,23 @@ async fn scan_root(
 
         let Some(item_type) = classify_media_path(&classify_path, &collection_type) else {
             continue;
+        };
+        let item_type = normalize_scanned_file_type(
+            &item_type,
+            &collection_type,
+            &parent_id,
+            &library_id,
+            is_strm_file,
+        );
+        let container = if is_strm_file {
+            probe_path
+                .as_ref()
+                .and_then(|target| strm::target_extension(&target.to_string_lossy()))
+        } else {
+            classify_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.to_ascii_lowercase())
         };
 
         seen_paths.push(path_string.clone());
@@ -299,10 +313,7 @@ async fn scan_root(
             parent_id,
             item_type,
             is_folder: false,
-            container: classify_path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .map(|extension| extension.to_ascii_lowercase()),
+            container,
             overview: parsed_metadata.overview.clone(),
             official_rating: parsed_metadata.official_rating.clone(),
             extended_video_type: (!parsed_name.extended_video_types.is_empty())
@@ -476,6 +487,24 @@ async fn run_media_probe_job(
     Ok(MediaProbeJobResult {
         stream_probe_succeeded,
     })
+}
+
+fn normalize_scanned_file_type(
+    item_type: &str,
+    collection_type: &str,
+    parent_id: &str,
+    library_id: &str,
+    is_strm_file: bool,
+) -> String {
+    if is_strm_file
+        && collection_type == "movies"
+        && item_type == "Video"
+        && parent_id == library_id
+    {
+        "Movie".to_string()
+    } else {
+        item_type.to_string()
+    }
 }
 
 async fn try_fetch_tmdb(

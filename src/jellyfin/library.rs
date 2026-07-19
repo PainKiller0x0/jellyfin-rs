@@ -439,15 +439,40 @@ async fn virtual_folders_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<Va
         });
     }
 
+    let folder_ids = folders
+        .iter()
+        .map(|folder| folder.id.clone())
+        .collect::<Vec<_>>();
+    let image_tags_by_id = crate::jellyfin::item_queries::batch_item_image_tags(db, &folder_ids)
+        .await
+        .unwrap_or_default();
+
     Ok(folders
         .into_iter()
         .map(|folder| {
+            let image_tags = image_tags_by_id
+                .get(&folder.id)
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let primary_image_tag = image_tags
+                .get("Primary")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let backdrop_image_tags = image_tags
+                .get("Backdrop")
+                .and_then(Value::as_str)
+                .filter(|tag| !tag.is_empty())
+                .map(|tag| vec![json!(tag)])
+                .unwrap_or_default();
             json!({
                 "Name": folder.name,
                 "Id": folder.id,
                 "ItemId": folder.id,
                 "CollectionType": folder.collection_type,
                 "Locations": folder.paths,
+                "ImageTags": image_tags,
+                "PrimaryImageTag": primary_image_tag,
+                "BackdropImageTags": backdrop_image_tags,
             })
         })
         .collect())

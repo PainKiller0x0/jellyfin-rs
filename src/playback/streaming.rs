@@ -597,7 +597,7 @@ fn playback_target_for_item(item: &MediaItem) -> anyhow::Result<PlaybackTarget> 
     if crate::strm::is_strm_path(path) {
         let target = crate::strm::resolve_strm_path(path)?;
         let target_text = target.to_string_lossy().to_string();
-        if is_http_url(&target_text) {
+        if crate::strm::is_remote_url(&target_text) {
             return Ok(PlaybackTarget::RemoteUrl(target_text));
         }
         return Ok(PlaybackTarget::LocalPath(target));
@@ -605,10 +605,6 @@ fn playback_target_for_item(item: &MediaItem) -> anyhow::Result<PlaybackTarget> 
     Ok(PlaybackTarget::LocalPath(std::path::PathBuf::from(
         &item.path,
     )))
-}
-
-fn is_http_url(value: &str) -> bool {
-    value.starts_with("http://") || value.starts_with("https://")
 }
 
 fn remote_stream_redirect(url: &str) -> Response {
@@ -751,6 +747,25 @@ mod tests {
         let target = playback_target_for_item(&media_item(&path.to_string_lossy())).unwrap();
         match target {
             PlaybackTarget::RemoteUrl(url) => assert_eq!(url, "https://example.test/movie.mp4"),
+            PlaybackTarget::LocalPath(_) => panic!("expected remote STRM target"),
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn playback_target_resolves_uppercase_remote_strm_url() {
+        let root =
+            std::env::temp_dir().join(format!("jellyfin-rs-strm-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("movie.strm");
+        std::fs::write(&path, "HTTPS://example.test/movie.mp4?token=1").unwrap();
+
+        let target = playback_target_for_item(&media_item(&path.to_string_lossy())).unwrap();
+        match target {
+            PlaybackTarget::RemoteUrl(url) => {
+                assert_eq!(url, "HTTPS://example.test/movie.mp4?token=1")
+            }
             PlaybackTarget::LocalPath(_) => panic!("expected remote STRM target"),
         }
 

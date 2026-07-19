@@ -423,11 +423,15 @@ pub fn apply_playback_profile(
     object.insert("SupportsProbing".to_string(), json!(true));
     object.insert("VideoType".to_string(), json!("VideoFile"));
     object.insert("IsoType".to_string(), Value::Null);
-    object.insert("Protocol".to_string(), json!("File"));
+    object
+        .entry("Protocol".to_string())
+        .or_insert_with(|| json!("File"));
     object.insert("EncoderPath".to_string(), Value::Null);
     object.insert("EncoderProtocol".to_string(), Value::Null);
     object.insert("Type".to_string(), json!("Default"));
-    object.insert("IsRemote".to_string(), json!(false));
+    object
+        .entry("IsRemote".to_string())
+        .or_insert_with(|| json!(false));
     if let Some(bitrate) = fallback_bitrate {
         object.insert(
             "FallbackMaxStreamingBitrate".to_string(),
@@ -764,6 +768,37 @@ mod tests {
 
         assert_eq!(media_source["Bitrate"], 18_000_000);
         assert_eq!(media_source["FallbackMaxStreamingBitrate"], 200_000_000);
+    }
+
+    #[test]
+    fn playback_profile_preserves_remote_http_media_source_flags() {
+        let mut media_source = json!({
+            "Container": "mp4",
+            "Protocol": "Http",
+            "IsRemote": true,
+            "Path": "https://example.test/movie.mp4",
+            "MediaStreams": [
+                { "Type": "Video", "Codec": "h264", "Index": 0 },
+                { "Type": "Audio", "Codec": "aac", "Index": 1 }
+            ],
+        });
+        let profile = json!({
+            "DirectPlayProfiles": [
+                { "Container": "mp4", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac" }
+            ]
+        });
+        let streams = media_source["MediaStreams"].as_array().unwrap().clone();
+
+        apply_playback_profile(
+            &mut media_source,
+            &profile,
+            &streams,
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(media_source["Protocol"], "Http");
+        assert_eq!(media_source["IsRemote"], true);
+        assert_eq!(media_source["Path"], "https://example.test/movie.mp4");
     }
 
     #[tokio::test]

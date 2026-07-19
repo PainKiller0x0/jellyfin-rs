@@ -4,6 +4,7 @@ import type {
   ActivityLogEntry,
   ItemCounts,
   PlaybackMap,
+  PlaybackStats,
   PlaybackSession,
   QueryResult,
   ScheduledTask,
@@ -64,4 +65,8 @@ export function adminLogs(token: string, afterId = 0, limit = 120) {
 
 export function playbackMap(token: string) {
   return request<PlaybackMap>('/Admin/PlaybackMap', { token });
+}
+
+export function playbackStats(token: string, days = 30) {
+  return request<PlaybackStats>(`/Admin/PlaybackStats?Days=${days}`, { token });
 }

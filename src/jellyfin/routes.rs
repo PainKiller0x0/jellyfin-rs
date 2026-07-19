@@ -42,6 +42,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/Admin/Logs", get(system::admin_http_logs))
         .route("/Admin/PlaybackMap", get(system::admin_playback_map))
+        .route("/Admin/PlaybackStats", get(system::admin_playback_stats))
         .route("/System/Endpoint", get(system::system_endpoint))
         .route(
             "/System/Ping",

@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, Set};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
@@ -27,6 +27,8 @@ use crate::{
 };
 
 const PLAYED_PERCENT_THRESHOLD: f64 = 0.9;
+const TICKS_PER_SECOND: i64 = 10_000_000;
+const WATCH_POSITION_TOLERANCE_SECONDS: i64 = 30;
 
 pub async fn playback_info(
     State(state): State<Arc<AppState>>,
@@ -276,6 +278,7 @@ async fn playback_progress_inner(
     let position_ticks = body.get("PositionTicks").and_then(JsonValue::as_i64);
     let user_id = request_user_id_or_default(&state, &headers, &query).await;
     let persistence_item_id = playback_body_persistence_item_id(&body).unwrap_or(item_id);
+    let runtime_ticks = body.get("RunTimeTicks").and_then(JsonValue::as_i64);
     let result = match event {
         PlaybackEvent::Start => {
             if position_ticks.is_some_and(|value| value > 0) {
@@ -303,12 +306,35 @@ async fn playback_progress_inner(
                 &user_id,
                 persistence_item_id,
                 position_ticks,
-                body.get("RunTimeTicks").and_then(JsonValue::as_i64),
+                runtime_ticks,
             )
             .await
         }
     };
     if let Err(error) = result {
+        return internal_error(error);
+    }
+
+    let play_session_id = playback_body_play_session_id(&body, &user_id, item_id);
+    let is_paused = body
+        .get("IsPaused")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    if let Err(error) = record_playback_watch_event(
+        &state.db,
+        &user_id,
+        persistence_item_id,
+        body.get("MediaSourceId").and_then(JsonValue::as_str),
+        &play_session_id,
+        body.get("Client").and_then(JsonValue::as_str),
+        body.get("DeviceName").and_then(JsonValue::as_str),
+        position_ticks,
+        runtime_ticks,
+        is_paused,
+        event,
+    )
+    .await
+    {
         return internal_error(error);
     }
 
@@ -454,6 +480,14 @@ fn playback_body_persistence_item_id(body: &JsonValue) -> Option<&str> {
         })
 }
 
+fn playback_body_play_session_id(body: &JsonValue, user_id: &str, item_id: &str) -> String {
+    body.get("PlaySessionId")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("{user_id}:{item_id}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn update_playback_session(
     state: &AppState,
@@ -567,6 +601,283 @@ enum PlaybackEvent {
     Start,
     Progress,
     Stopped,
+}
+
+struct WatchSessionRow {
+    item_id: String,
+    position_ticks: i64,
+    is_paused: bool,
+    last_event_at: i64,
+    ended_at: Option<i64>,
+    watch_seconds: i64,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_playback_watch_event(
+    db: &DatabaseConnection,
+    user_id: &str,
+    item_id: &str,
+    media_source_id: Option<&str>,
+    play_session_id: &str,
+    client: Option<&str>,
+    device_name: Option<&str>,
+    position_ticks: Option<i64>,
+    runtime_ticks: Option<i64>,
+    is_paused: bool,
+    event: PlaybackEvent,
+) -> anyhow::Result<()> {
+    let now = now_unix();
+    let item_id = canonical_watch_item_id(db, item_id).await?;
+    let existing = watch_session_row(db, play_session_id).await?;
+    let starts_new_session = existing
+        .as_ref()
+        .map(|session| {
+            event == PlaybackEvent::Start
+                && (session.ended_at.is_some() || session.item_id != item_id)
+        })
+        .unwrap_or(true);
+
+    if let Some(session) = existing.as_ref().filter(|session| {
+        session.ended_at.is_none() && !(event == PlaybackEvent::Start && starts_new_session)
+    }) {
+        let delta_seconds = watch_delta_seconds(
+            session.last_event_at,
+            now,
+            session.position_ticks,
+            position_ticks,
+            session.is_paused,
+        );
+        if delta_seconds > 0 {
+            add_watch_segment(
+                db,
+                user_id,
+                &session.item_id,
+                session.last_event_at,
+                delta_seconds,
+            )
+            .await?;
+        }
+    }
+
+    if starts_new_session {
+        increment_watch_play_count(db, user_id, &item_id, now).await?;
+    }
+
+    let accumulated_seconds = if starts_new_session {
+        0
+    } else {
+        existing
+            .as_ref()
+            .map(|session| {
+                session.watch_seconds.saturating_add(watch_delta_seconds(
+                    session.last_event_at,
+                    now,
+                    session.position_ticks,
+                    position_ticks,
+                    session.is_paused,
+                ))
+            })
+            .unwrap_or_default()
+    };
+    let ended_at = (event == PlaybackEvent::Stopped).then_some(now);
+    db.execute(crate::db::helpers::pg_statement(
+        r#"INSERT INTO playback_watch_sessions
+           (play_session_id, user_id, item_id, media_source_id, client, device_name, position_ticks, runtime_ticks, is_paused, started_at, last_event_at, ended_at, watch_seconds, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(play_session_id) DO UPDATE SET
+             user_id = excluded.user_id,
+             item_id = excluded.item_id,
+             media_source_id = excluded.media_source_id,
+             client = COALESCE(excluded.client, playback_watch_sessions.client),
+             device_name = COALESCE(excluded.device_name, playback_watch_sessions.device_name),
+             position_ticks = excluded.position_ticks,
+             runtime_ticks = COALESCE(excluded.runtime_ticks, playback_watch_sessions.runtime_ticks),
+             is_paused = excluded.is_paused,
+             started_at = CASE WHEN playback_watch_sessions.ended_at IS NOT NULL AND excluded.ended_at IS NULL THEN excluded.started_at ELSE playback_watch_sessions.started_at END,
+             last_event_at = excluded.last_event_at,
+             ended_at = excluded.ended_at,
+             watch_seconds = excluded.watch_seconds,
+             updated_at = excluded.updated_at"#,
+        vec![
+            play_session_id.into(),
+            user_id.into(),
+            item_id.into(),
+            media_source_id.map(str::to_string).into(),
+            client.map(str::to_string).into(),
+            device_name.map(str::to_string).into(),
+            position_ticks.unwrap_or_default().max(0).into(),
+            runtime_ticks.filter(|value| *value > 0).into(),
+            (is_paused || event == PlaybackEvent::Stopped).then_some(1_i64).unwrap_or(0).into(),
+            now.into(),
+            now.into(),
+            ended_at.into(),
+            accumulated_seconds.into(),
+            now.into(),
+        ],
+    ))
+    .await?;
+
+    Ok(())
+}
+
+async fn watch_session_row(
+    db: &DatabaseConnection,
+    play_session_id: &str,
+) -> anyhow::Result<Option<WatchSessionRow>> {
+    db.query_one(crate::db::helpers::pg_statement(
+        "SELECT item_id, position_ticks, is_paused, last_event_at, ended_at, watch_seconds FROM playback_watch_sessions WHERE play_session_id = ?",
+        vec![play_session_id.into()],
+    ))
+    .await?
+    .map(|row| {
+        Ok(WatchSessionRow {
+            item_id: row.get_str("item_id")?,
+            position_ticks: row.get_i64("position_ticks").unwrap_or_default(),
+            is_paused: row.get_i64("is_paused").unwrap_or_default() != 0,
+            last_event_at: row.get_i64("last_event_at").unwrap_or_default(),
+            ended_at: row.get_opt_i64("ended_at")?,
+            watch_seconds: row.get_i64("watch_seconds").unwrap_or_default(),
+        })
+    })
+    .transpose()
+}
+
+async fn canonical_watch_item_id(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<String> {
+    let Some(row) = db
+        .query_one(crate::db::helpers::pg_statement(
+            "SELECT mi.item_type, mi.parent_id, parent.item_type AS parent_item_type, parent.is_folder AS parent_is_folder FROM media_items mi LEFT JOIN media_items parent ON parent.id = mi.parent_id WHERE mi.id = ?",
+            vec![item_id.into()],
+        ))
+        .await?
+    else {
+        return Ok(item_id.to_string());
+    };
+    let item_type = row.get_str("item_type").unwrap_or_default();
+    let parent_id = row.get_str("parent_id").unwrap_or_default();
+    let parent_item_type = row.get_opt_str("parent_item_type")?.unwrap_or_default();
+    let parent_is_folder = row.get_i64("parent_is_folder").unwrap_or_default() != 0;
+    if item_type == "Video"
+        && !parent_id.is_empty()
+        && parent_is_folder
+        && matches!(parent_item_type.as_str(), "Movie" | "Episode")
+    {
+        Ok(parent_id)
+    } else {
+        Ok(item_id.to_string())
+    }
+}
+
+fn watch_delta_seconds(
+    previous_event_at: i64,
+    now: i64,
+    previous_position_ticks: i64,
+    position_ticks: Option<i64>,
+    was_paused: bool,
+) -> i64 {
+    if was_paused || now <= previous_event_at {
+        return 0;
+    }
+    let wall_seconds = (now - previous_event_at).min(playback_watch_max_gap_seconds());
+    let Some(position_ticks) = position_ticks else {
+        return wall_seconds.max(0);
+    };
+    let position_delta_ticks = position_ticks.saturating_sub(previous_position_ticks);
+    if position_delta_ticks < 0 {
+        return wall_seconds.max(0);
+    }
+    let position_seconds = ticks_to_seconds_ceil(position_delta_ticks);
+    wall_seconds
+        .min(position_seconds.saturating_add(WATCH_POSITION_TOLERANCE_SECONDS))
+        .max(0)
+}
+
+fn ticks_to_seconds_ceil(ticks: i64) -> i64 {
+    if ticks <= 0 {
+        0
+    } else {
+        ticks.saturating_add(TICKS_PER_SECOND - 1) / TICKS_PER_SECOND
+    }
+}
+
+fn playback_watch_max_gap_seconds() -> i64 {
+    std::env::var("JELLYFIN_RS_MAX_WATCH_DELTA_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(12 * 60 * 60)
+}
+
+async fn increment_watch_play_count(
+    db: &DatabaseConnection,
+    user_id: &str,
+    item_id: &str,
+    timestamp: i64,
+) -> anyhow::Result<()> {
+    let day = unix_day(timestamp);
+    db.execute(crate::db::helpers::pg_statement(
+        r#"INSERT INTO playback_watch_days (day, user_id, item_id, watch_seconds, play_count, last_played_at)
+           VALUES (?, ?, ?, 0, 1, ?)
+           ON CONFLICT(day, user_id, item_id) DO UPDATE SET
+             play_count = playback_watch_days.play_count + 1,
+             last_played_at = GREATEST(COALESCE(playback_watch_days.last_played_at, 0), excluded.last_played_at)"#,
+        vec![day.into(), user_id.into(), item_id.into(), timestamp.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn add_watch_segment(
+    db: &DatabaseConnection,
+    user_id: &str,
+    item_id: &str,
+    segment_start: i64,
+    seconds: i64,
+) -> anyhow::Result<()> {
+    if seconds <= 0 {
+        return Ok(());
+    }
+    let segment_end = segment_start.saturating_add(seconds);
+    for (day, day_seconds, last_played_at) in watch_segment_day_slices(segment_start, segment_end) {
+        db.execute(crate::db::helpers::pg_statement(
+            r#"INSERT INTO playback_watch_days (day, user_id, item_id, watch_seconds, play_count, last_played_at)
+               VALUES (?, ?, ?, ?, 0, ?)
+               ON CONFLICT(day, user_id, item_id) DO UPDATE SET
+                 watch_seconds = playback_watch_days.watch_seconds + excluded.watch_seconds,
+                 last_played_at = GREATEST(COALESCE(playback_watch_days.last_played_at, 0), excluded.last_played_at)"#,
+            vec![
+                day.into(),
+                user_id.into(),
+                item_id.into(),
+                day_seconds.into(),
+                last_played_at.into(),
+            ],
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+fn watch_segment_day_slices(start: i64, end: i64) -> Vec<(String, i64, i64)> {
+    let mut slices = Vec::new();
+    let mut cursor = start.max(0);
+    let end = end.max(cursor);
+    while cursor < end {
+        let next_day = unix_day_start(cursor).saturating_add(86_400);
+        let slice_end = end.min(next_day);
+        slices.push((unix_day(cursor), slice_end - cursor, slice_end));
+        cursor = slice_end;
+    }
+    slices
+}
+
+fn unix_day(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp.max(0), 0)
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string())
+}
+
+fn unix_day_start(timestamp: i64) -> i64 {
+    timestamp.max(0).div_euclid(86_400) * 86_400
 }
 
 pub(crate) async fn upsert_playback_position(
@@ -700,6 +1011,38 @@ pub async fn playing_item_start(
             .await;
     }
 
+    let body_value = body.as_ref().map(|Json(value)| value);
+    let play_session_id = legacy_play_session_id(&query, body_value, &user_id, &item_id);
+    let is_paused = body_value
+        .and_then(|value| value.get("IsPaused"))
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    if let Err(error) = record_playback_watch_event(
+        &state.db,
+        &user_id,
+        &item_id,
+        body_value
+            .and_then(|value| value.get("MediaSourceId"))
+            .and_then(JsonValue::as_str),
+        &play_session_id,
+        body_value
+            .and_then(|value| value.get("Client"))
+            .and_then(JsonValue::as_str),
+        body_value
+            .and_then(|value| value.get("DeviceName"))
+            .and_then(JsonValue::as_str),
+        position_ticks,
+        body_value
+            .and_then(|value| value.get("RunTimeTicks"))
+            .and_then(JsonValue::as_i64),
+        is_paused,
+        PlaybackEvent::Start,
+    )
+    .await
+    {
+        return internal_error(error);
+    }
+
     let session_info = crate::jellyfin::sessions::session_info(&state, &headers, &query).await;
     let item_name = find_media_item(&state.db, &user_id, &item_id)
         .await
@@ -738,6 +1081,27 @@ pub async fn playing_item_stop(
     {
         return internal_error(error);
     }
+    let play_session_id = legacy_play_session_id(&query, None, &user_id, &item_id);
+    if let Err(error) = record_playback_watch_event(
+        &state.db,
+        &user_id,
+        &item_id,
+        query
+            .get("MediaSourceId")
+            .or_else(|| query.get("mediaSourceId"))
+            .map(String::as_str),
+        &play_session_id,
+        None,
+        None,
+        position_ticks,
+        runtime_ticks,
+        true,
+        PlaybackEvent::Stopped,
+    )
+    .await
+    {
+        return internal_error(error);
+    }
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -764,7 +1128,66 @@ pub async fn playing_item_progress(
         }
     }
 
+    let body_value = body.as_ref().map(|Json(value)| value);
+    let play_session_id = legacy_play_session_id(&query, body_value, &user_id, &item_id);
+    let is_paused = query
+        .get("IsPaused")
+        .or_else(|| query.get("isPaused"))
+        .and_then(|value| value.parse::<bool>().ok())
+        .or_else(|| {
+            body_value
+                .and_then(|value| value.get("IsPaused"))
+                .and_then(JsonValue::as_bool)
+        })
+        .unwrap_or(false);
+    if let Err(error) = record_playback_watch_event(
+        &state.db,
+        &user_id,
+        &item_id,
+        query
+            .get("MediaSourceId")
+            .or_else(|| query.get("mediaSourceId"))
+            .map(String::as_str)
+            .or_else(|| {
+                body_value
+                    .and_then(|value| value.get("MediaSourceId"))
+                    .and_then(JsonValue::as_str)
+            }),
+        &play_session_id,
+        body_value
+            .and_then(|value| value.get("Client"))
+            .and_then(JsonValue::as_str),
+        body_value
+            .and_then(|value| value.get("DeviceName"))
+            .and_then(JsonValue::as_str),
+        position_ticks,
+        body_value
+            .and_then(|value| value.get("RunTimeTicks"))
+            .and_then(JsonValue::as_i64),
+        is_paused,
+        PlaybackEvent::Progress,
+    )
+    .await
+    {
+        return internal_error(error);
+    }
+
     StatusCode::NO_CONTENT.into_response()
+}
+
+fn legacy_play_session_id(
+    query: &HashMap<String, String>,
+    body: Option<&JsonValue>,
+    user_id: &str,
+    item_id: &str,
+) -> String {
+    body.and_then(|value| value.get("PlaySessionId"))
+        .and_then(JsonValue::as_str)
+        .or_else(|| query.get("PlaySessionId").map(String::as_str))
+        .or_else(|| query.get("playSessionId").map(String::as_str))
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("{user_id}:{item_id}"))
 }
 
 pub async fn current_user_playing_item_start(
@@ -808,7 +1231,10 @@ pub async fn current_user_playing_item_progress(
 
 #[cfg(test)]
 mod tests {
-    use super::{append_access_token_to_media_sources, current_user_playing_item_start};
+    use super::{
+        append_access_token_to_media_sources, current_user_playing_item_start, watch_delta_seconds,
+        watch_segment_day_slices,
+    };
     use crate::app::state::{AppState, PlaybackSession};
     use crate::db::row_ext::QueryResultExt;
     use axum::{
@@ -842,6 +1268,24 @@ mod tests {
             sources[0]["MediaAttachments"][0]["DeliveryUrl"],
             "/Videos/video/video/Attachments/5?api_key=token%201"
         );
+    }
+
+    #[test]
+    fn watch_delta_counts_wall_time_but_skips_paused_time() {
+        assert_eq!(
+            watch_delta_seconds(100, 130, 0, Some(300_000_000), false),
+            30
+        );
+        assert_eq!(watch_delta_seconds(100, 130, 0, Some(300_000_000), true), 0);
+        assert_eq!(watch_delta_seconds(100, 190, 0, Some(0), false), 30);
+    }
+
+    #[test]
+    fn watch_segments_split_across_utc_days() {
+        let slices = watch_segment_day_slices(86_390, 86_410);
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0], ("1970-01-01".to_string(), 10, 86_400));
+        assert_eq!(slices[1], ("1970-01-02".to_string(), 10, 86_410));
     }
 
     #[tokio::test]

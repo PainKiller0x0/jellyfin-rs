@@ -59,6 +59,7 @@ const MAX_ADMIN_SERVER_NAME_LEN: usize = 128;
 const CAMERA_UPLOADS_PATH: &str = "data/camera_uploads";
 const USER_USAGE_BACKUP_PATH: &str = "data/user_usage_stats";
 const FALLBACK_FONTS_PATH: &str = "data/fonts";
+const TICKS_PER_SECOND: i64 = 10_000_000;
 
 mod configuration;
 mod localization;
@@ -144,6 +145,21 @@ pub async fn admin_http_logs(
 
 pub async fn admin_playback_map(State(state): State<Arc<AppState>>) -> Response {
     Json(state.playback_distribution_json().await).into_response()
+}
+
+pub async fn admin_playback_stats(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let days = query_value(&query, "Days")
+        .or_else(|| query_value(&query, "days"))
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(30)
+        .clamp(1, 366);
+    match playback_stats_overview(&state.db, days).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => internal_error(error),
+    }
 }
 
 fn normalize_admin_server_name(value: &str) -> Option<String> {
@@ -2163,25 +2179,29 @@ async fn play_activity_rows(
     };
     let user_filter = if let Some(user_id) = user_id {
         values.push(user_id.to_string().into());
-        " AND ud.user_id = ?"
+        " AND pwd.user_id = ?"
     } else {
         ""
     };
     let day_filter = if let Some((start, end)) = day {
-        values.push(start.into());
-        values.push(end.into());
-        " AND ud.last_played_at >= ? AND ud.last_played_at < ?"
+        values.push(unix_day(start).into());
+        values.push(unix_day(end.saturating_sub(1)).into());
+        " AND pwd.day >= ? AND pwd.day <= ?"
     } else {
         ""
     };
     let sql = format!(
-        r#"SELECT ud.user_id, users.username, ud.item_id, mi.title, mi.item_type, mi.runtime_ticks, ud.play_count, ud.playback_position_ticks, ud.last_played_at
-           FROM user_data ud
-           JOIN media_items mi ON mi.id = ud.item_id
-           LEFT JOIN users ON users.id = ud.user_id
-           WHERE (COALESCE(ud.play_count, 0) > 0 OR ud.last_played_at IS NOT NULL){type_filter}{user_filter}{day_filter}
-           ORDER BY COALESCE(ud.last_played_at, ud.updated_at) DESC
-           LIMIT 200"#
+        r#"SELECT pwd.user_id, users.username, pwd.item_id, mi.title, mi.item_type, mi.runtime_ticks,
+                  SUM(pwd.play_count) AS play_count,
+                  SUM(pwd.watch_seconds) AS watch_seconds,
+                  MAX(pwd.last_played_at) AS last_played_at
+           FROM playback_watch_days pwd
+           JOIN media_items mi ON mi.id = pwd.item_id
+           LEFT JOIN users ON users.id = pwd.user_id
+           WHERE (COALESCE(pwd.play_count, 0) > 0 OR COALESCE(pwd.watch_seconds, 0) > 0){type_filter}{user_filter}{day_filter}
+           GROUP BY pwd.user_id, users.username, pwd.item_id, mi.title, mi.item_type, mi.runtime_ticks
+           ORDER BY MAX(pwd.last_played_at) DESC
+           LIMIT 500"#
     );
     let rows = db
         .query_all(crate::db::helpers::pg_statement(&sql, values))
@@ -2196,7 +2216,8 @@ async fn play_activity_rows(
             let item_type = row.get_str("item_type")?;
             let runtime_ticks = row.get_opt_i64("runtime_ticks")?;
             let play_count = row.get_i64("play_count").unwrap_or_default();
-            let position_ticks = row.get_i64("playback_position_ticks").unwrap_or_default();
+            let watch_seconds = row.get_i64("watch_seconds").unwrap_or_default();
+            let watch_ticks = watch_seconds.saturating_mul(TICKS_PER_SECOND);
             let last_played_at = row.get_opt_i64("last_played_at")?;
             Ok(json!({
                 "UserId": user_id,
@@ -2207,13 +2228,264 @@ async fn play_activity_rows(
                 "ItemType": item_type,
                 "RunTimeTicks": runtime_ticks,
                 "PlayCount": play_count,
-                "PlaybackPositionTicks": position_ticks,
+                "WatchSeconds": watch_seconds,
+                "WatchMinutes": watch_seconds / 60,
+                "DurationTicks": watch_ticks,
+                "PlaybackPositionTicks": 0,
                 "LastPlayedAt": last_played_at,
                 "Date": last_played_at.map(unix_to_jellyfin_date),
                 "LastPlayedDate": last_played_at.map(unix_to_jellyfin_date),
             }))
         })
         .collect()
+}
+
+async fn playback_stats_overview(db: &DatabaseConnection, days: i64) -> anyhow::Result<JsonValue> {
+    let now = now_unix();
+    let today_start = unix_day_start(now);
+    let start_day = unix_day(today_start.saturating_sub((days - 1) * 86_400));
+    let today = unix_day(today_start);
+
+    let totals = db
+        .query_one(crate::db::helpers::pg_statement(
+            r#"SELECT COALESCE(SUM(watch_seconds), 0) AS watch_seconds,
+                      COALESCE(SUM(play_count), 0) AS play_count,
+                      COUNT(DISTINCT user_id) AS user_count,
+                      COUNT(DISTINCT item_id) AS item_count
+               FROM playback_watch_days"#,
+            vec![],
+        ))
+        .await?
+        .map(|row| {
+            (
+                row.get_i64("watch_seconds").unwrap_or_default(),
+                row.get_i64("play_count").unwrap_or_default(),
+                row.get_i64("user_count").unwrap_or_default(),
+                row.get_i64("item_count").unwrap_or_default(),
+            )
+        })
+        .unwrap_or_default();
+
+    let today_watch_seconds = db
+        .query_one(crate::db::helpers::pg_statement(
+            "SELECT COALESCE(SUM(watch_seconds), 0) AS watch_seconds FROM playback_watch_days WHERE day = ?",
+            vec![today.clone().into()],
+        ))
+        .await?
+        .and_then(|row| row.get_i64("watch_seconds").ok())
+        .unwrap_or_default();
+
+    Ok(json!({
+        "TotalWatchSeconds": totals.0,
+        "TotalWatchMinutes": totals.0 / 60,
+        "TodayWatchSeconds": today_watch_seconds,
+        "TodayWatchMinutes": today_watch_seconds / 60,
+        "TotalPlayCount": totals.1,
+        "UserCount": totals.2,
+        "ItemCount": totals.3,
+        "Days": days,
+        "Daily": playback_stats_daily(db, &start_day, &today, days).await?,
+        "Users": playback_stats_top_users(db, &start_day).await?,
+        "Items": playback_stats_top_items(db, &start_day).await?,
+        "Series": playback_stats_top_series(db, &start_day).await?,
+    }))
+}
+
+async fn playback_stats_daily(
+    db: &DatabaseConnection,
+    start_day: &str,
+    end_day: &str,
+    days: i64,
+) -> anyhow::Result<Vec<JsonValue>> {
+    let rows = db
+        .query_all(crate::db::helpers::pg_statement(
+            r#"SELECT day, COALESCE(SUM(watch_seconds), 0) AS watch_seconds,
+                      COALESCE(SUM(play_count), 0) AS play_count
+               FROM playback_watch_days
+               WHERE day >= ? AND day <= ?
+               GROUP BY day
+               ORDER BY day ASC"#,
+            vec![start_day.into(), end_day.into()],
+        ))
+        .await?;
+    let mut by_day: HashMap<String, (i64, i64)> = HashMap::new();
+    for row in rows {
+        by_day.insert(
+            row.get_str("day")?,
+            (
+                row.get_i64("watch_seconds").unwrap_or_default(),
+                row.get_i64("play_count").unwrap_or_default(),
+            ),
+        );
+    }
+    let start = usage_stats_day_range(start_day)
+        .map(|(start, _)| start)
+        .unwrap_or_default();
+    Ok((0..days)
+        .map(|offset| {
+            let day = unix_day(start.saturating_add(offset * 86_400));
+            let (watch_seconds, play_count) = by_day.get(&day).copied().unwrap_or_default();
+            json!({
+                "Date": day,
+                "WatchSeconds": watch_seconds,
+                "WatchMinutes": watch_seconds / 60,
+                "PlayCount": play_count,
+            })
+        })
+        .collect())
+}
+
+async fn playback_stats_top_users(
+    db: &DatabaseConnection,
+    start_day: &str,
+) -> anyhow::Result<Vec<JsonValue>> {
+    let rows = db
+        .query_all(crate::db::helpers::pg_statement(
+            r#"SELECT pwd.user_id,
+                      COALESCE(NULLIF(users.display_name, ''), NULLIF(users.username, ''), pwd.user_id) AS user_name,
+                      COALESCE(SUM(pwd.watch_seconds), 0) AS watch_seconds,
+                      COALESCE(SUM(pwd.play_count), 0) AS play_count
+               FROM playback_watch_days pwd
+               LEFT JOIN users ON users.id = pwd.user_id
+               WHERE pwd.day >= ?
+               GROUP BY pwd.user_id, users.display_name, users.username
+               ORDER BY watch_seconds DESC, play_count DESC
+               LIMIT 10"#,
+            vec![start_day.into()],
+        ))
+        .await?;
+    rows.iter()
+        .map(|row| {
+            let watch_seconds = row.get_i64("watch_seconds").unwrap_or_default();
+            Ok(json!({
+                "UserId": row.get_str("user_id")?,
+                "UserName": row.get_str("user_name").unwrap_or_default(),
+                "WatchSeconds": watch_seconds,
+                "WatchMinutes": watch_seconds / 60,
+                "PlayCount": row.get_i64("play_count").unwrap_or_default(),
+            }))
+        })
+        .collect()
+}
+
+async fn playback_stats_top_items(
+    db: &DatabaseConnection,
+    start_day: &str,
+) -> anyhow::Result<Vec<JsonValue>> {
+    let rows = db
+        .query_all(crate::db::helpers::pg_statement(
+            &format!(
+                r#"SELECT pwd.item_id, mi.title, mi.item_type,
+                          {series_id_sql} AS series_id,
+                          {series_name_sql} AS series_name,
+                          COALESCE(SUM(pwd.watch_seconds), 0) AS watch_seconds,
+                          COALESCE(SUM(pwd.play_count), 0) AS play_count
+                   FROM playback_watch_days pwd
+                   LEFT JOIN media_items mi ON mi.id = pwd.item_id
+                   {series_join_sql}
+                   WHERE pwd.day >= ?
+                   GROUP BY pwd.item_id, mi.title, mi.item_type, series_id, series_name
+                   ORDER BY watch_seconds DESC, play_count DESC
+                   LIMIT 10"#,
+                series_id_sql = playback_series_id_sql(),
+                series_name_sql = playback_series_name_sql(),
+                series_join_sql = playback_series_join_sql(),
+            ),
+            vec![start_day.into()],
+        ))
+        .await?;
+    rows.iter()
+        .map(|row| {
+            let watch_seconds = row.get_i64("watch_seconds").unwrap_or_default();
+            Ok(json!({
+                "ItemId": row.get_str("item_id")?,
+                "ItemName": row.get_opt_str("title")?.unwrap_or_else(|| row.get_str("item_id").unwrap_or_default()),
+                "ItemType": row.get_opt_str("item_type")?.unwrap_or_default(),
+                "SeriesId": row.get_opt_str("series_id")?,
+                "SeriesName": row.get_opt_str("series_name")?,
+                "WatchSeconds": watch_seconds,
+                "WatchMinutes": watch_seconds / 60,
+                "PlayCount": row.get_i64("play_count").unwrap_or_default(),
+            }))
+        })
+        .collect()
+}
+
+async fn playback_stats_top_series(
+    db: &DatabaseConnection,
+    start_day: &str,
+) -> anyhow::Result<Vec<JsonValue>> {
+    let rows = db
+        .query_all(crate::db::helpers::pg_statement(
+            &format!(
+                r#"SELECT series_id, series_name,
+                          COALESCE(SUM(watch_seconds), 0) AS watch_seconds,
+                          COALESCE(SUM(play_count), 0) AS play_count,
+                          COUNT(DISTINCT item_id) AS item_count
+                   FROM (
+                     SELECT pwd.item_id,
+                            {series_id_sql} AS series_id,
+                            {series_name_sql} AS series_name,
+                            pwd.watch_seconds,
+                            pwd.play_count
+                     FROM playback_watch_days pwd
+                     LEFT JOIN media_items mi ON mi.id = pwd.item_id
+                     {series_join_sql}
+                     WHERE pwd.day >= ?
+                   ) stats
+                   WHERE series_id IS NOT NULL
+                   GROUP BY series_id, series_name
+                   ORDER BY watch_seconds DESC, play_count DESC
+                   LIMIT 10"#,
+                series_id_sql = playback_series_id_sql(),
+                series_name_sql = playback_series_name_sql(),
+                series_join_sql = playback_series_join_sql(),
+            ),
+            vec![start_day.into()],
+        ))
+        .await?;
+    rows.iter()
+        .map(|row| {
+            let watch_seconds = row.get_i64("watch_seconds").unwrap_or_default();
+            Ok(json!({
+                "SeriesId": row.get_str("series_id")?,
+                "SeriesName": row.get_opt_str("series_name")?.unwrap_or_else(|| row.get_str("series_id").unwrap_or_default()),
+                "WatchSeconds": watch_seconds,
+                "WatchMinutes": watch_seconds / 60,
+                "PlayCount": row.get_i64("play_count").unwrap_or_default(),
+                "ItemCount": row.get_i64("item_count").unwrap_or_default(),
+            }))
+        })
+        .collect()
+}
+
+fn playback_series_join_sql() -> &'static str {
+    r#"LEFT JOIN media_items episode_season ON episode_season.id = mi.parent_id AND episode_season.item_type = 'Season'
+       LEFT JOIN media_items episode_series ON episode_series.id = episode_season.parent_id AND episode_series.item_type = 'Series'
+       LEFT JOIN media_items direct_series ON direct_series.id = mi.parent_id AND direct_series.item_type = 'Series'
+       LEFT JOIN media_items video_parent ON video_parent.id = mi.parent_id
+       LEFT JOIN media_items video_season ON video_season.id = video_parent.parent_id AND video_season.item_type = 'Season'
+       LEFT JOIN media_items video_series ON video_series.id = video_season.parent_id AND video_series.item_type = 'Series'"#
+}
+
+fn playback_series_id_sql() -> &'static str {
+    r#"CASE
+         WHEN mi.item_type = 'Series' THEN mi.id
+         WHEN mi.item_type = 'Season' THEN direct_series.id
+         WHEN mi.item_type = 'Episode' THEN COALESCE(episode_series.id, direct_series.id)
+         WHEN mi.item_type = 'Video' AND video_parent.item_type = 'Episode' THEN video_series.id
+         ELSE NULL
+       END"#
+}
+
+fn playback_series_name_sql() -> &'static str {
+    r#"CASE
+         WHEN mi.item_type = 'Series' THEN mi.title
+         WHEN mi.item_type = 'Season' THEN direct_series.title
+         WHEN mi.item_type = 'Episode' THEN COALESCE(episode_series.title, direct_series.title)
+         WHEN mi.item_type = 'Video' AND video_parent.item_type = 'Episode' THEN video_series.title
+         ELSE NULL
+       END"#
 }
 
 async fn run_user_usage_custom_query(
@@ -2319,6 +2591,8 @@ fn allowed_usage_stats_table(table: &str) -> bool {
             | "media_studios"
             | "media_tags"
             | "people"
+            | "playback_watch_days"
+            | "playback_watch_sessions"
             | "provider_ids"
             | "studios"
             | "tags"
@@ -2437,7 +2711,7 @@ fn usage_stats_hourly_items(rows: &[JsonValue]) -> Vec<JsonValue> {
         let play_count = json_i64(row, "PlayCount").max(1);
         hours[hour].0 += 1;
         hours[hour].1 += play_count;
-        hours[hour].2 += json_i64(row, "RunTimeTicks").saturating_mul(play_count);
+        hours[hour].2 += usage_row_duration_ticks(row);
     }
     hours
         .into_iter()
@@ -2464,9 +2738,9 @@ fn usage_stats_duration_histogram_items(rows: &[JsonValue]) -> Vec<JsonValue> {
         ("120m+", Some(120_i64), None, 0_i64, 0_i64, 0_i64),
     ];
     for row in rows {
-        let runtime_ticks = json_i64(row, "RunTimeTicks");
-        let minutes = runtime_ticks / 600_000_000;
-        let index = if runtime_ticks <= 0 {
+        let duration_ticks = usage_row_duration_ticks(row);
+        let minutes = duration_ticks / 600_000_000;
+        let index = if duration_ticks <= 0 {
             0
         } else if minutes < 30 {
             1
@@ -2482,7 +2756,7 @@ fn usage_stats_duration_histogram_items(rows: &[JsonValue]) -> Vec<JsonValue> {
         let play_count = json_i64(row, "PlayCount").max(1);
         buckets[index].3 += 1;
         buckets[index].4 += play_count;
-        buckets[index].5 += runtime_ticks.saturating_mul(play_count);
+        buckets[index].5 += duration_ticks;
     }
     buckets
         .into_iter()
@@ -2542,7 +2816,7 @@ fn usage_stats_breakdown_items(rows: &[JsonValue], breakdown_type: &str) -> Opti
         let entry = groups.entry(key).or_insert((name, 0, 0, 0));
         entry.1 += 1;
         entry.2 += play_count;
-        entry.3 += json_i64(row, "RunTimeTicks").saturating_mul(play_count);
+        entry.3 += usage_row_duration_ticks(row);
     }
     let mut items = groups
         .into_iter()
@@ -2573,6 +2847,14 @@ fn json_i64(value: &JsonValue, key: &str) -> i64 {
         .get(key)
         .and_then(JsonValue::as_i64)
         .unwrap_or_default()
+}
+
+fn usage_row_duration_ticks(row: &JsonValue) -> i64 {
+    row.get("DurationTicks")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or_else(|| {
+            json_i64(row, "RunTimeTicks").saturating_mul(json_i64(row, "PlayCount").max(1))
+        })
 }
 
 fn json_string(value: &JsonValue, key: &str) -> Option<String> {
@@ -2613,6 +2895,16 @@ fn usage_stats_day_range(date: &str) -> Option<(i64, i64)> {
         .and_utc()
         .timestamp();
     Some((start, start + 86_400))
+}
+
+fn unix_day(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp.max(0), 0)
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string())
+}
+
+fn unix_day_start(timestamp: i64) -> i64 {
+    timestamp.max(0).div_euclid(86_400) * 86_400
 }
 
 fn usage_stats_query_range(query: &HashMap<String, String>) -> Option<Option<(i64, i64)>> {
@@ -5605,7 +5897,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn play_activity_uses_user_data() {
+    async fn play_activity_uses_precise_watch_days() {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
@@ -5628,7 +5920,7 @@ mod tests {
         .await
         .unwrap();
         db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO user_data (user_id, item_id, played, playback_position_ticks, play_count, last_played_at, updated_at) VALUES (?, ?, 1, 123, 2, 10, 10)",
+            "INSERT INTO playback_watch_days (day, user_id, item_id, watch_seconds, play_count, last_played_at) VALUES ('1970-01-01', ?, ?, 120, 2, 10)",
             vec!["u1".into(), "m1".into()],
         ))
         .await
@@ -5640,7 +5932,7 @@ mod tests {
         .await
         .unwrap();
         db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO user_data (user_id, item_id, played, playback_position_ticks, play_count, last_played_at, updated_at) VALUES (?, ?, 1, 456, 1, 90010, 90010)",
+            "INSERT INTO playback_watch_days (day, user_id, item_id, watch_seconds, play_count, last_played_at) VALUES ('1970-01-02', ?, ?, 60, 1, 90010)",
             vec!["u2".into(), "e1".into()],
         ))
         .await
@@ -5693,6 +5985,7 @@ mod tests {
         let by_user = usage_stats_breakdown_items(&rows, "User").unwrap();
         assert_eq!(by_user.len(), 2);
         assert_eq!(by_user[0]["PlayCount"], 2);
+        assert_eq!(by_user[0]["DurationTicks"], 1_200_000_000_i64);
         assert!(usage_stats_breakdown_items(&[], "Bad").is_none());
     }
 

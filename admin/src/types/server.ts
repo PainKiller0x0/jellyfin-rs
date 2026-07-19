@@ -102,6 +102,8 @@ export type AdminHttpLogResult = QueryResult<AdminHttpLogEntry> & {
 export type PlaybackRegion = {
   Region: string;
   RegionCode: string;
+  ProvinceCode?: string;
+  ProvinceName?: string;
   IsPrivate: boolean;
   PlayCount: number;
   UserCount: number;
@@ -129,4 +131,54 @@ export type PlaybackMap = {
   RegionCount: number;
   Regions: PlaybackRegion[];
   RecentEvents: PlaybackRecentEvent[];
+};
+
+export type PlaybackStatsDailyPoint = {
+  Date: string;
+  WatchSeconds: number;
+  WatchMinutes: number;
+  PlayCount: number;
+};
+
+export type PlaybackStatsUser = {
+  UserId: string;
+  UserName: string;
+  WatchSeconds: number;
+  WatchMinutes: number;
+  PlayCount: number;
+};
+
+export type PlaybackStatsItem = {
+  ItemId: string;
+  ItemName: string;
+  ItemType: string;
+  SeriesId?: string | null;
+  SeriesName?: string | null;
+  WatchSeconds: number;
+  WatchMinutes: number;
+  PlayCount: number;
+};
+
+export type PlaybackStatsSeries = {
+  SeriesId: string;
+  SeriesName: string;
+  WatchSeconds: number;
+  WatchMinutes: number;
+  PlayCount: number;
+  ItemCount: number;
+};
+
+export type PlaybackStats = {
+  TotalWatchSeconds: number;
+  TotalWatchMinutes: number;
+  TodayWatchSeconds: number;
+  TodayWatchMinutes: number;
+  TotalPlayCount: number;
+  UserCount: number;
+  ItemCount: number;
+  Days: number;
+  Daily: PlaybackStatsDailyPoint[];
+  Users: PlaybackStatsUser[];
+  Items: PlaybackStatsItem[];
+  Series: PlaybackStatsSeries[];
 };

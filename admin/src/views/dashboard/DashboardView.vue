@@ -14,15 +14,68 @@ import type {
   PlaybackMap,
   PlaybackRegion,
   PlaybackSession,
+  PlaybackStats,
+  PlaybackStatsSeries,
+  PlaybackStatsUser,
   ScheduledTask,
   SystemInfo
 } from '@/types/server';
 
 const CHINA_MAP_WIDTH = 1000;
 const CHINA_MAP_HEIGHT = 500;
+const GITHUB_HEAT_COLORS = ['#ebedf0', '#9be9a8', '#40c463', '#30a14e', '#216e39'] as const;
+const PROVINCE_CODE_ALIASES: Record<string, string> = {
+  bj: '11',
+  beijing: '11',
+  tj: '12',
+  tianjin: '12',
+  hebei: '13',
+  shanxi: '14',
+  sx: '14',
+  neimenggu: '15',
+  inner_mongolia: '15',
+  liaoning: '21',
+  jilin: '22',
+  heilongjiang: '23',
+  shanghai: '31',
+  jiangsu: '32',
+  zhejiang: '33',
+  anhui: '34',
+  fujian: '35',
+  jiangxi: '36',
+  shandong: '37',
+  henan: '41',
+  hubei: '42',
+  hunan: '43',
+  guangdong: '44',
+  guangxi: '45',
+  hainan: '46',
+  chongqing: '50',
+  sichuan: '51',
+  guizhou: '52',
+  yunnan: '53',
+  xizang: '54',
+  tibet: '54',
+  shaanxi: '61',
+  sn: '61',
+  gansu: '62',
+  qinghai: '63',
+  ningxia: '64',
+  xinjiang: '65',
+  taiwan: '71',
+  hongkong: '香港',
+  hong_kong: '香港',
+  macau: '澳门',
+  macao: '澳门'
+};
 type ChinaProvinceProperties = GeoJsonProperties & {
   id?: string;
   name?: string;
+};
+type ChinaProvincePath = {
+  id: string;
+  name: string;
+  d: string;
 };
 
 const chinaFeatures = chinaMapSource.features as Feature<Geometry, ChinaProvinceProperties>[];
@@ -35,11 +88,15 @@ const chinaProjection = geoMercator().fitExtent(
   chinaFeatureCollection
 );
 const chinaPath = geoPath(chinaProjection);
-const chinaProvincePaths = chinaFeatures.map(feature => ({
+const chinaProvincePaths: ChinaProvincePath[] = chinaFeatures.map(feature => ({
   id: feature.properties?.id ?? feature.properties?.name,
   name: feature.properties?.name ?? '',
   d: chinaPath(feature) ?? ''
-}));
+})).filter((province): province is ChinaProvincePath => Boolean(province.id && province.name && province.d));
+const chinaProvinceIds = new Set(chinaProvincePaths.map(province => province.id));
+const chinaProvinceNameToId = new Map(
+  chinaProvincePaths.map(province => [normalizeProvinceName(province.name), province.id])
+);
 
 const authStore = useAuthStore();
 const loading = ref(false);
@@ -53,6 +110,7 @@ const state = reactive<{
   system: SystemInfo | null;
   counts: ItemCounts | null;
   playbackMap: PlaybackMap | null;
+  playbackStats: PlaybackStats | null;
   sessions: PlaybackSession[];
   tasks: ScheduledTask[];
   activities: ActivityLogEntry[];
@@ -61,6 +119,7 @@ const state = reactive<{
   system: null,
   counts: null,
   playbackMap: null,
+  playbackStats: null,
   sessions: [],
   tasks: [],
   activities: [],
@@ -69,9 +128,71 @@ const state = reactive<{
 
 const regionRows = computed(() => state.playbackMap?.Regions ?? []);
 const recentPlaybackEvents = computed(() => state.playbackMap?.RecentEvents.slice(0, 6) ?? []);
-const maxRegionWeight = computed(() =>
-  Math.max(1, ...regionRows.value.map(region => Math.max(region.UserCount, region.PlayCount)))
+const watchDailyRows = computed(() => state.playbackStats?.Daily ?? []);
+const topWatchUsers = computed(() => state.playbackStats?.Users.slice(0, 5) ?? []);
+const topWatchSeries = computed(() => state.playbackStats?.Series.slice(0, 5) ?? []);
+const totalViewerCount = computed(() => regionRows.value.reduce((total, region) => total + region.UserCount, 0));
+const maxRegionUsers = computed(() => Math.max(1, ...regionRows.value.map(region => region.UserCount)));
+const maxDailyWatchSeconds = computed(() => Math.max(1, ...watchDailyRows.value.map(point => point.WatchSeconds)));
+const maxUserWatchSeconds = computed(() => Math.max(1, ...topWatchUsers.value.map(user => user.WatchSeconds)));
+const maxSeriesWatchSeconds = computed(() => Math.max(1, ...topWatchSeries.value.map(series => series.WatchSeconds)));
+const provinceRegionGroups = computed(() => {
+  const groups = new Map<
+    string,
+    {
+      viewerCount: number;
+      playCount: number;
+      ipCount: number;
+      regions: PlaybackRegion[];
+    }
+  >();
+
+  for (const region of regionRows.value) {
+    const provinceId = provinceIdForRegion(region);
+    if (!provinceId) {
+      continue;
+    }
+
+    const group = groups.get(provinceId) ?? {
+      viewerCount: 0,
+      playCount: 0,
+      ipCount: 0,
+      regions: []
+    };
+    group.viewerCount += region.UserCount;
+    group.playCount += region.PlayCount;
+    group.ipCount += region.IpCount;
+    group.regions.push(region);
+    groups.set(provinceId, group);
+  }
+
+  return groups;
+});
+const maxProvinceUsers = computed(() =>
+  Math.max(1, ...Array.from(provinceRegionGroups.value.values()).map(group => group.viewerCount))
 );
+const provinceHeatPaths = computed(() =>
+  chinaProvincePaths.map(province => {
+    const group = provinceRegionGroups.value.get(province.id);
+    const viewerCount = group?.viewerCount ?? 0;
+    const playCount = group?.playCount ?? 0;
+    const ipCount = group?.ipCount ?? 0;
+    const level = heatLevel(viewerCount, maxProvinceUsers.value);
+    return {
+      ...province,
+      viewerCount,
+      playCount,
+      ipCount,
+      color: GITHUB_HEAT_COLORS[level],
+      level,
+      tooltip: viewerCount
+        ? `${province.name} · ${viewerCount} 用户 · ${playCount} 次播放 · ${ipCount} IP`
+        : `${province.name} · 暂无观看`
+    };
+  })
+);
+const hasMappedProvince = computed(() => provinceHeatPaths.value.some(province => province.viewerCount > 0));
+const mapSummary = computed(() => `用户分布地图，${formatNumber(totalViewerCount.value)} 个观看用户计数`);
 
 const cards = computed(() => [
   {
@@ -93,9 +214,15 @@ const cards = computed(() => [
     tone: 'warning'
   },
   {
+    label: '观影时长',
+    value: formatDuration(state.playbackStats?.TotalWatchSeconds),
+    hint: `今日 ${formatDuration(state.playbackStats?.TodayWatchSeconds)}`,
+    tone: 'primary'
+  },
+  {
     label: '播放次数',
-    value: formatNumber(state.playbackMap?.TotalPlayCount),
-    hint: `${formatNumber(state.playbackMap?.RegionCount)} 个地区/IP 段`,
+    value: formatNumber(state.playbackStats?.TotalPlayCount ?? state.playbackMap?.TotalPlayCount),
+    hint: `${formatNumber(state.playbackStats?.UserCount)} 用户 / ${formatNumber(state.playbackStats?.ItemCount)} 内容`,
     tone: 'success'
   },
   {
@@ -119,13 +246,14 @@ async function loadDashboard() {
   loading.value = true;
   loadError.value = '';
   try {
-    const [system, counts, sessions, tasks, activities, playbackMap, logs] = await Promise.all([
+    const [system, counts, sessions, tasks, activities, playbackMap, playbackStats, logs] = await Promise.all([
       serverApi.systemInfo(authStore.token),
       serverApi.itemCounts(authStore.token),
       serverApi.activeSessions(authStore.token),
       serverApi.scheduledTasks(authStore.token),
       serverApi.activityLog(authStore.token),
       serverApi.playbackMap(authStore.token),
+      serverApi.playbackStats(authStore.token),
       serverApi.adminLogs(authStore.token, 0, 120)
     ]);
     state.system = system;
@@ -134,6 +262,7 @@ async function loadDashboard() {
     state.tasks = tasks;
     state.activities = activities.Items;
     state.playbackMap = playbackMap;
+    state.playbackStats = playbackStats;
     state.httpLogs = logs.Items;
     logLastId.value = logs.LastId;
     await nextTick(scrollLogsToBottom);
@@ -167,7 +296,12 @@ async function pollPlaybackMap() {
     return;
   }
   try {
-    state.playbackMap = await serverApi.playbackMap(authStore.token);
+    const [playbackMap, playbackStats] = await Promise.all([
+      serverApi.playbackMap(authStore.token),
+      serverApi.playbackStats(authStore.token)
+    ]);
+    state.playbackMap = playbackMap;
+    state.playbackStats = playbackStats;
   } catch {
     // Transient polling errors are ignored; manual refresh still reports failures.
   }
@@ -193,6 +327,22 @@ function scrollLogsToBottom() {
 
 function formatNumber(value: number | undefined) {
   return typeof value === 'number' ? value.toLocaleString() : '-';
+}
+
+function formatDuration(value: number | undefined) {
+  if (typeof value !== 'number') {
+    return '-';
+  }
+  const seconds = Math.max(0, Math.round(value));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours > 0) {
+    return `${hours.toLocaleString()}小时${minutes ? `${minutes}分` : ''}`;
+  }
+  if (minutes > 0) {
+    return `${minutes}分钟`;
+  }
+  return `${seconds}秒`;
 }
 
 function formatDate(value?: string | null) {
@@ -225,32 +375,113 @@ function statusType(statusCode: number) {
   return 'success';
 }
 
-function markerStyle(region: PlaybackRegion) {
-  const ratio = Math.min(1, Math.max(region.UserCount, region.PlayCount) / maxRegionWeight.value);
-  const size = 16 + ratio * 10;
-  const alpha = 0.7 + ratio * 0.2;
-  const x = Math.min(94, Math.max(6, region.X));
-  const y = Math.min(90, Math.max(8, region.Y));
-  return {
-    left: `${x}%`,
-    top: `${y}%`,
-    width: `${size}px`,
-    height: `${size}px`,
-    '--marker-alpha': alpha.toString()
-  };
-}
-
 function regionTooltip(region: PlaybackRegion) {
   const network = region.IsPrivate ? '内网' : '公网';
   return `${region.Region} · ${network} · ${region.PlayCount} 次播放 · ${region.UserCount} 用户`;
 }
 
-function markerLabel(region: PlaybackRegion) {
-  return region.UserCount > 99 ? '99+' : region.UserCount.toString();
+function normalizeProvinceName(value: string) {
+  return value
+    .trim()
+    .replace(/特别行政区|壮族自治区|回族自治区|维吾尔自治区|自治区|省|市/g, '')
+    .replace(/[\s._-]/g, '')
+    .toLowerCase();
+}
+
+function provinceIdForRegion(region: PlaybackRegion) {
+  if (region.IsPrivate) {
+    return undefined;
+  }
+
+  const candidates = [region.ProvinceCode, region.ProvinceName, region.RegionCode, region.Region].filter(
+    (value): value is string => Boolean(value)
+  );
+  for (const candidate of candidates) {
+    const value = candidate.trim();
+    if (chinaProvinceIds.has(value)) {
+      return value;
+    }
+
+    const codeMatch = value.match(/^(?:cn[-_:]?|province[-_:]?|region[-_:]?)?(\d{2})$/i);
+    if (codeMatch && chinaProvinceIds.has(codeMatch[1])) {
+      return codeMatch[1];
+    }
+
+    const alias = PROVINCE_CODE_ALIASES[value.toLowerCase()];
+    if (alias && chinaProvinceIds.has(alias)) {
+      return alias;
+    }
+
+    const normalized = normalizeProvinceName(value);
+    const nameMatch = chinaProvinceNameToId.get(normalized);
+    if (nameMatch) {
+      return nameMatch;
+    }
+
+    const containingName = chinaProvincePaths.find(province => {
+      const provinceName = normalizeProvinceName(province.name);
+      return normalized.length >= 2 && normalized.includes(provinceName);
+    });
+    if (containingName) {
+      return containingName.id;
+    }
+  }
+
+  return undefined;
+}
+
+function heatLevel(value: number, max: number) {
+  if (value <= 0) {
+    return 0;
+  }
+
+  const ratio = value / Math.max(1, max);
+  if (ratio <= 0.25) {
+    return 1;
+  }
+  if (ratio <= 0.5) {
+    return 2;
+  }
+  if (ratio <= 0.75) {
+    return 3;
+  }
+  return 4;
+}
+
+function githubHeatColor(value: number, max: number) {
+  return GITHUB_HEAT_COLORS[heatLevel(value, max)];
 }
 
 function regionBarStyle(region: PlaybackRegion) {
-  const ratio = Math.min(1, region.PlayCount / maxRegionWeight.value);
+  const ratio = Math.min(1, region.UserCount / maxRegionUsers.value);
+  return {
+    width: `${Math.max(8, ratio * 100)}%`,
+    background: githubHeatColor(region.UserCount, maxRegionUsers.value)
+  };
+}
+
+function regionHeatStyle(region: PlaybackRegion) {
+  return {
+    background: githubHeatColor(region.UserCount, maxRegionUsers.value)
+  };
+}
+
+function watchTrendStyle(seconds: number) {
+  const ratio = Math.min(1, seconds / maxDailyWatchSeconds.value);
+  return {
+    height: `${Math.max(4, ratio * 100)}%`
+  };
+}
+
+function userWatchBarStyle(user: PlaybackStatsUser) {
+  const ratio = Math.min(1, user.WatchSeconds / maxUserWatchSeconds.value);
+  return {
+    width: `${Math.max(8, ratio * 100)}%`
+  };
+}
+
+function seriesWatchBarStyle(series: PlaybackStatsSeries) {
+  const ratio = Math.min(1, series.WatchSeconds / maxSeriesWatchSeconds.value);
   return {
     width: `${Math.max(8, ratio * 100)}%`
   };
@@ -294,6 +525,74 @@ onBeforeUnmount(stopPolling);
       </ElCard>
     </div>
 
+    <div class="dashboard-page__grid dashboard-page__grid--watch">
+      <ElCard class="dashboard-page__panel" shadow="never">
+        <template #header>
+          <div class="dashboard-page__panel-title">
+            <ElIcon>
+              <DataAnalysis />
+            </ElIcon>
+            <span>按日观影时长</span>
+          </div>
+        </template>
+
+        <div class="dashboard-page__watch-chart" :aria-label="`最近 ${state.playbackStats?.Days ?? 30} 日观影时长`">
+          <ElTooltip
+            v-for="point in watchDailyRows"
+            :key="point.Date"
+            :content="`${point.Date} · ${formatDuration(point.WatchSeconds)} · ${point.PlayCount} 次播放`"
+            placement="top"
+            :show-after="120"
+          >
+            <div class="dashboard-page__watch-day">
+              <span class="dashboard-page__watch-bar" :style="watchTrendStyle(point.WatchSeconds)"></span>
+              <small>{{ dayjs(point.Date).format('MM-DD') }}</small>
+            </div>
+          </ElTooltip>
+          <ElEmpty v-if="!watchDailyRows.length" :image-size="80" description="暂无观影时长" />
+        </div>
+      </ElCard>
+
+      <ElCard class="dashboard-page__panel" shadow="never">
+        <template #header>
+          <div class="dashboard-page__panel-title">
+            <ElIcon>
+              <Histogram />
+            </ElIcon>
+            <span>用户 / 剧集时长</span>
+          </div>
+        </template>
+
+        <div class="dashboard-page__watch-rank-grid">
+          <div class="dashboard-page__watch-rank">
+            <div class="dashboard-page__watch-rank-title">用户</div>
+            <div v-for="user in topWatchUsers" :key="user.UserId" class="dashboard-page__watch-rank-row">
+              <div>
+                <strong>{{ user.UserName || user.UserId }}</strong>
+                <span>{{ user.PlayCount }} 次播放</span>
+                <b :style="userWatchBarStyle(user)"></b>
+              </div>
+              <ElTag effect="plain">{{ formatDuration(user.WatchSeconds) }}</ElTag>
+            </div>
+            <ElEmpty v-if="!topWatchUsers.length" :image-size="72" description="暂无用户数据" />
+          </div>
+
+          <div class="dashboard-page__watch-rank">
+            <div class="dashboard-page__watch-rank-title">剧集</div>
+            <div v-for="series in topWatchSeries" :key="series.SeriesId" class="dashboard-page__watch-rank-row">
+              <div>
+                <strong>{{ series.SeriesName || series.SeriesId }}</strong>
+                <span>{{ series.ItemCount }} 个条目 · {{ series.PlayCount }} 次播放</span>
+                <b :style="seriesWatchBarStyle(series)"></b>
+              </div>
+              <ElTag effect="plain">{{ formatDuration(series.WatchSeconds) }}</ElTag>
+            </div>
+            <ElEmpty v-if="!topWatchSeries.length" :image-size="72" description="暂无剧集数据" />
+          </div>
+        </div>
+      </ElCard>
+    </div>
+
     <div class="dashboard-page__grid dashboard-page__grid--map">
       <ElCard class="dashboard-page__panel" shadow="never">
         <template #header>
@@ -311,20 +610,12 @@ onBeforeUnmount(stopPolling);
               class="dashboard-page__map-canvas"
               :viewBox="`0 0 ${CHINA_MAP_WIDTH} ${CHINA_MAP_HEIGHT}`"
               preserveAspectRatio="xMidYMid meet"
-              aria-hidden="true"
-              focusable="false"
+              role="img"
+              :aria-label="mapSummary"
             >
               <defs>
-                <linearGradient id="mapOcean" x1="0" x2="1" y1="0" y2="1">
-                  <stop offset="0%" stop-color="#f8fbff" />
-                  <stop offset="100%" stop-color="#edf6f3" />
-                </linearGradient>
-                <linearGradient id="chinaMapLand" x1="0" x2="1" y1="0" y2="1">
-                  <stop offset="0%" stop-color="#d8ece4" />
-                  <stop offset="100%" stop-color="#b9d7cc" />
-                </linearGradient>
-                <filter id="mapLandShadow" x="-4%" y="-8%" width="108%" height="116%">
-                  <feDropShadow dx="0" dy="4" flood-color="#0f172a" flood-opacity="0.08" stdDeviation="5" />
+                <filter id="mapLandShadow" x="-3%" y="-6%" width="106%" height="112%">
+                  <feDropShadow dx="0" dy="3" flood-color="#1f2328" flood-opacity="0.06" stdDeviation="4" />
                 </filter>
               </defs>
               <rect class="dashboard-page__map-ocean" :width="CHINA_MAP_WIDTH" :height="CHINA_MAP_HEIGHT" rx="18" />
@@ -334,48 +625,48 @@ onBeforeUnmount(stopPolling);
               </g>
               <g class="dashboard-page__china-map" filter="url(#mapLandShadow)">
                 <path
-                  v-for="province in chinaProvincePaths"
+                  v-for="province in provinceHeatPaths"
                   :key="province.id"
                   class="dashboard-page__china-province"
+                  :class="{ 'dashboard-page__china-province--active': province.viewerCount > 0 }"
                   :d="province.d"
-                />
+                  :data-level="province.level"
+                  :style="{ fill: province.color }"
+                  :tabindex="province.viewerCount > 0 ? 0 : -1"
+                  :aria-label="province.tooltip"
+                >
+                  <title>{{ province.tooltip }}</title>
+                </path>
               </g>
             </svg>
             <div class="dashboard-page__map-badge">
-              <span>{{ formatNumber(state.playbackMap?.RegionCount) }}</span>
-              <small>地区/IP 段</small>
+              <span>{{ formatNumber(totalViewerCount) }}</span>
+              <small>观看用户计数</small>
             </div>
-            <ElTooltip
-              v-for="region in regionRows"
-              :key="region.RegionCode"
-              :content="regionTooltip(region)"
-              placement="top"
-              :show-after="120"
-            >
-              <button
-                class="dashboard-page__map-marker"
-                :class="{ 'dashboard-page__map-marker--private': region.IsPrivate }"
-                :style="markerStyle(region)"
-                :aria-label="regionTooltip(region)"
-                type="button"
-              >
-                <span>{{ markerLabel(region) }}</span>
-              </button>
-            </ElTooltip>
-            <div class="dashboard-page__map-legend" aria-hidden="true">
-              <span><i class="dashboard-page__map-dot"></i>公网</span>
-              <span><i class="dashboard-page__map-dot dashboard-page__map-dot--private"></i>内网</span>
+            <div class="dashboard-page__map-legend" aria-label="观看用户计数颜色图例">
+              <span>少</span>
+              <i
+                v-for="color in GITHUB_HEAT_COLORS"
+                :key="color"
+                class="dashboard-page__map-legend-cell"
+                :style="{ background: color }"
+              ></i>
+              <span>多</span>
             </div>
             <div v-if="!regionRows.length" class="dashboard-page__map-empty">暂无播放分布</div>
+            <div v-else-if="!hasMappedProvince" class="dashboard-page__map-empty">暂无省份归属</div>
           </div>
           <div class="dashboard-page__region-list">
             <div v-for="region in regionRows.slice(0, 8)" :key="region.RegionCode" class="dashboard-page__region">
+              <i class="dashboard-page__region-swatch" :style="regionHeatStyle(region)"></i>
               <div>
                 <strong>{{ region.Region }}</strong>
-                <span>{{ region.SampleIps.join(', ') || '-' }}</span>
+                <span>{{ region.UserCount }} 用户 · {{ region.IpCount }} IP · {{ region.SampleIps.join(', ') || '-' }}</span>
                 <b :style="regionBarStyle(region)"></b>
               </div>
-              <ElTag type="success" effect="plain">{{ region.PlayCount }} 次 / {{ region.UserCount }} 用户</ElTag>
+              <ElTag class="dashboard-page__region-count" type="success" effect="plain">
+                {{ region.UserCount }} 人 / {{ region.PlayCount }} 次
+              </ElTag>
             </div>
           </div>
         </div>
@@ -606,6 +897,113 @@ onBeforeUnmount(stopPolling);
   align-items: stretch;
 }
 
+.dashboard-page__grid--watch {
+  grid-template-columns: minmax(0, 1.15fr) minmax(360px, 0.85fr);
+}
+
+.dashboard-page__watch-chart {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(18px, 1fr));
+  gap: 8px;
+  align-items: end;
+  min-height: 240px;
+  padding: 14px 10px 8px;
+  border: 1px solid var(--admin-border);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(37, 99, 235, 0.06), rgba(255, 255, 255, 0) 42%),
+    #ffffff;
+}
+
+.dashboard-page__watch-day {
+  display: grid;
+  grid-template-rows: minmax(160px, 1fr) 22px;
+  gap: 8px;
+  min-width: 0;
+  align-items: end;
+}
+
+.dashboard-page__watch-bar {
+  display: block;
+  min-height: 4px;
+  border-radius: 5px 5px 2px 2px;
+  background: linear-gradient(180deg, #2563eb 0%, #0f766e 100%);
+  box-shadow: 0 6px 14px rgba(37, 99, 235, 0.14);
+}
+
+.dashboard-page__watch-day small {
+  overflow: hidden;
+  color: var(--admin-muted);
+  font-size: 10px;
+  line-height: 1.2;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dashboard-page__watch-rank-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.dashboard-page__watch-rank {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.dashboard-page__watch-rank-title {
+  color: var(--admin-muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.dashboard-page__watch-rank-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-height: 54px;
+  padding: 9px 10px;
+  border: 1px solid var(--admin-border);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.dashboard-page__watch-rank-row div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.dashboard-page__watch-rank-row strong,
+.dashboard-page__watch-rank-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dashboard-page__watch-rank-row strong {
+  font-size: 13px;
+}
+
+.dashboard-page__watch-rank-row span {
+  color: var(--admin-muted);
+  font-size: 12px;
+}
+
+.dashboard-page__watch-rank-row b {
+  display: block;
+  width: 8%;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2563eb 0%, #dc6a3d 100%);
+}
+
 .dashboard-page__map {
   display: grid;
   gap: 14px;
@@ -618,7 +1016,7 @@ onBeforeUnmount(stopPolling);
   overflow: hidden;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #f8fbff;
+  background: #f6f8fa;
   isolation: isolate;
 }
 
@@ -630,37 +1028,41 @@ onBeforeUnmount(stopPolling);
 }
 
 .dashboard-page__map-ocean {
-  fill: url('#mapOcean');
-  stroke: rgba(15, 118, 110, 0.1);
+  fill: #ffffff;
+  stroke: rgba(31, 35, 40, 0.08);
   stroke-width: 1;
 }
 
 .dashboard-page__map-grid path {
   fill: none;
-  stroke: rgba(100, 116, 139, 0.18);
+  stroke: rgba(31, 35, 40, 0.1);
   stroke-dasharray: 4 10;
   stroke-linecap: round;
   vector-effect: non-scaling-stroke;
 }
 
 .dashboard-page__china-province {
-  fill: url('#chinaMapLand');
-  stroke: rgba(255, 255, 255, 0.9);
+  fill: #ebedf0;
+  stroke: #ffffff;
   stroke-linejoin: round;
-  stroke-width: 1.15;
+  stroke-width: 1;
   vector-effect: non-scaling-stroke;
+  transition:
+    filter 0.16s ease,
+    stroke 0.16s ease,
+    stroke-width 0.16s ease;
 }
 
-.dashboard-page__china-province:nth-child(3n + 1) {
-  fill: #d3e8df;
+.dashboard-page__china-province--active {
+  cursor: pointer;
 }
 
-.dashboard-page__china-province:nth-child(3n + 2) {
-  fill: #c7ded5;
-}
-
-.dashboard-page__china-province:nth-child(3n) {
-  fill: #bdd8ce;
+.dashboard-page__china-province--active:hover,
+.dashboard-page__china-province--active:focus-visible {
+  outline: 0;
+  filter: brightness(0.96);
+  stroke: #1f2328;
+  stroke-width: 1.5;
 }
 
 .dashboard-page__map-badge {
@@ -672,15 +1074,15 @@ onBeforeUnmount(stopPolling);
   gap: 1px;
   min-width: 72px;
   padding: 6px 8px;
-  border: 1px solid rgba(15, 118, 110, 0.18);
+  border: 1px solid rgba(31, 35, 40, 0.12);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.74);
+  background: rgba(255, 255, 255, 0.82);
   box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
   backdrop-filter: blur(8px);
 }
 
 .dashboard-page__map-badge span {
-  color: #0f766e;
+  color: #216e39;
   font-size: 14px;
   font-weight: 800;
   line-height: 1;
@@ -698,38 +1100,28 @@ onBeforeUnmount(stopPolling);
   bottom: 14px;
   z-index: 2;
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  gap: 5px;
   align-items: center;
-  padding: 7px 9px;
-  border: 1px solid rgba(15, 118, 110, 0.16);
+  padding: 7px 8px;
+  border: 1px solid rgba(31, 35, 40, 0.12);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.84);
-  color: #334155;
-  font-size: 12px;
+  color: #57606a;
+  font-size: 11px;
   box-shadow: 0 10px 26px rgba(15, 23, 42, 0.08);
   backdrop-filter: blur(8px);
 }
 
 .dashboard-page__map-legend span {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
   line-height: 1;
 }
 
-.dashboard-page__map-dot {
-  display: inline-block;
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: #dc6a3d;
-  box-shadow: 0 0 0 4px rgba(220, 106, 61, 0.14);
-}
-
-.dashboard-page__map-dot--private {
-  background: #0f766e;
-  box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.14);
+.dashboard-page__map-legend-cell {
+  display: block;
+  width: 11px;
+  height: 11px;
+  border: 1px solid rgba(31, 35, 40, 0.08);
+  border-radius: 2px;
 }
 
 .dashboard-page__map-empty {
@@ -748,95 +1140,6 @@ onBeforeUnmount(stopPolling);
   backdrop-filter: blur(8px);
 }
 
-.dashboard-page__map-marker {
-  position: absolute;
-  z-index: 3;
-  display: grid;
-  min-width: 16px;
-  min-height: 16px;
-  padding: 0;
-  place-items: center;
-  border: 2px solid rgba(255, 255, 255, 0.9);
-  border-radius: 999px;
-  cursor: pointer;
-  transform: translate(-50%, -50%);
-  background:
-    radial-gradient(circle at 38% 34%, rgba(255, 255, 255, 0.95), rgba(255, 255, 255, 0) 34%),
-    rgba(220, 106, 61, var(--marker-alpha));
-  box-shadow:
-    0 0 0 5px rgba(220, 106, 61, 0.12),
-    0 8px 18px rgba(127, 29, 29, 0.16);
-  transition:
-    box-shadow 0.18s ease,
-    transform 0.18s ease;
-}
-
-.dashboard-page__map-marker::after {
-  position: absolute;
-  bottom: -3px;
-  width: 7px;
-  height: 7px;
-  content: '';
-  border-right: 2px solid rgba(255, 255, 255, 0.9);
-  border-bottom: 2px solid rgba(255, 255, 255, 0.9);
-  background: rgba(220, 106, 61, var(--marker-alpha));
-  transform: rotate(45deg);
-}
-
-.dashboard-page__map-marker:hover,
-.dashboard-page__map-marker:focus-visible {
-  outline: 0;
-  transform: translate(-50%, -54%) scale(1.06);
-  box-shadow:
-    0 0 0 7px rgba(220, 106, 61, 0.16),
-    0 12px 24px rgba(127, 29, 29, 0.2);
-}
-
-.dashboard-page__map-marker--private {
-  background:
-    radial-gradient(circle at 38% 34%, rgba(255, 255, 255, 0.95), rgba(255, 255, 255, 0) 34%),
-    rgba(15, 118, 110, var(--marker-alpha));
-  box-shadow:
-    0 0 0 5px rgba(15, 118, 110, 0.12),
-    0 8px 18px rgba(19, 78, 74, 0.16);
-}
-
-.dashboard-page__map-marker--private::after {
-  background: rgba(15, 118, 110, var(--marker-alpha));
-}
-
-.dashboard-page__map-marker--private:hover,
-.dashboard-page__map-marker--private:focus-visible {
-  box-shadow:
-    0 0 0 7px rgba(15, 118, 110, 0.16),
-    0 12px 24px rgba(19, 78, 74, 0.2);
-}
-
-.dashboard-page__map-marker span {
-  position: absolute;
-  top: -10px;
-  right: -10px;
-  z-index: 1;
-  display: grid;
-  min-width: 16px;
-  height: 16px;
-  padding: 0 4px;
-  place-items: center;
-  border: 1px solid rgba(220, 106, 61, 0.2);
-  border-radius: 999px;
-  color: #b45309;
-  background: rgba(255, 255, 255, 0.9);
-  box-shadow: 0 6px 14px rgba(15, 23, 42, 0.1);
-  font-size: 10px;
-  font-weight: 800;
-  line-height: 1;
-}
-
-.dashboard-page__map-marker--private span {
-  border-color: rgba(15, 118, 110, 0.22);
-  color: #0f766e;
-}
-
 .dashboard-page__region-list {
   display: grid;
   gap: 10px;
@@ -844,13 +1147,20 @@ onBeforeUnmount(stopPolling);
 
 .dashboard-page__region {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
   gap: 12px;
   align-items: center;
   padding: 10px 12px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
   background: #ffffff;
+}
+
+.dashboard-page__region-swatch {
+  width: 12px;
+  height: 12px;
+  border: 1px solid rgba(31, 35, 40, 0.08);
+  border-radius: 3px;
 }
 
 .dashboard-page__region div {
@@ -880,7 +1190,7 @@ onBeforeUnmount(stopPolling);
   height: 3px;
   overflow: hidden;
   border-radius: 999px;
-  background: linear-gradient(90deg, #0f766e 0%, #dc6a3d 100%);
+  background: #40c463;
 }
 
 .dashboard-page__log-stream {
@@ -956,6 +1266,10 @@ onBeforeUnmount(stopPolling);
     grid-template-columns: 1fr;
   }
 
+  .dashboard-page__grid--watch {
+    grid-template-columns: 1fr;
+  }
+
   .dashboard-page__log-row {
     grid-template-columns: 120px 58px minmax(180px, 1fr);
   }
@@ -974,8 +1288,31 @@ onBeforeUnmount(stopPolling);
     min-height: 240px;
   }
 
-  .dashboard-page__region {
+  .dashboard-page__watch-chart {
+    grid-template-columns: repeat(auto-fit, minmax(14px, 1fr));
+    min-height: 190px;
+    gap: 5px;
+  }
+
+  .dashboard-page__watch-day {
+    grid-template-rows: minmax(124px, 1fr) 18px;
+  }
+
+  .dashboard-page__watch-day small {
+    display: none;
+  }
+
+  .dashboard-page__watch-rank-grid {
     grid-template-columns: 1fr;
+  }
+
+  .dashboard-page__region {
+    grid-template-columns: 14px minmax(0, 1fr);
+  }
+
+  .dashboard-page__region-count {
+    grid-column: 2;
+    justify-self: start;
   }
 
   .dashboard-page__log-stream {

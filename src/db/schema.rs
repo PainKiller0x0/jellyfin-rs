@@ -119,6 +119,30 @@ pub fn migrations() -> Vec<Migration> {
             "failed to create activity log index",
         ),
         (
+            r#"CREATE TABLE IF NOT EXISTS playback_watch_sessions (play_session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, item_id TEXT NOT NULL, media_source_id TEXT, client TEXT, device_name TEXT, position_ticks BIGINT NOT NULL DEFAULT 0, runtime_ticks BIGINT, is_paused BIGINT NOT NULL DEFAULT 0, started_at BIGINT NOT NULL, last_event_at BIGINT NOT NULL, ended_at BIGINT, watch_seconds BIGINT NOT NULL DEFAULT 0, updated_at BIGINT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"#,
+            "failed to migrate playback_watch_sessions",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_playback_watch_sessions_user ON playback_watch_sessions(user_id, last_event_at DESC)",
+            "failed to create playback watch session user index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_playback_watch_sessions_item ON playback_watch_sessions(item_id, last_event_at DESC)",
+            "failed to create playback watch session item index",
+        ),
+        (
+            r#"CREATE TABLE IF NOT EXISTS playback_watch_days (day TEXT NOT NULL, user_id TEXT NOT NULL, item_id TEXT NOT NULL, watch_seconds BIGINT NOT NULL DEFAULT 0, play_count BIGINT NOT NULL DEFAULT 0, last_played_at BIGINT, PRIMARY KEY(day, user_id, item_id), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"#,
+            "failed to migrate playback_watch_days",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_playback_watch_days_user_day ON playback_watch_days(user_id, day DESC)",
+            "failed to create playback watch day user index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_playback_watch_days_item_day ON playback_watch_days(item_id, day DESC)",
+            "failed to create playback watch day item index",
+        ),
+        (
             r#"CREATE TABLE IF NOT EXISTS task_results (task_id TEXT PRIMARY KEY, status TEXT NOT NULL, start_time BIGINT, end_time BIGINT, message TEXT)"#,
             "failed to migrate task_results",
         ),
@@ -461,6 +485,30 @@ pub fn optional_migrations() -> Vec<Migration> {
         (
             "CREATE INDEX IF NOT EXISTS idx_linked_children_item_id ON linked_children(item_id)",
             "add linked_children.item_id index",
+        ),
+        (
+            r#"CREATE TABLE IF NOT EXISTS playback_watch_sessions (play_session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, item_id TEXT NOT NULL, media_source_id TEXT, client TEXT, device_name TEXT, position_ticks BIGINT NOT NULL DEFAULT 0, runtime_ticks BIGINT, is_paused BIGINT NOT NULL DEFAULT 0, started_at BIGINT NOT NULL, last_event_at BIGINT NOT NULL, ended_at BIGINT, watch_seconds BIGINT NOT NULL DEFAULT 0, updated_at BIGINT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"#,
+            "create playback_watch_sessions table",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_playback_watch_sessions_user ON playback_watch_sessions(user_id, last_event_at DESC)",
+            "add playback watch session user index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_playback_watch_sessions_item ON playback_watch_sessions(item_id, last_event_at DESC)",
+            "add playback watch session item index",
+        ),
+        (
+            r#"CREATE TABLE IF NOT EXISTS playback_watch_days (day TEXT NOT NULL, user_id TEXT NOT NULL, item_id TEXT NOT NULL, watch_seconds BIGINT NOT NULL DEFAULT 0, play_count BIGINT NOT NULL DEFAULT 0, last_played_at BIGINT, PRIMARY KEY(day, user_id, item_id), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"#,
+            "create playback_watch_days table",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_playback_watch_days_user_day ON playback_watch_days(user_id, day DESC)",
+            "add playback watch day user index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_playback_watch_days_item_day ON playback_watch_days(item_id, day DESC)",
+            "add playback watch day item index",
         ),
         // --- StrmAssistant integration tables ---
         (

@@ -1,6 +1,9 @@
 <script setup lang="ts">
+import { geoMercator, geoPath } from 'd3-geo';
 import dayjs from 'dayjs';
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
+import chinaMapSource from 'china-map-geojson/lib/china';
+import type { Feature, Geometry, GeoJsonProperties } from 'geojson';
 
 import * as serverApi from '@/services/server';
 import { useAuthStore } from '@/stores/auth';
@@ -14,6 +17,29 @@ import type {
   ScheduledTask,
   SystemInfo
 } from '@/types/server';
+
+const CHINA_MAP_WIDTH = 1000;
+const CHINA_MAP_HEIGHT = 500;
+type ChinaProvinceProperties = GeoJsonProperties & {
+  id?: string;
+  name?: string;
+};
+
+const chinaFeatures = chinaMapSource.features as Feature<Geometry, ChinaProvinceProperties>[];
+const chinaFeatureCollection = chinaMapSource;
+const chinaProjection = geoMercator().fitExtent(
+  [
+    [74, 22],
+    [CHINA_MAP_WIDTH - 58, CHINA_MAP_HEIGHT - 22]
+  ],
+  chinaFeatureCollection
+);
+const chinaPath = geoPath(chinaProjection);
+const chinaProvincePaths = chinaFeatures.map(feature => ({
+  id: feature.properties?.id ?? feature.properties?.name,
+  name: feature.properties?.name ?? '',
+  d: chinaPath(feature) ?? ''
+}));
 
 const authStore = useAuthStore();
 const loading = ref(false);
@@ -201,15 +227,32 @@ function statusType(statusCode: number) {
 
 function markerStyle(region: PlaybackRegion) {
   const ratio = Math.min(1, Math.max(region.UserCount, region.PlayCount) / maxRegionWeight.value);
-  const size = 18 + ratio * 28;
-  const alpha = 0.28 + ratio * 0.62;
+  const size = 16 + ratio * 10;
+  const alpha = 0.7 + ratio * 0.2;
+  const x = Math.min(94, Math.max(6, region.X));
+  const y = Math.min(90, Math.max(8, region.Y));
   return {
-    left: `${region.X}%`,
-    top: `${region.Y}%`,
+    left: `${x}%`,
+    top: `${y}%`,
     width: `${size}px`,
     height: `${size}px`,
-    backgroundColor: `rgba(22, 163, 74, ${alpha})`,
-    borderColor: `rgba(21, 128, 61, ${Math.min(1, alpha + 0.18)})`
+    '--marker-alpha': alpha.toString()
+  };
+}
+
+function regionTooltip(region: PlaybackRegion) {
+  const network = region.IsPrivate ? '内网' : '公网';
+  return `${region.Region} · ${network} · ${region.PlayCount} 次播放 · ${region.UserCount} 用户`;
+}
+
+function markerLabel(region: PlaybackRegion) {
+  return region.UserCount > 99 ? '99+' : region.UserCount.toString();
+}
+
+function regionBarStyle(region: PlaybackRegion) {
+  const ratio = Math.min(1, region.PlayCount / maxRegionWeight.value);
+  return {
+    width: `${Math.max(8, ratio * 100)}%`
   };
 }
 
@@ -264,22 +307,73 @@ onBeforeUnmount(stopPolling);
 
         <div class="dashboard-page__map">
           <div class="dashboard-page__map-surface">
-            <button
+            <svg
+              class="dashboard-page__map-canvas"
+              :viewBox="`0 0 ${CHINA_MAP_WIDTH} ${CHINA_MAP_HEIGHT}`"
+              preserveAspectRatio="xMidYMid meet"
+              aria-hidden="true"
+              focusable="false"
+            >
+              <defs>
+                <linearGradient id="mapOcean" x1="0" x2="1" y1="0" y2="1">
+                  <stop offset="0%" stop-color="#f8fbff" />
+                  <stop offset="100%" stop-color="#edf6f3" />
+                </linearGradient>
+                <linearGradient id="chinaMapLand" x1="0" x2="1" y1="0" y2="1">
+                  <stop offset="0%" stop-color="#d8ece4" />
+                  <stop offset="100%" stop-color="#b9d7cc" />
+                </linearGradient>
+                <filter id="mapLandShadow" x="-4%" y="-8%" width="108%" height="116%">
+                  <feDropShadow dx="0" dy="4" flood-color="#0f172a" flood-opacity="0.08" stdDeviation="5" />
+                </filter>
+              </defs>
+              <rect class="dashboard-page__map-ocean" :width="CHINA_MAP_WIDTH" :height="CHINA_MAP_HEIGHT" rx="18" />
+              <g class="dashboard-page__map-grid">
+                <path d="M110 98H900M110 182H900M110 266H900M110 350H900M110 434H900" />
+                <path d="M188 62V455M326 62V455M464 62V455M602 62V455M740 62V455M878 62V455" />
+              </g>
+              <g class="dashboard-page__china-map" filter="url(#mapLandShadow)">
+                <path
+                  v-for="province in chinaProvincePaths"
+                  :key="province.id"
+                  class="dashboard-page__china-province"
+                  :d="province.d"
+                />
+              </g>
+            </svg>
+            <div class="dashboard-page__map-badge">
+              <span>{{ formatNumber(state.playbackMap?.RegionCount) }}</span>
+              <small>地区/IP 段</small>
+            </div>
+            <ElTooltip
               v-for="region in regionRows"
               :key="region.RegionCode"
-              class="dashboard-page__map-marker"
-              :style="markerStyle(region)"
-              type="button"
+              :content="regionTooltip(region)"
+              placement="top"
+              :show-after="120"
             >
-              <span>{{ region.UserCount }}</span>
-            </button>
-            <ElEmpty v-if="!regionRows.length" :image-size="80" description="暂无播放分布" />
+              <button
+                class="dashboard-page__map-marker"
+                :class="{ 'dashboard-page__map-marker--private': region.IsPrivate }"
+                :style="markerStyle(region)"
+                :aria-label="regionTooltip(region)"
+                type="button"
+              >
+                <span>{{ markerLabel(region) }}</span>
+              </button>
+            </ElTooltip>
+            <div class="dashboard-page__map-legend" aria-hidden="true">
+              <span><i class="dashboard-page__map-dot"></i>公网</span>
+              <span><i class="dashboard-page__map-dot dashboard-page__map-dot--private"></i>内网</span>
+            </div>
+            <div v-if="!regionRows.length" class="dashboard-page__map-empty">暂无播放分布</div>
           </div>
           <div class="dashboard-page__region-list">
             <div v-for="region in regionRows.slice(0, 8)" :key="region.RegionCode" class="dashboard-page__region">
               <div>
                 <strong>{{ region.Region }}</strong>
                 <span>{{ region.SampleIps.join(', ') || '-' }}</span>
+                <b :style="regionBarStyle(region)"></b>
               </div>
               <ElTag type="success" effect="plain">{{ region.PlayCount }} 次 / {{ region.UserCount }} 用户</ElTag>
             </div>
@@ -519,59 +613,228 @@ onBeforeUnmount(stopPolling);
 
 .dashboard-page__map-surface {
   position: relative;
-  display: grid;
-  min-height: 300px;
-  place-items: center;
+  height: clamp(320px, 31vw, 430px);
+  min-height: 320px;
   overflow: hidden;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background:
-    radial-gradient(ellipse at 18% 36%, rgba(96, 165, 250, 0.28) 0 6%, transparent 6.4%),
-    radial-gradient(ellipse at 28% 54%, rgba(96, 165, 250, 0.25) 0 9%, transparent 9.5%),
-    radial-gradient(ellipse at 48% 42%, rgba(96, 165, 250, 0.22) 0 13%, transparent 13.5%),
-    radial-gradient(ellipse at 66% 48%, rgba(96, 165, 250, 0.24) 0 14%, transparent 14.5%),
-    radial-gradient(ellipse at 78% 67%, rgba(96, 165, 250, 0.22) 0 7%, transparent 7.6%),
-    linear-gradient(180deg, #f8fafc 0%, #eef6f2 100%);
+  background: #f8fbff;
+  isolation: isolate;
 }
 
-.dashboard-page__map-surface::before {
+.dashboard-page__map-canvas {
   position: absolute;
-  inset: 18px;
-  content: '';
-  border: 1px solid rgba(148, 163, 184, 0.28);
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.dashboard-page__map-ocean {
+  fill: url('#mapOcean');
+  stroke: rgba(15, 118, 110, 0.1);
+  stroke-width: 1;
+}
+
+.dashboard-page__map-grid path {
+  fill: none;
+  stroke: rgba(100, 116, 139, 0.18);
+  stroke-dasharray: 4 10;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.dashboard-page__china-province {
+  fill: url('#chinaMapLand');
+  stroke: rgba(255, 255, 255, 0.9);
+  stroke-linejoin: round;
+  stroke-width: 1.15;
+  vector-effect: non-scaling-stroke;
+}
+
+.dashboard-page__china-province:nth-child(3n + 1) {
+  fill: #d3e8df;
+}
+
+.dashboard-page__china-province:nth-child(3n + 2) {
+  fill: #c7ded5;
+}
+
+.dashboard-page__china-province:nth-child(3n) {
+  fill: #bdd8ce;
+}
+
+.dashboard-page__map-badge {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 2;
+  display: grid;
+  gap: 1px;
+  min-width: 72px;
+  padding: 6px 8px;
+  border: 1px solid rgba(15, 118, 110, 0.18);
   border-radius: 8px;
-  background-image:
-    linear-gradient(rgba(148, 163, 184, 0.18) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(148, 163, 184, 0.18) 1px, transparent 1px);
-  background-size: 64px 64px;
+  background: rgba(255, 255, 255, 0.74);
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
+  backdrop-filter: blur(8px);
+}
+
+.dashboard-page__map-badge span {
+  color: #0f766e;
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.dashboard-page__map-badge small {
+  color: var(--admin-muted);
+  font-size: 10px;
+  line-height: 1.25;
+}
+
+.dashboard-page__map-legend {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 9px;
+  border: 1px solid rgba(15, 118, 110, 0.16);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.84);
+  color: #334155;
+  font-size: 12px;
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.08);
+  backdrop-filter: blur(8px);
+}
+
+.dashboard-page__map-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1;
+}
+
+.dashboard-page__map-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #dc6a3d;
+  box-shadow: 0 0 0 4px rgba(220, 106, 61, 0.14);
+}
+
+.dashboard-page__map-dot--private {
+  background: #0f766e;
+  box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.14);
+}
+
+.dashboard-page__map-empty {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 1;
+  padding: 7px 12px;
+  border: 1px solid rgba(100, 116, 139, 0.16);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  color: #64748b;
+  font-size: 13px;
+  transform: translate(-50%, -50%);
   pointer-events: none;
+  backdrop-filter: blur(8px);
 }
 
 .dashboard-page__map-marker {
   position: absolute;
-  z-index: 1;
+  z-index: 3;
   display: grid;
-  min-width: 18px;
-  min-height: 18px;
+  min-width: 16px;
+  min-height: 16px;
   padding: 0;
   place-items: center;
-  border: 2px solid;
+  border: 2px solid rgba(255, 255, 255, 0.9);
   border-radius: 999px;
-  color: #052e16;
-  cursor: default;
-  font-size: 12px;
-  font-weight: 800;
-  line-height: 1;
+  cursor: pointer;
   transform: translate(-50%, -50%);
-  box-shadow: 0 8px 20px rgba(22, 101, 52, 0.18);
+  background:
+    radial-gradient(circle at 38% 34%, rgba(255, 255, 255, 0.95), rgba(255, 255, 255, 0) 34%),
+    rgba(220, 106, 61, var(--marker-alpha));
+  box-shadow:
+    0 0 0 5px rgba(220, 106, 61, 0.12),
+    0 8px 18px rgba(127, 29, 29, 0.16);
+  transition:
+    box-shadow 0.18s ease,
+    transform 0.18s ease;
+}
+
+.dashboard-page__map-marker::after {
+  position: absolute;
+  bottom: -3px;
+  width: 7px;
+  height: 7px;
+  content: '';
+  border-right: 2px solid rgba(255, 255, 255, 0.9);
+  border-bottom: 2px solid rgba(255, 255, 255, 0.9);
+  background: rgba(220, 106, 61, var(--marker-alpha));
+  transform: rotate(45deg);
+}
+
+.dashboard-page__map-marker:hover,
+.dashboard-page__map-marker:focus-visible {
+  outline: 0;
+  transform: translate(-50%, -54%) scale(1.06);
+  box-shadow:
+    0 0 0 7px rgba(220, 106, 61, 0.16),
+    0 12px 24px rgba(127, 29, 29, 0.2);
+}
+
+.dashboard-page__map-marker--private {
+  background:
+    radial-gradient(circle at 38% 34%, rgba(255, 255, 255, 0.95), rgba(255, 255, 255, 0) 34%),
+    rgba(15, 118, 110, var(--marker-alpha));
+  box-shadow:
+    0 0 0 5px rgba(15, 118, 110, 0.12),
+    0 8px 18px rgba(19, 78, 74, 0.16);
+}
+
+.dashboard-page__map-marker--private::after {
+  background: rgba(15, 118, 110, var(--marker-alpha));
+}
+
+.dashboard-page__map-marker--private:hover,
+.dashboard-page__map-marker--private:focus-visible {
+  box-shadow:
+    0 0 0 7px rgba(15, 118, 110, 0.16),
+    0 12px 24px rgba(19, 78, 74, 0.2);
 }
 
 .dashboard-page__map-marker span {
+  position: absolute;
+  top: -10px;
+  right: -10px;
+  z-index: 1;
   display: grid;
-  width: 100%;
-  height: 100%;
   min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
   place-items: center;
+  border: 1px solid rgba(220, 106, 61, 0.2);
+  border-radius: 999px;
+  color: #b45309;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 6px 14px rgba(15, 23, 42, 0.1);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.dashboard-page__map-marker--private span {
+  border-color: rgba(15, 118, 110, 0.22);
+  color: #0f766e;
 }
 
 .dashboard-page__region-list {
@@ -609,6 +872,15 @@ onBeforeUnmount(stopPolling);
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.dashboard-page__region b {
+  display: block;
+  width: 8%;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #0f766e 0%, #dc6a3d 100%);
 }
 
 .dashboard-page__log-stream {

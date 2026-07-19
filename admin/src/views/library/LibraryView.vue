@@ -61,6 +61,36 @@ const pathRules: FormRules<PathForm> = {
 };
 
 const totalPaths = computed(() => folders.value.reduce((sum, folder) => sum + folder.Locations.length, 0));
+const createPathRows = computed(() => parsePaths(form.pathsText));
+const typeCount = computed(() =>
+  folders.value.reduce<Record<string, number>>((counts, folder) => {
+    const key = folder.CollectionType || 'mixed';
+    counts[key] = (counts[key] ?? 0) + 1;
+    return counts;
+  }, {})
+);
+const libraryStats = computed(() => [
+  {
+    label: '媒体库',
+    value: folders.value.length,
+    hint: '个'
+  },
+  {
+    label: '媒体路径',
+    value: totalPaths.value,
+    hint: '条'
+  },
+  {
+    label: '电影库',
+    value: typeCount.value.movies ?? 0,
+    hint: '个'
+  },
+  {
+    label: '剧集库',
+    value: typeCount.value.tvshows ?? 0,
+    hint: '个'
+  }
+]);
 
 async function loadFolders() {
   if (!authStore.token) {
@@ -103,6 +133,12 @@ function appendCreatePath(path: string) {
     paths.push(path);
   }
   form.pathsText = paths.join('\n');
+}
+
+function removeCreatePath(path: string) {
+  form.pathsText = parsePaths(form.pathsText)
+    .filter(item => item !== path)
+    .join('\n');
 }
 
 async function submitCreate() {
@@ -231,6 +267,34 @@ function hideFolderImage(event: Event) {
   image.style.display = 'none';
 }
 
+function collectionTypeLabel(value: string) {
+  return collectionTypes.find(item => item.value === value)?.label ?? (value || '混合内容');
+}
+
+function collectionTypeIcon(value: string) {
+  if (value === 'movies') {
+    return 'Film';
+  }
+  if (value === 'tvshows') {
+    return 'VideoCamera';
+  }
+  if (value === 'music') {
+    return 'Headset';
+  }
+  return 'Collection';
+}
+
+function collectionTypeClass(value: string) {
+  if (value === 'movies' || value === 'tvshows' || value === 'music') {
+    return `library-page__cover--${value}`;
+  }
+  return 'library-page__cover--mixed';
+}
+
+function coverInitial(folder: VirtualFolder) {
+  return folder.Name.slice(0, 1).toUpperCase();
+}
+
 async function uploadFolderImage(folder: VirtualFolder, uploadFile: UploadFile) {
   if (!authStore.token || !uploadFile.raw) {
     return;
@@ -304,7 +368,13 @@ onMounted(loadFolders);
         <h1>媒体库</h1>
         <p>{{ folders.length }} 个媒体库，{{ totalPaths }} 个路径。</p>
       </div>
-      <ElSpace wrap>
+      <div class="library-page__heading-actions">
+        <ElButton :loading="loading" @click="loadFolders">
+          <ElIcon>
+            <Refresh />
+          </ElIcon>
+          刷新
+        </ElButton>
         <ElButton @click="scanLibrary">
           <ElIcon>
             <VideoPlay />
@@ -323,85 +393,181 @@ onMounted(loadFolders);
           </ElIcon>
           新建媒体库
         </ElButton>
-      </ElSpace>
+      </div>
     </div>
 
-    <ElCard shadow="never">
-      <ElTable v-loading="loading" :data="folders" empty-text="暂无媒体库">
-        <ElTableColumn label="名称" min-width="180" prop="Name" />
-        <ElTableColumn label="图片" width="104">
-          <template #default="{ row }">
-            <div class="library-page__cover">
-              <span>{{ row.Name.slice(0, 1).toUpperCase() }}</span>
-              <img
-                :alt="row.Name"
-                :src="folderImageUrl(row)"
-                @error="hideFolderImage"
-                @load="showFolderImage"
-              />
+    <div class="library-page__stats">
+      <div v-for="stat in libraryStats" :key="stat.label" class="library-page__stat">
+        <span>{{ stat.label }}</span>
+        <strong>{{ stat.value }}</strong>
+        <small>{{ stat.hint }}</small>
+      </div>
+    </div>
+
+    <div v-loading="loading" class="library-page__library-list">
+      <article v-for="folder in folders" :key="folder.Id" class="library-page__library-card">
+        <div class="library-page__library-main">
+          <div class="library-page__cover" :class="collectionTypeClass(folder.CollectionType)">
+            <span>{{ coverInitial(folder) }}</span>
+            <img
+              :alt="folder.Name"
+              :src="folderImageUrl(folder)"
+              @error="hideFolderImage"
+              @load="showFolderImage"
+            />
+          </div>
+
+          <div class="library-page__library-copy">
+            <div class="library-page__library-title">
+              <div>
+                <h2>{{ folder.Name }}</h2>
+                <span>{{ folder.ItemId }}</span>
+              </div>
+              <ElTag effect="plain" type="success">{{ collectionTypeLabel(folder.CollectionType) }}</ElTag>
             </div>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="类型" width="120" prop="CollectionType" />
-        <ElTableColumn label="路径" min-width="320">
-          <template #default="{ row }">
+
             <div class="library-page__paths">
-              <ElTag v-for="path in row.Locations" :key="path" closable effect="plain" @close="removePath(row, path)">
-                {{ path }}
-              </ElTag>
-              <ElButton link type="primary" @click="openPathDialog(row)">
+              <div v-for="path in folder.Locations" :key="path" class="library-page__path-pill">
+                <ElIcon>
+                  <Folder />
+                </ElIcon>
+                <span>{{ path }}</span>
+                <ElButton circle text type="danger" @click="removePath(folder, path)">
+                  <ElIcon>
+                    <Close />
+                  </ElIcon>
+                </ElButton>
+              </div>
+              <ElButton class="library-page__path-add" text type="primary" @click="openPathDialog(folder)">
                 <ElIcon>
                   <Plus />
                 </ElIcon>
                 路径
               </ElButton>
             </div>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn align="right" label="操作" width="220">
-          <template #default="{ row }">
-            <ElUpload
-              accept="image/jpeg,image/png,image/webp"
-              :auto-upload="false"
-              :on-change="folderImageChangeHandler(row)"
-              :show-file-list="false"
-            >
-              <ElButton :loading="uploadingImageId === row.ItemId" link type="primary">上传图片</ElButton>
-            </ElUpload>
-            <ElButton :loading="deletingImageId === row.ItemId" link type="danger" @click="deleteFolderImage(row)">
-              删除图片
-            </ElButton>
-            <ElButton link type="danger" @click="removeFolder(row)">删除</ElButton>
-          </template>
-        </ElTableColumn>
-      </ElTable>
-    </ElCard>
+          </div>
+        </div>
 
-    <ElDialog v-model="createDialogVisible" title="新建媒体库" width="520px" @closed="resetForm">
-      <ElForm ref="formRef" :model="form" :rules="rules" label-position="top">
-        <ElFormItem label="名称" prop="name">
-          <ElInput v-model.trim="form.name" />
-        </ElFormItem>
-        <ElFormItem label="媒体类型" prop="collectionType">
-          <ElSelect v-model="form.collectionType" class="library-page__control">
-            <ElOption v-for="item in collectionTypes" :key="item.value" :label="item.label" :value="item.value" />
-          </ElSelect>
-        </ElFormItem>
-        <ElFormItem label="路径">
-          <div class="library-page__path-input">
-            <ElInput v-model="form.pathsText" :rows="4" type="textarea" />
-            <ElButton @click="openDirectoryPicker('create')">
+        <div class="library-page__card-actions">
+          <ElButton @click="openPathDialog(folder)">
+            <ElIcon>
+              <FolderAdd />
+            </ElIcon>
+            添加路径
+          </ElButton>
+          <ElUpload
+            accept="image/jpeg,image/png,image/webp"
+            :auto-upload="false"
+            :on-change="folderImageChangeHandler(folder)"
+            :show-file-list="false"
+          >
+            <ElButton :loading="uploadingImageId === folder.ItemId">
               <ElIcon>
-                <FolderOpened />
+                <Upload />
               </ElIcon>
-              选择
+              上传封面
             </ElButton>
+          </ElUpload>
+          <ElButton :loading="deletingImageId === folder.ItemId" @click="deleteFolderImage(folder)">
+            <ElIcon>
+              <Picture />
+            </ElIcon>
+            删除封面
+          </ElButton>
+          <ElButton type="danger" @click="removeFolder(folder)">
+            <ElIcon>
+              <Delete />
+            </ElIcon>
+            删除
+          </ElButton>
+        </div>
+      </article>
+
+      <ElEmpty v-if="!loading && !folders.length" :image-size="96" description="暂无媒体库">
+        <ElButton type="primary" @click="openCreateDialog">
+          <ElIcon>
+            <Plus />
+          </ElIcon>
+          新建媒体库
+        </ElButton>
+      </ElEmpty>
+    </div>
+
+    <ElDialog
+      v-model="createDialogVisible"
+      class="library-page__create-dialog"
+      width="min(660px, calc(100vw - 32px))"
+      @closed="resetForm"
+    >
+      <template #header>
+        <div class="library-page__dialog-header">
+          <div class="library-page__dialog-icon">
+            <ElIcon>
+              <FolderOpened />
+            </ElIcon>
+          </div>
+          <h2>新建媒体库</h2>
+        </div>
+      </template>
+
+      <ElForm ref="formRef" class="library-page__create-form" :model="form" :rules="rules" label-position="top">
+        <ElFormItem label="名称" prop="name">
+          <ElInput v-model.trim="form.name" placeholder="电影" size="large" />
+        </ElFormItem>
+
+        <ElFormItem label="媒体类型" prop="collectionType">
+          <div class="library-page__type-grid">
+            <button
+              v-for="item in collectionTypes"
+              :key="item.value"
+              class="library-page__type-option"
+              :class="{ 'is-active': form.collectionType === item.value }"
+              type="button"
+              @click="form.collectionType = item.value"
+            >
+              <ElIcon>
+                <component :is="collectionTypeIcon(item.value)" />
+              </ElIcon>
+              <strong>{{ item.label }}</strong>
+              <span>{{ item.value }}</span>
+            </button>
+          </div>
+        </ElFormItem>
+
+        <ElFormItem label="路径">
+          <div class="library-page__create-paths">
+            <div class="library-page__create-path-input">
+              <ElInput v-model="form.pathsText" :rows="3" placeholder="/media/Movies" type="textarea" />
+              <ElButton @click="openDirectoryPicker('create')">
+                <ElIcon>
+                  <FolderOpened />
+                </ElIcon>
+                选择
+              </ElButton>
+            </div>
+
+            <div v-if="createPathRows.length" class="library-page__create-path-list">
+              <div v-for="path in createPathRows" :key="path" class="library-page__create-path-row">
+                <ElIcon>
+                  <Folder />
+                </ElIcon>
+                <span>{{ path }}</span>
+                <ElButton circle text type="danger" @click="removeCreatePath(path)">
+                  <ElIcon>
+                    <Close />
+                  </ElIcon>
+                </ElButton>
+              </div>
+            </div>
           </div>
         </ElFormItem>
       </ElForm>
+
       <template #footer>
-        <ElButton @click="createDialogVisible = false">取消</ElButton>
-        <ElButton :loading="saving" type="primary" @click="submitCreate">保存</ElButton>
+        <div class="library-page__dialog-footer">
+          <ElButton @click="createDialogVisible = false">取消</ElButton>
+          <ElButton :loading="saving" type="primary" @click="submitCreate">保存</ElButton>
+        </div>
       </template>
     </ElDialog>
 
@@ -441,7 +607,9 @@ onMounted(loadFolders);
 <style scoped lang="scss">
 .library-page {
   display: grid;
-  gap: 18px;
+  align-content: start;
+  gap: 16px;
+  padding: 24px 32px 32px;
 }
 
 .library-page__heading {
@@ -463,26 +631,190 @@ onMounted(loadFolders);
   }
 }
 
+.library-page__heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.library-page__stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 12px;
+}
+
+.library-page__stat {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 6px;
+  align-items: baseline;
+  min-height: 58px;
+  padding: 12px 14px;
+  border: 1px solid var(--admin-border);
+  border-radius: 8px;
+  background: #ffffff;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--admin-muted);
+    font-size: 13px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: #0f766e;
+    font-size: 24px;
+    line-height: 1;
+  }
+
+  small {
+    color: var(--admin-muted);
+    font-size: 12px;
+  }
+}
+
+.library-page__library-list {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-height: 280px;
+}
+
+.library-page__library-list :deep(.el-loading-mask) {
+  border-radius: 8px;
+}
+
+.library-page__library-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px;
+  align-items: start;
+  padding: 16px;
+  border: 1px solid var(--admin-border);
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.04);
+}
+
+.library-page__library-main {
+  display: flex;
+  gap: 14px;
+  min-width: 0;
+}
+
+.library-page__library-copy {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  flex: 1;
+}
+
+.library-page__library-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+
+  div {
+    display: grid;
+    min-width: 0;
+    gap: 4px;
+  }
+
+  h2 {
+    margin: 0;
+    overflow: hidden;
+    color: #0f172a;
+    font-size: 17px;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: var(--admin-muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
 .library-page__paths {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  min-height: 32px;
   align-items: center;
+  min-height: 34px;
+}
+
+.library-page__path-pill {
+  display: inline-grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: center;
+  max-width: min(100%, 460px);
+  min-height: 32px;
+  padding: 3px 3px 3px 9px;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  background: #f8fbff;
+  color: #2563eb;
+  font-size: 13px;
+
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .el-button {
+    width: 24px;
+    height: 24px;
+    min-height: 24px;
+  }
+}
+
+.library-page__path-add {
+  min-height: 32px;
 }
 
 .library-page__cover {
   position: relative;
   display: grid;
-  width: 64px;
-  height: 40px;
+  width: 116px;
+  height: 74px;
+  flex: 0 0 116px;
   place-items: center;
   overflow: hidden;
-  border: 1px solid var(--admin-border);
+  border: 1px solid rgba(15, 23, 42, 0.08);
   border-radius: 8px;
-  background: #f1f5f9;
-  color: #64748b;
+  background: linear-gradient(135deg, #e2e8f0, #f8fafc);
+  color: #ffffff;
+  font-size: 24px;
   font-weight: 700;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.36);
+
+  &::after {
+    position: absolute;
+    inset: 0;
+    content: '';
+    background:
+      linear-gradient(135deg, rgba(255, 255, 255, 0.22), transparent 42%),
+      linear-gradient(180deg, transparent 44%, rgba(15, 23, 42, 0.2));
+    pointer-events: none;
+  }
+
+  span {
+    position: relative;
+    z-index: 1;
+    text-shadow: 0 2px 6px rgba(15, 23, 42, 0.22);
+  }
 
   img {
     position: absolute;
@@ -492,6 +824,207 @@ onMounted(loadFolders);
     height: 100%;
     object-fit: cover;
   }
+}
+
+.library-page__cover--movies {
+  background: linear-gradient(135deg, #0f766e, #2563eb);
+}
+
+.library-page__cover--tvshows {
+  background: linear-gradient(135deg, #7c3aed, #0e7490);
+}
+
+.library-page__cover--music {
+  background: linear-gradient(135deg, #b45309, #be123c);
+}
+
+.library-page__cover--mixed {
+  background: linear-gradient(135deg, #475569, #0f766e);
+}
+
+.library-page__card-actions {
+  display: grid;
+  grid-template-columns: repeat(2, max-content);
+  gap: 8px;
+  justify-content: end;
+}
+
+.library-page__card-actions :deep(.el-upload) {
+  display: block;
+}
+
+:deep(.library-page__create-dialog) {
+  overflow: hidden;
+  border-radius: 8px;
+}
+
+:deep(.library-page__create-dialog .el-dialog__header) {
+  margin: 0;
+  padding: 18px 24px;
+  border-bottom: 1px solid var(--admin-border);
+}
+
+:deep(.library-page__create-dialog .el-dialog__body) {
+  padding: 20px 24px 4px;
+}
+
+:deep(.library-page__create-dialog .el-dialog__footer) {
+  padding: 16px 24px 20px;
+  border-top: 1px solid var(--admin-border);
+}
+
+.library-page__dialog-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+
+  h2 {
+    margin: 0;
+    color: #0f172a;
+    font-size: 20px;
+    line-height: 1.25;
+  }
+}
+
+.library-page__dialog-icon {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border-radius: 8px;
+  color: #0f766e;
+  background: #e6f4f1;
+  font-size: 18px;
+}
+
+.library-page__create-form :deep(.el-form-item) {
+  margin-bottom: 18px;
+}
+
+.library-page__create-form :deep(.el-form-item__label) {
+  padding-bottom: 7px;
+  color: #334155;
+  font-weight: 700;
+}
+
+.library-page__type-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  width: 100%;
+}
+
+.library-page__type-option {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  min-height: 94px;
+  padding: 12px 10px;
+  border: 1px solid var(--admin-border);
+  border-radius: 8px;
+  color: var(--admin-text);
+  background: #ffffff;
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color 0.16s ease,
+    background 0.16s ease,
+    box-shadow 0.16s ease;
+
+  .el-icon {
+    display: grid;
+    width: 30px;
+    height: 30px;
+    place-items: center;
+    border-radius: 8px;
+    color: #0f766e;
+    background: #e6f4f1;
+    font-size: 17px;
+  }
+
+  strong {
+    overflow: hidden;
+    font-size: 14px;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: var(--admin-muted);
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &:hover,
+  &.is-active {
+    border-color: rgba(15, 118, 110, 0.45);
+    background: #f3fbf8;
+    box-shadow: 0 10px 24px rgba(15, 118, 110, 0.08);
+  }
+
+  &.is-active {
+    outline: 2px solid rgba(15, 118, 110, 0.12);
+  }
+}
+
+.library-page__create-paths {
+  display: grid;
+  gap: 10px;
+  width: 100%;
+}
+
+.library-page__create-path-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 104px;
+  gap: 10px;
+  align-items: stretch;
+
+  .el-button {
+    height: 100%;
+    min-height: 72px;
+  }
+}
+
+.library-page__create-path-list {
+  display: grid;
+  gap: 8px;
+  max-height: 116px;
+  overflow: auto;
+}
+
+.library-page__create-path-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-height: 34px;
+  padding: 5px 5px 5px 10px;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  background: #f8fbff;
+  color: #2563eb;
+  font-size: 13px;
+
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .el-button {
+    width: 24px;
+    height: 24px;
+    min-height: 24px;
+  }
+}
+
+.library-page__dialog-footer {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
 }
 
 .library-page__control {
@@ -506,12 +1039,82 @@ onMounted(loadFolders);
   align-items: start;
 }
 
+@media (max-width: 1120px) {
+  .library-page__library-card {
+    grid-template-columns: 1fr;
+  }
+
+  .library-page__card-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+}
+
 @media (max-width: 760px) {
+  .library-page {
+    padding: 18px;
+  }
+
   .library-page__heading {
     flex-direction: column;
   }
 
+  .library-page__heading-actions {
+    justify-content: flex-start;
+  }
+
+  .library-page__stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .library-page__library-main {
+    align-items: flex-start;
+  }
+
+  .library-page__cover {
+    width: 96px;
+    height: 64px;
+    flex-basis: 96px;
+  }
+
   .library-page__path-input {
+    grid-template-columns: 1fr;
+  }
+
+  .library-page__type-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .library-page__create-path-input {
+    grid-template-columns: 1fr;
+
+    .el-button {
+      min-height: 40px;
+    }
+  }
+}
+
+@media (max-width: 540px) {
+  .library-page__stats {
+    grid-template-columns: 1fr;
+  }
+
+  .library-page__library-main {
+    display: grid;
+  }
+
+  .library-page__cover {
+    width: 100%;
+    height: 120px;
+  }
+
+  .library-page__library-title {
+    display: grid;
+  }
+
+  .library-page__card-actions {
+    display: grid;
     grid-template-columns: 1fr;
   }
 }

@@ -37,6 +37,28 @@ const apiKeyRules: FormRules<ApiKeyForm> = {
 
 const tmdbEnabled = computed(() => Boolean(tmdbConfig.value?.HasApiKey || tmdbConfig.value?.IsTmdbEnabled));
 const doubanHasCookie = computed(() => Boolean(doubanConfig.value?.HasCookie));
+const settingsStats = computed(() => [
+  {
+    label: '服务器',
+    value: serverName.value || '-',
+    hint: '名称'
+  },
+  {
+    label: 'TMDb',
+    value: tmdbEnabled.value ? '已启用' : '未配置',
+    hint: '元数据'
+  },
+  {
+    label: '豆瓣',
+    value: doubanHasCookie.value ? '已配置' : '匿名',
+    hint: '刮削'
+  },
+  {
+    label: 'API 密钥',
+    value: keys.value.length,
+    hint: '个'
+  }
+]);
 
 async function loadSettings() {
   if (!authStore.token) {
@@ -204,121 +226,147 @@ onMounted(loadSettings);
       </ElButton>
     </div>
 
-    <div class="settings-page__grid">
-      <ElCard shadow="never">
-        <template #header>
-          <div class="settings-page__card-title">
+    <div class="settings-page__stats">
+      <div v-for="stat in settingsStats" :key="stat.label" class="settings-page__stat">
+        <span>{{ stat.label }}</span>
+        <strong>{{ stat.value }}</strong>
+        <small>{{ stat.hint }}</small>
+      </div>
+    </div>
+
+    <div v-loading="loading" class="settings-page__config-grid">
+      <article class="settings-page__panel">
+        <div class="settings-page__panel-head">
+          <div class="settings-page__panel-icon">
             <ElIcon>
               <Monitor />
             </ElIcon>
-            <span>服务器</span>
           </div>
-        </template>
+          <div>
+            <h2>服务器</h2>
+            <p>后台与客户端显示名称。</p>
+          </div>
+        </div>
 
-        <ElForm label-position="top">
+        <ElForm class="settings-page__form" label-position="top">
           <ElFormItem label="名称">
             <ElInput v-model.trim="serverName" maxlength="128" show-word-limit />
           </ElFormItem>
-          <ElButton :loading="savingServerName" type="primary" @click="saveServerName">保存</ElButton>
+          <div class="settings-page__form-actions">
+            <ElButton :loading="savingServerName" type="primary" @click="saveServerName">保存名称</ElButton>
+          </div>
         </ElForm>
-      </ElCard>
+      </article>
 
-      <ElCard shadow="never">
-        <template #header>
-          <div class="settings-page__card-title">
+      <article class="settings-page__panel settings-page__panel--metadata">
+        <div class="settings-page__panel-head">
+          <div class="settings-page__panel-icon">
             <ElIcon>
               <SetUp />
             </ElIcon>
-            <span>豆瓣</span>
-            <ElTag :type="doubanHasCookie ? 'success' : 'info'" effect="plain">
-              {{ doubanHasCookie ? '已配置 Cookie' : '匿名模式' }}
-            </ElTag>
           </div>
-        </template>
+          <div>
+            <h2>元数据源</h2>
+            <p>配置 TMDb API Key 与豆瓣 Cookie。</p>
+          </div>
+        </div>
 
-        <ElForm label-position="top">
-          <ElFormItem label="Cookie">
+        <div class="settings-page__source-list">
+          <section class="settings-page__source">
+            <div class="settings-page__source-head">
+              <div>
+                <h3>TMDb</h3>
+                <span>电影、剧集和人物元数据。</span>
+              </div>
+              <ElTag :type="tmdbEnabled ? 'success' : 'info'" effect="plain">
+                {{ tmdbEnabled ? '已启用' : '未配置' }}
+              </ElTag>
+            </div>
+
+            <div class="settings-page__inline-control">
+              <ElInput v-model.trim="tmdbApiKey" placeholder="TMDb API Key" show-password type="password" />
+              <ElButton :loading="savingTmdb" type="primary" @click="saveTmdbApiKey">保存</ElButton>
+            </div>
+          </section>
+
+          <section class="settings-page__source">
+            <div class="settings-page__source-head">
+              <div>
+                <h3>豆瓣</h3>
+                <span>中文资料与评分补充。</span>
+              </div>
+              <ElTag :type="doubanHasCookie ? 'success' : 'info'" effect="plain">
+                {{ doubanHasCookie ? '已配置 Cookie' : '匿名模式' }}
+              </ElTag>
+            </div>
+
             <ElInput
               v-model="doubanCookie"
               maxlength="16384"
               placeholder="dbcl2=...; ck=..."
               show-password
               type="textarea"
-              :autosize="{ minRows: 2, maxRows: 4 }"
+              :autosize="{ minRows: 2, maxRows: 3 }"
             />
-          </ElFormItem>
-          <ElButton :loading="savingDouban" type="primary" @click="saveDoubanCookie">保存</ElButton>
-        </ElForm>
-      </ElCard>
+            <div class="settings-page__form-actions">
+              <ElButton :loading="savingDouban" type="primary" @click="saveDoubanCookie">保存 Cookie</ElButton>
+            </div>
+          </section>
+        </div>
+      </article>
 
-      <ElCard shadow="never">
-        <template #header>
-          <div class="settings-page__card-title">
-            <ElIcon>
-              <SetUp />
-            </ElIcon>
-            <span>TMDb</span>
-            <ElTag :type="tmdbEnabled ? 'success' : 'info'" effect="plain">
-              {{ tmdbEnabled ? '已启用' : '未配置' }}
-            </ElTag>
+      <article class="settings-page__panel settings-page__panel--keys">
+        <div class="settings-page__panel-head settings-page__panel-head--split">
+          <div class="settings-page__panel-title">
+            <div class="settings-page__panel-icon">
+              <ElIcon>
+                <Key />
+              </ElIcon>
+            </div>
+            <div>
+              <h2>API 密钥</h2>
+              <p>{{ keys.length }} 个应用密钥。</p>
+            </div>
           </div>
-        </template>
-
-        <ElForm label-position="top">
-          <ElFormItem label="API Key">
-            <ElInput v-model.trim="tmdbApiKey" placeholder="TMDb API Key" show-password type="password" />
-          </ElFormItem>
-          <ElButton :loading="savingTmdb" type="primary" @click="saveTmdbApiKey">保存</ElButton>
-        </ElForm>
-      </ElCard>
-
-      <ElCard shadow="never">
-        <template #header>
-          <div class="settings-page__card-title">
+          <ElButton type="primary" @click="openApiKeyDialog">
             <ElIcon>
-              <Key />
+              <Plus />
             </ElIcon>
-            <span>API 密钥</span>
-            <ElTag effect="plain">{{ keys.length }}</ElTag>
-          </div>
-        </template>
+            新建密钥
+          </ElButton>
+        </div>
 
-        <ElButton type="primary" @click="openApiKeyDialog">
-          <ElIcon>
-            <Plus />
-          </ElIcon>
-          新建密钥
-        </ElButton>
-      </ElCard>
+        <div class="settings-page__key-list">
+          <div v-for="key in keys" :key="key.Id || key.AccessToken" class="settings-page__key-row">
+            <div class="settings-page__key-app">
+              <strong>{{ key.AppName }}</strong>
+              <ElTooltip :content="key.AccessToken" placement="top">
+                <span class="settings-page__token">{{ maskToken(key.AccessToken) }}</span>
+              </ElTooltip>
+            </div>
+            <div class="settings-page__key-meta">
+              <span>创建 {{ formatDate(key.DateCreated) }}</span>
+              <span>最近使用 {{ formatDate(key.DateLastActivity) }}</span>
+            </div>
+            <ElButton type="danger" @click="removeApiKey(key)">
+              <ElIcon>
+                <Delete />
+              </ElIcon>
+              删除
+            </ElButton>
+          </div>
+
+          <ElEmpty v-if="!loading && !keys.length" :image-size="88" description="暂无 API 密钥">
+            <ElButton type="primary" @click="openApiKeyDialog">
+              <ElIcon>
+                <Plus />
+              </ElIcon>
+              新建密钥
+            </ElButton>
+          </ElEmpty>
+        </div>
+      </article>
     </div>
-
-    <ElCard shadow="never">
-      <ElTable v-loading="loading" :data="keys" empty-text="暂无 API 密钥">
-        <ElTableColumn label="应用" min-width="160" prop="AppName" />
-        <ElTableColumn label="Token" min-width="190">
-          <template #default="{ row }">
-            <ElTooltip :content="row.AccessToken" placement="top">
-              <span class="settings-page__token">{{ maskToken(row.AccessToken) }}</span>
-            </ElTooltip>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="创建时间" min-width="150">
-          <template #default="{ row }">
-            {{ formatDate(row.DateCreated) }}
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="最近使用" min-width="150">
-          <template #default="{ row }">
-            {{ formatDate(row.DateLastActivity) }}
-          </template>
-        </ElTableColumn>
-        <ElTableColumn align="right" label="操作" width="100">
-          <template #default="{ row }">
-            <ElButton link type="danger" @click="removeApiKey(row)">删除</ElButton>
-          </template>
-        </ElTableColumn>
-      </ElTable>
-    </ElCard>
 
     <ElDialog v-model="apiKeyDialogVisible" title="新建 API 密钥" width="440px">
       <ElForm ref="apiKeyFormRef" :model="apiKeyForm" :rules="apiKeyRules" label-position="top">
@@ -337,7 +385,9 @@ onMounted(loadSettings);
 <style scoped lang="scss">
 .settings-page {
   display: grid;
-  gap: 18px;
+  align-content: start;
+  gap: 16px;
+  padding: 24px 32px 32px;
 }
 
 .settings-page__heading {
@@ -359,30 +409,282 @@ onMounted(loadSettings);
   }
 }
 
-.settings-page__grid {
+.settings-page__stats {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 12px;
 }
 
-.settings-page__card-title {
+.settings-page__stat {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 10px;
+  align-items: baseline;
+  min-height: 58px;
+  padding: 12px 14px;
+  border: 1px solid var(--admin-border);
+  border-radius: 8px;
+  background: #ffffff;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--admin-muted);
+    font-size: 13px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    overflow: hidden;
+    color: #0f766e;
+    font-size: 20px;
+    line-height: 1.15;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  small {
+    grid-column: 1 / -1;
+    color: var(--admin-muted);
+    font-size: 12px;
+  }
+}
+
+.settings-page__config-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.72fr) minmax(0, 1.28fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.settings-page__config-grid :deep(.el-loading-mask) {
+  border-radius: 8px;
+}
+
+.settings-page__panel {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--admin-border);
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.04);
+}
+
+.settings-page__panel--metadata {
+  grid-row: span 2;
+}
+
+.settings-page__panel--keys {
+  grid-column: 1 / -1;
+}
+
+.settings-page__panel-head,
+.settings-page__panel-title {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 12px;
+  min-width: 0;
+}
+
+.settings-page__panel-head {
+  h2,
+  p {
+    margin: 0;
+  }
+
+  h2 {
+    color: #0f172a;
+    font-size: 17px;
+    line-height: 1.25;
+  }
+
+  p {
+    margin-top: 4px;
+    color: var(--admin-muted);
+    font-size: 13px;
+  }
+}
+
+.settings-page__panel-head--split {
+  justify-content: space-between;
+}
+
+.settings-page__panel-icon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  place-items: center;
+  border-radius: 8px;
+  color: #0f766e;
+  background: #e6f4f1;
+  font-size: 18px;
+}
+
+.settings-page__form :deep(.el-form-item) {
+  margin-bottom: 14px;
+}
+
+.settings-page__form :deep(.el-form-item__label) {
+  padding-bottom: 7px;
+  color: #334155;
   font-weight: 700;
 }
 
+.settings-page__form-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.settings-page__source-list {
+  display: grid;
+  gap: 12px;
+}
+
+.settings-page__source {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #edf2f7;
+  border-radius: 8px;
+  background: #fbfdff;
+}
+
+.settings-page__source-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+
+  h3,
+  span {
+    margin: 0;
+  }
+
+  h3 {
+    color: #1f2937;
+    font-size: 15px;
+    line-height: 1.25;
+  }
+
+  span {
+    display: block;
+    margin-top: 3px;
+    color: var(--admin-muted);
+    font-size: 12px;
+  }
+}
+
+.settings-page__inline-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.settings-page__key-list {
+  display: grid;
+  gap: 8px;
+}
+
+.settings-page__key-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(260px, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  min-height: 54px;
+  padding: 10px 12px;
+  border: 1px solid #edf2f7;
+  border-radius: 8px;
+  background: #fbfdff;
+}
+
+.settings-page__key-app {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+
+  strong {
+    overflow: hidden;
+    color: #0f172a;
+    font-size: 14px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+.settings-page__key-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+
+  span {
+    min-height: 28px;
+    padding: 6px 9px;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    color: #475569;
+    background: #f8fafc;
+    font-size: 12px;
+    line-height: 1.2;
+  }
+}
+
 .settings-page__token {
+  overflow: hidden;
+  color: var(--admin-muted);
   font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @media (max-width: 820px) {
+  .settings-page {
+    padding: 18px;
+  }
+
   .settings-page__heading {
     flex-direction: column;
   }
 
-  .settings-page__grid {
+  .settings-page__stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settings-page__config-grid,
+  .settings-page__key-row {
     grid-template-columns: 1fr;
+  }
+
+  .settings-page__panel--metadata,
+  .settings-page__panel--keys {
+    grid-column: auto;
+    grid-row: auto;
+  }
+
+  .settings-page__panel-head--split {
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 540px) {
+  .settings-page__stats,
+  .settings-page__inline-control {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-page__panel-head--split,
+  .settings-page__source-head {
+    display: grid;
+  }
+
+  .settings-page__form-actions {
+    justify-content: flex-start;
   }
 }
 </style>

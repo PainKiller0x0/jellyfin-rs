@@ -1,15 +1,12 @@
 import { request } from '@/services/http';
-import type { JellyfinUser } from '@/types/jellyfin';
+import type { JellyfinUser, JellyfinUserPolicy } from '@/types/jellyfin';
 
 export type CreateUserPayload = {
   name: string;
   password?: string;
 };
 
-export type UpdateUserPolicyPayload = {
-  IsAdministrator?: boolean;
-  IsDisabled?: boolean;
-};
+export type UpdateUserPolicyPayload = Partial<JellyfinUserPolicy>;
 
 export function users(token: string) {
   return request<JellyfinUser[]>('/Users', { token });

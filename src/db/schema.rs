@@ -426,6 +426,42 @@ pub fn optional_migrations() -> Vec<Migration> {
             "CREATE INDEX IF NOT EXISTS idx_user_data_user_id ON user_data(user_id)",
             "add user_data.user_id index",
         ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_user_data_user_resume ON user_data(user_id, updated_at DESC, item_id) WHERE playback_position_ticks > 0",
+            "add user_data resume index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_user_data_user_played_item ON user_data(user_id, played, item_id)",
+            "add user_data played index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_library_type_modified ON media_items(library_id, item_type, modified_at DESC)",
+            "add media_items latest index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_parent_type_episode_order ON media_items(parent_id, item_type, episode_number, season_number, id)",
+            "add media_items parent type episode order index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_streams_video_width_item ON media_streams(width, item_id) WHERE stream_type = 'Video' AND width IS NOT NULL",
+            "add media_streams video width index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_streams_video_codec_item ON media_streams(codec, item_id) WHERE stream_type = 'Video' AND codec IS NOT NULL",
+            "add media_streams video codec index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_tags_tag_id ON media_tags(tag_id)",
+            "add media_tags.tag_id index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_studios_studio_id ON media_studios(studio_id)",
+            "add media_studios.studio_id index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_linked_children_item_id ON linked_children(item_id)",
+            "add linked_children.item_id index",
+        ),
         // --- StrmAssistant integration tables ---
         (
             r#"CREATE TABLE IF NOT EXISTS chapters (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, start_position_ticks BIGINT NOT NULL, name TEXT NOT NULL DEFAULT '', marker_type TEXT, source TEXT NOT NULL DEFAULT 'manual', created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE)"#,
@@ -454,6 +490,10 @@ pub fn optional_migrations() -> Vec<Migration> {
         (
             r#"CREATE TABLE IF NOT EXISTS media_game_genres (item_id TEXT NOT NULL, game_genre_id TEXT NOT NULL, PRIMARY KEY(item_id, game_genre_id), FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, FOREIGN KEY(game_genre_id) REFERENCES game_genres(id) ON DELETE CASCADE)"#,
             "create media_game_genres table",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_game_genres_game_genre_id ON media_game_genres(game_genre_id)",
+            "add media_game_genres.game_genre_id index",
         ),
     ]
 }

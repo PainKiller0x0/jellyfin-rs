@@ -614,9 +614,16 @@ pub async fn resume_media_items(
 ) -> anyhow::Result<Vec<MediaItem>> {
     let mut items = decode_media_items(
         &db.query_all(crate::db::helpers::pg_statement(
-            &media_item_select_sql(
-                "WHERE media_items.is_folder = 0 AND media_items.item_type <> 'Video' AND COALESCE(user_data.playback_position_ticks, 0) > 0 ORDER BY user_data.updated_at DESC LIMIT 500",
-            ),
+            r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.is_public, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.premiere_date, media_items.runtime_ticks, media_items.size_bytes, media_items.season_number, media_items.episode_number, media_items.community_rating, media_items.critic_rating, media_items.created_at, media_items.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at
+               FROM user_data ud
+               JOIN media_items ON media_items.id = ud.item_id
+               LEFT JOIN libraries ON libraries.id = media_items.library_id
+               WHERE ud.user_id = ?
+                 AND ud.playback_position_ticks > 0
+                 AND media_items.is_folder = 0
+                 AND media_items.item_type <> 'Video'
+               ORDER BY ud.updated_at DESC
+               LIMIT 500"#,
             vec![user_id.into()],
         ))
         .await

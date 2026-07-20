@@ -151,6 +151,23 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            match library::tmdb_metadata::refresh_existing_tmdb_titles(
+                &ep_state.db,
+                &api_key,
+                &tmdb_client,
+                tmdb_base_url.as_deref(),
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::info!("Refreshed {n} existing TMDb item title(s)");
+                }
+                Err(e) => {
+                    tracing::warn!("refresh_existing_tmdb_titles failed: {e:#}");
+                }
+            }
+
             // Fetch person biographies and images in background
             let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
             let tmdb_client = ep_state.tmdb_http_client().await;

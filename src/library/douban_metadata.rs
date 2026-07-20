@@ -16,6 +16,7 @@ const SEARCH_URL: &str = "https://movie.douban.com/subject_search";
 const SUGGEST_URL: &str = "https://movie.douban.com/j/subject_suggest";
 const DESKTOP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const MOBILE_USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148";
+const MAX_METADATA_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub struct DoubanSubject {
@@ -638,8 +639,18 @@ async fn download_and_save_douban_image(
         .send()
         .await?
         .error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_METADATA_IMAGE_BYTES as u64)
+    {
+        anyhow::bail!("image is too large");
+    }
     let bytes = response.bytes().await?;
-    let ext = image_extension(url);
+    if bytes.len() > MAX_METADATA_IMAGE_BYTES {
+        anyhow::bail!("image is too large");
+    }
+    let ext = crate::library::image_processing::detect_image_extension(&bytes)
+        .ok_or_else(|| anyhow::anyhow!("Douban image response was not a supported image"))?;
     let dir = std::path::PathBuf::from("data").join("images");
     tokio::fs::create_dir_all(&dir).await.ok();
     let path = dir.join(format!(
@@ -1198,22 +1209,6 @@ fn fold_lookup_name(name: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn image_extension(url: &str) -> &'static str {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    match path
-        .rsplit('.')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "jpg" | "jpeg" => "jpg",
-        "png" => "png",
-        "webp" => "webp",
-        _ => "jpg",
-    }
 }
 
 #[cfg(test)]

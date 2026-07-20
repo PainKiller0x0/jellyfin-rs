@@ -286,11 +286,6 @@ pub(super) async fn download_and_cache_image(
         .send()
         .await?
         .error_for_status()?;
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string);
     if response
         .content_length()
         .is_some_and(|length| length > super::MAX_IMAGE_BYTES as u64)
@@ -301,11 +296,8 @@ pub(super) async fn download_and_cache_image(
     if bytes.len() > super::MAX_IMAGE_BYTES {
         bail!("image is too large");
     }
-    let extension = content_type
-        .as_deref()
-        .and_then(super::extension_from_content_type)
-        .or_else(|| super::extension_from_url(image_url.as_str()))
-        .unwrap_or("bin");
+    let extension = super::detect_image_extension(&bytes)
+        .ok_or_else(|| anyhow::anyhow!("remote image response was not a supported image"))?;
 
     let directory = PathBuf::from("data").join("images");
     tokio::fs::create_dir_all(&directory)
@@ -348,11 +340,13 @@ async fn fetch_remote_image(
     {
         bail!("image is too large");
     }
-    let content_type = remote_image_content_type(response.headers());
     let bytes = response.bytes().await?;
     if bytes.len() > super::MAX_IMAGE_BYTES {
         bail!("image is too large");
     }
+    let extension = super::detect_image_extension(&bytes)
+        .ok_or_else(|| anyhow::anyhow!("remote image response was not a supported image"))?;
+    let content_type = super::content_type_from_extension(extension);
     Ok((bytes, content_type))
 }
 
@@ -365,23 +359,6 @@ fn remote_image_response(bytes: Bytes, content_type: &'static str) -> Response {
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
     (headers, Body::from(bytes)).into_response()
-}
-
-fn remote_image_content_type(headers: &HeaderMap) -> &'static str {
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match content_type.as_str() {
-        "image/jpeg" => "image/jpeg",
-        "image/png" => "image/png",
-        "image/webp" => "image/webp",
-        "image/gif" => "image/gif",
-        _ => "application/octet-stream",
-    }
 }
 
 fn validate_remote_image_url(
@@ -802,10 +779,9 @@ struct TmdbTvImage {
 #[cfg(test)]
 mod tests {
     use super::{
-        image_url_query, remote_image_content_type, remote_image_type,
-        should_keep_remote_image_language, validate_remote_image_url,
+        image_url_query, remote_image_type, should_keep_remote_image_language,
+        validate_remote_image_url,
     };
-    use axum::http::{HeaderMap, HeaderValue, header};
     use std::collections::HashMap;
 
     #[test]
@@ -867,25 +843,6 @@ mod tests {
         query.clear();
         query.insert("ImageUrl".to_string(), "".to_string());
         assert_eq!(image_url_query(&query), None);
-    }
-
-    #[test]
-    fn remote_image_content_type_is_image_only() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("image/webp; charset=binary"),
-        );
-        assert_eq!(remote_image_content_type(&headers), "image/webp");
-
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/html; charset=utf-8"),
-        );
-        assert_eq!(
-            remote_image_content_type(&headers),
-            "application/octet-stream"
-        );
     }
 
     #[test]

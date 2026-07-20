@@ -437,13 +437,14 @@ async fn serve_item_image(
     // Check processed image cache before doing expensive re-processing
     if should_process(query) {
         let cache_key = format!(
-            "{}_{}_{}_{}_{}_{}",
+            "{}_{}_{}_{}_{}_{}_{}",
             item_id,
             image_type,
             image_index,
             options.width.unwrap_or(0),
             options.height.unwrap_or(0),
             options.quality,
+            sanitize_file_part(&etag),
         );
         let cache_ext = match options.format {
             EncodedImageFormat::Jpeg => "jpg",
@@ -500,7 +501,12 @@ async fn serve_item_image(
                 }
                 return (response_headers, Body::from(processed)).into_response();
             }
-            Err(error) => return internal_error(error),
+            Err(error) => {
+                tracing::warn!(
+                    "invalid image asset for {item_id}:{image_type}:{image_index}: {error:#}"
+                );
+                return dynamic_image_response(db, item_id, image_type, &options).await;
+            }
         }
     }
 
@@ -516,7 +522,13 @@ async fn serve_item_image(
         }
     };
 
-    let content_type = content_type_from_path(&path);
+    let Some(extension) = detect_image_extension(&bytes) else {
+        tracing::warn!(
+            "invalid image asset for {item_id}:{image_type}:{image_index}: unsupported image bytes"
+        );
+        return dynamic_image_response(db, item_id, image_type, &options).await;
+    };
+    let content_type = content_type_from_extension(extension);
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -929,32 +941,7 @@ fn normalized_content_type(content_type: &str) -> String {
 }
 
 pub(super) fn detect_image_extension(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        Some("jpg")
-    } else if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
-        Some("png")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("gif")
-    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some("webp")
-    } else {
-        None
-    }
-}
-
-fn extension_from_url(url: &str) -> Option<&'static str> {
-    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
-    if path.ends_with(".jpg") || path.ends_with(".jpeg") {
-        Some("jpg")
-    } else if path.ends_with(".png") {
-        Some("png")
-    } else if path.ends_with(".webp") {
-        Some("webp")
-    } else if path.ends_with(".gif") {
-        Some("gif")
-    } else {
-        None
-    }
+    crate::library::image_processing::detect_image_extension(bytes)
 }
 
 pub fn content_type_from_path(path: &str) -> &'static str {

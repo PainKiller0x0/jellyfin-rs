@@ -54,6 +54,20 @@ pub fn process_image(bytes: &[u8], options: &ImageRequestOptions) -> anyhow::Res
     encode_image(resize_to_options(image, options), options)
 }
 
+pub fn detect_image_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
+        Some("png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
 pub fn create_collage(
     image_bytes: &[Vec<u8>],
     width: u32,
@@ -224,5 +238,17 @@ mod tests {
         let second = create_placeholder(32, 32, "second", &options).unwrap();
         let collage = create_collage(&[first, second], 80, 45, &options).unwrap();
         assert!(collage.starts_with(b"\x89PNG"));
+    }
+
+    #[test]
+    fn detects_supported_image_extensions() {
+        assert_eq!(detect_image_extension(b"\xFF\xD8\xFF\xE0"), Some("jpg"));
+        assert_eq!(
+            detect_image_extension(b"\x89PNG\r\n\x1A\nextra"),
+            Some("png")
+        );
+        assert_eq!(detect_image_extension(b"GIF89aextra"), Some("gif"));
+        assert_eq!(detect_image_extension(b"RIFFxxxxWEBPextra"), Some("webp"));
+        assert_eq!(detect_image_extension(b"not an image"), None);
     }
 }

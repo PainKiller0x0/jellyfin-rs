@@ -13,6 +13,8 @@ use crate::{
 
 static EPISODE_TMDB_BATCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const TMDB_API_KEY_QUERY: &str = "api_key=";
+const TMDB_TITLE_BACKFILL_KEY: &str = "tmdb_title_backfill_v1_completed";
+const MAX_METADATA_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Extract TMDb ID from `{tmdb-XXXXX}`, `{tmdbid-XXXXX}`, or `[tmdbid=XXXXX]` in the path
 pub fn extract_tmdb_id(path: &Path) -> Option<String> {
@@ -741,6 +743,55 @@ pub async fn lookup_stored_tmdb_id(
     Ok(row.and_then(|r| r.get_opt_str("provider_item_id").ok().flatten()))
 }
 
+async fn fetch_tmdb_display_name(
+    client: &reqwest::Client,
+    api_key: &str,
+    tmdb_base_url: Option<&str>,
+    tmdb_id: &str,
+    item_type: &str,
+) -> anyhow::Result<Option<String>> {
+    let (endpoint, name_key) = match item_type {
+        "Series" => (format!("tv/{tmdb_id}"), "name"),
+        "Movie" => (format!("movie/{tmdb_id}"), "title"),
+        _ => return Ok(None),
+    };
+    let response = client
+        .get(tmdb::api_url(tmdb_base_url, &endpoint))
+        .query(&[("api_key", api_key), ("language", "zh-CN")])
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await?;
+    Ok(response
+        .get(name_key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string))
+}
+
+async fn app_setting_is_true(db: &DatabaseConnection, key: &str) -> anyhow::Result<bool> {
+    let row = db
+        .query_one(crate::db::helpers::pg_statement(
+            "SELECT value FROM app_settings WHERE key = ?",
+            vec![key.into()],
+        ))
+        .await?;
+    Ok(row
+        .and_then(|row| row.get_opt_str("value").ok().flatten())
+        .is_some_and(|value| value.eq_ignore_ascii_case("true")))
+}
+
+async fn set_app_setting(db: &DatabaseConnection, key: &str, value: &str) -> anyhow::Result<()> {
+    db.execute(crate::db::helpers::pg_statement(
+        "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        vec![key.into(), value.into(), now_unix().into()],
+    ))
+    .await?;
+    Ok(())
+}
+
 /// Parse a folder name into (title, optional year) by cleaning provider tags
 /// e.g. "X战警 (2000) {tmdb-36657}" → ("X战警", Some(2000))
 fn parse_folder_name(path: &Path) -> Option<(String, Option<i64>)> {
@@ -905,6 +956,79 @@ pub async fn fill_missing_tmdb(
     Ok(count)
 }
 
+/// One-time backfill for libraries created before TMDb scraping updated item titles.
+pub async fn refresh_existing_tmdb_titles(
+    db: &sea_orm::DatabaseConnection,
+    api_key: &str,
+    client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
+) -> anyhow::Result<usize> {
+    if app_setting_is_true(db, TMDB_TITLE_BACKFILL_KEY).await? {
+        return Ok(0);
+    }
+
+    let rows = db
+        .query_all(crate::db::helpers::pg_statement(
+            r#"SELECT mi.id, mi.title, mi.item_type, p.provider_item_id AS tmdb_id
+               FROM media_items mi
+               JOIN provider_ids p ON p.item_id = mi.id AND p.provider = 'Tmdb'
+               WHERE mi.item_type IN ('Movie', 'Series')"#,
+            vec![],
+        ))
+        .await?;
+
+    let total = rows.len();
+    if total == 0 {
+        set_app_setting(db, TMDB_TITLE_BACKFILL_KEY, "true").await?;
+        return Ok(0);
+    }
+
+    tracing::info!("refresh_existing_tmdb_titles: checking {total} TMDb item title(s)");
+    let mut updated = 0usize;
+    let mut failed = 0usize;
+    for row in &rows {
+        let item_id = match row.get_str("id") {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let current_title = row.get_str("title").unwrap_or_default();
+        let item_type = row.get_str("item_type").unwrap_or_default();
+        let tmdb_id = match row.get_str("tmdb_id") {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        match fetch_tmdb_display_name(client, api_key, tmdb_base_url, &tmdb_id, &item_type).await {
+            Ok(Some(title)) if title != current_title => {
+                db.execute(crate::db::helpers::pg_statement(
+                    "UPDATE media_items SET title = ?, updated_at = ? WHERE id = ?",
+                    vec![title.as_str().into(), now_unix().into(), item_id.into()],
+                ))
+                .await?;
+                updated += 1;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    "refresh_existing_tmdb_titles: failed for {item_id} tmdb-{tmdb_id}: {}",
+                    redact_tmdb_error(&error)
+                );
+            }
+        }
+    }
+
+    if failed == 0 {
+        set_app_setting(db, TMDB_TITLE_BACKFILL_KEY, "true").await?;
+    } else {
+        tracing::warn!(
+            "refresh_existing_tmdb_titles: {failed} title(s) failed; will retry on next startup"
+        );
+    }
+    tracing::info!("refresh_existing_tmdb_titles: updated {updated}/{total} title(s)");
+    Ok(updated)
+}
+
 /// Fetch TMDb metadata for a Series or Movie and store it in the database
 pub async fn fetch_and_apply_tmdb_metadata(
     db: &sea_orm::DatabaseConnection,
@@ -985,6 +1109,11 @@ pub async fn fetch_and_apply_tmdb_metadata(
         }
     };
     tracing::info!("TMDb metadata fetched for {item_type} {tmdb_id}");
+    let title = metadata
+        .get("Name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let overview = metadata
         .get("Overview")
         .and_then(|v| v.as_str())
@@ -1040,71 +1169,42 @@ pub async fn fetch_and_apply_tmdb_metadata(
     }
 
     // Update media item
-    if let Some(overview) = overview {
-        let _ = db
-            .execute(crate::db::helpers::pg_statement(
-                "UPDATE media_items SET overview = ? WHERE id = ?",
-                vec![overview.into(), item_id.into()],
-            ))
-            .await;
-    }
-    if let Some(year) = year {
-        let _ = db
-            .execute(crate::db::helpers::pg_statement(
-                "UPDATE media_items SET production_year = ? WHERE id = ?",
-                vec![year.into(), item_id.into()],
-            ))
-            .await;
-    }
-    if let Some(premiere_date) = premiere_date.as_deref() {
-        let _ = db
-            .execute(crate::db::helpers::pg_statement(
-                "UPDATE media_items SET premiere_date = ? WHERE id = ?",
-                vec![premiere_date.into(), item_id.into()],
-            ))
-            .await;
-    }
-    // Update community_rating (TMDb vote_average is 0-10, store as-is)
-    if let Some(rating) = metadata
+    let community_rating = metadata
         .get("CommunityRating")
         .and_then(|v| v.as_f64())
-        .filter(|r| *r > 0.0)
-    {
-        let _ = db
-            .execute(crate::db::helpers::pg_statement(
-                "UPDATE media_items SET community_rating = ? WHERE id = ?",
-                vec![rating.into(), item_id.into()],
-            ))
-            .await;
-    }
-
-    // Update official_rating (PG, R, etc.)
-    if let Some(rating) = metadata
+        .filter(|r| *r > 0.0);
+    let official_rating = metadata
         .get("OfficialRating")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        let _ = db
-            .execute(crate::db::helpers::pg_statement(
-                "UPDATE media_items SET official_rating = ? WHERE id = ?",
-                vec![rating.into(), item_id.into()],
-            ))
-            .await;
-    }
-
-    // Update runtime_ticks from TMDb runtime (minutes → ticks: 1 min = 60 * 10_000_000)
-    if let Some(ticks) = metadata
+        .filter(|s| !s.is_empty());
+    let runtime_ticks = metadata
         .get("RuntimeTicks")
         .and_then(|v| v.as_i64())
-        .filter(|t| *t > 0)
-    {
-        let _ = db
-            .execute(crate::db::helpers::pg_statement(
-                "UPDATE media_items SET runtime_ticks = ? WHERE id = ? AND runtime_ticks IS NULL",
-                vec![ticks.into(), item_id.into()],
-            ))
-            .await;
-    }
+        .filter(|t| *t > 0);
+    db.execute(crate::db::helpers::pg_statement(
+        r#"UPDATE media_items
+           SET title = COALESCE(?, title),
+               overview = COALESCE(?, overview),
+               production_year = COALESCE(?, production_year),
+               premiere_date = COALESCE(?, premiere_date),
+               community_rating = COALESCE(?, community_rating),
+               official_rating = COALESCE(?, official_rating),
+               runtime_ticks = COALESCE(runtime_ticks, ?),
+               updated_at = ?
+           WHERE id = ?"#,
+        vec![
+            title.into(),
+            overview.into(),
+            year.into(),
+            premiere_date.as_deref().into(),
+            community_rating.into(),
+            official_rating.into(),
+            runtime_ticks.into(),
+            now_unix().into(),
+            item_id.into(),
+        ],
+    ))
+    .await?;
 
     // Store provider IDs
     if let Some(provider_ids) = metadata.get("ProviderIds") {
@@ -1278,8 +1378,18 @@ async fn download_and_save_tmdb_image(
     image_type: &str,
 ) -> anyhow::Result<()> {
     let response = client.get(url).send().await?.error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_METADATA_IMAGE_BYTES as u64)
+    {
+        anyhow::bail!("image is too large");
+    }
     let bytes = response.bytes().await?;
-    let ext = tmdb_image_extension(url);
+    if bytes.len() > MAX_METADATA_IMAGE_BYTES {
+        anyhow::bail!("image is too large");
+    }
+    let ext = crate::library::image_processing::detect_image_extension(&bytes)
+        .ok_or_else(|| anyhow::anyhow!("TMDb image response was not a supported image"))?;
     let dir = std::path::PathBuf::from("data").join("images");
     tokio::fs::create_dir_all(&dir).await.ok();
     let path = dir.join(format!(
@@ -1306,22 +1416,6 @@ async fn download_and_save_tmdb_image(
         ))
         .await;
     Ok(())
-}
-
-fn tmdb_image_extension(url: &str) -> &'static str {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    match path
-        .rsplit('.')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "jpg" | "jpeg" => "jpg",
-        "png" => "png",
-        "webp" => "webp",
-        _ => "jpg",
-    }
 }
 
 fn extract_season_number(path: &Path) -> Option<i64> {
@@ -1626,37 +1720,9 @@ mod tests {
     use super::{
         clean_title_with_year, episode_title_candidate, extract_tmdb_id,
         local_episode_title_from_path, parse_season_number, redact_tmdb_api_key,
-        should_skip_name_based_tmdb_lookup, tmdb_image_extension,
+        should_skip_name_based_tmdb_lookup,
     };
     use std::path::Path;
-
-    #[test]
-    fn tmdb_image_extension_allows_known_image_types() {
-        assert_eq!(
-            tmdb_image_extension("https://image.tmdb.org/t/p/w500/poster.jpeg?x=1"),
-            "jpg"
-        );
-        assert_eq!(
-            tmdb_image_extension("https://image.tmdb.org/t/p/w500/logo.PNG"),
-            "png"
-        );
-        assert_eq!(
-            tmdb_image_extension("https://image.tmdb.org/t/p/w500/still.webp#tag"),
-            "webp"
-        );
-    }
-
-    #[test]
-    fn tmdb_image_extension_rejects_non_image_suffixes() {
-        assert_eq!(
-            tmdb_image_extension("https://image.tmdb.org/t/p/w500/poster.php"),
-            "jpg"
-        );
-        assert_eq!(
-            tmdb_image_extension("https://image.tmdb.org/t/p/w500/poster"),
-            "jpg"
-        );
-    }
 
     #[test]
     fn tmdb_error_redaction_hides_api_key_query_values() {

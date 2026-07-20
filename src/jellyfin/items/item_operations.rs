@@ -7,12 +7,30 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    Set, sea_query::OnConflict,
+};
 use serde_json::{Value, json};
 
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
+    entities::{
+        genres::{self, Entity as Genres},
+        image_assets::{self, Entity as ImageAssets},
+        media_genres::{self, Entity as MediaGenres},
+        media_items::{self, Entity as MediaItems},
+        media_people::{self, Entity as MediaPeople},
+        media_streams::{self, Entity as MediaStreams},
+        media_studios::{self, Entity as MediaStudios},
+        media_tags::{self, Entity as MediaTags},
+        people::{self, Entity as People},
+        provider_ids::{self, Entity as ProviderIds},
+        studios::{self, Entity as Studios},
+        tags::{self, Entity as Tags},
+        user_data::{self, Entity as UserData},
+    },
     jellyfin::common::internal_error,
     library::path_utils,
     playback::streaming::readable_media_path,
@@ -168,38 +186,56 @@ async fn descendant_item_rows(
 }
 
 async fn delete_item_records(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<()> {
-    for table in [
-        "media_streams",
-        "user_data",
-        "media_people",
-        "media_genres",
-        "media_tags",
-        "media_studios",
-        "provider_ids",
-        "image_assets",
-    ] {
-        db.execute(crate::db::helpers::pg_statement(
-            &format!("DELETE FROM {table} WHERE item_id = ?"),
-            vec![item_id.into()],
-        ))
+    MediaStreams::delete_many()
+        .filter(media_streams::Column::ItemId.eq(item_id))
+        .exec(db)
         .await
-        .with_context(|| format!("failed to delete {table} for item: {item_id}"))?;
-    }
-    db.execute(crate::db::helpers::pg_statement(
-        "DELETE FROM media_items WHERE id = ?",
-        vec![item_id.into()],
-    ))
-    .await
-    .with_context(|| format!("failed to delete media item: {item_id}"))?;
+        .with_context(|| format!("failed to delete media_streams for item: {item_id}"))?;
+    UserData::delete_many()
+        .filter(user_data::Column::ItemId.eq(item_id))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to delete user_data for item: {item_id}"))?;
+    MediaPeople::delete_many()
+        .filter(media_people::Column::ItemId.eq(item_id))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to delete media_people for item: {item_id}"))?;
+    MediaGenres::delete_many()
+        .filter(media_genres::Column::ItemId.eq(item_id))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to delete media_genres for item: {item_id}"))?;
+    MediaTags::delete_many()
+        .filter(media_tags::Column::ItemId.eq(item_id))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to delete media_tags for item: {item_id}"))?;
+    MediaStudios::delete_many()
+        .filter(media_studios::Column::ItemId.eq(item_id))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to delete media_studios for item: {item_id}"))?;
+    ProviderIds::delete_many()
+        .filter(provider_ids::Column::ItemId.eq(item_id))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to delete provider_ids for item: {item_id}"))?;
+    ImageAssets::delete_many()
+        .filter(image_assets::Column::ItemId.eq(item_id))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to delete image_assets for item: {item_id}"))?;
+    MediaItems::delete_by_id(item_id.to_string())
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to delete media item: {item_id}"))?;
     Ok(())
 }
 
 async fn media_item_exists(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<bool> {
-    Ok(db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT id FROM media_items WHERE id = ?",
-            vec![item_id.into()],
-        ))
+    Ok(MediaItems::find_by_id(item_id.to_string())
+        .one(db)
         .await
         .with_context(|| format!("failed to find media item: {item_id}"))?
         .is_some())
@@ -212,11 +248,8 @@ pub(crate) async fn update_item_inner(
 ) -> anyhow::Result<bool> {
     let body = normalize_item_update_body(body).map_err(|(_, message)| anyhow::anyhow!(message))?;
     let now = now_unix();
-    let existing = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT title, overview, production_year, premiere_date, community_rating, runtime_ticks FROM media_items WHERE id = ?",
-            vec![item_id.into()],
-        ))
+    let existing = MediaItems::find_by_id(item_id.to_string())
+        .one(db)
         .await
         .with_context(|| format!("failed to fetch item for update: {item_id}"))?;
     let Some(existing) = existing else {
@@ -229,12 +262,12 @@ pub(crate) async fn update_item_inner(
         .filter(|value| !value.trim().is_empty())
         .map(str::trim)
         .map(ToString::to_string)
-        .unwrap_or(existing.get_str("title")?);
+        .unwrap_or_else(|| existing.title.clone());
     let overview = body
         .get("Overview")
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .or(existing.get_opt_str("overview")?);
+        .or_else(|| existing.overview.clone());
     let production_year = body
         .get("ProductionYear")
         .and_then(Value::as_i64)
@@ -243,36 +276,33 @@ pub(crate) async fn update_item_inner(
                 .and_then(Value::as_str)
                 .and_then(year_from_yyyy_mm_dd)
         })
-        .or(existing.get_opt_i64("production_year")?);
+        .or(existing.production_year);
     let premiere_date = body
         .get("PremiereDate")
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .or(existing.get_opt_str("premiere_date")?);
+        .or_else(|| existing.premiere_date.clone());
     let community_rating = body
         .get("CommunityRating")
         .and_then(Value::as_f64)
-        .or(existing.get_f64("community_rating")?);
+        .or(existing.community_rating);
     let runtime_ticks = body
         .get("RuntimeTicks")
         .and_then(Value::as_i64)
-        .or(existing.get_opt_i64("runtime_ticks")?);
+        .or(existing.runtime_ticks);
 
-    db.execute(crate::db::helpers::pg_statement(
-        "UPDATE media_items SET title = ?, overview = ?, production_year = ?, premiere_date = ?, community_rating = ?, runtime_ticks = ?, updated_at = ? WHERE id = ?",
-        vec![
-            title.into(),
-            overview.into(),
-            production_year.into(),
-            premiere_date.into(),
-            community_rating.into(),
-            runtime_ticks.into(),
-            now.into(),
-            item_id.into(),
-        ],
-    ))
-    .await
-    .with_context(|| format!("failed to update item metadata: {item_id}"))?;
+    let mut active: media_items::ActiveModel = existing.into();
+    active.title = Set(title);
+    active.overview = Set(overview);
+    active.production_year = Set(production_year);
+    active.premiere_date = Set(premiere_date);
+    active.community_rating = Set(community_rating);
+    active.runtime_ticks = Set(runtime_ticks);
+    active.updated_at = Set(now);
+    active
+        .update(db)
+        .await
+        .with_context(|| format!("failed to update item metadata: {item_id}"))?;
 
     if let Some(provider_ids) = body.get("ProviderIds").and_then(Value::as_object) {
         for (provider, provider_item_id) in provider_ids {
@@ -287,27 +317,9 @@ pub(crate) async fn update_item_inner(
         }
     }
 
-    update_named_relations(
-        db,
-        item_id,
-        "genres",
-        "media_genres",
-        "genre_id",
-        "Genres",
-        &body,
-    )
-    .await?;
-    update_named_relations(db, item_id, "tags", "media_tags", "tag_id", "Tags", &body).await?;
-    update_named_relations(
-        db,
-        item_id,
-        "studios",
-        "media_studios",
-        "studio_id",
-        "Studios",
-        &body,
-    )
-    .await?;
+    update_named_relations(db, item_id, NamedRelationKind::Genre, "Genres", &body).await?;
+    update_named_relations(db, item_id, NamedRelationKind::Tag, "Tags", &body).await?;
+    update_named_relations(db, item_id, NamedRelationKind::Studio, "Studios", &body).await?;
     update_people(db, item_id, &body).await?;
 
     Ok(true)
@@ -592,61 +604,210 @@ async fn item_content_type_path(
     db: &DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Option<String>> {
-    let Some(row) = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT path, is_folder FROM media_items WHERE id = ?",
-            vec![item_id.into()],
-        ))
+    let Some(item) = MediaItems::find_by_id(item_id.to_string())
+        .one(db)
         .await
         .with_context(|| format!("failed to find media item content type path: {item_id}"))?
     else {
         return Ok(None);
     };
-    let path = path_utils::normalize_path(&row.get_str("path")?);
+    let path = path_utils::normalize_path(&item.path);
     if path.trim().is_empty() {
         return Ok(Some(item_id.to_string()));
     }
-    if row.get_i64("is_folder").unwrap_or_default() != 0 {
+    if item.is_folder != 0 {
         return Ok(Some(path));
     }
     Ok(Some(path_utils::parent_path(&path).unwrap_or(path)))
 }
 
+#[derive(Clone, Copy)]
+enum NamedRelationKind {
+    Genre,
+    Tag,
+    Studio,
+}
+
 async fn update_named_relations(
     db: &DatabaseConnection,
     item_id: &str,
-    table: &str,
-    relation_table: &str,
-    relation_column: &str,
+    kind: NamedRelationKind,
     body_key: &str,
     body: &Value,
 ) -> anyhow::Result<()> {
     let Some(values) = body.get(body_key).and_then(Value::as_array) else {
         return Ok(());
     };
-    db.execute(crate::db::helpers::pg_statement(
-        &format!("DELETE FROM {relation_table} WHERE item_id = ?"),
-        vec![item_id.into()],
-    ))
-    .await
-    .with_context(|| format!("failed to clear {relation_table} for item: {item_id}"))?;
+    clear_named_relations(db, item_id, kind).await?;
     for value in values {
         let Some(name) = value.as_str().filter(|value| !value.trim().is_empty()) else {
             continue;
         };
-        let id = stable_text_id(&format!("{table}:{}", name.trim().to_ascii_lowercase()));
-        db.execute(crate::db::helpers::pg_statement(
-            &format!("INSERT INTO {table} (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING"),
-            vec![id.clone().into(), name.trim().into(), now_unix().into()],
-        ))
-        .await
-        .with_context(|| format!("failed to upsert {table}: {name}"))?;
-        db.execute(crate::db::helpers::pg_statement(
-            &format!("INSERT INTO {relation_table} (item_id, {relation_column}) VALUES (?, ?) ON CONFLICT(item_id, {relation_column}) DO NOTHING"),
-            vec![item_id.into(), id.into()],
-        ))
-        .await
-        .with_context(|| format!("failed to link {table} to item: {item_id}"))?;
+        let relation_id = upsert_named_value(db, kind, name.trim()).await?;
+        link_named_relation(db, item_id, kind, &relation_id).await?;
+    }
+    Ok(())
+}
+
+async fn clear_named_relations(
+    db: &DatabaseConnection,
+    item_id: &str,
+    kind: NamedRelationKind,
+) -> anyhow::Result<()> {
+    match kind {
+        NamedRelationKind::Genre => {
+            MediaGenres::delete_many()
+                .filter(media_genres::Column::ItemId.eq(item_id))
+                .exec(db)
+                .await
+                .with_context(|| format!("failed to clear media_genres for item: {item_id}"))?;
+        }
+        NamedRelationKind::Tag => {
+            MediaTags::delete_many()
+                .filter(media_tags::Column::ItemId.eq(item_id))
+                .exec(db)
+                .await
+                .with_context(|| format!("failed to clear media_tags for item: {item_id}"))?;
+        }
+        NamedRelationKind::Studio => {
+            MediaStudios::delete_many()
+                .filter(media_studios::Column::ItemId.eq(item_id))
+                .exec(db)
+                .await
+                .with_context(|| format!("failed to clear media_studios for item: {item_id}"))?;
+        }
+    }
+    Ok(())
+}
+
+async fn upsert_named_value(
+    db: &DatabaseConnection,
+    kind: NamedRelationKind,
+    name: &str,
+) -> anyhow::Result<String> {
+    let now = now_unix();
+    match kind {
+        NamedRelationKind::Genre => {
+            let id = stable_text_id(&format!("genres:{}", name.to_ascii_lowercase()));
+            Genres::insert(genres::ActiveModel {
+                id: Set(id.clone()),
+                name: Set(name.to_string()),
+                created_at: Set(now),
+            })
+            .on_conflict(
+                OnConflict::column(genres::Column::Name)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+            .with_context(|| format!("failed to upsert genre: {name}"))?;
+            Ok(Genres::find()
+                .filter(genres::Column::Name.eq(name))
+                .one(db)
+                .await?
+                .map(|genre| genre.id)
+                .unwrap_or(id))
+        }
+        NamedRelationKind::Tag => {
+            let id = stable_text_id(&format!("tags:{}", name.to_ascii_lowercase()));
+            Tags::insert(tags::ActiveModel {
+                id: Set(id.clone()),
+                name: Set(name.to_string()),
+                created_at: Set(now),
+            })
+            .on_conflict(
+                OnConflict::column(tags::Column::Name)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+            .with_context(|| format!("failed to upsert tag: {name}"))?;
+            Ok(Tags::find()
+                .filter(tags::Column::Name.eq(name))
+                .one(db)
+                .await?
+                .map(|tag| tag.id)
+                .unwrap_or(id))
+        }
+        NamedRelationKind::Studio => {
+            let id = stable_text_id(&format!("studios:{}", name.to_ascii_lowercase()));
+            Studios::insert(studios::ActiveModel {
+                id: Set(id.clone()),
+                name: Set(name.to_string()),
+                created_at: Set(now),
+            })
+            .on_conflict(
+                OnConflict::column(studios::Column::Name)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+            .with_context(|| format!("failed to upsert studio: {name}"))?;
+            Ok(Studios::find()
+                .filter(studios::Column::Name.eq(name))
+                .one(db)
+                .await?
+                .map(|studio| studio.id)
+                .unwrap_or(id))
+        }
+    }
+}
+
+async fn link_named_relation(
+    db: &DatabaseConnection,
+    item_id: &str,
+    kind: NamedRelationKind,
+    relation_id: &str,
+) -> anyhow::Result<()> {
+    match kind {
+        NamedRelationKind::Genre => {
+            MediaGenres::insert(media_genres::ActiveModel {
+                item_id: Set(item_id.to_string()),
+                genre_id: Set(relation_id.to_string()),
+            })
+            .on_conflict(
+                OnConflict::columns([media_genres::Column::ItemId, media_genres::Column::GenreId])
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+            .with_context(|| format!("failed to link genre to item: {item_id}"))?;
+        }
+        NamedRelationKind::Tag => {
+            MediaTags::insert(media_tags::ActiveModel {
+                item_id: Set(item_id.to_string()),
+                tag_id: Set(relation_id.to_string()),
+            })
+            .on_conflict(
+                OnConflict::columns([media_tags::Column::ItemId, media_tags::Column::TagId])
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+            .with_context(|| format!("failed to link tag to item: {item_id}"))?;
+        }
+        NamedRelationKind::Studio => {
+            MediaStudios::insert(media_studios::ActiveModel {
+                item_id: Set(item_id.to_string()),
+                studio_id: Set(relation_id.to_string()),
+            })
+            .on_conflict(
+                OnConflict::columns([
+                    media_studios::Column::ItemId,
+                    media_studios::Column::StudioId,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+            .with_context(|| format!("failed to link studio to item: {item_id}"))?;
+        }
     }
     Ok(())
 }
@@ -655,12 +816,11 @@ async fn update_people(db: &DatabaseConnection, item_id: &str, body: &Value) -> 
     let Some(values) = body.get("People").and_then(Value::as_array) else {
         return Ok(());
     };
-    db.execute(crate::db::helpers::pg_statement(
-        "DELETE FROM media_people WHERE item_id = ?",
-        vec![item_id.into()],
-    ))
-    .await
-    .with_context(|| format!("failed to clear people for item: {item_id}"))?;
+    MediaPeople::delete_many()
+        .filter(media_people::Column::ItemId.eq(item_id))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to clear people for item: {item_id}"))?;
     for (sort_order, value) in values.iter().enumerate() {
         let Some(name) = value
             .get("Name")
@@ -672,16 +832,43 @@ async fn update_people(db: &DatabaseConnection, item_id: &str, body: &Value) -> 
         let id = stable_text_id(&format!("people:{}", name.trim().to_ascii_lowercase()));
         let role = value.get("Role").and_then(Value::as_str);
         let person_type = value.get("Type").and_then(Value::as_str).unwrap_or("Actor");
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO people (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING",
-            vec![id.clone().into(), name.trim().into(), now_unix().into()],
-        ))
+        People::insert(people::ActiveModel {
+            id: Set(id.clone()),
+            name: Set(name.trim().to_string()),
+            created_at: Set(now_unix()),
+            ..Default::default()
+        })
+        .on_conflict(
+            OnConflict::column(people::Column::Name)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
         .await
         .with_context(|| format!("failed to upsert person: {name}"))?;
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_people (item_id, person_id, role, person_type, sort_order) VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id, person_id, person_type) DO UPDATE SET role = excluded.role, sort_order = excluded.sort_order",
-            vec![item_id.into(), id.into(), role.into(), person_type.into(), i64::try_from(sort_order).unwrap_or(i64::MAX).into()],
-        ))
+        let person_id = People::find()
+            .filter(people::Column::Name.eq(name.trim()))
+            .one(db)
+            .await?
+            .map(|person| person.id)
+            .unwrap_or(id);
+        MediaPeople::insert(media_people::ActiveModel {
+            item_id: Set(item_id.to_string()),
+            person_id: Set(person_id),
+            role: Set(role.map(str::to_string)),
+            person_type: Set(person_type.to_string()),
+            sort_order: Set(i64::try_from(sort_order).unwrap_or(i64::MAX)),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                media_people::Column::ItemId,
+                media_people::Column::PersonId,
+                media_people::Column::PersonType,
+            ])
+            .update_columns([media_people::Column::Role, media_people::Column::SortOrder])
+            .to_owned(),
+        )
+        .exec_without_returning(db)
         .await
         .with_context(|| format!("failed to link person to item: {item_id}"))?;
     }
@@ -711,20 +898,42 @@ pub async fn add_item_tag(
         Err(e) => return internal_error(e),
     }
     let id = stable_text_id(&format!("tags:{}", name.trim().to_ascii_lowercase()));
-    if let Err(e) = state
-        .db
-        .execute(crate::db::helpers::pg_statement(
-            "INSERT INTO tags (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING",
-            vec![id.clone().into(), name.trim().into(), now_unix().into()],
-        ))
-        .await
+    let tag_id = match Tags::insert(tags::ActiveModel {
+        id: Set(id.clone()),
+        name: Set(name.trim().to_string()),
+        created_at: Set(now_unix()),
+    })
+    .on_conflict(
+        OnConflict::column(tags::Column::Name)
+            .do_nothing()
+            .to_owned(),
+    )
+    .exec_without_returning(&state.db)
+    .await
     {
-        return internal_error(e.into());
-    }
-    if let Err(e) = state.db.execute(crate::db::helpers::pg_statement(
-        "INSERT INTO media_tags (item_id, tag_id) VALUES (?, ?) ON CONFLICT(item_id, tag_id) DO NOTHING",
-        vec![item_id.into(), id.into()],
-    )).await {
+        Ok(_) => match Tags::find()
+            .filter(tags::Column::Name.eq(name.trim()))
+            .one(&state.db)
+            .await
+        {
+            Ok(Some(tag)) => tag.id,
+            Ok(None) => id,
+            Err(e) => return internal_error(e.into()),
+        },
+        Err(e) => return internal_error(e.into()),
+    };
+    if let Err(e) = MediaTags::insert(media_tags::ActiveModel {
+        item_id: Set(item_id),
+        tag_id: Set(tag_id),
+    })
+    .on_conflict(
+        OnConflict::columns([media_tags::Column::ItemId, media_tags::Column::TagId])
+            .do_nothing()
+            .to_owned(),
+    )
+    .exec_without_returning(&state.db)
+    .await
+    {
         return internal_error(e.into());
     }
     StatusCode::NO_CONTENT.into_response()
@@ -753,12 +962,19 @@ pub async fn delete_item_tag(
         Err(e) => return internal_error(e),
     }
     let id = stable_text_id(&format!("tags:{}", name.trim().to_ascii_lowercase()));
-    if let Err(e) = state
-        .db
-        .execute(crate::db::helpers::pg_statement(
-            "DELETE FROM media_tags WHERE item_id = ? AND tag_id = ?",
-            vec![item_id.into(), id.into()],
-        ))
+    let tag_id = match Tags::find()
+        .filter(tags::Column::Name.eq(name.trim()))
+        .one(&state.db)
+        .await
+    {
+        Ok(Some(tag)) => tag.id,
+        Ok(None) => id,
+        Err(e) => return internal_error(e.into()),
+    };
+    if let Err(e) = MediaTags::delete_many()
+        .filter(media_tags::Column::ItemId.eq(item_id))
+        .filter(media_tags::Column::TagId.eq(tag_id))
+        .exec(&state.db)
         .await
     {
         return internal_error(e.into());
@@ -771,15 +987,17 @@ pub async fn delete_item_subtitle(
     State(state): State<Arc<AppState>>,
     Path((item_id, index)): Path<(String, i64)>,
 ) -> Response {
-    // Find the subtitle stream to get its file path
-    let row = state.db.query_one(crate::db::helpers::pg_statement(
-        "SELECT path FROM media_streams WHERE item_id = ? AND stream_index = ? AND stream_type = 'Subtitle' AND is_external = 1",
-        vec![item_id.clone().into(), index.into()],
-    )).await;
+    let row = MediaStreams::find()
+        .filter(media_streams::Column::ItemId.eq(&item_id))
+        .filter(media_streams::Column::StreamIndex.eq(index))
+        .filter(media_streams::Column::StreamType.eq("Subtitle"))
+        .filter(media_streams::Column::IsExternal.eq(1))
+        .one(&state.db)
+        .await;
 
     match row {
-        Ok(Some(r)) => {
-            if let Ok(path) = r.get_str("path") {
+        Ok(Some(stream)) => {
+            if let Some(path) = stream.path {
                 if !readable_media_path(&state.db, &path).await {
                     return StatusCode::NOT_FOUND.into_response();
                 }
@@ -789,11 +1007,13 @@ pub async fn delete_item_subtitle(
                     }
                 }
             }
-            // Remove from media_streams
-            if let Err(error) = state.db.execute(crate::db::helpers::pg_statement(
-                "DELETE FROM media_streams WHERE item_id = ? AND stream_index = ? AND stream_type = 'Subtitle'",
-                vec![item_id.into(), index.into()],
-            )).await {
+            if let Err(error) = MediaStreams::delete_many()
+                .filter(media_streams::Column::ItemId.eq(item_id))
+                .filter(media_streams::Column::StreamIndex.eq(index))
+                .filter(media_streams::Column::StreamType.eq("Subtitle"))
+                .exec(&state.db)
+                .await
+            {
                 return internal_error(error.into());
             }
             StatusCode::NO_CONTENT.into_response()
@@ -808,16 +1028,17 @@ pub async fn make_item_private(
     Path(item_id): Path<String>,
 ) -> Response {
     let now = now_unix();
-    match state
-        .db
-        .execute(crate::db::helpers::pg_statement(
-            "UPDATE media_items SET is_public = 0, updated_at = ? WHERE id = ?",
-            vec![now.into(), item_id.into()],
-        ))
-        .await
-    {
-        Ok(result) if result.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+    match MediaItems::find_by_id(item_id).one(&state.db).await {
+        Ok(Some(item)) => {
+            let mut active: media_items::ActiveModel = item.into();
+            active.is_public = Set(0);
+            active.updated_at = Set(now);
+            match active.update(&state.db).await {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(e) => internal_error(e.into()),
+            }
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => internal_error(e.into()),
     }
 }
@@ -828,16 +1049,17 @@ pub async fn make_item_public(
     Path(item_id): Path<String>,
 ) -> Response {
     let now = now_unix();
-    match state
-        .db
-        .execute(crate::db::helpers::pg_statement(
-            "UPDATE media_items SET is_public = 1, updated_at = ? WHERE id = ?",
-            vec![now.into(), item_id.into()],
-        ))
-        .await
-    {
-        Ok(result) if result.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+    match MediaItems::find_by_id(item_id).one(&state.db).await {
+        Ok(Some(item)) => {
+            let mut active: media_items::ActiveModel = item.into();
+            active.is_public = Set(1);
+            active.updated_at = Set(now);
+            match active.update(&state.db).await {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(e) => internal_error(e.into()),
+            }
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => internal_error(e.into()),
     }
 }
@@ -849,7 +1071,8 @@ mod tests {
         MAX_ITEM_RELATION_NAMES, delete_item_records_for_ids, media_item_exists,
         normalize_item_update_body, update_item_content_type_inner, update_item_inner,
     };
-    use sea_orm::{ConnectionTrait, DatabaseConnection};
+    use crate::entities::{media_items, media_items::Entity as MediaItems};
+    use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
     use serde_json::json;
 
     #[tokio::test]
@@ -947,14 +1170,20 @@ mod tests {
             return;
         };
         insert_media_item(&db, "movie", "", 0).await;
-        let result = db
-            .execute(crate::db::helpers::pg_statement(
-                "UPDATE media_items SET is_public = 0 WHERE id = ?",
-                vec!["movie".into()],
-            ))
+        let item = MediaItems::find_by_id("movie".to_string())
+            .one(&db)
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(result.rows_affected(), 1);
+        let mut active: media_items::ActiveModel = item.into();
+        active.is_public = Set(0);
+        active.update(&db).await.unwrap();
+        let item = MediaItems::find_by_id("movie".to_string())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.is_public, 0);
     }
 
     #[tokio::test]
@@ -1012,16 +1241,20 @@ mod tests {
     }
 
     async fn insert_media_item(db: &DatabaseConnection, id: &str, parent_id: &str, is_folder: i64) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', ?, 1, 1, 1)",
-            vec![
-                id.into(),
-                id.into(),
-                format!("/tmp/{id}").into(),
-                parent_id.into(),
-                is_folder.into(),
-            ],
-        ))
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(id.to_string()),
+            path: Set(format!("/tmp/{id}")),
+            library_id: Set(String::new()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set("Movie".to_string()),
+            is_folder: Set(is_folder),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }

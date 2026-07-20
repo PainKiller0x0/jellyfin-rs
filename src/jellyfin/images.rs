@@ -10,17 +10,18 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
+    ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+    sea_query::OnConflict,
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
     app::state::AppState,
-    db::row_ext::QueryResultExt,
     entities::{
         image_assets::{self, Entity as ImageAssets},
         libraries::Entity as Libraries,
+        media_items::{self, Entity as MediaItems},
     },
     jellyfin::common::{
         image as placeholder_image, internal_error, ok_response, wants_json_response,
@@ -55,12 +56,6 @@ type LegacyItemImagePath = (
     String,
     String,
 );
-
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
-}
 
 #[derive(Deserialize)]
 pub(crate) struct UserImagePath {
@@ -599,30 +594,13 @@ async fn find_item_image_asset_by_type(
     image_type: &str,
     image_index: i64,
 ) -> anyhow::Result<Option<image_assets::Model>> {
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT id, item_id, image_type, image_index, path, etag, width, height, size_bytes, created_at, updated_at FROM image_assets WHERE item_id = ? AND image_type = ? AND CAST(image_index AS TEXT) = ? LIMIT 1",
-            vec![item_id.into(), image_type.into(), image_index.to_string().into()],
-        ))
+    ImageAssets::find()
+        .filter(image_assets::Column::ItemId.eq(item_id))
+        .filter(image_assets::Column::ImageType.eq(image_type))
+        .filter(image_assets::Column::ImageIndex.eq(image_index))
+        .one(db)
         .await
-        .context("failed to query item image asset")?;
-
-    row.map(|row| {
-        Ok(image_assets::Model {
-            id: row.get_str("id")?,
-            item_id: row.get_str("item_id")?,
-            image_type: row.get_str("image_type")?,
-            image_index: row.get_i64("image_index")?,
-            path: row.get_opt_str("path")?,
-            etag: row.get_opt_str("etag")?,
-            width: row.get_opt_i64("width")?,
-            height: row.get_opt_i64("height")?,
-            size_bytes: row.get_opt_i64("size_bytes")?,
-            created_at: row.get_i64("created_at")?,
-            updated_at: row.get_i64("updated_at")?,
-        })
-    })
-    .transpose()
+        .context("failed to query item image asset")
 }
 
 async fn dynamic_image_response(
@@ -662,28 +640,65 @@ async fn collage_source_images(
     } else {
         "Primary"
     };
-    let sql = format!(
-        "SELECT image_assets.path FROM image_assets JOIN media_items mi ON mi.id = image_assets.item_id WHERE mi.parent_id = ? AND {} AND image_assets.image_type = ? ORDER BY mi.title ASC, image_assets.image_index ASC LIMIT 4",
-        visible_media_item_sql("mi")
-    );
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            &sql,
-            vec![item_id.into(), preferred_type.into()],
-        ))
+    let children = MediaItems::find()
+        .filter(media_items::Column::ParentId.eq(item_id))
+        .order_by_asc(media_items::Column::Title)
+        .all(db)
         .await
         .context("failed to find child images for collage")?;
 
     let mut images = Vec::new();
-    for row in &rows {
-        let path: String = row.get_str("path")?;
-        if image_storage_path_allowed(&path) {
-            if let Ok(bytes) = tokio::fs::read(&path).await {
-                images.push(bytes);
+    for child in children {
+        if !visible_media_item(db, &child).await? {
+            continue;
+        }
+        let assets = ImageAssets::find()
+            .filter(image_assets::Column::ItemId.eq(&child.id))
+            .filter(image_assets::Column::ImageType.eq(preferred_type))
+            .order_by_asc(image_assets::Column::ImageIndex)
+            .all(db)
+            .await
+            .context("failed to find child image assets for collage")?;
+        for asset in assets {
+            let Some(path) = asset.path else {
+                continue;
+            };
+            if image_storage_path_allowed(&path) {
+                if let Ok(bytes) = tokio::fs::read(&path).await {
+                    images.push(bytes);
+                }
+            }
+            if images.len() >= 4 {
+                return Ok(images);
             }
         }
     }
     Ok(images)
+}
+
+async fn visible_media_item(
+    db: &DatabaseConnection,
+    item: &media_items::Model,
+) -> anyhow::Result<bool> {
+    if item.is_public == 0 {
+        return Ok(false);
+    }
+    if item.parent_id.is_empty() {
+        return Ok(true);
+    }
+    if Libraries::find_by_id(item.parent_id.clone())
+        .one(db)
+        .await
+        .context("failed to check parent library visibility")?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    Ok(MediaItems::find_by_id(item.parent_id.clone())
+        .one(db)
+        .await
+        .context("failed to check parent item visibility")?
+        .is_some_and(|parent| parent.is_public != 0))
 }
 
 fn image_response(bytes: Vec<u8>, content_type: &'static str, etag: String) -> Response {
@@ -758,20 +773,35 @@ async fn save_item_image(
         .with_context(|| format!("failed to write image file: {}", path.display()))?;
 
     let now = now_unix();
-    db.execute(crate::db::helpers::pg_statement(
-        r#"INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, size_bytes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET path = excluded.path, etag = excluded.etag, size_bytes = excluded.size_bytes, updated_at = excluded.updated_at"#,
-        vec![
-            stable_text_id(&format!("image-asset:{item_id}:{image_type}:{image_index}")).into(),
-            item_id.into(),
-            image_type.into(),
-            image_index.into(),
-            path.to_string_lossy().to_string().into(),
-            etag.into(),
-            i64::try_from(bytes.len()).unwrap_or(i64::MAX).into(),
-            now.into(),
-            now.into(),
-        ],
-    ))
+    ImageAssets::insert(image_assets::ActiveModel {
+        id: Set(stable_text_id(&format!(
+            "image-asset:{item_id}:{image_type}:{image_index}"
+        ))),
+        item_id: Set(item_id.to_string()),
+        image_type: Set(image_type.to_string()),
+        image_index: Set(image_index),
+        path: Set(Some(path.to_string_lossy().to_string())),
+        etag: Set(Some(etag)),
+        size_bytes: Set(Some(i64::try_from(bytes.len()).unwrap_or(i64::MAX))),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::columns([
+            image_assets::Column::ItemId,
+            image_assets::Column::ImageType,
+            image_assets::Column::ImageIndex,
+        ])
+        .update_columns([
+            image_assets::Column::Path,
+            image_assets::Column::Etag,
+            image_assets::Column::SizeBytes,
+            image_assets::Column::UpdatedAt,
+        ])
+        .to_owned(),
+    )
+    .exec_without_returning(db)
     .await
     .context("failed to upsert image asset")?;
 
@@ -1188,13 +1218,18 @@ fn validate_image_id<'a>(value: &'a str, label: &str) -> anyhow::Result<&'a str>
 }
 
 async fn image_item_exists(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<bool> {
-    Ok(db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT id FROM media_items WHERE id = ? UNION ALL SELECT id FROM libraries WHERE id = ? LIMIT 1",
-            vec![item_id.into(), item_id.into()],
-        ))
+    let item_exists = MediaItems::find_by_id(item_id.to_string())
+        .one(db)
         .await
         .context("failed to validate image item")?
+        .is_some();
+    if item_exists {
+        return Ok(true);
+    }
+    Ok(Libraries::find_by_id(item_id.to_string())
+        .one(db)
+        .await
+        .context("failed to validate image library")?
         .is_some())
 }
 
@@ -1233,7 +1268,11 @@ mod tests {
         decode_image_body, image_storage_path_allowed, image_type_and_index, is_image_too_large,
         item_images_inner,
     };
-    use sea_orm::ConnectionTrait;
+    use crate::entities::{
+        image_assets::{self, Entity as ImageAssets},
+        media_items::{self, Entity as MediaItems},
+    };
+    use sea_orm::{DatabaseConnection, EntityTrait, Set};
     use serde_json::json;
     use std::fs;
 
@@ -1298,18 +1337,8 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, 0, 1, 1, 1)",
-            vec!["private".into(), "Private".into(), "/tmp/private.mkv".into()],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, created_at, updated_at) VALUES (?, ?, 'Primary', 0, 'data/images/private.png', 'tag', 1, 1)",
-            vec!["img1".into(), "private".into()],
-        ))
-        .await
-        .unwrap();
+        insert_test_item(&db, "private", "", 0, 0).await;
+        insert_test_image(&db, "img1", "private", "data/images/private.png", "tag").await;
 
         assert!(
             crate::jellyfin::item_queries::find_media_item(&db, "u1", "private")
@@ -1331,18 +1360,7 @@ mod tests {
             ("private-parent", "", 0),
             ("hidden-child", "private-parent", 1),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', 1, ?, 1, 1, 1)",
-                vec![
-                    id.into(),
-                    id.into(),
-                    format!("/tmp/{id}").into(),
-                    parent_id.into(),
-                    is_public.into(),
-                ],
-            ))
-            .await
-            .unwrap();
+            insert_test_item(&db, id, parent_id, 1, is_public).await;
         }
 
         let image_dir = std::path::PathBuf::from("data").join("images");
@@ -1355,17 +1373,14 @@ mod tests {
             ("public-image", "public-child", &public_image),
             ("hidden-image", "hidden-child", &hidden_image),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, created_at, updated_at) VALUES (?, ?, 'Primary', 0, ?, ?, 1, 1)",
-                vec![
-                    format!("{asset_id}-{}", uuid::Uuid::new_v4()).into(),
-                    item_id.into(),
-                    path.to_string_lossy().to_string().into(),
-                    asset_id.into(),
-                ],
-            ))
-            .await
-            .unwrap();
+            insert_test_image(
+                &db,
+                &format!("{asset_id}-{}", uuid::Uuid::new_v4()),
+                item_id,
+                &path.to_string_lossy(),
+                asset_id,
+            )
+            .await;
         }
 
         let images = collage_source_images(&db, "album", "Primary")
@@ -1381,5 +1396,54 @@ mod tests {
 
         let _ = fs::remove_file(public_image);
         let _ = fs::remove_file(hidden_image);
+    }
+
+    async fn insert_test_item(
+        db: &DatabaseConnection,
+        id: &str,
+        parent_id: &str,
+        is_folder: i64,
+        is_public: i64,
+    ) {
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(id.to_string()),
+            path: Set(format!("/tmp/{id}")),
+            library_id: Set(String::new()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set("Movie".to_string()),
+            is_folder: Set(is_folder),
+            is_public: Set(is_public),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_test_image(
+        db: &DatabaseConnection,
+        id: &str,
+        item_id: &str,
+        path: &str,
+        etag: &str,
+    ) {
+        ImageAssets::insert(image_assets::ActiveModel {
+            id: Set(id.to_string()),
+            item_id: Set(item_id.to_string()),
+            image_type: Set("Primary".to_string()),
+            image_index: Set(0),
+            path: Set(Some(path.to_string())),
+            etag: Set(Some(etag.to_string())),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
     }
 }

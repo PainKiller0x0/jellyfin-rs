@@ -1,10 +1,14 @@
 use std::path::{Path, PathBuf};
 
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::db::helpers::pg_statement;
-use crate::db::row_ext::QueryResultExt;
+use crate::entities::{
+    media_items::{self, Entity as MediaItems},
+    media_streams::{self, Entity as MediaStreams},
+};
 use crate::util::{now_unix, stable_item_id};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,46 +69,35 @@ pub async fn serialize_mediainfo(
     media_path: &Path,
     root_folder: Option<&str>,
 ) -> anyhow::Result<()> {
-    // Get media streams via raw SQL
-    let stream_rows = db
-        .query_all(pg_statement(
-            "SELECT stream_index, stream_type, codec, language, title, bit_rate, width, height, channels, sample_rate, is_external FROM media_streams WHERE item_id = ? ORDER BY stream_index ASC",
-            vec![item_id.into()],
-        ))
+    let streams = MediaStreams::find()
+        .filter(media_streams::Column::ItemId.eq(item_id))
+        .order_by_asc(media_streams::Column::StreamIndex)
+        .all(db)
         .await?;
 
-    // Get runtime and container
-    let item_row = db
-        .query_one(pg_statement(
-            "SELECT runtime_ticks, container, size_bytes FROM media_items WHERE id = ?",
-            vec![item_id.into()],
-        ))
-        .await?;
-
-    let runtime_ticks = item_row
-        .as_ref()
-        .and_then(|r| r.get_i64("runtime_ticks").ok());
-    let container = item_row.as_ref().and_then(|r| r.get_str("container").ok());
-    let size_bytes = item_row.as_ref().and_then(|r| r.get_i64("size_bytes").ok());
+    let item = MediaItems::find_by_id(item_id.to_string()).one(db).await?;
+    let runtime_ticks = item.as_ref().and_then(|item| item.runtime_ticks);
+    let container = item.as_ref().and_then(|item| item.container.clone());
+    let size_bytes = item.as_ref().and_then(|item| item.size_bytes);
 
     // Get chapters
     let chapters = crate::chapters::get_chapters(db, item_id).await?;
 
     let sidecar = MediaInfoSidecar {
-        media_streams: stream_rows
+        media_streams: streams
             .iter()
             .map(|s| MediaStreamEntry {
-                stream_index: s.get_i64("stream_index").unwrap_or(0),
-                stream_type: s.get_str("stream_type").unwrap_or_default(),
-                codec: s.get_str("codec").ok(),
-                language: s.get_str("language").ok(),
-                title: s.get_str("title").ok(),
-                bit_rate: s.get_i64("bit_rate").ok(),
-                width: s.get_i64("width").ok(),
-                height: s.get_i64("height").ok(),
-                channels: s.get_i64("channels").ok(),
-                sample_rate: s.get_i64("sample_rate").ok(),
-                is_external: s.get_i64("is_external").unwrap_or(0) != 0,
+                stream_index: s.stream_index,
+                stream_type: s.stream_type.clone(),
+                codec: s.codec.clone(),
+                language: s.language.clone(),
+                title: s.title.clone(),
+                bit_rate: s.bit_rate,
+                width: s.width,
+                height: s.height,
+                channels: s.channels,
+                sample_rate: s.sample_rate,
+                is_external: s.is_external != 0,
             })
             .collect(),
         chapters: chapters
@@ -151,11 +144,10 @@ pub async fn deserialize_mediainfo(
 
     // Restore media streams
     if !sidecar.media_streams.is_empty() {
-        db.execute(pg_statement(
-            "DELETE FROM media_streams WHERE item_id = ?",
-            vec![item_id.into()],
-        ))
-        .await?;
+        MediaStreams::delete_many()
+            .filter(media_streams::Column::ItemId.eq(item_id))
+            .exec(db)
+            .await?;
 
         let now = now_unix();
         for stream in &sidecar.media_streams {
@@ -163,50 +155,46 @@ pub async fn deserialize_mediainfo(
                 "{item_id}:{}:{}",
                 stream.stream_index, stream.stream_type
             )));
-            db.execute(pg_statement(
-                "INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, title, bit_rate, width, height, channels, sample_rate, is_external, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                vec![
-                    id.into(),
-                    item_id.into(),
-                    stream.stream_index.into(),
-                    stream.stream_type.clone().into(),
-                    stream.codec.clone().into(),
-                    stream.language.clone().into(),
-                    stream.title.clone().into(),
-                    stream.bit_rate.into(),
-                    stream.width.into(),
-                    stream.height.into(),
-                    stream.channels.into(),
-                    stream.sample_rate.into(),
-                    (stream.is_external as i64).into(),
-                    now.into(),
-                ],
-            ))
+            MediaStreams::insert(media_streams::ActiveModel {
+                id: Set(id),
+                item_id: Set(item_id.to_string()),
+                stream_index: Set(stream.stream_index),
+                stream_type: Set(stream.stream_type.clone()),
+                codec: Set(stream.codec.clone()),
+                language: Set(stream.language.clone()),
+                title: Set(stream.title.clone()),
+                bit_rate: Set(stream.bit_rate),
+                width: Set(stream.width),
+                height: Set(stream.height),
+                channels: Set(stream.channels),
+                sample_rate: Set(stream.sample_rate),
+                is_external: Set(stream.is_external as i64),
+                created_at: Set(now),
+                ..Default::default()
+            })
+            .exec_without_returning(db)
             .await?;
         }
     }
 
     // Restore item properties
-    let mut updates = Vec::new();
-    let mut params: Vec<sea_orm::Value> = Vec::new();
-
-    if let Some(rt) = sidecar.runtime_ticks {
-        updates.push("runtime_ticks = ?");
-        params.push(rt.into());
-    }
-    if let Some(ref c) = sidecar.container {
-        updates.push("container = ?");
-        params.push(c.clone().into());
-    }
-    if let Some(sb) = sidecar.size_bytes {
-        updates.push("size_bytes = ?");
-        params.push(sb.into());
-    }
-
-    if !updates.is_empty() {
-        params.push(item_id.into());
-        let sql = format!("UPDATE media_items SET {} WHERE id = ?", updates.join(", "));
-        db.execute(pg_statement(&sql, params)).await?;
+    if sidecar.runtime_ticks.is_some()
+        || sidecar.container.is_some()
+        || sidecar.size_bytes.is_some()
+    {
+        if let Some(item) = MediaItems::find_by_id(item_id.to_string()).one(db).await? {
+            let mut active: media_items::ActiveModel = item.into();
+            if let Some(runtime_ticks) = sidecar.runtime_ticks {
+                active.runtime_ticks = Set(Some(runtime_ticks));
+            }
+            if let Some(container) = sidecar.container.clone() {
+                active.container = Set(Some(container));
+            }
+            if let Some(size_bytes) = sidecar.size_bytes {
+                active.size_bytes = Set(Some(size_bytes));
+            }
+            active.update(db).await?;
+        }
     }
 
     // Restore chapters

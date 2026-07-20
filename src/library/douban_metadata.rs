@@ -2,12 +2,22 @@ use std::{path::Path, time::Duration};
 
 use anyhow::Context;
 use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, COOKIE, REFERER, USER_AGENT};
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
+    sea_query::OnConflict,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    db::row_ext::QueryResultExt,
+    entities::{
+        genres::{self, Entity as Genres},
+        image_assets::{self, Entity as ImageAssets},
+        media_genres::{self, Entity as MediaGenres},
+        media_items::{self, Entity as MediaItems},
+        media_people::{self, Entity as MediaPeople},
+        people::{self, Entity as People},
+    },
     util::{normalize_yyyy_mm_dd, year_from_yyyy_mm_dd},
 };
 
@@ -161,26 +171,35 @@ pub async fn fill_missing_douban(
     db: &DatabaseConnection,
     cookie: Option<&str>,
 ) -> anyhow::Result<usize> {
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            r#"SELECT mi.id, mi.title, mi.path, mi.item_type, p.provider_item_id AS douban_id
-           FROM media_items mi
-           LEFT JOIN provider_ids p ON p.item_id = mi.id AND p.provider = 'Douban'
-           WHERE mi.is_folder = 1
-             AND mi.item_type IN ('Movie', 'Series')
-             AND (
-                 p.provider_item_id IS NULL
-                 OR mi.overview IS NULL
-                 OR mi.production_year IS NULL
-                 OR mi.premiere_date IS NULL
-                 OR NOT EXISTS (
-                     SELECT 1 FROM image_assets ia
-                     WHERE ia.item_id = mi.id AND ia.image_type = 'Primary'
-                 )
-             )"#,
-            vec![],
-        ))
+    let candidates = MediaItems::find()
+        .filter(media_items::Column::IsFolder.eq(1))
+        .filter(media_items::Column::ItemType.is_in(["Movie", "Series"]))
+        .all(db)
         .await?;
+    let mut rows = Vec::new();
+    for item in candidates {
+        let douban_id = crate::db::provider_ids::get(db, &item.id, DOUBAN_PROVIDER).await?;
+        let has_primary_image = ImageAssets::find()
+            .filter(image_assets::Column::ItemId.eq(&item.id))
+            .filter(image_assets::Column::ImageType.eq("Primary"))
+            .one(db)
+            .await?
+            .is_some();
+        if douban_id.is_none()
+            || item.overview.is_none()
+            || item.production_year.is_none()
+            || item.premiere_date.is_none()
+            || !has_primary_image
+        {
+            rows.push(DoubanFillTarget {
+                id: item.id,
+                title: item.title,
+                path: item.path,
+                item_type: item.item_type,
+                douban_id,
+            });
+        }
+    }
 
     if rows.is_empty() {
         return Ok(0);
@@ -192,14 +211,11 @@ pub async fn fill_missing_douban(
     tracing::info!("fill_missing_douban: {total} items need name-based Douban lookup");
 
     for row in rows {
-        let item_id = match row.get_str("id") {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let title = row.get_str("title").unwrap_or_default();
-        let item_type = row.get_str("item_type").unwrap_or_default();
-        let path = row.get_str("path").unwrap_or_default();
-        if let Ok(Some(douban_id)) = row.get_opt_str("douban_id") {
+        let item_id = row.id;
+        let title = row.title;
+        let item_type = row.item_type;
+        let path = row.path;
+        if let Some(douban_id) = row.douban_id {
             match fetch_subject_details(&client, cookie, &douban_id, &item_type).await {
                 Ok(details) => {
                     apply_subject_metadata(db, &item_id, &details, cookie).await?;
@@ -262,6 +278,14 @@ pub async fn fill_missing_douban(
 
     tracing::info!("fill_missing_douban: filled {filled}/{total} items");
     Ok(filled)
+}
+
+struct DoubanFillTarget {
+    id: String,
+    title: String,
+    path: String,
+    item_type: String,
+    douban_id: Option<String>,
 }
 
 async fn search_subjects(
@@ -481,27 +505,33 @@ async fn apply_subject_metadata(
         .await
         .with_context(|| format!("failed to save Douban provider id for item: {item_id}"))?;
 
-    db.execute(crate::db::helpers::pg_statement(
-        r#"UPDATE media_items
-           SET overview = COALESCE(overview, ?),
-               production_year = COALESCE(production_year, ?),
-               premiere_date = COALESCE(premiere_date, ?),
-               community_rating = COALESCE(community_rating, ?),
-               runtime_ticks = COALESCE(runtime_ticks, ?),
-               updated_at = ?
-           WHERE id = ?"#,
-        vec![
-            subject.overview.as_deref().into(),
-            subject.year.into(),
-            subject.premiere_date.as_deref().into(),
-            subject.community_rating.into(),
-            subject.runtime_ticks.into(),
-            crate::util::now_unix().into(),
-            item_id.into(),
-        ],
-    ))
-    .await
-    .with_context(|| format!("failed to apply Douban metadata for item: {item_id}"))?;
+    if let Some(item) = MediaItems::find_by_id(item_id.to_string())
+        .one(db)
+        .await
+        .with_context(|| format!("failed to load item for Douban metadata: {item_id}"))?
+    {
+        let mut active: media_items::ActiveModel = item.clone().into();
+        if item.overview.is_none() {
+            active.overview = Set(subject.overview.clone());
+        }
+        if item.production_year.is_none() {
+            active.production_year = Set(subject.year);
+        }
+        if item.premiere_date.is_none() {
+            active.premiere_date = Set(subject.premiere_date.clone());
+        }
+        if item.community_rating.is_none() {
+            active.community_rating = Set(subject.community_rating);
+        }
+        if item.runtime_ticks.is_none() {
+            active.runtime_ticks = Set(subject.runtime_ticks);
+        }
+        active.updated_at = Set(crate::util::now_unix());
+        active
+            .update(db)
+            .await
+            .with_context(|| format!("failed to apply Douban metadata for item: {item_id}"))?;
+    }
 
     upsert_named_relations(
         db,
@@ -545,16 +575,27 @@ async fn upsert_named_relations(
     relation_column: &str,
     names: &[String],
 ) -> anyhow::Result<()> {
+    if (table, relation_table, relation_column) != ("genres", "media_genres", "genre_id") {
+        anyhow::bail!(
+            "unsupported Douban relation mapping: {table}/{relation_table}/{relation_column}"
+        );
+    }
     for name in names {
         let name = name.trim();
         if name.is_empty() {
             continue;
         }
         let id = upsert_name_get_id(db, table, name, &format!("{table}:")).await?;
-        db.execute(crate::db::helpers::pg_statement(
-            &format!("INSERT INTO {relation_table} (item_id, {relation_column}) VALUES (?, ?) ON CONFLICT(item_id, {relation_column}) DO NOTHING"),
-            vec![item_id.into(), id.into()],
-        ))
+        MediaGenres::insert(media_genres::ActiveModel {
+            item_id: Set(item_id.to_string()),
+            genre_id: Set(id),
+        })
+        .on_conflict(
+            OnConflict::columns([media_genres::Column::ItemId, media_genres::Column::GenreId])
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
         .await?;
     }
     Ok(())
@@ -584,17 +625,29 @@ async fn upsert_people(
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty());
         let id = upsert_name_get_id(db, "people", name, "people:").await?;
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_people (item_id, person_id, role, person_type, sort_order) VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id, person_id, person_type) DO UPDATE SET role = COALESCE(excluded.role, media_people.role), sort_order = excluded.sort_order",
-            vec![
-                item_id.into(),
-                id.into(),
-                role.into(),
-                person_type.into(),
-                i64::try_from(sort_order).unwrap_or(i64::MAX).into(),
-            ],
-        ))
-        .await?;
+        let sort_order = i64::try_from(sort_order).unwrap_or(i64::MAX);
+        if let Some(existing) = MediaPeople::find()
+            .filter(media_people::Column::ItemId.eq(item_id))
+            .filter(media_people::Column::PersonId.eq(&id))
+            .filter(media_people::Column::PersonType.eq(person_type))
+            .one(db)
+            .await?
+        {
+            let mut active: media_people::ActiveModel = existing.clone().into();
+            active.role = Set(role.map(ToString::to_string).or(existing.role));
+            active.sort_order = Set(sort_order);
+            active.update(db).await?;
+        } else {
+            MediaPeople::insert(media_people::ActiveModel {
+                item_id: Set(item_id.to_string()),
+                person_id: Set(id),
+                role: Set(role.map(ToString::to_string)),
+                person_type: Set(person_type.to_string()),
+                sort_order: Set(sort_order),
+            })
+            .exec_without_returning(db)
+            .await?;
+        }
     }
     Ok(())
 }
@@ -606,20 +659,50 @@ async fn upsert_name_get_id(
     id_prefix: &str,
 ) -> anyhow::Result<String> {
     let id = crate::util::stable_text_id(&format!("{id_prefix}{}", name.to_ascii_lowercase()));
-    db.execute(crate::db::helpers::pg_statement(
-        &format!(
-            "INSERT INTO {table} (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING"
-        ),
-        vec![id.clone().into(), name.into(), crate::util::now_unix().into()],
-    ))
-    .await?;
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            &format!("SELECT id FROM {table} WHERE name = ?"),
-            vec![name.into()],
-        ))
-        .await?;
-    Ok(row.and_then(|row| row.get_str("id").ok()).unwrap_or(id))
+    match table {
+        "genres" => {
+            Genres::insert(genres::ActiveModel {
+                id: Set(id.clone()),
+                name: Set(name.to_string()),
+                created_at: Set(crate::util::now_unix()),
+            })
+            .on_conflict(
+                OnConflict::column(genres::Column::Name)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await?;
+            Ok(Genres::find()
+                .filter(genres::Column::Name.eq(name))
+                .one(db)
+                .await?
+                .map(|genre| genre.id)
+                .unwrap_or(id))
+        }
+        "people" => {
+            People::insert(people::ActiveModel {
+                id: Set(id.clone()),
+                name: Set(name.to_string()),
+                created_at: Set(crate::util::now_unix()),
+                ..Default::default()
+            })
+            .on_conflict(
+                OnConflict::column(people::Column::Name)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await?;
+            Ok(People::find()
+                .filter(people::Column::Name.eq(name))
+                .one(db)
+                .await?
+                .map(|person| person.id)
+                .unwrap_or(id))
+        }
+        _ => anyhow::bail!("unsupported Douban name table: {table}"),
+    }
 }
 
 async fn download_and_save_douban_image(
@@ -656,22 +739,38 @@ async fn download_and_save_douban_image(
     ));
     tokio::fs::write(&path, &bytes).await?;
     let now = crate::util::now_unix();
-    db.execute(crate::db::helpers::pg_statement(
-        r#"INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, width, height, size_bytes, created_at, updated_at)
-           VALUES (?, ?, ?, 0, ?, ?, NULL, NULL, ?, ?, ?)
-           ON CONFLICT(item_id, image_type, image_index)
-           DO UPDATE SET path = excluded.path, etag = excluded.etag, size_bytes = excluded.size_bytes, updated_at = excluded.updated_at"#,
-        vec![
-            crate::util::stable_text_id(&format!("image-asset:{item_id}:{image_type}:0")).into(),
-            item_id.into(),
-            image_type.into(),
-            path.to_string_lossy().to_string().into(),
-            crate::util::stable_text_id(&format!("douban:{item_id}:{image_type}:{url}")).into(),
-            i64::try_from(bytes.len()).unwrap_or(i64::MAX).into(),
-            now.into(),
-            now.into(),
-        ],
-    ))
+    ImageAssets::insert(image_assets::ActiveModel {
+        id: Set(crate::util::stable_text_id(&format!(
+            "image-asset:{item_id}:{image_type}:0"
+        ))),
+        item_id: Set(item_id.to_string()),
+        image_type: Set(image_type.to_string()),
+        image_index: Set(0),
+        path: Set(Some(path.to_string_lossy().to_string())),
+        etag: Set(Some(crate::util::stable_text_id(&format!(
+            "douban:{item_id}:{image_type}:{url}"
+        )))),
+        width: Set(None),
+        height: Set(None),
+        size_bytes: Set(Some(i64::try_from(bytes.len()).unwrap_or(i64::MAX))),
+        created_at: Set(now),
+        updated_at: Set(now),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            image_assets::Column::ItemId,
+            image_assets::Column::ImageType,
+            image_assets::Column::ImageIndex,
+        ])
+        .update_columns([
+            image_assets::Column::Path,
+            image_assets::Column::Etag,
+            image_assets::Column::SizeBytes,
+            image_assets::Column::UpdatedAt,
+        ])
+        .to_owned(),
+    )
+    .exec_without_returning(db)
     .await?;
     Ok(())
 }

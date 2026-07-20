@@ -1,11 +1,24 @@
 use std::{collections::HashMap, path::Path, sync::OnceLock};
 
 use anyhow::Context;
-use sea_orm::{ConnectionTrait, DatabaseConnection, Value};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    Set, sea_query::OnConflict,
+};
 use tokio::sync::Mutex;
 
 use crate::{
     db::row_ext::QueryResultExt,
+    entities::{
+        genres::{self, Entity as Genres},
+        image_assets::{self, Entity as ImageAssets},
+        media_genres::{self, Entity as MediaGenres},
+        media_items::{self, Entity as MediaItems},
+        media_people::{self, Entity as MediaPeople},
+        media_studios::{self, Entity as MediaStudios},
+        people::{self, Entity as People},
+        studios::{self, Entity as Studios},
+    },
     jellyfin::providers,
     tmdb,
     util::{normalize_yyyy_mm_dd, now_unix, year_from_yyyy_mm_dd},
@@ -307,28 +320,36 @@ struct SeasonTmdbResponse {
 }
 
 async fn normalize_episode_years_from_premiere_dates(db: &sea_orm::DatabaseConnection) {
-    match db
-        .execute(crate::db::helpers::pg_statement(
-            r#"UPDATE media_items
-               SET production_year = CAST(SUBSTRING(premiere_date FROM 1 FOR 4) AS BIGINT),
-                   updated_at = ?
-               WHERE item_type = 'Episode'
-                 AND premiere_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-                 AND (
-                     production_year IS NULL
-                     OR production_year <> CAST(SUBSTRING(premiere_date FROM 1 FOR 4) AS BIGINT)
-                 )"#,
-            vec![now_unix().into()],
-        ))
+    match MediaItems::find()
+        .filter(media_items::Column::ItemType.eq("Episode"))
+        .filter(media_items::Column::PremiereDate.is_not_null())
+        .all(db)
         .await
     {
-        Ok(result) if result.rows_affected() > 0 => {
-            tracing::info!(
-                count = result.rows_affected(),
-                "normalized episode production years from premiere dates"
-            );
+        Ok(items) => {
+            let mut updated = 0u64;
+            for item in items {
+                let Some(year) = item.premiere_date.as_deref().and_then(year_from_yyyy_mm_dd)
+                else {
+                    continue;
+                };
+                if item.production_year == Some(year) {
+                    continue;
+                }
+                let mut active: media_items::ActiveModel = item.into();
+                active.production_year = Set(Some(year));
+                active.updated_at = Set(now_unix());
+                if active.update(db).await.is_ok() {
+                    updated += 1;
+                }
+            }
+            if updated > 0 {
+                tracing::info!(
+                    count = updated,
+                    "normalized episode production years from premiere dates"
+                );
+            }
         }
-        Ok(_) => {}
         Err(error) => {
             tracing::warn!("failed to normalize episode production years: {error:#}");
         }
@@ -434,48 +455,36 @@ async fn apply_season_tmdb_response(
     if let Some(tmdb_season_id) = season.id {
         crate::db::provider_ids::upsert(db, season_id, "Tmdb", &tmdb_season_id.to_string()).await?;
     }
-    if let Some(name) = season
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+    if let Some(item) = MediaItems::find_by_id(season_id.to_string())
+        .one(db)
+        .await?
     {
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE media_items SET title = ?, season_number = ?, production_year = COALESCE(?, production_year), premiere_date = COALESCE(?, premiere_date), updated_at = ? WHERE id = ?",
-            vec![
-                name.into(),
-                season_number.into(),
-                production_year.into(),
-                premiere_date.as_deref().into(),
-                now_unix().into(),
-                season_id.into(),
-            ],
-        ))
-        .await?;
-    } else {
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE media_items SET season_number = ?, production_year = COALESCE(?, production_year), premiere_date = COALESCE(?, premiere_date), updated_at = ? WHERE id = ?",
-            vec![
-                season_number.into(),
-                production_year.into(),
-                premiere_date.as_deref().into(),
-                now_unix().into(),
-                season_id.into(),
-            ],
-        ))
-        .await?;
-    }
-    if let Some(overview) = season
-        .overview
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE media_items SET overview = ?, updated_at = ? WHERE id = ?",
-            vec![overview.into(), now_unix().into(), season_id.into()],
-        ))
-        .await?;
+        let mut active: media_items::ActiveModel = item.clone().into();
+        if let Some(name) = season
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            active.title = Set(name.to_string());
+        }
+        active.season_number = Set(Some(season_number));
+        if item.production_year.is_none() {
+            active.production_year = Set(production_year);
+        }
+        if item.premiere_date.is_none() {
+            active.premiere_date = Set(premiere_date.clone());
+        }
+        if let Some(overview) = season
+            .overview
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            active.overview = Set(Some(overview.to_string()));
+        }
+        active.updated_at = Set(now_unix());
+        active.update(db).await?;
     }
     if !has_primary {
         if let Some(poster_path) = season.poster_path.as_deref() {
@@ -593,57 +602,45 @@ async fn apply_episode_tmdb_response(
         .await?;
     }
 
-    if let Some(title) = episode_title_candidate(
-        episode.name.as_deref(),
-        &target.current_title,
-        &target.series_title,
-        target.series_year,
-        target.episode_number,
-        &target.path,
-    ) {
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE media_items SET title = ?, updated_at = ? WHERE id = ?",
-            vec![
-                title.into(),
-                now_unix().into(),
-                target.episode_id.as_str().into(),
-            ],
-        ))
-        .await?;
-    }
-
-    if let Some(overview) = episode
-        .overview
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+    if let Some(item) = MediaItems::find_by_id(target.episode_id.clone())
+        .one(db)
+        .await?
     {
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE media_items SET overview = ?, updated_at = ? WHERE id = ?",
-            vec![
-                overview.into(),
-                now_unix().into(),
-                target.episode_id.as_str().into(),
-            ],
-        ))
-        .await?;
-    }
+        let mut active: media_items::ActiveModel = item.clone().into();
+        if let Some(title) = episode_title_candidate(
+            episode.name.as_deref(),
+            &target.current_title,
+            &target.series_title,
+            target.series_year,
+            target.episode_number,
+            &target.path,
+        ) {
+            active.title = Set(title);
+        }
 
-    let premiere_date = episode.air_date.as_deref().and_then(normalize_yyyy_mm_dd);
-    let production_year = premiere_date.as_deref().and_then(year_from_yyyy_mm_dd);
-    let community_rating = episode.vote_average.filter(|rating| *rating > 0.0);
-    if production_year.is_some() || premiere_date.is_some() || community_rating.is_some() {
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE media_items SET production_year = COALESCE(?, production_year), premiere_date = COALESCE(?, premiere_date), community_rating = COALESCE(?, community_rating), updated_at = ? WHERE id = ?",
-            vec![
-                production_year.into(),
-                premiere_date.as_deref().into(),
-                community_rating.into(),
-                now_unix().into(),
-                target.episode_id.as_str().into(),
-            ],
-        ))
-        .await?;
+        if let Some(overview) = episode
+            .overview
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            active.overview = Set(Some(overview.to_string()));
+        }
+
+        let premiere_date = episode.air_date.as_deref().and_then(normalize_yyyy_mm_dd);
+        let production_year = premiere_date.as_deref().and_then(year_from_yyyy_mm_dd);
+        let community_rating = episode.vote_average.filter(|rating| *rating > 0.0);
+        if item.production_year.is_none() {
+            active.production_year = Set(production_year);
+        }
+        if item.premiere_date.is_none() {
+            active.premiere_date = Set(premiere_date);
+        }
+        if item.community_rating.is_none() {
+            active.community_rating = Set(community_rating);
+        }
+        active.updated_at = Set(now_unix());
+        active.update(db).await?;
     }
 
     if let Some(still) = episode.still_path.as_deref() {
@@ -1201,11 +1198,12 @@ pub async fn refresh_existing_tmdb_titles(
 
         match fetch_tmdb_display_name(client, api_key, tmdb_base_url, &tmdb_id, &item_type).await {
             Ok(Some(title)) if title != current_title => {
-                db.execute(crate::db::helpers::pg_statement(
-                    "UPDATE media_items SET title = ?, updated_at = ? WHERE id = ?",
-                    vec![title.as_str().into(), now_unix().into(), item_id.into()],
-                ))
-                .await?;
+                if let Some(item) = MediaItems::find_by_id(item_id.clone()).one(db).await? {
+                    let mut active: media_items::ActiveModel = item.into();
+                    active.title = Set(title);
+                    active.updated_at = Set(now_unix());
+                    active.update(db).await?;
+                }
                 updated += 1;
             }
             Ok(_) => {}
@@ -1380,30 +1378,32 @@ pub async fn fetch_and_apply_tmdb_metadata(
         .get("RuntimeTicks")
         .and_then(|v| v.as_i64())
         .filter(|t| *t > 0);
-    db.execute(crate::db::helpers::pg_statement(
-        r#"UPDATE media_items
-           SET title = COALESCE(?, title),
-               overview = COALESCE(?, overview),
-               production_year = COALESCE(?, production_year),
-               premiere_date = COALESCE(?, premiere_date),
-               community_rating = COALESCE(?, community_rating),
-               official_rating = COALESCE(?, official_rating),
-               runtime_ticks = COALESCE(runtime_ticks, ?),
-               updated_at = ?
-           WHERE id = ?"#,
-        vec![
-            title.into(),
-            overview.into(),
-            year.into(),
-            premiere_date.as_deref().into(),
-            community_rating.into(),
-            official_rating.into(),
-            runtime_ticks.into(),
-            now_unix().into(),
-            item_id.into(),
-        ],
-    ))
-    .await?;
+    if let Some(item) = MediaItems::find_by_id(item_id.to_string()).one(db).await? {
+        let mut active: media_items::ActiveModel = item.clone().into();
+        if let Some(title) = title {
+            active.title = Set(title.to_string());
+        }
+        if let Some(overview) = overview {
+            active.overview = Set(Some(overview.to_string()));
+        }
+        if let Some(year) = year {
+            active.production_year = Set(Some(year));
+        }
+        if let Some(premiere_date) = premiere_date.clone() {
+            active.premiere_date = Set(Some(premiere_date));
+        }
+        if let Some(community_rating) = community_rating {
+            active.community_rating = Set(Some(community_rating));
+        }
+        if let Some(official_rating) = official_rating {
+            active.official_rating = Set(Some(official_rating.to_string()));
+        }
+        if item.runtime_ticks.is_none() {
+            active.runtime_ticks = Set(runtime_ticks);
+        }
+        active.updated_at = Set(now_unix());
+        active.update(db).await?;
+    }
 
     // Store provider IDs
     if let Some(provider_ids) = metadata.get("ProviderIds") {
@@ -1421,62 +1421,131 @@ pub async fn fetch_and_apply_tmdb_metadata(
     let now = crate::util::now_unix();
     for genre_name in &genres {
         let genre_id = crate::util::stable_text_id(&format!("genre:{genre_name}"));
-        let _ = db
-            .execute(crate::db::helpers::pg_statement(
-                "INSERT INTO genres (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING",
-                vec![genre_id.clone().into(), genre_name.as_str().into(), now.into()],
-            ))
-            .await;
-        let _ = db
-            .execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_genres (item_id, genre_id) VALUES (?, ?) ON CONFLICT(item_id, genre_id) DO NOTHING",
-                vec![item_id.into(), genre_id.into()],
-            ))
-            .await;
+        let _ = Genres::insert(genres::ActiveModel {
+            id: Set(genre_id.clone()),
+            name: Set(genre_name.clone()),
+            created_at: Set(now),
+        })
+        .on_conflict(
+            OnConflict::column(genres::Column::Name)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await;
+        let genre_id = Genres::find()
+            .filter(genres::Column::Name.eq(genre_name))
+            .one(db)
+            .await
+            .ok()
+            .flatten()
+            .map(|genre| genre.id)
+            .unwrap_or(genre_id);
+        let _ = MediaGenres::insert(media_genres::ActiveModel {
+            item_id: Set(item_id.to_string()),
+            genre_id: Set(genre_id),
+        })
+        .on_conflict(
+            OnConflict::columns([media_genres::Column::ItemId, media_genres::Column::GenreId])
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await;
     }
 
     // Upsert studios
     for studio_name in &studios {
         let studio_id = crate::util::stable_text_id(&format!("studio:{studio_name}"));
-        let _ = db
-            .execute(crate::db::helpers::pg_statement(
-                "INSERT INTO studios (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING",
-                vec![studio_id.clone().into(), studio_name.as_str().into(), now.into()],
-            ))
-            .await;
-        let _ = db
-            .execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_studios (item_id, studio_id) VALUES (?, ?) ON CONFLICT(item_id, studio_id) DO NOTHING",
-                vec![item_id.into(), studio_id.into()],
-            ))
-            .await;
+        let _ = Studios::insert(studios::ActiveModel {
+            id: Set(studio_id.clone()),
+            name: Set(studio_name.clone()),
+            created_at: Set(now),
+        })
+        .on_conflict(
+            OnConflict::column(studios::Column::Name)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await;
+        let studio_id = Studios::find()
+            .filter(studios::Column::Name.eq(studio_name))
+            .one(db)
+            .await
+            .ok()
+            .flatten()
+            .map(|studio| studio.id)
+            .unwrap_or(studio_id);
+        let _ = MediaStudios::insert(media_studios::ActiveModel {
+            item_id: Set(item_id.to_string()),
+            studio_id: Set(studio_id),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                media_studios::Column::ItemId,
+                media_studios::Column::StudioId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await;
     }
 
     // Upsert people
     for (name, role, person_type, image_url) in &people {
         let person_id = crate::util::stable_text_id(&format!("person:{name}"));
-        let _ = db
-            .execute(crate::db::helpers::pg_statement(
-                "INSERT INTO people (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING",
-                vec![person_id.clone().into(), name.as_str().into(), now.into()],
-            ))
-            .await;
+        let _ = People::insert(people::ActiveModel {
+            id: Set(person_id.clone()),
+            name: Set(name.clone()),
+            created_at: Set(now),
+            ..Default::default()
+        })
+        .on_conflict(
+            OnConflict::column(people::Column::Name)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await;
+        let person_id = People::find()
+            .filter(people::Column::Name.eq(name))
+            .one(db)
+            .await
+            .ok()
+            .flatten()
+            .map(|person| person.id)
+            .unwrap_or(person_id);
         let sort_order = people
             .iter()
             .position(|(n, _, _, _)| n == name)
             .unwrap_or(0) as i64;
-        let _ = db
-            .execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_people (item_id, person_id, role, person_type, sort_order) VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id, person_id, person_type) DO UPDATE SET role = excluded.role WHERE excluded.role IS NOT NULL AND excluded.role <> ''",
-                vec![
-                    item_id.into(),
-                    person_id.clone().into(),
-                    role.as_str().into(),
-                    Value::from(person_type.as_str()),
-                    sort_order.into(),
-                ],
-            ))
+        if let Some(existing) = MediaPeople::find()
+            .filter(media_people::Column::ItemId.eq(item_id))
+            .filter(media_people::Column::PersonId.eq(&person_id))
+            .filter(media_people::Column::PersonType.eq(person_type))
+            .one(db)
+            .await
+            .ok()
+            .flatten()
+        {
+            if !role.is_empty() {
+                let mut active: media_people::ActiveModel = existing.into();
+                active.role = Set(Some(role.clone()));
+                let _ = active.update(db).await;
+            }
+        } else {
+            let _ = MediaPeople::insert(media_people::ActiveModel {
+                item_id: Set(item_id.to_string()),
+                person_id: Set(person_id.clone()),
+                role: Set(Some(role.clone())),
+                person_type: Set(person_type.clone()),
+                sort_order: Set(sort_order),
+            })
+            .exec_without_returning(db)
             .await;
+        }
         // Download person profile image
         if let Some(img_url) = image_url {
             if let Err(e) =
@@ -1595,21 +1664,39 @@ async fn download_and_save_tmdb_image(
     ));
     tokio::fs::write(&path, &bytes).await?;
     let now = crate::util::now_unix();
-    let _ = db
-        .execute(crate::db::helpers::pg_statement(
-            r#"INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, width, height, size_bytes, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, NULL, NULL, ?, ?, ?) ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET path = excluded.path, etag = excluded.etag, size_bytes = excluded.size_bytes, updated_at = excluded.updated_at"#,
-            vec![
-                crate::util::stable_text_id(&format!("image-asset:{item_id}:{image_type}:0")).into(),
-                item_id.into(),
-                image_type.into(),
-                path.to_string_lossy().to_string().into(),
-                crate::util::stable_text_id(&format!("tmdb:{item_id}:{image_type}")).into(),
-                i64::try_from(bytes.len()).unwrap_or(i64::MAX).into(),
-                now.into(),
-                now.into(),
-            ],
-        ))
-        .await;
+    let _ = ImageAssets::insert(image_assets::ActiveModel {
+        id: Set(crate::util::stable_text_id(&format!(
+            "image-asset:{item_id}:{image_type}:0"
+        ))),
+        item_id: Set(item_id.to_string()),
+        image_type: Set(image_type.to_string()),
+        image_index: Set(0),
+        path: Set(Some(path.to_string_lossy().to_string())),
+        etag: Set(Some(crate::util::stable_text_id(&format!(
+            "tmdb:{item_id}:{image_type}"
+        )))),
+        width: Set(None),
+        height: Set(None),
+        size_bytes: Set(Some(i64::try_from(bytes.len()).unwrap_or(i64::MAX))),
+        created_at: Set(now),
+        updated_at: Set(now),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            image_assets::Column::ItemId,
+            image_assets::Column::ImageType,
+            image_assets::Column::ImageIndex,
+        ])
+        .update_columns([
+            image_assets::Column::Path,
+            image_assets::Column::Etag,
+            image_assets::Column::SizeBytes,
+            image_assets::Column::UpdatedAt,
+        ])
+        .to_owned(),
+    )
+    .exec_without_returning(db)
+    .await;
     Ok(())
 }
 
@@ -1668,17 +1755,11 @@ async fn get_parent_series_tmdb_id(
     db: &DatabaseConnection,
     season_item_id: &str,
 ) -> Option<String> {
-    // Get the parent_id of the season, then get its TMDb ID
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT parent_id FROM media_items WHERE id = ?",
-            vec![season_item_id.into()],
-        ))
+    let season = MediaItems::find_by_id(season_item_id.to_string())
+        .one(db)
         .await
         .ok()??;
-    let parent_id: String = row.get_str("parent_id").ok()?;
-    // Get the TMDb ID from provider_ids
-    crate::db::provider_ids::get(db, &parent_id, "Tmdb")
+    crate::db::provider_ids::get(db, &season.parent_id, "Tmdb")
         .await
         .ok()?
 }
@@ -1816,18 +1897,13 @@ pub async fn fetch_person_tmdb(
         .error_for_status()?
         .json()
         .await?;
-    if let Some(biography) = resp.biography.filter(|b| !b.is_empty()) {
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE people SET overview = ?, tmdb_id = ? WHERE id = ?",
-            vec![biography.into(), tmdb_id.into(), person_id.into()],
-        ))
-        .await?;
-    } else {
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE people SET tmdb_id = ? WHERE id = ?",
-            vec![tmdb_id.into(), person_id.into()],
-        ))
-        .await?;
+    if let Some(person) = People::find_by_id(person_id.to_string()).one(db).await? {
+        let mut active: people::ActiveModel = person.into();
+        if let Some(biography) = resp.biography.filter(|b| !b.is_empty()) {
+            active.overview = Set(Some(biography));
+        }
+        active.tmdb_id = Set(Some(tmdb_id.to_string()));
+        active.update(db).await?;
     }
     // Also try to fetch TMDb image
     let img_url = tmdb::api_url(tmdb_base_url, &format!("person/{tmdb_id}/images"));
@@ -1887,19 +1963,20 @@ pub async fn batch_fetch_person_tmdb(
     client: &reqwest::Client,
     tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<usize> {
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            "SELECT id, name FROM people WHERE (overview IS NULL OR tmdb_id IS NULL) AND name IS NOT NULL AND name <> '' LIMIT 50",
-            vec![],
-        ))
+    let people = People::find()
+        .all(db)
         .await
         .context("failed to list people without biography")?;
 
     let mut count = 0;
-    for row in &rows {
-        let id: String = row.get_str("id")?;
-        let name: String = row.get_str("name")?;
-        try_fetch_person_tmdb(db, &id, &name, api_key, client, tmdb_base_url).await;
+    for person in people
+        .into_iter()
+        .filter(|person| {
+            (person.overview.is_none() || person.tmdb_id.is_none()) && !person.name.is_empty()
+        })
+        .take(50)
+    {
+        try_fetch_person_tmdb(db, &person.id, &person.name, api_key, client, tmdb_base_url).await;
         count += 1;
     }
     Ok(count)

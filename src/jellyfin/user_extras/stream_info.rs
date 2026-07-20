@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::{
     Json,
@@ -6,16 +6,17 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sea_orm::ConnectionTrait;
+use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{Value, json};
 
-use crate::{app::state::AppState, db::row_ext::QueryResultExt};
-
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
-}
+use crate::{
+    app::state::AppState,
+    entities::{
+        libraries::Entity as Libraries,
+        media_items::{self, Entity as MediaItems},
+        media_streams::{self, Entity as MediaStreams},
+    },
+};
 
 /// DELETE /Users/{user_id}/TrackSelections/{track_type} — clear track selections
 pub async fn clear_track_selections(
@@ -28,22 +29,12 @@ pub async fn clear_track_selections(
 
 /// GET /AudioCodecs — list audio codecs from media_streams
 pub async fn audio_codecs(State(state): State<Arc<AppState>>) -> Response {
-    let rows = public_stream_rows(
-        &state.db,
-        "media_streams.codec AS value",
-        "media_streams.stream_type = 'Audio' AND media_streams.codec IS NOT NULL AND media_streams.codec <> ''",
-        "media_streams.codec ASC",
-    )
-    .await;
+    let values =
+        public_stream_text_values(&state.db, Some("Audio"), |stream| stream.codec.as_deref()).await;
 
-    let codecs: Vec<Value> = rows
+    let codecs: Vec<Value> = values
         .iter()
-        .filter_map(|r| {
-            r.get_opt_str("value")
-                .ok()
-                .flatten()
-                .map(|c| json!({"Name": c, "Id": c}))
-        })
+        .map(|codec| json!({"Name": codec, "Id": codec}))
         .collect();
 
     Json(json!({ "Items": codecs, "TotalRecordCount": codecs.len() })).into_response()
@@ -51,27 +42,19 @@ pub async fn audio_codecs(State(state): State<Arc<AppState>>) -> Response {
 
 /// GET /AudioLayouts — list audio channel layouts
 pub async fn audio_layouts(State(state): State<Arc<AppState>>) -> Response {
-    let rows = public_stream_rows(
-        &state.db,
-        "media_streams.channels AS value",
-        "media_streams.stream_type = 'Audio' AND media_streams.channels IS NOT NULL",
-        "media_streams.channels ASC",
-    )
-    .await;
+    let values = public_stream_channel_values(&state.db).await;
 
-    let layouts: Vec<Value> = rows
+    let layouts: Vec<Value> = values
         .iter()
-        .filter_map(|r| {
-            r.get_opt_i64("value").ok().flatten().map(|ch| {
-                let name = match ch {
-                    1 => "Mono".to_string(),
-                    2 => "Stereo".to_string(),
-                    6 => "5.1".to_string(),
-                    8 => "7.1".to_string(),
-                    n => format!("{}ch", n),
-                };
-                json!({"Name": name, "Id": ch})
-            })
+        .map(|ch| {
+            let name = match ch {
+                1 => "Mono".to_string(),
+                2 => "Stereo".to_string(),
+                6 => "5.1".to_string(),
+                8 => "7.1".to_string(),
+                n => format!("{}ch", n),
+            };
+            json!({"Name": name, "Id": ch})
         })
         .collect();
 
@@ -80,22 +63,14 @@ pub async fn audio_layouts(State(state): State<Arc<AppState>>) -> Response {
 
 /// GET /SubtitleCodecs — list subtitle codecs
 pub async fn subtitle_codecs(State(state): State<Arc<AppState>>) -> Response {
-    let rows = public_stream_rows(
-        &state.db,
-        "media_streams.codec AS value",
-        "media_streams.stream_type = 'Subtitle' AND media_streams.codec IS NOT NULL AND media_streams.codec <> ''",
-        "media_streams.codec ASC",
-    )
+    let values = public_stream_text_values(&state.db, Some("Subtitle"), |stream| {
+        stream.codec.as_deref()
+    })
     .await;
 
-    let codecs: Vec<Value> = rows
+    let codecs: Vec<Value> = values
         .iter()
-        .filter_map(|r| {
-            r.get_opt_str("value")
-                .ok()
-                .flatten()
-                .map(|c| json!({"Name": c, "Id": c}))
-        })
+        .map(|codec| json!({"Name": codec, "Id": codec}))
         .collect();
 
     Json(json!({ "Items": codecs, "TotalRecordCount": codecs.len() })).into_response()
@@ -103,40 +78,87 @@ pub async fn subtitle_codecs(State(state): State<Arc<AppState>>) -> Response {
 
 /// GET /StreamLanguages — list stream languages
 pub async fn stream_languages(State(state): State<Arc<AppState>>) -> Response {
-    let rows = public_stream_rows(
-        &state.db,
-        "media_streams.language AS value",
-        "media_streams.language IS NOT NULL AND media_streams.language <> ''",
-        "media_streams.language ASC",
-    )
-    .await;
+    let values =
+        public_stream_text_values(&state.db, None, |stream| stream.language.as_deref()).await;
 
-    let langs: Vec<Value> = rows
+    let langs: Vec<Value> = values
         .iter()
-        .filter_map(|r| {
-            r.get_opt_str("value")
-                .ok()
-                .flatten()
-                .map(|l| json!({"Name": l, "Id": l}))
-        })
+        .map(|language| json!({"Name": language, "Id": language}))
         .collect();
 
     Json(json!({ "Items": langs, "TotalRecordCount": langs.len() })).into_response()
 }
 
-async fn public_stream_rows(
-    db: &sea_orm::DatabaseConnection,
-    select_expr: &str,
-    filter: &str,
-    order_by: &str,
-) -> Vec<sea_orm::QueryResult> {
-    let visible = visible_media_item_sql("media_items");
-    let sql = format!(
-        "SELECT DISTINCT {select_expr} FROM media_streams JOIN media_items ON media_items.id = media_streams.item_id WHERE {visible} AND {filter} ORDER BY {order_by}"
-    );
-    db.query_all(crate::db::helpers::pg_statement(&sql, vec![]))
+async fn public_stream_text_values<F>(
+    db: &DatabaseConnection,
+    stream_type: Option<&str>,
+    value_for_stream: F,
+) -> Vec<String>
+where
+    F: Fn(&media_streams::Model) -> Option<&str>,
+{
+    let mut values = public_streams(db)
         .await
-        .unwrap_or_default()
+        .into_iter()
+        .filter(|stream| stream_type.is_none_or(|stream_type| stream.stream_type == stream_type))
+        .filter_map(|stream| {
+            value_for_stream(&stream)
+                .map(str::trim)
+                .map(ToString::to_string)
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+async fn public_stream_channel_values(db: &DatabaseConnection) -> Vec<i64> {
+    let mut values = public_streams(db)
+        .await
+        .into_iter()
+        .filter(|stream| stream.stream_type == "Audio")
+        .filter_map(|stream| stream.channels)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+async fn public_streams(db: &DatabaseConnection) -> Vec<media_streams::Model> {
+    let streams = MediaStreams::find().all(db).await.unwrap_or_default();
+    let items = MediaItems::find().all(db).await.unwrap_or_default();
+    let libraries = Libraries::find().all(db).await.unwrap_or_default();
+    let library_ids = libraries
+        .into_iter()
+        .map(|library| library.id)
+        .collect::<HashSet<_>>();
+    let item_by_id = items
+        .into_iter()
+        .map(|item| (item.id.clone(), item))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    streams
+        .into_iter()
+        .filter(|stream| {
+            item_by_id
+                .get(&stream.item_id)
+                .is_some_and(|item| visible_media_item(item, &item_by_id, &library_ids))
+        })
+        .collect()
+}
+
+fn visible_media_item(
+    item: &media_items::Model,
+    item_by_id: &std::collections::HashMap<String, media_items::Model>,
+    library_ids: &HashSet<String>,
+) -> bool {
+    item.is_public != 0
+        && (item.parent_id.is_empty()
+            || library_ids.contains(&item.parent_id)
+            || item_by_id
+                .get(&item.parent_id)
+                .is_some_and(|parent| parent.is_public != 0))
 }
 
 /// GET /ItemTypes — list item types
@@ -155,9 +177,12 @@ pub async fn item_types() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::public_stream_rows;
-    use crate::db::row_ext::QueryResultExt;
-    use sea_orm::ConnectionTrait;
+    use super::{public_stream_channel_values, public_stream_text_values};
+    use crate::entities::{
+        media_items::{self, Entity as MediaItems},
+        media_streams::{self, Entity as MediaStreams},
+    };
+    use sea_orm::{EntityTrait, Set};
 
     #[tokio::test]
     async fn stream_filters_hide_private_media_values() {
@@ -188,62 +213,52 @@ mod tests {
                 1_i64,
             ),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?, ?, ?, 1, 1, 1)",
-                vec![
-                    id.into(),
-                    id.into(),
-                    id.into(),
-                    parent_id.into(),
-                    item_type.into(),
-                    is_folder.into(),
-                    public.into(),
-                ],
-            ))
+            MediaItems::insert(media_items::ActiveModel {
+                id: Set(id.to_string()),
+                title: Set(id.to_string()),
+                path: Set(id.to_string()),
+                library_id: Set(String::new()),
+                parent_id: Set(parent_id.to_string()),
+                item_type: Set(item_type.to_string()),
+                is_folder: Set(is_folder),
+                is_public: Set(public),
+                modified_at: Set(1),
+                created_at: Set(1),
+                updated_at: Set(1),
+                ..Default::default()
+            })
+            .exec_without_returning(&db)
             .await
             .unwrap();
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, channels, is_external, created_at) VALUES (?, ?, 0, 'Audio', ?, ?, ?, 0, 1)",
-                vec![
-                    format!("{id}-audio").into(),
-                    id.into(),
-                    codec.into(),
-                    lang.into(),
-                    channels.into(),
-                ],
-            ))
+            MediaStreams::insert(media_streams::ActiveModel {
+                id: Set(format!("{id}-audio")),
+                item_id: Set(id.to_string()),
+                stream_index: Set(0),
+                stream_type: Set("Audio".to_string()),
+                codec: Set(Some(codec.to_string())),
+                language: Set(Some(lang.to_string())),
+                channels: Set(Some(channels)),
+                is_external: Set(0),
+                created_at: Set(1),
+                ..Default::default()
+            })
+            .exec_without_returning(&db)
             .await
             .unwrap();
         }
 
-        let codecs = public_stream_rows(
-            &db,
-            "media_streams.codec AS value",
-            "media_streams.stream_type = 'Audio' AND media_streams.codec IS NOT NULL AND media_streams.codec <> ''",
-            "media_streams.codec ASC",
-        )
-        .await;
+        let codecs =
+            public_stream_text_values(&db, Some("Audio"), |stream| stream.codec.as_deref()).await;
         assert_eq!(codecs.len(), 1);
-        assert_eq!(codecs[0].get_str("value").unwrap(), "aac");
+        assert_eq!(codecs[0], "aac");
 
-        let languages = public_stream_rows(
-            &db,
-            "media_streams.language AS value",
-            "media_streams.language IS NOT NULL AND media_streams.language <> ''",
-            "media_streams.language ASC",
-        )
-        .await;
+        let languages =
+            public_stream_text_values(&db, None, |stream| stream.language.as_deref()).await;
         assert_eq!(languages.len(), 1);
-        assert_eq!(languages[0].get_str("value").unwrap(), "eng");
+        assert_eq!(languages[0], "eng");
 
-        let layouts = public_stream_rows(
-            &db,
-            "media_streams.channels AS value",
-            "media_streams.stream_type = 'Audio' AND media_streams.channels IS NOT NULL",
-            "media_streams.channels ASC",
-        )
-        .await;
+        let layouts = public_stream_channel_values(&db).await;
         assert_eq!(layouts.len(), 1);
-        assert_eq!(layouts[0].get_i64("value").unwrap(), 2);
+        assert_eq!(layouts[0], 2);
     }
 }

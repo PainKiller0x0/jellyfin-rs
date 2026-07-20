@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::Context;
 use axum::{
@@ -3527,14 +3531,20 @@ fn normalize_device_custom_name(value: Option<&str>) -> anyhow::Result<Option<St
 }
 
 async fn revoke_device(state: &AppState, device_id: &str, now: i64) -> anyhow::Result<()> {
-    state
-        .db
-        .execute(crate::db::helpers::pg_statement(
-            "UPDATE access_tokens SET revoked_at = ? WHERE device_id = ? AND revoked_at IS NULL",
-            vec![now.into(), device_id.into()],
-        ))
+    let tokens = AccessTokens::find()
+        .filter(access_tokens::Column::DeviceId.eq(device_id))
+        .filter(access_tokens::Column::RevokedAt.is_null())
+        .all(&state.db)
         .await
-        .context("failed to revoke device tokens")?;
+        .context("failed to find device tokens")?;
+    for token in tokens {
+        let mut active: access_tokens::ActiveModel = token.into();
+        active.revoked_at = Set(Some(now));
+        active
+            .update(&state.db)
+            .await
+            .context("failed to revoke device tokens")?;
+    }
 
     state
         .playback_sessions
@@ -4085,18 +4095,20 @@ async fn visible_notification_ids(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT id FROM activity_log WHERE log_type = 'Notification' AND (user_id IS NULL OR user_id = ?) AND id IN ({placeholders})"
-    );
-    let mut values = vec![user_id.into()];
-    values.extend(ids.iter().map(|id| id.as_str().into()));
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, values))
+    let rows = ActivityLog::find()
+        .filter(activity_log::Column::LogType.eq("Notification"))
+        .filter(activity_log::Column::Id.is_in(ids.to_vec()))
+        .all(db)
         .await?;
-    Ok(rows
+    let visible_ids = rows
+        .into_iter()
+        .filter(|row| row.user_id.as_deref().map_or(true, |id| id == user_id))
+        .map(|row| row.id)
+        .collect::<HashSet<_>>();
+    Ok(ids
         .iter()
-        .filter_map(|row| row.get_str("id").ok())
+        .filter(|id| visible_ids.contains(*id))
+        .cloned()
         .collect())
 }
 
@@ -5094,7 +5106,9 @@ mod tests {
     };
     use crate::app::state::AppState;
     use crate::app::state::{PlaybackSession, PlaybackState, SessionCapabilities};
-    use crate::entities::{access_tokens, activity_log, users};
+    use crate::entities::{
+        access_tokens, activity_log, media_items, playback_watch_days, task_results, users,
+    };
     use axum::{
         Json,
         body::Bytes,
@@ -5102,7 +5116,7 @@ mod tests {
         http::HeaderMap,
         response::IntoResponse,
     };
-    use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, Set};
+    use sea_orm::{DatabaseConnection, EntityTrait, PaginatorTrait, Set};
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
     use uuid::Uuid;
@@ -5736,10 +5750,14 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO task_results (task_id, status, start_time, end_time, message) VALUES ('scan-library', 'Failed', 1, 2, 'boom')",
-            vec![],
-        ))
+        task_results::Entity::insert(task_results::ActiveModel {
+            task_id: Set("scan-library".to_string()),
+            status: Set("Failed".to_string()),
+            start_time: Set(Some(1)),
+            end_time: Set(Some(2)),
+            message: Set(Some("boom".to_string())),
+        })
+        .exec(&db)
         .await
         .unwrap();
 
@@ -6059,42 +6077,40 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, ?, ?, 0, 0, 1, 1)",
-            vec!["u1".into(), "alice".into(), "Alice".into()],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, ?, ?, 0, 0, 1, 1)",
-            vec!["u2".into(), "bob".into(), "Bob".into()],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, 1, 1, 1)",
-            vec!["m1".into(), "Movie".into(), "D:/movie.mkv".into()],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO playback_watch_days (day, user_id, item_id, watch_seconds, play_count, last_played_at) VALUES ('1970-01-01', ?, ?, 120, 2, 10)",
-            vec!["u1".into(), "m1".into()],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Episode', 0, 1, 1, 1)",
-            vec!["e1".into(), "Episode".into(), "D:/episode.mkv".into()],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO playback_watch_days (day, user_id, item_id, watch_seconds, play_count, last_played_at) VALUES ('1970-01-02', ?, ?, 60, 1, 90010)",
-            vec!["u2".into(), "e1".into()],
-        ))
-        .await
-        .unwrap();
+        insert_test_user(&db, "u1", "alice", "Alice", 0, None).await;
+        insert_test_user(&db, "u2", "bob", "Bob", 0, None).await;
+        insert_test_item(
+            &db,
+            "m1",
+            "Movie",
+            "D:/movie.mkv",
+            "Movie",
+            0,
+            None,
+            None,
+            None,
+            1,
+            1,
+            1,
+        )
+        .await;
+        insert_watch_day(&db, "1970-01-01", "u1", "m1", 120, 2, Some(10)).await;
+        insert_test_item(
+            &db,
+            "e1",
+            "Episode",
+            "D:/episode.mkv",
+            "Episode",
+            0,
+            None,
+            None,
+            None,
+            1,
+            1,
+            1,
+        )
+        .await;
+        insert_watch_day(&db, "1970-01-02", "u2", "e1", 60, 1, Some(90010)).await;
 
         let rows = play_activity_rows(&db, &[], None, None).await.unwrap();
         assert_eq!(rows.len(), 2);
@@ -6206,12 +6222,21 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES ('m1', 'Movie', 'D:/movie.mkv', '', '', 'Movie', 0, 1, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_test_item(
+            &db,
+            "m1",
+            "Movie",
+            "D:/movie.mkv",
+            "Movie",
+            0,
+            None,
+            None,
+            None,
+            1,
+            1,
+            1,
+        )
+        .await;
 
         let ok = run_user_usage_custom_query(
             &db,
@@ -6250,12 +6275,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, password_hash, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'alice', 'Alice', 'secret-hash', 1, 0, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_test_user(&db, "u1", "alice", "Alice", 1, Some("secret-hash")).await;
         let state = Arc::new(test_state(db));
 
         let response =
@@ -6271,18 +6291,36 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, overview, production_year, runtime_ticks, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, 'overview', 2024, 1200000000, 1, 2, 3)",
-            vec!["m1".into(), "Movie".into(), "D:/movie.mkv".into()],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Episode', 0, 1, 2, 3)",
-            vec!["e1".into(), "Episode".into(), "D:/episode.mkv".into()],
-        ))
-        .await
-        .unwrap();
+        insert_test_item(
+            &db,
+            "m1",
+            "Movie",
+            "D:/movie.mkv",
+            "Movie",
+            0,
+            Some("overview"),
+            Some(2024),
+            Some(1_200_000_000),
+            1,
+            2,
+            3,
+        )
+        .await;
+        insert_test_item(
+            &db,
+            "e1",
+            "Episode",
+            "D:/episode.mkv",
+            "Episode",
+            0,
+            None,
+            None,
+            None,
+            1,
+            2,
+            3,
+        )
+        .await;
         let mut query = HashMap::new();
         query.insert("IncludeItemTypes".to_string(), "Movie".to_string());
         query.insert("ReportColumns".to_string(), "Name,Year,Runtime".to_string());
@@ -6468,12 +6506,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'alice', 'Alice', 0, 0, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_test_user(&db, "u1", "alice", "Alice", 0, None).await;
         let state = Arc::new(test_state(db));
 
         assert_eq!(
@@ -6494,6 +6527,89 @@ mod tests {
         assert_eq!(alice.len(), 1);
         assert_eq!(alice[0]["Name"], "SMTP Test");
         assert!(other.is_empty());
+    }
+
+    async fn insert_test_user(
+        db: &DatabaseConnection,
+        id: &str,
+        username: &str,
+        display_name: &str,
+        is_admin: i64,
+        password_hash: Option<&str>,
+    ) {
+        users::Entity::insert(users::ActiveModel {
+            id: Set(id.to_string()),
+            username: Set(username.to_string()),
+            password_hash: Set(password_hash.map(ToString::to_string)),
+            display_name: Set(display_name.to_string()),
+            is_admin: Set(is_admin),
+            is_disabled: Set(0),
+            created_at: Set(1),
+            updated_at: Set(1),
+            last_login_at: Set(None),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_test_item(
+        db: &DatabaseConnection,
+        id: &str,
+        title: &str,
+        path: &str,
+        item_type: &str,
+        is_folder: i64,
+        overview: Option<&str>,
+        production_year: Option<i64>,
+        runtime_ticks: Option<i64>,
+        modified_at: i64,
+        created_at: i64,
+        updated_at: i64,
+    ) {
+        media_items::Entity::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(path.to_string()),
+            library_id: Set(String::new()),
+            parent_id: Set(String::new()),
+            item_type: Set(item_type.to_string()),
+            is_folder: Set(is_folder),
+            is_public: Set(1),
+            overview: Set(overview.map(ToString::to_string)),
+            production_year: Set(production_year),
+            runtime_ticks: Set(runtime_ticks),
+            modified_at: Set(modified_at),
+            created_at: Set(created_at),
+            updated_at: Set(updated_at),
+            ..Default::default()
+        })
+        .exec(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_watch_day(
+        db: &DatabaseConnection,
+        day: &str,
+        user_id: &str,
+        item_id: &str,
+        watch_seconds: i64,
+        play_count: i64,
+        last_played_at: Option<i64>,
+    ) {
+        playback_watch_days::Entity::insert(playback_watch_days::ActiveModel {
+            day: Set(day.to_string()),
+            user_id: Set(user_id.to_string()),
+            item_id: Set(item_id.to_string()),
+            watch_seconds: Set(watch_seconds),
+            play_count: Set(play_count),
+            last_played_at: Set(last_played_at),
+        })
+        .exec(db)
+        .await
+        .unwrap();
     }
 
     #[test]

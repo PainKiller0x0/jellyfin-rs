@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -15,7 +15,10 @@ use crate::{
         AppState, PlaybackSession, PlaybackState, SessionCapabilities, SessionUserInfo,
         session_timeout_seconds,
     },
-    entities::users::{self, Entity as Users},
+    entities::{
+        access_tokens::{self, Entity as AccessTokens},
+        users::{self, Entity as Users},
+    },
     jellyfin::{
         auth::{auth_header_value_field, request_token, request_user_id_or_default},
         common::internal_error,
@@ -194,12 +197,11 @@ pub async fn logout(
     };
 
     let now = now_unix();
-    if let Err(error) = state
-        .db
-        .execute(crate::db::helpers::pg_statement(
-            "UPDATE access_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
-            vec![now.into(), stable_text_id(&token).into()],
-        ))
+    if let Err(error) = AccessTokens::update_many()
+        .col_expr(access_tokens::Column::RevokedAt, now.into())
+        .filter(access_tokens::Column::TokenHash.eq(stable_text_id(&token)))
+        .filter(access_tokens::Column::RevokedAt.is_null())
+        .exec(&state.db)
         .await
     {
         return internal_error(error.into());
@@ -793,11 +795,12 @@ mod tests {
     use crate::app::state::{
         AppState, PlaybackSession, PlaybackState, SessionCapabilities, SessionUserInfo,
     };
+    use crate::entities::users::{self, Entity as Users};
     use axum::{
         extract::State,
         http::{HeaderMap, HeaderValue, StatusCode},
     };
-    use sea_orm::{ConnectionTrait, DatabaseConnection};
+    use sea_orm::{DatabaseConnection, EntityTrait, Set};
     use serde_json::json;
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
@@ -1038,12 +1041,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u2', 'guest', 'guest', 0, 0, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_test_user(&db, "u2", "guest").await;
         let state = Arc::new(test_state(db));
         let mut session = test_session();
         session.additional_users.clear();
@@ -1108,12 +1106,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('new-user', 'new-user', 'new-user', 0, 0, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_test_user(&db, "new-user", "new-user").await;
         let state = Arc::new(test_state(db));
         let mut session = test_session();
         session.additional_users = (0..MAX_SESSION_ARRAY_ITEMS)
@@ -1187,6 +1180,22 @@ mod tests {
                 supports_persistent_identifier: true,
             },
         }
+    }
+
+    async fn insert_test_user(db: &DatabaseConnection, id: &str, username: &str) {
+        Users::insert(users::ActiveModel {
+            id: Set(id.to_string()),
+            username: Set(username.to_string()),
+            display_name: Set(username.to_string()),
+            is_admin: Set(0),
+            is_disabled: Set(0),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
     }
 
     fn test_state(db: DatabaseConnection) -> AppState {

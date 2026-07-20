@@ -6,12 +6,15 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use sea_orm::ConnectionTrait;
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde_json::{Value, json};
 
 use crate::{
     app::state::AppState,
-    db::row_ext::QueryResultExt,
+    entities::{
+        linked_children::{self, Entity as LinkedChildren},
+        media_items::Entity as MediaItems,
+    },
     jellyfin::{
         auth::request_user_id_and_admin_or_default, collect::playlist_write_access,
         common::internal_error,
@@ -210,15 +213,23 @@ async fn move_playlist_item_inner(
     item_id: &str,
     new_index: usize,
 ) -> anyhow::Result<bool> {
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            r#"SELECT lc.item_id FROM linked_children lc JOIN media_items mi ON mi.id = lc.parent_id WHERE lc.parent_id = ? AND mi.item_type = 'Playlist' ORDER BY lc.sort_order ASC"#,
-            vec![playlist_id.into()],
-        ))
+    let Some(playlist) = MediaItems::find_by_id(playlist_id.to_string())
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if playlist.item_type != "Playlist" {
+        return Ok(false);
+    }
+    let children = LinkedChildren::find()
+        .filter(linked_children::Column::ParentId.eq(playlist_id))
+        .order_by_asc(linked_children::Column::SortOrder)
+        .all(db)
         .await?;
-    let mut ids = rows
+    let mut ids = children
         .iter()
-        .filter_map(|row| row.get_str("item_id").ok())
+        .map(|child| child.item_id.clone())
         .collect::<Vec<_>>();
     let Some(index) = ids.iter().position(|id| id == item_id) else {
         return Ok(false);
@@ -226,15 +237,15 @@ async fn move_playlist_item_inner(
     let moved = ids.remove(index);
     ids.insert(new_index.min(ids.len()), moved);
     for (index, id) in ids.iter().enumerate() {
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE linked_children SET sort_order = ? WHERE parent_id = ? AND item_id = ?",
-            vec![
-                i64::try_from(index).unwrap_or(i64::MAX).into(),
-                playlist_id.into(),
-                id.as_str().into(),
-            ],
-        ))
-        .await?;
+        let Some(child) = LinkedChildren::find_by_id((playlist_id.to_string(), id.to_string()))
+            .one(db)
+            .await?
+        else {
+            continue;
+        };
+        let mut active: linked_children::ActiveModel = child.into();
+        active.sort_order = Set(i64::try_from(index).unwrap_or(i64::MAX));
+        active.update(db).await?;
     }
     Ok(true)
 }
@@ -261,7 +272,8 @@ pub async fn add_to_playlist_info(
 mod tests {
     use super::*;
     use crate::app::state::PlaybackSession;
-    use sea_orm::{ConnectionTrait, DatabaseConnection};
+    use crate::entities::media_items;
+    use sea_orm::{DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
     use uuid::Uuid;
@@ -339,18 +351,31 @@ mod tests {
             ("b", "Audio"),
             ("c", "Audio"),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', ?, 0, 1, 1, 1, 1)",
-                vec![id.into(), id.into(), id.into(), item_type.into()],
-            ))
+            MediaItems::insert(media_items::ActiveModel {
+                id: Set(id.to_string()),
+                title: Set(id.to_string()),
+                path: Set(id.to_string()),
+                library_id: Set(String::new()),
+                parent_id: Set(String::new()),
+                item_type: Set(item_type.to_string()),
+                is_folder: Set(0),
+                is_public: Set(1),
+                modified_at: Set(1),
+                created_at: Set(1),
+                updated_at: Set(1),
+                ..Default::default()
+            })
+            .exec_without_returning(&db)
             .await
             .unwrap();
         }
         for (index, id) in ["a", "b", "c"].iter().enumerate() {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES ('playlist', ?, ?)",
-                vec![(*id).into(), i64::try_from(index).unwrap().into()],
-            ))
+            LinkedChildren::insert(linked_children::ActiveModel {
+                parent_id: Set("playlist".to_string()),
+                item_id: Set((*id).to_string()),
+                sort_order: Set(i64::try_from(index).unwrap()),
+            })
+            .exec_without_returning(&db)
             .await
             .unwrap();
         }
@@ -366,16 +391,15 @@ mod tests {
                 .unwrap()
         );
 
-        let rows = db
-            .query_all(crate::db::helpers::pg_statement(
-                "SELECT item_id FROM linked_children WHERE parent_id = 'playlist' ORDER BY sort_order ASC",
-                vec![],
-            ))
+        let rows = LinkedChildren::find()
+            .filter(linked_children::Column::ParentId.eq("playlist"))
+            .order_by_asc(linked_children::Column::SortOrder)
+            .all(&db)
             .await
             .unwrap();
         let ids = rows
             .iter()
-            .filter_map(|row| row.get_str("item_id").ok())
+            .map(|row| row.item_id.clone())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["c", "a", "b"]);
     }

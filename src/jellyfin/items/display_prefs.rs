@@ -7,11 +7,13 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sea_orm::ConnectionTrait;
+use sea_orm::{EntityTrait, Set, sea_query::OnConflict};
 use serde_json::{Value, json};
 
 use crate::{
-    app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error,
+    app::state::AppState,
+    entities::display_preferences::{self, Entity as DisplayPreferences},
+    jellyfin::common::internal_error,
     util::now_unix,
 };
 
@@ -49,13 +51,24 @@ pub async fn update_display_preferences(
         Err(error) => return validation_error_response(error.0, error.1),
     };
     let id = display_preferences_key(&prefs_id, &user_id, &client);
-    match state
-        .db
-        .execute(crate::db::helpers::pg_statement(
-            r#"INSERT INTO display_preferences (id, user_id, preferences_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET preferences_json = excluded.preferences_json, user_id = excluded.user_id, updated_at = excluded.updated_at"#,
-            vec![id.into(), user_id.into(), prefs_json.into(), now.into(), now.into()],
-        ))
-        .await
+    match DisplayPreferences::insert(display_preferences::ActiveModel {
+        id: Set(id),
+        user_id: Set(user_id),
+        preferences_json: Set(prefs_json),
+        created_at: Set(now),
+        updated_at: Set(now),
+    })
+    .on_conflict(
+        OnConflict::column(display_preferences::Column::Id)
+            .update_columns([
+                display_preferences::Column::PreferencesJson,
+                display_preferences::Column::UserId,
+                display_preferences::Column::UpdatedAt,
+            ])
+            .to_owned(),
+    )
+    .exec_without_returning(&state.db)
+    .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error.into()),
@@ -69,22 +82,21 @@ async fn display_preferences_inner(
     client: &str,
 ) -> anyhow::Result<Option<Value>> {
     let id = display_preferences_key(prefs_id, user_id, client);
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT preferences_json FROM display_preferences WHERE id IN (?, ?) ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END LIMIT 1",
-            vec![
-                id.clone().into(),
-                legacy_display_preferences_key(prefs_id).into(),
-                id.into(),
-            ],
-        ))
+    let model = if let Some(model) = DisplayPreferences::find_by_id(id)
+        .one(db)
         .await
-        .context("failed to load display preferences")?;
-    match row {
-        Some(row) => {
-            let json_str: String = row.get_str("preferences_json")?;
-            Ok(Some(serde_json::from_str(&json_str)?))
-        }
+        .context("failed to load display preferences")?
+    {
+        Some(model)
+    } else {
+        DisplayPreferences::find_by_id(legacy_display_preferences_key(prefs_id))
+            .one(db)
+            .await
+            .context("failed to load legacy display preferences")?
+    };
+
+    match model {
+        Some(model) => Ok(Some(serde_json::from_str(&model.preferences_json)?)),
         None => Ok(None),
     }
 }

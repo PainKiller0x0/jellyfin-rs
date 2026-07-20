@@ -17,7 +17,9 @@ use crate::{
     db::row_ext::QueryResultExt,
     entities::{
         image_assets::{self, Entity as ImageAssets},
+        media_people::{self, Entity as MediaPeople},
         people::Entity as People,
+        user_data::Entity as UserData,
     },
     jellyfin::{
         auth::request_user_id_and_admin_or_default,
@@ -126,14 +128,10 @@ async fn person_detail(
         .or_else(|| query.get("userId"))
         .map(String::as_str);
     let is_favorite = if let Some(uid) = user_id {
-        state
-            .db
-            .query_one(crate::db::helpers::pg_statement(
-                "SELECT is_favorite FROM user_data WHERE user_id = ? AND item_id = ?",
-                vec![uid.into(), person.id.clone().into()],
-            ))
+        UserData::find_by_id((uid.to_string(), person.id.clone()))
+            .one(&state.db)
             .await?
-            .map(|r| r.get_i64("is_favorite").unwrap_or(0) != 0)
+            .map(|data| data.is_favorite != 0)
             .unwrap_or(false)
     } else {
         false
@@ -325,30 +323,26 @@ async fn has_artist_relation(
 ) -> anyhow::Result<bool> {
     let artist_type = query_param(query, &["ArtistType", "artistType"]);
     let person_types = artist_person_types(false, artist_type);
-    let placeholders = person_types
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut values: Vec<Value> = vec![person_id.into()];
-    values.extend(person_types.iter().map(|value| (*value).into()));
-
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            &format!(
-                "SELECT COUNT(*) AS cnt FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id WHERE mp.person_id = ? AND LOWER(mp.person_type) IN ({placeholders}){}",
-                if include_private {
-                    String::new()
-                } else {
-                    format!(" AND {}", visible_media_item_sql("mi"))
-                }
-            ),
-            values,
-        ))
+    let links = MediaPeople::find()
+        .filter(media_people::Column::PersonId.eq(person_id))
+        .all(db)
         .await?;
-    Ok(row
-        .map(|row| row.get_i64("cnt").unwrap_or_default() > 0)
-        .unwrap_or(false))
+    for link in links {
+        if !person_types
+            .iter()
+            .any(|person_type| link.person_type.eq_ignore_ascii_case(person_type))
+        {
+            continue;
+        }
+        if include_private
+            || crate::jellyfin::item_queries::find_media_item(db, "", &link.item_id)
+                .await?
+                .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) async fn has_person_relation(
@@ -356,22 +350,20 @@ pub(crate) async fn has_person_relation(
     person_id: &str,
     include_private: bool,
 ) -> anyhow::Result<bool> {
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            &format!(
-                "SELECT COUNT(*) AS cnt FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id WHERE mp.person_id = ?{}",
-                if include_private {
-                    String::new()
-                } else {
-                    format!(" AND {}", visible_media_item_sql("mi"))
-                }
-            ),
-            vec![person_id.into()],
-        ))
+    let links = MediaPeople::find()
+        .filter(media_people::Column::PersonId.eq(person_id))
+        .all(db)
         .await?;
-    Ok(row
-        .map(|row| row.get_i64("cnt").unwrap_or_default() > 0)
-        .unwrap_or(false))
+    for link in links {
+        if include_private
+            || crate::jellyfin::item_queries::find_media_item(db, "", &link.item_id)
+                .await?
+                .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn artist_person_types(album_only: bool, artist_type: Option<&str>) -> Vec<&'static str> {
@@ -687,9 +679,15 @@ mod tests {
         artist_person_types, count_tagged_items, fetch_tagged_items, has_person_relation,
         serve_person_image,
     };
+    use crate::entities::{
+        image_assets::{self, Entity as ImageAssets},
+        media_items::{self, Entity as MediaItems},
+        media_people::{self, Entity as MediaPeople},
+        people::{self, Entity as People},
+    };
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
-    use sea_orm::ConnectionTrait;
+    use sea_orm::{EntityTrait, Set};
     use std::path::PathBuf;
 
     #[test]
@@ -841,13 +839,18 @@ mod tests {
         ));
         std::fs::create_dir_all(image_path.parent().unwrap()).unwrap();
         std::fs::write(&image_path, b"png").unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, created_at, updated_at) VALUES (?, 'p1', 'Primary', 0, ?, 'tag', 1, 1)",
-            vec![
-                format!("img-{}", uuid::Uuid::new_v4().simple()).into(),
-                image_path.to_string_lossy().to_string().into(),
-            ],
-        ))
+        ImageAssets::insert(image_assets::ActiveModel {
+            id: Set(format!("img-{}", uuid::Uuid::new_v4().simple())),
+            item_id: Set("p1".to_string()),
+            image_type: Set("Primary".to_string()),
+            image_index: Set(0),
+            path: Set(Some(image_path.to_string_lossy().to_string())),
+            etag: Set(Some("tag".to_string())),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
         .await
         .unwrap();
 
@@ -870,10 +873,13 @@ mod tests {
     }
 
     async fn insert_person(db: &sea_orm::DatabaseConnection, id: &str, name: &str) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO people (id, name, created_at) VALUES (?, ?, 1)",
-            vec![id.into(), name.into()],
-        ))
+        People::insert(people::ActiveModel {
+            id: Set(id.to_string()),
+            name: Set(name.to_string()),
+            created_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
@@ -894,16 +900,21 @@ mod tests {
         parent_id: &str,
         is_public: i64,
     ) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', 0, ?, 1, 1, 1)",
-            vec![
-                id.into(),
-                title.into(),
-                id.into(),
-                parent_id.into(),
-                is_public.into(),
-            ],
-        ))
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(id.to_string()),
+            library_id: Set(String::new()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set("Movie".to_string()),
+            is_folder: Set(0),
+            is_public: Set(is_public),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
@@ -914,10 +925,14 @@ mod tests {
         person_id: &str,
         person_type: &str,
     ) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_people (item_id, person_id, person_type, sort_order) VALUES (?, ?, ?, 0)",
-            vec![item_id.into(), person_id.into(), person_type.into()],
-        ))
+        MediaPeople::insert(media_people::ActiveModel {
+            item_id: Set(item_id.to_string()),
+            person_id: Set(person_id.to_string()),
+            person_type: Set(person_type.to_string()),
+            sort_order: Set(0),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
@@ -1029,27 +1044,10 @@ async fn find_person_image_asset(
     image_type: &str,
     image_index: i64,
 ) -> anyhow::Result<Option<image_assets::Model>> {
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT id, item_id, image_type, image_index, path, etag, width, height, size_bytes, created_at, updated_at FROM image_assets WHERE item_id = ? AND image_type = ? AND CAST(image_index AS TEXT) = ? LIMIT 1",
-            vec![person_id.into(), image_type.into(), image_index.to_string().into()],
-        ))
-        .await?;
-
-    row.map(|row| {
-        Ok(image_assets::Model {
-            id: row.get_str("id")?,
-            item_id: row.get_str("item_id")?,
-            image_type: row.get_str("image_type")?,
-            image_index: row.get_i64("image_index")?,
-            path: row.get_opt_str("path")?,
-            etag: row.get_opt_str("etag")?,
-            width: row.get_opt_i64("width")?,
-            height: row.get_opt_i64("height")?,
-            size_bytes: row.get_opt_i64("size_bytes")?,
-            created_at: row.get_i64("created_at")?,
-            updated_at: row.get_i64("updated_at")?,
-        })
-    })
-    .transpose()
+    Ok(ImageAssets::find()
+        .filter(image_assets::Column::ItemId.eq(person_id))
+        .filter(image_assets::Column::ImageType.eq(image_type))
+        .filter(image_assets::Column::ImageIndex.eq(image_index))
+        .one(db)
+        .await?)
 }

@@ -432,38 +432,25 @@ pub async fn home_section_items(
 #[cfg(test)]
 mod tests {
     use super::movie_recommendations_inner;
-    use sea_orm::ConnectionTrait;
+    use crate::entities::{
+        libraries::{self, Entity as Libraries},
+        media_items::{self, Entity as MediaItems},
+    };
+    use sea_orm::{DatabaseConnection, EntityTrait, Set};
 
     #[tokio::test]
     async fn movie_recommendations_ignore_private_candidates_before_limit() {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES ('movies', 'Movies', 'movies', 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_library(&db).await;
         for (id, title, parent_id, is_public, rating) in [
             ("private", "Private", "", 0, 10.0),
             ("hidden-parent", "Hidden Parent", "", 0, 9.5),
             ("hidden-child", "Hidden Child", "hidden-parent", 1, 9.0),
             ("public", "Public", "", 1, 8.0),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, community_rating, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', ?, 'Movie', 1, ?, ?, 1, 1, 1)",
-                vec![
-                    id.into(),
-                    title.into(),
-                    id.into(),
-                    parent_id.into(),
-                    is_public.into(),
-                    rating.into(),
-                ],
-            ))
-            .await
-            .unwrap();
+            insert_movie(&db, id, title, parent_id, is_public, rating).await;
         }
 
         let categories = movie_recommendations_inner(&db, "u1", None, 1, 1)
@@ -471,5 +458,46 @@ mod tests {
             .unwrap();
         assert_eq!(categories.len(), 1);
         assert_eq!(categories[0]["Items"][0]["Id"], "public");
+    }
+
+    async fn insert_library(db: &DatabaseConnection) {
+        Libraries::insert(libraries::ActiveModel {
+            id: Set("movies".to_string()),
+            name: Set("Movies".to_string()),
+            collection_type: Set("movies".to_string()),
+            created_at: Set(1),
+            updated_at: Set(1),
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_movie(
+        db: &DatabaseConnection,
+        id: &str,
+        title: &str,
+        parent_id: &str,
+        is_public: i64,
+        rating: f64,
+    ) {
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(id.to_string()),
+            library_id: Set("movies".to_string()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set("Movie".to_string()),
+            is_folder: Set(1),
+            is_public: Set(is_public),
+            community_rating: Set(Some(rating)),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
     }
 }

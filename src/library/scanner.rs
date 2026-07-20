@@ -1,13 +1,22 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
-use sea_orm::ConnectionTrait;
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use walkdir::WalkDir;
 
 use crate::{
     app::state::AppState,
-    db::row_ext::QueryResultExt,
+    entities::{
+        image_assets::{self, Entity as ImageAssets},
+        libraries::Entity as Libraries,
+        library_paths::{self, Entity as LibraryPaths},
+        media_genres::{self, Entity as MediaGenres},
+        media_items::{self, Entity as MediaItems},
+        media_people::{self, Entity as MediaPeople},
+        media_studios::{self, Entity as MediaStudios},
+        provider_ids::{self, Entity as ProviderIds},
+    },
     library::{
         classify::{classify_media_path, parent_id_for_path, tv_folder_type},
         images::upsert_sidecar_images,
@@ -932,70 +941,91 @@ fn queue_metadata_fetch(
 }
 
 async fn clear_scraped_folder_metadata(db: &sea_orm::DatabaseConnection, item_id: &str) {
-    for table in [
-        "provider_ids",
-        "media_genres",
-        "media_studios",
-        "media_people",
-    ] {
-        if let Err(error) = db
-            .execute(crate::db::helpers::pg_statement(
-                &format!("DELETE FROM {table} WHERE item_id = ?"),
-                vec![item_id.into()],
-            ))
-            .await
-        {
-            tracing::debug!("failed to clear {table} for folder {item_id}: {error:#}");
-        }
-    }
-    if let Err(error) = db
-        .execute(crate::db::helpers::pg_statement(
-            r#"UPDATE media_items
-               SET overview = NULL,
-                   official_rating = NULL,
-                   production_year = NULL,
-                   premiere_date = NULL,
-                   community_rating = NULL,
-                   critic_rating = NULL,
-                   runtime_ticks = NULL
-               WHERE id = ? AND item_type = 'Folder'"#,
-            vec![item_id.into()],
-        ))
+    if let Err(error) = ProviderIds::delete_many()
+        .filter(provider_ids::Column::ItemId.eq(item_id))
+        .exec(db)
         .await
     {
-        tracing::debug!("failed to clear scraped scalar metadata for folder {item_id}: {error:#}");
+        tracing::debug!("failed to clear provider_ids for folder {item_id}: {error:#}");
+    }
+    if let Err(error) = MediaGenres::delete_many()
+        .filter(media_genres::Column::ItemId.eq(item_id))
+        .exec(db)
+        .await
+    {
+        tracing::debug!("failed to clear media_genres for folder {item_id}: {error:#}");
+    }
+    if let Err(error) = MediaStudios::delete_many()
+        .filter(media_studios::Column::ItemId.eq(item_id))
+        .exec(db)
+        .await
+    {
+        tracing::debug!("failed to clear media_studios for folder {item_id}: {error:#}");
+    }
+    if let Err(error) = MediaPeople::delete_many()
+        .filter(media_people::Column::ItemId.eq(item_id))
+        .exec(db)
+        .await
+    {
+        tracing::debug!("failed to clear media_people for folder {item_id}: {error:#}");
+    }
+
+    match MediaItems::find_by_id(item_id.to_string()).one(db).await {
+        Ok(Some(item)) if item.item_type == "Folder" => {
+            let mut active: media_items::ActiveModel = item.into();
+            active.overview = Set(None);
+            active.official_rating = Set(None);
+            active.production_year = Set(None);
+            active.premiere_date = Set(None);
+            active.community_rating = Set(None);
+            active.critic_rating = Set(None);
+            active.runtime_ticks = Set(None);
+            if let Err(error) = active.update(db).await {
+                tracing::debug!(
+                    "failed to clear scraped scalar metadata for folder {item_id}: {error:#}"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!("failed to load folder for metadata clearing {item_id}: {error:#}");
+        }
     }
 }
 
 async fn tmdb_metadata_is_current(db: &sea_orm::DatabaseConnection, item_id: &str) -> bool {
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            r#"SELECT CASE WHEN EXISTS (
-                    SELECT 1 FROM provider_ids p
-                    WHERE p.item_id = mi.id AND p.provider = 'Tmdb'
-                )
-                AND mi.overview IS NOT NULL
-                AND mi.production_year IS NOT NULL
-                AND mi.premiere_date IS NOT NULL
-                AND EXISTS (
-                    SELECT 1 FROM image_assets ia
-                    WHERE ia.item_id = mi.id AND ia.image_type = 'Primary'
-                )
-                THEN 1::BIGINT ELSE 0::BIGINT END AS is_current
-               FROM media_items mi
-               WHERE mi.id = ?"#,
-            vec![item_id.into()],
-        ))
-        .await;
-
-    match row {
-        Ok(Some(row)) => row.get_bool_from_i64("is_current").unwrap_or(false),
-        Ok(None) => false,
+    let item = match MediaItems::find_by_id(item_id.to_string()).one(db).await {
+        Ok(Some(item)) => item,
+        Ok(None) => return false,
         Err(error) => {
-            tracing::debug!("failed to check TMDb metadata state for {item_id}: {error:#}");
-            false
+            tracing::debug!("failed to read item for TMDb metadata state {item_id}: {error:#}");
+            return false;
         }
+    };
+    if item.overview.is_none() || item.production_year.is_none() || item.premiere_date.is_none() {
+        return false;
     }
+
+    let has_tmdb_id = ProviderIds::find()
+        .filter(provider_ids::Column::ItemId.eq(item_id))
+        .filter(provider_ids::Column::Provider.eq("Tmdb"))
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    if !has_tmdb_id {
+        return false;
+    }
+
+    ImageAssets::find()
+        .filter(image_assets::Column::ItemId.eq(item_id))
+        .filter(image_assets::Column::ImageType.eq("Primary"))
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn has_sidecar_nfo(path: &std::path::Path) -> bool {
@@ -1007,27 +1037,35 @@ fn has_sidecar_nfo(path: &std::path::Path) -> bool {
 }
 
 async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String, String)>> {
-    let rows = state
-        .db
-        .query_all(crate::db::helpers::pg_statement(
-            "SELECT lp.path, lp.library_id, l.collection_type FROM library_paths lp JOIN libraries l ON l.id = lp.library_id ORDER BY lp.path ASC",
-            vec![],
-        ))
+    let paths = LibraryPaths::find()
+        .order_by_asc(library_paths::Column::Path)
+        .all(&state.db)
         .await
         .context("failed to list library paths for scan")?;
-    if rows.is_empty() {
+    if paths.is_empty() {
         return Ok(Vec::new());
     }
 
-    rows.iter()
-        .map(|row| -> anyhow::Result<(PathBuf, String, String)> {
-            Ok((
-                PathBuf::from(path_utils::normalize_path(&row.get_str("path")?)),
-                row.get_str("library_id")?,
-                row.get_str("collection_type")?,
-            ))
+    let libraries = Libraries::find()
+        .all(&state.db)
+        .await
+        .context("failed to list libraries for scan")?
+        .into_iter()
+        .map(|library| (library.id.clone(), library))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    Ok(paths
+        .into_iter()
+        .filter_map(|path| {
+            libraries.get(&path.library_id).map(|library| {
+                (
+                    PathBuf::from(path_utils::normalize_path(&path.path)),
+                    path.library_id,
+                    library.collection_type.clone(),
+                )
+            })
         })
-        .collect()
+        .collect())
 }
 
 fn media_probe_concurrency() -> usize {

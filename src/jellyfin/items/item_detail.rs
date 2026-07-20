@@ -1217,7 +1217,12 @@ mod tests {
         attach_media_sources, enrich_episode_list, get_episode_parent_info,
         item_json_with_provider_ids,
     };
-    use sea_orm::{ConnectionTrait, DatabaseConnection};
+    use crate::entities::{
+        libraries::{self, Entity as Libraries},
+        media_items::{self, Entity as MediaItems},
+        media_streams::{self, Entity as MediaStreams},
+    };
+    use sea_orm::{DatabaseConnection, EntityTrait, Set};
     use serde_json::json;
 
     #[test]
@@ -1290,12 +1295,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
-            vec!["tv".into(), "TV".into(), "tvshows".into()],
-        ))
-        .await
-        .unwrap();
+        insert_library(&db, "tv", "TV", "tvshows").await;
         insert_item(&db, "series", "Series", "tv", "Series", 1, 1, None, None).await;
         insert_item(
             &db,
@@ -1455,26 +1455,39 @@ mod tests {
         };
         for (id, name, collection_type) in [("movies", "Movies", "movies"), ("tv", "TV", "tvshows")]
         {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
-                vec![id.into(), name.into(), collection_type.into()],
-            ))
-            .await
-            .unwrap();
+            insert_library(&db, id, name, collection_type).await;
         }
 
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('movie', 'Movie', '/tmp/movie', 'movies', 'movies', 'Movie', 1, 1, 1, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES ('movie-video', 'Movie.mkv', '/tmp/movie/Movie.mkv', 'movies', 'movie', 'Video', 0, 1, 'mkv', 1, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_item_with_path(
+            &db,
+            "movie",
+            "Movie",
+            "/tmp/movie",
+            "movies",
+            "movies",
+            "Movie",
+            1,
+            1,
+            None,
+            None,
+            None,
+        )
+        .await;
+        insert_item_with_path(
+            &db,
+            "movie-video",
+            "Movie.mkv",
+            "/tmp/movie/Movie.mkv",
+            "movies",
+            "movie",
+            "Video",
+            0,
+            1,
+            Some("mkv"),
+            None,
+            None,
+        )
+        .await;
         insert_item(&db, "series", "Series", "tv", "Series", 1, 1, None, None).await;
         insert_item(
             &db,
@@ -1517,19 +1530,7 @@ mod tests {
                 "/tmp/show/Season 1/Episode.zh.ass",
             ),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, title, path, is_external, created_at) VALUES (?, ?, ?, 'Subtitle', ?, 'zh-CN', ?, ?, 1, 1)",
-                vec![
-                    id.into(),
-                    item_id.into(),
-                    index.into(),
-                    codec.into(),
-                    format!("{item_id}.zh.{codec}").into(),
-                    path.into(),
-                ],
-            ))
-            .await
-            .unwrap();
+            insert_external_subtitle(&db, id, item_id, index, codec, path).await;
         }
 
         let movie = crate::jellyfin::item_queries::find_media_item_for_admin(&db, "u1", "movie")
@@ -1567,6 +1568,20 @@ mod tests {
         }
     }
 
+    async fn insert_library(db: &DatabaseConnection, id: &str, name: &str, collection_type: &str) {
+        Libraries::insert(libraries::ActiveModel {
+            id: Set(id.to_string()),
+            name: Set(name.to_string()),
+            collection_type: Set(collection_type.to_string()),
+            created_at: Set(1),
+            updated_at: Set(1),
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn insert_item(
         db: &DatabaseConnection,
         id: &str,
@@ -1578,20 +1593,86 @@ mod tests {
         season_number: Option<i64>,
         episode_number: Option<i64>,
     ) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, season_number, episode_number, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'tv', ?, ?, ?, ?, ?, ?, 1, 1, 1)",
-            vec![
-                id.into(),
-                title.into(),
-                id.into(),
-                parent_id.into(),
-                item_type.into(),
-                is_folder.into(),
-                is_public.into(),
-                season_number.into(),
-                episode_number.into(),
-            ],
-        ))
+        insert_item_with_path(
+            db,
+            id,
+            title,
+            id,
+            "tv",
+            parent_id,
+            item_type,
+            is_folder,
+            is_public,
+            None,
+            season_number,
+            episode_number,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_item_with_path(
+        db: &DatabaseConnection,
+        id: &str,
+        title: &str,
+        path: &str,
+        library_id: &str,
+        parent_id: &str,
+        item_type: &str,
+        is_folder: i64,
+        is_public: i64,
+        container: Option<&str>,
+        season_number: Option<i64>,
+        episode_number: Option<i64>,
+    ) {
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(path.to_string()),
+            library_id: Set(library_id.to_string()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set(item_type.to_string()),
+            is_folder: Set(is_folder),
+            is_public: Set(is_public),
+            container: Set(container.map(ToString::to_string)),
+            season_number: Set(season_number),
+            episode_number: Set(episode_number),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_external_subtitle(
+        db: &DatabaseConnection,
+        id: &str,
+        item_id: &str,
+        stream_index: i64,
+        codec: &str,
+        path: &str,
+    ) {
+        MediaStreams::insert(media_streams::ActiveModel {
+            id: Set(id.to_string()),
+            item_id: Set(item_id.to_string()),
+            stream_index: Set(stream_index),
+            stream_type: Set("Subtitle".to_string()),
+            codec: Set(Some(codec.to_string())),
+            language: Set(Some("zh-CN".to_string())),
+            title: Set(Some(format!("{item_id}.zh.{codec}"))),
+            path: Set(Some(path.to_string())),
+            is_interlaced: Set(0),
+            is_default: Set(0),
+            is_forced: Set(0),
+            is_hearing_impaired: Set(0),
+            is_external: Set(1),
+            created_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }

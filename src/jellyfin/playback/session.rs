@@ -6,7 +6,10 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    Set, sea_query::Expr,
+};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
@@ -14,7 +17,10 @@ use crate::{
         AppState, PlaybackSession, PlaybackState, SessionCapabilities, session_timeout_seconds,
     },
     db::row_ext::QueryResultExt,
-    entities::user_data::{self, Entity as UserData},
+    entities::{
+        media_items::{self, Entity as MediaItems},
+        user_data::{self, Entity as UserData},
+    },
     jellyfin::{
         auth::{
             query_user_id_or_request, request_token, request_user_id_and_admin_or_default,
@@ -431,21 +437,10 @@ async fn playback_progress_inner(
         .and_then(JsonValue::as_i64)
         .filter(|v| *v > 0)
     {
-        let _ = state
-            .db
-            .execute(crate::db::helpers::pg_statement(
-                "UPDATE media_items SET runtime_ticks = ? WHERE id = ? AND runtime_ticks IS NULL",
-                vec![runtime_ticks.into(), item_id.into()],
-            ))
-            .await;
+        let _ = update_runtime_ticks_if_missing(&state.db, item_id, runtime_ticks).await;
         if let Some(media_source_id) = body.get("MediaSourceId").and_then(JsonValue::as_str) {
-            let _ = state
-                .db
-                .execute(crate::db::helpers::pg_statement(
-                    "UPDATE media_items SET runtime_ticks = ? WHERE id = ? AND runtime_ticks IS NULL",
-                    vec![runtime_ticks.into(), media_source_id.into()],
-                ))
-                .await;
+            let _ =
+                update_runtime_ticks_if_missing(&state.db, media_source_id, runtime_ticks).await;
         }
     }
 
@@ -886,28 +881,35 @@ async fn watch_session_row(
 }
 
 async fn canonical_watch_item_id(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<String> {
-    let Some(row) = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT mi.item_type, mi.parent_id, parent.item_type AS parent_item_type, parent.is_folder AS parent_is_folder FROM media_items mi LEFT JOIN media_items parent ON parent.id = mi.parent_id WHERE mi.id = ?",
-            vec![item_id.into()],
-        ))
-        .await?
-    else {
+    let Some(item) = MediaItems::find_by_id(item_id.to_string()).one(db).await? else {
         return Ok(item_id.to_string());
     };
-    let item_type = row.get_str("item_type").unwrap_or_default();
-    let parent_id = row.get_str("parent_id").unwrap_or_default();
-    let parent_item_type = row.get_opt_str("parent_item_type")?.unwrap_or_default();
-    let parent_is_folder = row.get_i64("parent_is_folder").unwrap_or_default() != 0;
-    if item_type == "Video"
-        && !parent_id.is_empty()
-        && parent_is_folder
-        && matches!(parent_item_type.as_str(), "Movie" | "Episode")
-    {
-        Ok(parent_id)
-    } else {
-        Ok(item_id.to_string())
+    if item.item_type == "Video" && !item.parent_id.is_empty() {
+        let parent_id = item.parent_id.clone();
+        if let Some(parent) = MediaItems::find_by_id(parent_id.clone()).one(db).await? {
+            if parent.is_folder != 0 && matches!(parent.item_type.as_str(), "Movie" | "Episode") {
+                return Ok(parent_id);
+            }
+        }
     }
+    Ok(item_id.to_string())
+}
+
+async fn update_runtime_ticks_if_missing(
+    db: &DatabaseConnection,
+    item_id: &str,
+    runtime_ticks: i64,
+) -> anyhow::Result<()> {
+    MediaItems::update_many()
+        .col_expr(
+            media_items::Column::RuntimeTicks,
+            Expr::value(runtime_ticks),
+        )
+        .filter(media_items::Column::Id.eq(item_id))
+        .filter(media_items::Column::RuntimeTicks.is_null())
+        .exec(db)
+        .await?;
+    Ok(())
 }
 
 fn watch_delta_seconds(
@@ -1165,13 +1167,7 @@ pub async fn playing_item_start(
         .and_then(|b| b.get("RunTimeTicks").and_then(JsonValue::as_i64))
         .filter(|v| *v > 0)
     {
-        let _ = state
-            .db
-            .execute(crate::db::helpers::pg_statement(
-                "UPDATE media_items SET runtime_ticks = ? WHERE id = ? AND runtime_ticks IS NULL",
-                vec![rt.into(), item_id.clone().into()],
-            ))
-            .await;
+        let _ = update_runtime_ticks_if_missing(&state.db, &item_id, rt).await;
     }
 
     let is_paused = body_value
@@ -1434,14 +1430,18 @@ mod tests {
         watch_segment_day_slices,
     };
     use crate::app::state::{AppState, PlaybackSession};
-    use crate::db::row_ext::QueryResultExt;
+    use crate::entities::{
+        media_items::{self, Entity as MediaItems},
+        user_data::Entity as UserData,
+        users::{self, Entity as Users},
+    };
     use axum::{
         Json,
         extract::{Path, Query, State},
         http::{HeaderMap, StatusCode},
         response::IntoResponse,
     };
-    use sea_orm::{ConnectionTrait, DatabaseConnection};
+    use sea_orm::{DatabaseConnection, EntityTrait, Set};
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
     use uuid::Uuid;
@@ -1522,16 +1522,12 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let row = state
-            .db
-            .query_one(crate::db::helpers::pg_statement(
-                "SELECT playback_position_ticks FROM user_data WHERE user_id = ? AND item_id = ?",
-                vec![state.user_id.to_string().into(), "m1".into()],
-            ))
+        let user_data = UserData::find_by_id((state.user_id.to_string(), "m1".to_string()))
+            .one(&state.db)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.get_i64("playback_position_ticks").unwrap(), 42);
+        assert_eq!(user_data.playback_position_ticks, 42);
     }
 
     #[tokio::test]
@@ -1608,17 +1604,37 @@ mod tests {
     }
 
     async fn seed_user_and_item(db: &DatabaseConnection, user_id: &str, item_id: &str) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, 'test', 'Test', 0, 0, 1, 1) ON CONFLICT(id) DO NOTHING",
-            vec![user_id.into()],
-        ))
+        Users::insert(users::ActiveModel {
+            id: Set(user_id.to_string()),
+            username: Set("test".to_string()),
+            display_name: Set("Test".to_string()),
+            is_admin: Set(0),
+            is_disabled: Set(0),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .on_conflict_do_nothing()
+        .exec_without_returning(db)
         .await
         .unwrap();
         let path = format!("D:/{item_id}.mkv");
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, 'Movie', ?, '', '', 'Movie', 0, 1, 1, 1, 1) ON CONFLICT(id) DO NOTHING",
-            vec![item_id.into(), path.into()],
-        ))
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(item_id.to_string()),
+            title: Set("Movie".to_string()),
+            path: Set(path),
+            library_id: Set(String::new()),
+            parent_id: Set(String::new()),
+            item_type: Set("Movie".to_string()),
+            is_folder: Set(0),
+            is_public: Set(1),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .on_conflict_do_nothing()
+        .exec_without_returning(db)
         .await
         .unwrap();
     }

@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{DatabaseConnection, EntityTrait, Set, sea_query::OnConflict};
 
+use crate::entities::image_assets::{self, Entity as ImageAssets};
 use crate::util::{now_unix, stable_text_id};
 
 pub async fn upsert_sidecar_images(
@@ -43,20 +44,35 @@ pub async fn upsert_image_asset(
     let etag = stable_text_id(&format!(
         "image:{item_id}:{image_type}:{image_index}:{path}"
     ));
-    db.execute(crate::db::helpers::pg_statement(
-        r#"INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, size_bytes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET path = excluded.path, etag = excluded.etag, size_bytes = excluded.size_bytes, updated_at = excluded.updated_at"#,
-        vec![
-            stable_text_id(&format!("image-asset:{item_id}:{image_type}:{image_index}")).into(),
-            item_id.into(),
-            image_type.into(),
-            image_index.into(),
-            path.into(),
-            etag.into(),
-            size_bytes.into(),
-            now.into(),
-            now.into(),
-        ],
-    ))
+    ImageAssets::insert(image_assets::ActiveModel {
+        id: Set(stable_text_id(&format!(
+            "image-asset:{item_id}:{image_type}:{image_index}"
+        ))),
+        item_id: Set(item_id.to_string()),
+        image_type: Set(image_type.to_string()),
+        image_index: Set(image_index),
+        path: Set(Some(path.to_string())),
+        etag: Set(Some(etag)),
+        size_bytes: Set(size_bytes),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::columns([
+            image_assets::Column::ItemId,
+            image_assets::Column::ImageType,
+            image_assets::Column::ImageIndex,
+        ])
+        .update_columns([
+            image_assets::Column::Path,
+            image_assets::Column::Etag,
+            image_assets::Column::SizeBytes,
+            image_assets::Column::UpdatedAt,
+        ])
+        .to_owned(),
+    )
+    .exec_without_returning(db)
     .await
     .with_context(|| format!("failed to upsert image asset for item: {item_id}"))?;
     Ok(())

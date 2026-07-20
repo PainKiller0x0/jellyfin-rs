@@ -10,8 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -19,7 +18,6 @@ use uuid::Uuid;
 
 use crate::{
     app::state::{AppState, PlaybackSession, PlaybackState, SessionCapabilities},
-    db::row_ext::QueryResultExt,
     entities::{
         access_tokens, access_tokens::Entity as AccessTokens, api_keys,
         api_keys::Entity as ApiKeys, app_settings, app_settings::Entity as AppSettings, users,
@@ -1497,18 +1495,14 @@ async fn ensure_enabled_admin_remains(
         return Ok(());
     }
 
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT COUNT(*) AS cnt FROM users WHERE id <> ? AND is_admin <> 0 AND is_disabled = 0",
-            vec![user_id.into()],
-        ))
+    let enabled_admin_count = Users::find()
+        .filter(users::Column::Id.ne(user_id))
+        .filter(users::Column::IsAdmin.ne(0))
+        .filter(users::Column::IsDisabled.eq(0))
+        .all(db)
         .await
-        .context("failed to count enabled administrators")?;
-    let enabled_admin_count = row
-        .map(|row| row.get_i64("cnt"))
-        .transpose()
-        .context("failed to read enabled administrator count")?
-        .unwrap_or_default();
+        .context("failed to count enabled administrators")?
+        .len();
     if enabled_admin_count == 0 {
         bail!(LAST_ENABLED_ADMIN_ERROR);
     }
@@ -1560,12 +1554,20 @@ async fn revoke_user_tokens(
     user_id: &str,
     now: i64,
 ) -> anyhow::Result<()> {
-    db.execute(crate::db::helpers::pg_statement(
-        "UPDATE access_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
-        vec![now.into(), user_id.into()],
-    ))
-    .await
-    .context("failed to revoke user tokens")?;
+    let tokens = AccessTokens::find()
+        .filter(access_tokens::Column::UserId.eq(user_id))
+        .filter(access_tokens::Column::RevokedAt.is_null())
+        .all(db)
+        .await
+        .context("failed to find user tokens to revoke")?;
+    for token in tokens {
+        let mut active: access_tokens::ActiveModel = token.into();
+        active.revoked_at = Set(Some(now));
+        active
+            .update(db)
+            .await
+            .context("failed to revoke user tokens")?;
+    }
     Ok(())
 }
 
@@ -1615,34 +1617,53 @@ pub async fn authenticated_user_id(
         return Ok(None);
     };
     let now = now_unix();
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            r#"SELECT access_tokens.user_id FROM access_tokens JOIN users ON users.id = access_tokens.user_id WHERE access_tokens.token_hash = ? AND access_tokens.revoked_at IS NULL AND users.is_disabled = 0 AND (access_tokens.expires_at IS NULL OR access_tokens.expires_at > ?)"#,
-            vec![stable_text_id(&token).into(), now.into()],
-        ))
+    let token_hash = stable_text_id(&token);
+    let Some(access_token) = AccessTokens::find()
+        .filter(access_tokens::Column::TokenHash.eq(&token_hash))
+        .filter(access_tokens::Column::RevokedAt.is_null())
+        .one(db)
         .await
-        .context("failed to validate access token")?;
-
-    let Some(row) = row else {
+        .context("failed to validate access token")?
+    else {
         return Ok(None);
     };
-    let user_id: String = row.get_str("user_id")?;
+    if access_token
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now)
+    {
+        return Ok(None);
+    }
+    let Some(user) = Users::find_by_id(access_token.user_id.clone())
+        .one(db)
+        .await
+        .context("failed to validate access token user")?
+        .filter(|user| user.is_disabled == 0)
+    else {
+        return Ok(None);
+    };
 
-    db.execute(crate::db::helpers::pg_statement(
-        "UPDATE access_tokens SET last_used_at = ? WHERE token_hash = ?",
-        vec![now.into(), stable_text_id(&token).into()],
-    ))
-    .await
-    .context("failed to update access token usage")?;
+    let mut active: access_tokens::ActiveModel = access_token.into();
+    active.last_used_at = Set(Some(now));
+    active
+        .update(db)
+        .await
+        .context("failed to update access token usage")?;
 
-    db.execute(crate::db::helpers::pg_statement(
-        "UPDATE api_keys SET last_used_at = ? WHERE access_token = ?",
-        vec![now.into(), token.into()],
-    ))
-    .await
-    .context("failed to update api key usage")?;
+    for api_key in ApiKeys::find()
+        .filter(api_keys::Column::AccessToken.eq(&token))
+        .all(db)
+        .await
+        .context("failed to find api key usage rows")?
+    {
+        let mut active: api_keys::ActiveModel = api_key.into();
+        active.last_used_at = Set(Some(now));
+        active
+            .update(db)
+            .await
+            .context("failed to update api key usage")?;
+    }
 
-    Ok(Some(user_id))
+    Ok(Some(user.id))
 }
 
 pub async fn require_auth(
@@ -2917,7 +2938,7 @@ enum AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::ConnectionTrait;
+    use sea_orm::EntityTrait;
     use tokio::sync::{RwLock, broadcast};
 
     #[test]
@@ -3547,11 +3568,15 @@ mod tests {
             return;
         };
         let state = test_state(db);
-        let statement = crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, 'admin', 'admin', 1, 0, 1, 1)",
-            vec![state.user_id.to_string().into()],
-        );
-        state.db.execute(statement).await.unwrap();
+        insert_test_user_named(
+            &state.db,
+            &state.user_id.to_string(),
+            "admin",
+            None,
+            true,
+            false,
+        )
+        .await;
 
         create_api_key_inner(
             &state,
@@ -3816,12 +3841,15 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, password_hash, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'alice', 'alice', ?, 0, 0, 1, 1)",
-            vec![hash_password("secret").unwrap().into()],
-        ))
-        .await
-        .unwrap();
+        insert_test_user_named(
+            &db,
+            "u1",
+            "alice",
+            Some(hash_password("secret").unwrap()),
+            false,
+            false,
+        )
+        .await;
 
         let state = test_state(db);
         let mut headers = HeaderMap::new();
@@ -3874,12 +3902,15 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, password_hash, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'alice', 'alice', ?, 0, 0, 1, 1)",
-            vec![hash_password("secret").unwrap().into()],
-        ))
-        .await
-        .unwrap();
+        insert_test_user_named(
+            &db,
+            "u1",
+            "alice",
+            Some(hash_password("secret").unwrap()),
+            false,
+            false,
+        )
+        .await;
 
         let state = Arc::new(test_state(db));
         let mut headers = HeaderMap::new();
@@ -3992,12 +4023,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'old', 'old', 0, 0, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_test_user_named(&db, "u1", "old", None, false, false).await;
 
         let response = update_user_response(&db, "u1", &json!({ "Name": "new" })).await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -4011,12 +4037,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'old', 'old', 0, 0, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_test_user_named(&db, "u1", "old", None, false, false).await;
 
         let response = update_user_response(&db, "u1", &json!({ "Name": "bad\nname" })).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -4030,12 +4051,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'alice', 'alice', 0, 0, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_test_user_named(&db, "u1", "alice", None, false, false).await;
 
         update_user_policy_inner(
             &db,
@@ -4065,12 +4081,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'alice', 'alice', 0, 0, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_test_user_named(&db, "u1", "alice", None, false, false).await;
 
         update_user_policy_inner(&db, "u1", &json!({ "EnableAllFolders": false }))
             .await
@@ -4214,16 +4225,29 @@ mod tests {
         is_admin: bool,
         is_disabled: bool,
     ) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, 1)",
-            vec![
-                id.into(),
-                id.into(),
-                id.into(),
-                (if is_admin { 1i64 } else { 0i64 }).into(),
-                (if is_disabled { 1i64 } else { 0i64 }).into(),
-            ],
-        ))
+        insert_test_user_named(db, id, id, None, is_admin, is_disabled).await;
+    }
+
+    async fn insert_test_user_named(
+        db: &DatabaseConnection,
+        id: &str,
+        username: &str,
+        password_hash: Option<String>,
+        is_admin: bool,
+        is_disabled: bool,
+    ) {
+        Users::insert(users::ActiveModel {
+            id: Set(id.to_string()),
+            username: Set(username.to_string()),
+            password_hash: Set(password_hash),
+            display_name: Set(username.to_string()),
+            is_admin: Set(i64::from(is_admin)),
+            is_disabled: Set(i64::from(is_disabled)),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }

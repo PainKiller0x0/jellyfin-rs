@@ -8,13 +8,16 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
-    entities::user_data::{self, Entity as UserData},
+    entities::{
+        media_people::{self, Entity as MediaPeople},
+        user_data::{self, Entity as UserData},
+    },
     jellyfin::{auth::request_user_id_or_default, common::internal_error, item_queries},
     util::{now_unix, unix_to_jellyfin_date},
 };
@@ -221,29 +224,35 @@ async fn user_data_json(
     item_id: &str,
 ) -> anyhow::Result<JsonValue> {
     let item_ids = playback_user_data_item_ids(db, item_id).await?;
-    let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT COUNT(*) AS row_count, COALESCE(MAX(is_favorite), 0) AS is_favorite, \
-         COALESCE(MAX(played), 0) AS played, COALESCE(MAX(playback_position_ticks), 0) AS playback_position_ticks, \
-         MAX(played_percentage) AS played_percentage, COALESCE(MAX(play_count), 0) AS play_count, \
-         MAX(last_played_at) AS last_played_at, MAX(rating) AS rating \
-         FROM user_data WHERE user_id = ? AND item_id IN ({placeholders})"
-    );
-    let mut values: Vec<sea_orm::Value> = vec![user_id.into()];
-    values.extend(item_ids.iter().map(|id| id.as_str().into()));
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(&sql, values))
+    let rows = UserData::find()
+        .filter(user_data::Column::UserId.eq(user_id))
+        .filter(user_data::Column::ItemId.is_in(item_ids))
+        .all(db)
         .await?;
 
-    match row {
-        Some(row) if row.get_i64("row_count")? > 0 => {
-            let is_favorite = row.get_i64("is_favorite")? != 0;
-            let played = row.get_i64("played")? != 0;
-            let playback_position_ticks = row.get_i64("playback_position_ticks")?;
-            let played_percentage = row.get_f64("played_percentage")?;
-            let play_count = row.get_i64("play_count")?;
-            let last_played_at = row.get_opt_i64("last_played_at")?;
-            let rating = row.get_f64("rating")?;
+    match rows.is_empty() {
+        false => {
+            let is_favorite = rows.iter().any(|row| row.is_favorite != 0);
+            let played = rows.iter().any(|row| row.played != 0);
+            let playback_position_ticks = rows
+                .iter()
+                .map(|row| row.playback_position_ticks)
+                .max()
+                .unwrap_or_default();
+            let played_percentage = rows
+                .iter()
+                .filter_map(|row| row.played_percentage)
+                .max_by(f64::total_cmp);
+            let play_count = rows
+                .iter()
+                .map(|row| row.play_count)
+                .max()
+                .unwrap_or_default();
+            let last_played_at = rows.iter().filter_map(|row| row.last_played_at).max();
+            let rating = rows
+                .iter()
+                .filter_map(|row| row.rating)
+                .max_by(f64::total_cmp);
             Ok(json!({
                 "ItemId": item_id,
                 "Key": item_id,
@@ -583,13 +592,19 @@ async fn public_person_exists(
     db: &sea_orm::DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<bool> {
-    Ok(db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT 1 AS found FROM people p JOIN media_people mp ON mp.person_id = p.id JOIN media_items mi ON mi.id = mp.item_id WHERE p.id = ? AND mi.is_public = 1 AND (mi.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = mi.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = mi.parent_id AND parent.is_public = 1)) LIMIT 1",
-            vec![item_id.into()],
-        ))
-        .await?
-        .is_some())
+    let links = MediaPeople::find()
+        .filter(media_people::Column::PersonId.eq(item_id))
+        .all(db)
+        .await?;
+    for link in links {
+        if item_queries::find_media_item(db, "", &link.item_id)
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn user_data_error(error: anyhow::Error) -> Response {
@@ -645,9 +660,14 @@ mod tests {
         apply_user_item_data_update, rating_from_request, set_user_data_flag_json,
         upsert_user_data_simple, user_data_json,
     };
-    use crate::db::row_ext::QueryResultExt;
-    use sea_orm::ConnectionTrait;
-    use sea_orm::Set;
+    use crate::entities::{
+        media_items::{self, Entity as MediaItems},
+        media_people::{self, Entity as MediaPeople},
+        people::{self, Entity as People},
+        user_data::Entity as UserData,
+        users::{self, Entity as Users},
+    };
+    use sea_orm::{EntityTrait, Set};
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -672,17 +692,14 @@ mod tests {
         assert_eq!(unplayed["PlaybackPositionTicks"], 0);
         assert!(unplayed["LastPlayedDate"].is_null());
 
-        let row = db
-            .query_one(crate::db::helpers::pg_statement(
-                "SELECT played, play_count, last_played_at FROM user_data WHERE user_id = 'u1' AND item_id = 'i1'",
-                vec![],
-            ))
+        let row = UserData::find_by_id(("u1".to_string(), "i1".to_string()))
+            .one(&db)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.get_i64("played").unwrap(), 0);
-        assert_eq!(row.get_i64("play_count").unwrap(), 0);
-        assert_eq!(row.get_opt_i64("last_played_at").unwrap(), None);
+        assert_eq!(row.played, 0);
+        assert_eq!(row.play_count, 0);
+        assert_eq!(row.last_played_at, None);
     }
 
     #[test]
@@ -752,48 +769,31 @@ mod tests {
         let Some(db) = seeded_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('private', 'Private', '/tmp/private.mkv', '', '', 'Movie', 0, 0, 1, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO people (id, name, created_at) VALUES ('p1', 'Person', 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_people (item_id, person_id, person_type, sort_order) VALUES ('i1', 'p1', 'Actor', 0)",
-            vec![],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('private-parent', 'Private Parent', '/tmp/private-parent', '', '', 'Movie', 1, 0, 1, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('public-child', 'Public Child', '/tmp/public-child.mkv', '', 'private-parent', 'Movie', 0, 1, 1, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO people (id, name, created_at) VALUES ('p2', 'Hidden Person', 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_people (item_id, person_id, person_type, sort_order) VALUES ('public-child', 'p2', 'Actor', 0)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_media_item(&db, "private", "Private", "/tmp/private.mkv", "", 0, 0).await;
+        insert_person(&db, "p1", "Person").await;
+        link_person(&db, "i1", "p1").await;
+        insert_media_item(
+            &db,
+            "private-parent",
+            "Private Parent",
+            "/tmp/private-parent",
+            "",
+            1,
+            0,
+        )
+        .await;
+        insert_media_item(
+            &db,
+            "public-child",
+            "Public Child",
+            "/tmp/public-child.mkv",
+            "private-parent",
+            0,
+            1,
+        )
+        .await;
+        insert_person(&db, "p2", "Hidden Person").await;
+        link_person(&db, "public-child", "p2").await;
 
         set_user_data_flag_json(&db, "u1", "i1", "is_favorite", true)
             .await
@@ -827,18 +827,73 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return None;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES ('u1', 'u1', 'u1', 0, 0, 1, 1)",
-            vec![],
-        ))
+        Users::insert(users::ActiveModel {
+            id: Set("u1".to_string()),
+            username: Set("u1".to_string()),
+            display_name: Set("u1".to_string()),
+            is_admin: Set(0),
+            is_disabled: Set(0),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
         .await
         .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES ('i1', 'Movie', '/tmp/i1.mkv', '', '', 'Movie', 0, 1, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_media_item(&db, "i1", "Movie", "/tmp/i1.mkv", "", 0, 1).await;
         Some(db)
+    }
+
+    async fn insert_media_item(
+        db: &sea_orm::DatabaseConnection,
+        id: &str,
+        title: &str,
+        path: &str,
+        parent_id: &str,
+        is_folder: i64,
+        is_public: i64,
+    ) {
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(path.to_string()),
+            library_id: Set(String::new()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set("Movie".to_string()),
+            is_folder: Set(is_folder),
+            is_public: Set(is_public),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_person(db: &sea_orm::DatabaseConnection, id: &str, name: &str) {
+        People::insert(people::ActiveModel {
+            id: Set(id.to_string()),
+            name: Set(name.to_string()),
+            created_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn link_person(db: &sea_orm::DatabaseConnection, item_id: &str, person_id: &str) {
+        MediaPeople::insert(media_people::ActiveModel {
+            item_id: Set(item_id.to_string()),
+            person_id: Set(person_id.to_string()),
+            person_type: Set("Actor".to_string()),
+            sort_order: Set(0),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
     }
 }

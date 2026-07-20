@@ -641,7 +641,23 @@ mod tests {
         list_media_stream_values_inner, list_years_inner, paged_query_result, year_exists,
         year_item,
     };
-    use sea_orm::ConnectionTrait;
+    use crate::entities::{
+        game_genres::{self, Entity as GameGenres},
+        genres::{self, Entity as Genres},
+        media_game_genres::{self, Entity as MediaGameGenres},
+        media_genres::{self, Entity as MediaGenres},
+        media_items::{self, Entity as MediaItems},
+        media_people::{self, Entity as MediaPeople},
+        media_streams::{self, Entity as MediaStreams},
+        media_studios::{self, Entity as MediaStudios},
+        media_tags::{self, Entity as MediaTags},
+        people::{self, Entity as People},
+        studios::{self, Entity as Studios},
+        tags::{self, Entity as Tags},
+        user_data::{self, Entity as UserData},
+        users::{self, Entity as Users},
+    };
+    use sea_orm::{EntityTrait, Set};
     use serde_json::{Value, json};
     use std::collections::HashMap;
 
@@ -903,58 +919,131 @@ mod tests {
         container: &str,
         extended_video_type: &str,
     ) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, production_year, official_rating, container, extended_video_type, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', 0, ?, ?, ?, ?, ?, 1, 1, 1)",
-            vec![
-                id.into(),
-                title.into(),
-                id.into(),
-                parent_id.into(),
-                is_public.into(),
-                year.into(),
-                rating.into(),
-                container.into(),
-                extended_video_type.into(),
-            ],
-        ))
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(id.to_string()),
+            library_id: Set(String::new()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set("Movie".to_string()),
+            is_folder: Set(0),
+            is_public: Set(is_public),
+            production_year: Set(Some(year)),
+            official_rating: Set(Some(rating.to_string())),
+            container: Set(Some(container.to_string())),
+            extended_video_type: Set(Some(extended_video_type.to_string())),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
 
     async fn insert_user(db: &sea_orm::DatabaseConnection, user_id: &str) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, ?, ?, 0, 0, 1, 1)",
-            vec![user_id.into(), user_id.into(), user_id.into()],
-        ))
+        Users::insert(users::ActiveModel {
+            id: Set(user_id.to_string()),
+            username: Set(user_id.to_string()),
+            display_name: Set(user_id.to_string()),
+            is_admin: Set(0),
+            is_disabled: Set(0),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
 
     async fn favorite_item(db: &sea_orm::DatabaseConnection, user_id: &str, item_id: &str) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO user_data (user_id, item_id, is_favorite, played, playback_position_ticks, play_count, updated_at) VALUES (?, ?, 1, 0, 0, 0, 1)",
-            vec![user_id.into(), item_id.into()],
-        ))
+        UserData::insert(user_data::ActiveModel {
+            user_id: Set(user_id.to_string()),
+            item_id: Set(item_id.to_string()),
+            is_favorite: Set(1),
+            played: Set(0),
+            playback_position_ticks: Set(0),
+            play_count: Set(0),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
 
     async fn insert_stream(db: &sea_orm::DatabaseConnection, item_id: &str, codec: &str) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, created_at) VALUES (?, ?, 0, 'Video', ?, 1)",
-            vec![format!("stream-{item_id}").into(), item_id.into(), codec.into()],
-        ))
+        MediaStreams::insert(media_streams::ActiveModel {
+            id: Set(format!("stream-{item_id}")),
+            item_id: Set(item_id.to_string()),
+            stream_index: Set(0),
+            stream_type: Set("Video".to_string()),
+            codec: Set(Some(codec.to_string())),
+            created_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
 
     async fn insert_named(db: &sea_orm::DatabaseConnection, table: &str, id: &str, name: &str) {
-        db.execute(crate::db::helpers::pg_statement(
-            &format!("INSERT INTO {table} (id, name, created_at) VALUES (?, ?, 1)"),
-            vec![id.into(), name.into()],
-        ))
-        .await
-        .unwrap();
+        match table {
+            "genres" => {
+                Genres::insert(genres::ActiveModel {
+                    id: Set(id.to_string()),
+                    name: Set(name.to_string()),
+                    created_at: Set(1),
+                })
+                .exec_without_returning(db)
+                .await
+                .unwrap();
+            }
+            "tags" => {
+                Tags::insert(tags::ActiveModel {
+                    id: Set(id.to_string()),
+                    name: Set(name.to_string()),
+                    created_at: Set(1),
+                })
+                .exec_without_returning(db)
+                .await
+                .unwrap();
+            }
+            "studios" => {
+                Studios::insert(studios::ActiveModel {
+                    id: Set(id.to_string()),
+                    name: Set(name.to_string()),
+                    created_at: Set(1),
+                })
+                .exec_without_returning(db)
+                .await
+                .unwrap();
+            }
+            "people" => {
+                People::insert(people::ActiveModel {
+                    id: Set(id.to_string()),
+                    name: Set(name.to_string()),
+                    created_at: Set(1),
+                    ..Default::default()
+                })
+                .exec_without_returning(db)
+                .await
+                .unwrap();
+            }
+            "game_genres" => {
+                GameGenres::insert(game_genres::ActiveModel {
+                    id: Set(id.to_string()),
+                    name: Set(name.to_string()),
+                    created_at: Set(1),
+                })
+                .exec_without_returning(db)
+                .await
+                .unwrap();
+            }
+            _ => panic!("unsupported named table: {table}"),
+        }
     }
 
     async fn link_named(
@@ -964,21 +1053,56 @@ mod tests {
         item_id: &str,
         value_id: &str,
     ) {
-        if table == "media_people" && column == "person_id" {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_people (item_id, person_id, person_type, sort_order) VALUES (?, ?, 'Actor', 0)",
-                vec![item_id.into(), value_id.into()],
-            ))
-            .await
-            .unwrap();
-            return;
+        match (table, column) {
+            ("media_genres", "genre_id") => {
+                MediaGenres::insert(media_genres::ActiveModel {
+                    item_id: Set(item_id.to_string()),
+                    genre_id: Set(value_id.to_string()),
+                })
+                .exec_without_returning(db)
+                .await
+                .unwrap();
+            }
+            ("media_tags", "tag_id") => {
+                MediaTags::insert(media_tags::ActiveModel {
+                    item_id: Set(item_id.to_string()),
+                    tag_id: Set(value_id.to_string()),
+                })
+                .exec_without_returning(db)
+                .await
+                .unwrap();
+            }
+            ("media_studios", "studio_id") => {
+                MediaStudios::insert(media_studios::ActiveModel {
+                    item_id: Set(item_id.to_string()),
+                    studio_id: Set(value_id.to_string()),
+                })
+                .exec_without_returning(db)
+                .await
+                .unwrap();
+            }
+            ("media_people", "person_id") => {
+                MediaPeople::insert(media_people::ActiveModel {
+                    item_id: Set(item_id.to_string()),
+                    person_id: Set(value_id.to_string()),
+                    person_type: Set("Actor".to_string()),
+                    sort_order: Set(0),
+                    ..Default::default()
+                })
+                .exec_without_returning(db)
+                .await
+                .unwrap();
+            }
+            ("media_game_genres", "game_genre_id") => {
+                MediaGameGenres::insert(media_game_genres::ActiveModel {
+                    item_id: Set(item_id.to_string()),
+                    game_genre_id: Set(value_id.to_string()),
+                })
+                .exec_without_returning(db)
+                .await
+                .unwrap();
+            }
+            _ => panic!("unsupported relation: {table}.{column}"),
         }
-
-        db.execute(crate::db::helpers::pg_statement(
-            &format!("INSERT INTO {table} (item_id, {column}) VALUES (?, ?)"),
-            vec![item_id.into(), value_id.into()],
-        ))
-        .await
-        .unwrap();
     }
 }

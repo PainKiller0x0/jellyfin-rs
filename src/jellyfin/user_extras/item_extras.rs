@@ -1021,10 +1021,22 @@ mod tests {
         query_limit, remote_subtitle_search, seed_ids_for_artist, seed_ids_for_item,
         seed_ids_for_music_genre, studio_image_with_index, trickplay_info,
     };
+    use crate::entities::{
+        chapters::{self, Entity as Chapters},
+        genres::{self, Entity as Genres},
+        libraries::{self, Entity as Libraries},
+        library_paths::{self, Entity as LibraryPaths},
+        linked_children::{self, Entity as LinkedChildren},
+        media_genres::{self, Entity as MediaGenres},
+        media_items::{self, Entity as MediaItems},
+        media_people::{self, Entity as MediaPeople},
+        people::{self, Entity as People},
+        trickplay_images::{self, Entity as TrickplayImages},
+    };
     use axum::{
         body::to_bytes, extract::Path, extract::Query, extract::State, response::IntoResponse,
     };
-    use sea_orm::{ConnectionTrait, DatabaseConnection};
+    use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1128,55 +1140,30 @@ mod tests {
                 1_i64,
             ),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?, ?, ?, 1, 1, 1)",
-                vec![
-                    id.into(),
-                    title.into(),
-                    format!("D:/{id}.mp3").into(),
-                    parent_id.into(),
-                    item_type.into(),
-                    is_folder.into(),
-                    is_public.into(),
-                ],
-            ))
-            .await
-            .unwrap();
+            insert_media_item(
+                &db,
+                id,
+                title,
+                &format!("D:/{id}.mp3"),
+                "",
+                parent_id,
+                item_type,
+                is_folder,
+                is_public,
+                None,
+            )
+            .await;
         }
 
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES ('playlist', 'song1', 0), ('playlist', 'hidden-song', 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO people (id, name, created_at) VALUES ('artist1', 'Artist', 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_linked_child(&db, "playlist", "song1", 0).await;
+        insert_linked_child(&db, "playlist", "hidden-song", 1).await;
+        insert_person(&db, "artist1", "Artist").await;
         for item_id in ["song1", "hidden-song"] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_people (item_id, person_id, person_type, sort_order) VALUES (?, 'artist1', 'Artist', 0)",
-                vec![item_id.into()],
-            ))
-            .await
-            .unwrap();
+            insert_media_person(&db, item_id, "artist1", "Artist").await;
         }
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO genres (id, name, created_at) VALUES ('genre1', 'Genre', 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_genre(&db, "genre1", "Genre").await;
         for item_id in ["song1", "song2", "hidden-song"] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_genres (item_id, genre_id) VALUES (?, 'genre1')",
-                vec![item_id.into()],
-            ))
-            .await
-            .unwrap();
+            insert_media_genre(&db, item_id, "genre1").await;
         }
 
         assert_eq!(
@@ -1244,12 +1231,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
-            vec!["movies".into(), "Movies".into(), "movies".into()],
-        ))
-        .await
-        .unwrap();
+        insert_library(&db, "movies", "Movies", "movies").await;
         for (id, title, path, parent_id, item_type, is_folder) in [
             ("movie1", "Movie", "D:/Movie", "movies", "Movie", 1_i64),
             (
@@ -1277,19 +1259,10 @@ mod tests {
                 0_i64,
             ),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', ?, ?, ?, 1, 1, 1)",
-                vec![
-                    id.into(),
-                    title.into(),
-                    path.into(),
-                    parent_id.into(),
-                    item_type.into(),
-                    is_folder.into(),
-                ],
-            ))
-            .await
-            .unwrap();
+            insert_media_item(
+                &db, id, title, path, "movies", parent_id, item_type, is_folder, 1, None,
+            )
+            .await;
         }
 
         let items = item_extras(&db, "u1", "video1", ExtraKind::SpecialFeature)
@@ -1310,12 +1283,7 @@ mod tests {
         assert!(ids.contains(&"extra1"));
         assert!(ids.contains(&"trailer1"));
 
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE media_items SET is_public = 0 WHERE id = ?",
-            vec!["video1".into()],
-        ))
-        .await
-        .unwrap();
+        update_item_public(&db, "video1", 0).await;
         assert!(
             item_extras(&db, "u1", "video1", ExtraKind::SpecialFeature)
                 .await
@@ -1356,20 +1324,10 @@ mod tests {
                 1_i64,
             ),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', ?, ?, ?, ?, 1, 1, 1)",
-                vec![
-                    id.into(),
-                    title.into(),
-                    path.into(),
-                    parent_id.into(),
-                    item_type.into(),
-                    is_folder.into(),
-                    is_public.into(),
-                ],
-            ))
-            .await
-            .unwrap();
+            insert_media_item(
+                &db, id, title, path, "movies", parent_id, item_type, is_folder, is_public, None,
+            )
+            .await;
         }
         assert!(
             item_extras(&db, "u1", "hidden-video", ExtraKind::SpecialFeature)
@@ -1388,25 +1346,20 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Video', 0, 1, 1, 1)",
-            vec!["item1".into(), "Video".into(), "D:/video.mkv".into()],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO trickplay_images (id, item_id, width, tile_count, interval_ticks, path, created_at) VALUES (?, ?, ?, ?, ?, ?, 1)",
-            vec![
-                "tp1".into(),
-                "item1".into(),
-                320_i64.into(),
-                3_i64.into(),
-                5_000_000_i64.into(),
-                "D:/tiles.jpg".into(),
-            ],
-        ))
-        .await
-        .unwrap();
+        insert_media_item(
+            &db,
+            "item1",
+            "Video",
+            "D:/video.mkv",
+            "",
+            "",
+            "Video",
+            0,
+            1,
+            None,
+        )
+        .await;
+        insert_trickplay(&db, "tp1", "item1", 320, 3, 5_000_000, "D:/tiles.jpg").await;
 
         let info = trickplay_info(&db, "item1", 320).await.unwrap().unwrap();
         assert_eq!(info.tile_count, 3);
@@ -1415,32 +1368,45 @@ mod tests {
         assert!(trickplay_info(&db, "item1", 640).await.unwrap().is_none());
         assert_eq!(parse_trickplay_index("2.jpg"), Some(2));
 
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE media_items SET is_public = 0 WHERE id = ?",
-            vec!["item1".into()],
-        ))
-        .await
-        .unwrap();
+        update_item_public(&db, "item1", 0).await;
         assert!(trickplay_info(&db, "item1", 320).await.unwrap().is_none());
 
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('private-parent', 'Private Parent', 'D:/private-parent', '', '', 'Movie', 1, 0, 1, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('public-child', 'Public Child', 'D:/public-child.mkv', '', 'private-parent', 'Video', 0, 1, 1, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO trickplay_images (id, item_id, width, tile_count, interval_ticks, path, created_at) VALUES ('tp2', 'public-child', 320, 1, 5000000, 'D:/hidden-tiles.jpg', 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_media_item(
+            &db,
+            "private-parent",
+            "Private Parent",
+            "D:/private-parent",
+            "",
+            "",
+            "Movie",
+            1,
+            0,
+            None,
+        )
+        .await;
+        insert_media_item(
+            &db,
+            "public-child",
+            "Public Child",
+            "D:/public-child.mkv",
+            "",
+            "private-parent",
+            "Video",
+            0,
+            1,
+            None,
+        )
+        .await;
+        insert_trickplay(
+            &db,
+            "tp2",
+            "public-child",
+            320,
+            1,
+            5_000_000,
+            "D:/hidden-tiles.jpg",
+        )
+        .await;
         assert!(
             trickplay_info(&db, "public-child", 320)
                 .await
@@ -1465,18 +1431,8 @@ mod tests {
         std::fs::write(&allowed_tile, b"tile").unwrap();
         std::fs::write(&rejected_tile, b"secret").unwrap();
 
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES ('lib', 'Library', 'movies', 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO library_paths (id, library_id, path, created_at) VALUES ('path1', 'lib', ?, 1)",
-            vec![library.to_string_lossy().to_string().into()],
-        ))
-        .await
-        .unwrap();
+        insert_library(&db, "lib", "Library", "movies").await;
+        insert_library_path(&db, "path1", "lib", &library.to_string_lossy()).await;
 
         assert!(
             (TrickplayInfo {
@@ -1507,28 +1463,25 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, runtime_ticks, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Episode', 0, ?, 1, 1, 1)",
-            vec![
-                "ep1".into(),
-                "Episode".into(),
-                "D:/ep1.mkv".into(),
-                100_i64.into(),
-            ],
-        ))
-        .await
-        .unwrap();
+        insert_media_item(
+            &db,
+            "ep1",
+            "Episode",
+            "D:/ep1.mkv",
+            "",
+            "",
+            "Episode",
+            0,
+            1,
+            Some(100),
+        )
+        .await;
         for (id, ticks, marker) in [
             ("intro-start", 10_i64, "IntroStart"),
             ("intro-end", 20_i64, "IntroEnd"),
             ("credits", 80_i64, "CreditsStart"),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO chapters (id, item_id, start_position_ticks, name, marker_type, source, created_at, updated_at) VALUES (?, 'ep1', ?, ?, ?, 'test', 1, 1)",
-                vec![id.into(), ticks.into(), marker.into(), marker.into()],
-            ))
-            .await
-            .unwrap();
+            insert_chapter(&db, id, "ep1", ticks, marker, marker).await;
         }
 
         let value = media_segments_value(&db, "ep1", &HashMap::new())
@@ -1566,12 +1519,7 @@ mod tests {
             .unwrap();
         assert_eq!(filtered["TotalRecordCount"], 1);
         assert_eq!(filtered["Items"][0]["Type"], "Intro");
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE media_items SET is_public = 0 WHERE id = ?",
-            vec!["ep1".into()],
-        ))
-        .await
-        .unwrap();
+        update_item_public(&db, "ep1", 0).await;
         assert!(
             media_segments_value(&db, "ep1", &HashMap::new())
                 .await
@@ -1585,24 +1533,41 @@ mod tests {
                 .is_none()
         );
 
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, runtime_ticks, modified_at, created_at, updated_at) VALUES ('private-parent', 'Private Parent', 'D:/private-parent', '', '', 'Series', 1, 0, NULL, 1, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, runtime_ticks, modified_at, created_at, updated_at) VALUES ('hidden-episode', 'Hidden Episode', 'D:/hidden-episode.mkv', '', 'private-parent', 'Episode', 0, 1, 100, 1, 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO chapters (id, item_id, start_position_ticks, name, marker_type, source, created_at, updated_at) VALUES ('hidden-intro', 'hidden-episode', 10, 'IntroStart', 'IntroStart', 'test', 1, 1)",
-            vec![],
-        ))
-        .await
-        .unwrap();
+        insert_media_item(
+            &db,
+            "private-parent",
+            "Private Parent",
+            "D:/private-parent",
+            "",
+            "",
+            "Series",
+            1,
+            0,
+            None,
+        )
+        .await;
+        insert_media_item(
+            &db,
+            "hidden-episode",
+            "Hidden Episode",
+            "D:/hidden-episode.mkv",
+            "",
+            "private-parent",
+            "Episode",
+            0,
+            1,
+            Some(100),
+        )
+        .await;
+        insert_chapter(
+            &db,
+            "hidden-intro",
+            "hidden-episode",
+            10,
+            "IntroStart",
+            "IntroStart",
+        )
+        .await;
         assert!(
             media_segments_value(&db, "hidden-episode", &HashMap::new())
                 .await
@@ -1622,18 +1587,19 @@ mod tests {
             ("private-parent", "", 0_i64),
             ("public-child", "private-parent", 1_i64),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Video', 0, ?, 1, 1, 1)",
-                vec![
-                    id.into(),
-                    id.into(),
-                    format!("D:/{id}.mkv").into(),
-                    parent_id.into(),
-                    is_public.into(),
-                ],
-            ))
-            .await
-            .unwrap();
+            insert_media_item(
+                &db,
+                id,
+                id,
+                &format!("D:/{id}.mkv"),
+                "",
+                parent_id,
+                "Video",
+                0,
+                is_public,
+                None,
+            )
+            .await;
         }
 
         assert!(public_item_exists(&db, "public").await.unwrap());
@@ -1685,6 +1651,188 @@ mod tests {
         assert_eq!(value["TotalRecordCount"], 0);
         assert_eq!(value["StartIndex"], 0);
         assert!(value["Items"].as_array().unwrap().is_empty());
+    }
+
+    async fn insert_library(db: &DatabaseConnection, id: &str, name: &str, collection_type: &str) {
+        Libraries::insert(libraries::ActiveModel {
+            id: Set(id.to_string()),
+            name: Set(name.to_string()),
+            collection_type: Set(collection_type.to_string()),
+            created_at: Set(1),
+            updated_at: Set(1),
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_library_path(db: &DatabaseConnection, id: &str, library_id: &str, path: &str) {
+        LibraryPaths::insert(library_paths::ActiveModel {
+            id: Set(id.to_string()),
+            library_id: Set(library_id.to_string()),
+            path: Set(path.to_string()),
+            created_at: Set(1),
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_media_item(
+        db: &DatabaseConnection,
+        id: &str,
+        title: &str,
+        path: &str,
+        library_id: &str,
+        parent_id: &str,
+        item_type: &str,
+        is_folder: i64,
+        is_public: i64,
+        runtime_ticks: Option<i64>,
+    ) {
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(path.to_string()),
+            library_id: Set(library_id.to_string()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set(item_type.to_string()),
+            is_folder: Set(is_folder),
+            is_public: Set(is_public),
+            runtime_ticks: Set(runtime_ticks),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn update_item_public(db: &DatabaseConnection, id: &str, is_public: i64) {
+        let mut active: media_items::ActiveModel = MediaItems::find_by_id(id.to_string())
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        active.is_public = Set(is_public);
+        active.update(db).await.unwrap();
+    }
+
+    async fn insert_linked_child(
+        db: &DatabaseConnection,
+        parent_id: &str,
+        item_id: &str,
+        sort_order: i64,
+    ) {
+        LinkedChildren::insert(linked_children::ActiveModel {
+            parent_id: Set(parent_id.to_string()),
+            item_id: Set(item_id.to_string()),
+            sort_order: Set(sort_order),
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_person(db: &DatabaseConnection, id: &str, name: &str) {
+        People::insert(people::ActiveModel {
+            id: Set(id.to_string()),
+            name: Set(name.to_string()),
+            created_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_media_person(
+        db: &DatabaseConnection,
+        item_id: &str,
+        person_id: &str,
+        person_type: &str,
+    ) {
+        MediaPeople::insert(media_people::ActiveModel {
+            item_id: Set(item_id.to_string()),
+            person_id: Set(person_id.to_string()),
+            person_type: Set(person_type.to_string()),
+            role: Set(None),
+            sort_order: Set(0),
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_genre(db: &DatabaseConnection, id: &str, name: &str) {
+        Genres::insert(genres::ActiveModel {
+            id: Set(id.to_string()),
+            name: Set(name.to_string()),
+            created_at: Set(1),
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_media_genre(db: &DatabaseConnection, item_id: &str, genre_id: &str) {
+        MediaGenres::insert(media_genres::ActiveModel {
+            item_id: Set(item_id.to_string()),
+            genre_id: Set(genre_id.to_string()),
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_trickplay(
+        db: &DatabaseConnection,
+        id: &str,
+        item_id: &str,
+        width: i64,
+        tile_count: i64,
+        interval_ticks: i64,
+        path: &str,
+    ) {
+        TrickplayImages::insert(trickplay_images::ActiveModel {
+            id: Set(id.to_string()),
+            item_id: Set(item_id.to_string()),
+            width: Set(width),
+            tile_count: Set(tile_count),
+            interval_ticks: Set(interval_ticks),
+            path: Set(path.to_string()),
+            created_at: Set(1),
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_chapter(
+        db: &DatabaseConnection,
+        id: &str,
+        item_id: &str,
+        start_position_ticks: i64,
+        name: &str,
+        marker_type: &str,
+    ) {
+        Chapters::insert(chapters::ActiveModel {
+            id: Set(id.to_string()),
+            item_id: Set(item_id.to_string()),
+            start_position_ticks: Set(start_position_ticks),
+            name: Set(name.to_string()),
+            marker_type: Set(Some(marker_type.to_string())),
+            source: Set("test".to_string()),
+            created_at: Set(1),
+            updated_at: Set(1),
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
     }
 
     fn test_state(db: DatabaseConnection) -> crate::app::state::AppState {

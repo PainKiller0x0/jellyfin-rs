@@ -365,12 +365,17 @@ mod tests {
     use super::{
         child_items_by_type, descendant_episodes, enrich_season_list, show_episodes, show_seasons,
     };
+    use crate::entities::{
+        image_assets::{self, Entity as ImageAssets},
+        libraries::{self, Entity as Libraries},
+        media_items::{self, Entity as MediaItems},
+    };
     use axum::{
         body::to_bytes,
         extract::{Extension, Path, Query, State},
         response::IntoResponse,
     };
-    use sea_orm::{ConnectionTrait, DatabaseConnection};
+    use sea_orm::{DatabaseConnection, EntityTrait, Set};
     use serde_json::{Value, json};
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
@@ -381,12 +386,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
-            vec!["tv".into(), "TV".into(), "tvshows".into()],
-        ))
-        .await
-        .unwrap();
+        insert_library(&db).await;
         insert_item(&db, "series", "Series", "tv", "Series", 1, 1, None, None).await;
         insert_item(
             &db,
@@ -478,12 +478,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
-            vec!["tv".into(), "TV".into(), "tvshows".into()],
-        ))
-        .await
-        .unwrap();
+        insert_library(&db).await;
         insert_item(&db, "series", "Series", "tv", "Series", 1, 1, None, None).await;
         insert_item(&db, "season", "S1", "series", "Season", 1, 1, None, None).await;
         insert_item(
@@ -539,12 +534,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
-            vec!["tv".into(), "TV".into(), "tvshows".into()],
-        ))
-        .await
-        .unwrap();
+        insert_library(&db).await;
         insert_item(&db, "series", "Series", "tv", "Series", 1, 1, None, None).await;
         insert_item(&db, "season", "S1", "series", "Season", 1, 1, None, None).await;
         insert_episode_with_size(
@@ -572,10 +562,17 @@ mod tests {
         crate::db::provider_ids::upsert(&db, "smaller-scraped", "Tmdb", "episode-tmdb")
             .await
             .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO image_assets (id, item_id, image_type, image_index, etag, created_at, updated_at) VALUES ('image-1', ?, 'Primary', 0, 'etag-1', 1, 1)",
-            vec!["smaller-scraped".into()],
-        ))
+        ImageAssets::insert(image_assets::ActiveModel {
+            id: Set("image-1".to_string()),
+            item_id: Set("smaller-scraped".to_string()),
+            image_type: Set("Primary".to_string()),
+            image_index: Set(0),
+            etag: Set(Some("etag-1".to_string())),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
         .await
         .unwrap();
 
@@ -593,12 +590,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
-            vec!["tv".into(), "TV".into(), "tvshows".into()],
-        ))
-        .await
-        .unwrap();
+        insert_library(&db).await;
         insert_item(&db, "series", "Series", "tv", "Series", 1, 1, None, None).await;
         insert_item(&db, "season", "S1", "series", "Season", 1, 1, None, None).await;
         insert_item(
@@ -640,12 +632,7 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, ?, 1, 1)",
-            vec!["tv".into(), "TV".into(), "tvshows".into()],
-        ))
-        .await
-        .unwrap();
+        insert_library(&db).await;
         insert_item(&db, "series", "Series", "tv", "Series", 1, 1, None, None).await;
         insert_item(&db, "season-1", "S1", "series", "Season", 1, 1, None, None).await;
 
@@ -667,6 +654,20 @@ mod tests {
         assert_eq!(value["StartIndex"], 0);
     }
 
+    async fn insert_library(db: &sea_orm::DatabaseConnection) {
+        Libraries::insert(libraries::ActiveModel {
+            id: Set("tv".to_string()),
+            name: Set("TV".to_string()),
+            collection_type: Set("tvshows".to_string()),
+            created_at: Set(1),
+            updated_at: Set(1),
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn insert_item(
         db: &sea_orm::DatabaseConnection,
         id: &str,
@@ -678,20 +679,23 @@ mod tests {
         season_number: Option<i64>,
         episode_number: Option<i64>,
     ) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, season_number, episode_number, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'tv', ?, ?, ?, ?, ?, ?, 1, 1, 1)",
-            vec![
-                id.into(),
-                title.into(),
-                id.into(),
-                parent_id.into(),
-                item_type.into(),
-                is_folder.into(),
-                is_public.into(),
-                season_number.into(),
-                episode_number.into(),
-            ],
-        ))
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(id.to_string()),
+            library_id: Set("tv".to_string()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set(item_type.to_string()),
+            is_folder: Set(is_folder),
+            is_public: Set(is_public),
+            season_number: Set(season_number),
+            episode_number: Set(episode_number),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
@@ -706,19 +710,25 @@ mod tests {
         size_bytes: i64,
         overview: Option<&str>,
     ) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, overview, season_number, episode_number, size_bytes, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'tv', ?, 'Episode', 0, 1, ?, ?, ?, ?, 1, 1, 1)",
-            vec![
-                id.into(),
-                title.into(),
-                id.into(),
-                parent_id.into(),
-                overview.into(),
-                season_number.into(),
-                episode_number.into(),
-                size_bytes.into(),
-            ],
-        ))
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(id.to_string()),
+            library_id: Set("tv".to_string()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set("Episode".to_string()),
+            is_folder: Set(0),
+            is_public: Set(1),
+            overview: Set(overview.map(ToString::to_string)),
+            season_number: Set(season_number),
+            episode_number: Set(episode_number),
+            size_bytes: Set(Some(size_bytes)),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }

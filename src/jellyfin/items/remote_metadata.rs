@@ -6,12 +6,12 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sea_orm::ConnectionTrait;
+use sea_orm::EntityTrait;
 use serde_json::{Value, json};
 
 use crate::{
     app::state::AppState,
-    db::row_ext::QueryResultExt,
+    entities::media_items::Entity as MediaItems,
     jellyfin::{common::internal_error, providers},
     library::douban_metadata,
 };
@@ -279,13 +279,10 @@ async fn item_type_for_id(
     db: &sea_orm::DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Option<String>> {
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT item_type FROM media_items WHERE id = ?",
-            vec![item_id.into()],
-        ))
-        .await?;
-    Ok(row.and_then(|row| row.get_str("item_type").ok()))
+    Ok(MediaItems::find_by_id(item_id.to_string())
+        .one(db)
+        .await?
+        .map(|item| item.item_type))
 }
 
 fn merge_remote_search_values(mut base: Value, details: Value) -> Value {
@@ -328,7 +325,8 @@ fn merge_remote_search_values(mut base: Value, details: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::ConnectionTrait;
+    use crate::entities::media_items;
+    use sea_orm::Set;
 
     #[test]
     fn remote_search_item_type_uses_last_path_segment() {
@@ -367,10 +365,20 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Series', 1, 1, 1, 1)",
-            vec!["series1".into(), "Series".into(), "/tmp/series".into()],
-        ))
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set("series1".to_string()),
+            title: Set("Series".to_string()),
+            path: Set("/tmp/series".to_string()),
+            library_id: Set(String::new()),
+            parent_id: Set(String::new()),
+            item_type: Set("Series".to_string()),
+            is_folder: Set(1),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
         .await
         .unwrap();
 

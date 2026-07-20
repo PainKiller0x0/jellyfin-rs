@@ -8,13 +8,13 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
     app::state::AppState,
-    db::row_ext::QueryResultExt,
+    entities::media_items::Entity as MediaItems,
     jellyfin::common::{internal_error, ok_response, wants_json_response},
     jellyfin::providers,
     library::images::upsert_image_asset,
@@ -446,44 +446,33 @@ async fn search_tmdb_id_by_item(state: &AppState, item_id: &str) -> anyhow::Resu
         .clone()
         .filter(|key| !key.is_empty())
         .context("no TMDb API key configured")?;
-    let row = state
-        .db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT title, production_year, item_type, parent_id FROM media_items WHERE id = ?",
-            vec![item_id.into()],
-        ))
+    let item = MediaItems::find_by_id(item_id.to_string())
+        .one(&state.db)
         .await
         .context("failed to fetch item for TMDb search")?;
-    let Some(row) = row else {
+    let Some(item) = item else {
         return Ok(None);
     };
-    let name: String = row.get_str("title")?;
-    let year: Option<i64> = row.get_opt_i64("production_year")?;
-    let item_type: String = row.get_str("item_type")?;
-    let parent_id: Option<String> = row.get_opt_str("parent_id")?;
 
-    if item_type.eq_ignore_ascii_case("Season") {
-        return match parent_id
-            .as_deref()
-            .filter(|parent_id| !parent_id.is_empty())
-        {
+    if item.item_type.eq_ignore_ascii_case("Season") {
+        return match non_empty_str(&item.parent_id) {
             Some(parent_id) => lookup_tmdb_id(&state.db, parent_id).await,
             None => Ok(None),
         };
     }
 
-    if item_type.eq_ignore_ascii_case("Episode") {
+    if item.item_type.eq_ignore_ascii_case("Episode") {
         return lookup_episode_series_tmdb_id(&state.db, item_id).await;
     }
 
     let tmdb_base_url = state.tmdb_proxy_url.read().await.clone();
     let tmdb_client = state.tmdb_http_client().await;
-    let results = if item_type.eq_ignore_ascii_case("Series") {
+    let results = if item.item_type.eq_ignore_ascii_case("Series") {
         providers::tmdb_tv_search(
             &tmdb_client,
             &api_key,
-            &name,
-            year,
+            &item.title,
+            item.production_year,
             tmdb_base_url.as_deref(),
         )
         .await?
@@ -491,8 +480,8 @@ async fn search_tmdb_id_by_item(state: &AppState, item_id: &str) -> anyhow::Resu
         providers::tmdb_movie_search(
             &tmdb_client,
             &api_key,
-            &name,
-            year,
+            &item.title,
+            item.production_year,
             tmdb_base_url.as_deref(),
         )
         .await?
@@ -513,42 +502,30 @@ async fn fetch_remote_images_by_type(
     tmdb_id: &str,
     requested_type: &str,
 ) -> anyhow::Result<Vec<Value>> {
-    let row = state
-        .db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT item_type, title, parent_id, season_number FROM media_items WHERE id = ?",
-            vec![item_id.into()],
-        ))
+    let item = MediaItems::find_by_id(item_id.to_string())
+        .one(&state.db)
         .await
         .context("failed to fetch item type for images")?;
 
-    let Some(row) = row else {
+    let Some(item) = item else {
         return Ok(Vec::new());
     };
 
     let tmdb_base_url = state.tmdb_proxy_url.read().await.clone();
     let tmdb_client = state.tmdb_http_client().await;
-    let item_type: String = row.get_str("item_type").unwrap_or_default();
-    if item_type.eq_ignore_ascii_case("Series") {
+    if item.item_type.eq_ignore_ascii_case("Series") {
         return fetch_tmdb_tv_images(&tmdb_client, api_key, tmdb_id, tmdb_base_url.as_deref())
             .await;
     }
 
-    if item_type.eq_ignore_ascii_case("Season") {
-        let title: String = row.get_str("title").unwrap_or_default();
-        let parent_id: Option<String> = row.get_opt_str("parent_id").ok().flatten();
-        let series_tmdb_id = match parent_id
-            .as_deref()
-            .filter(|parent_id| !parent_id.is_empty())
-        {
+    if item.item_type.eq_ignore_ascii_case("Season") {
+        let series_tmdb_id = match non_empty_str(&item.parent_id) {
             Some(parent_id) => lookup_tmdb_id(&state.db, parent_id).await.ok().flatten(),
             None => None,
         };
-        let season_number = row
-            .get_opt_i64("season_number")
-            .ok()
-            .flatten()
-            .or_else(|| crate::library::tmdb_metadata::parse_season_number(&title));
+        let season_number = item
+            .season_number
+            .or_else(|| crate::library::tmdb_metadata::parse_season_number(&item.title));
 
         let mut images = Vec::new();
         if requested_type.eq_ignore_ascii_case("Primary") {
@@ -599,7 +576,7 @@ async fn fetch_remote_images_by_type(
         return Ok(images);
     }
 
-    if item_type.eq_ignore_ascii_case("Episode") {
+    if item.item_type.eq_ignore_ascii_case("Episode") {
         if let Some(series_tmdb_id) = lookup_episode_series_tmdb_id(&state.db, item_id).await? {
             return fetch_tmdb_tv_images(
                 &tmdb_client,
@@ -618,19 +595,34 @@ async fn lookup_episode_series_tmdb_id(
     db: &DatabaseConnection,
     episode_id: &str,
 ) -> anyhow::Result<Option<String>> {
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            r#"SELECT p.provider_item_id
-               FROM media_items episode
-               JOIN media_items season ON season.id = episode.parent_id
-               JOIN media_items series ON series.id = season.parent_id
-               JOIN provider_ids p ON p.item_id = series.id AND p.provider = 'Tmdb'
-               WHERE episode.id = ?"#,
-            vec![episode_id.into()],
-        ))
+    let Some(episode) = MediaItems::find_by_id(episode_id.to_string())
+        .one(db)
         .await
-        .context("failed to look up episode series TMDb id")?;
-    Ok(row.and_then(|row| row.get_opt_str("provider_item_id").ok().flatten()))
+        .context("failed to read episode for TMDb id lookup")?
+    else {
+        return Ok(None);
+    };
+    let Some(season_id) = non_empty_str(&episode.parent_id) else {
+        return Ok(None);
+    };
+    let Some(season) = MediaItems::find_by_id(season_id.to_string())
+        .one(db)
+        .await
+        .context("failed to read season for TMDb id lookup")?
+    else {
+        return Ok(None);
+    };
+    let Some(series_id) = non_empty_str(&season.parent_id) else {
+        return Ok(None);
+    };
+    crate::db::provider_ids::get(db, series_id, "Tmdb")
+        .await
+        .context("failed to look up episode series TMDb id")
+}
+
+fn non_empty_str(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 async fn fetch_tmdb_tv_images(

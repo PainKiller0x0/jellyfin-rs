@@ -9,18 +9,29 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
     app::state::AppState,
-    db::row_ext::QueryResultExt,
     entities::{
+        chapters::{self, Entity as Chapters},
+        image_assets::{self, Entity as ImageAssets},
         libraries::{self, Entity as Libraries},
         library_paths::{self, Entity as LibraryPaths},
+        linked_children::{self, Entity as LinkedChildren},
+        media_game_genres::{self, Entity as MediaGameGenres},
+        media_genres::{self, Entity as MediaGenres},
+        media_items::{self, Entity as MediaItems},
+        media_people::{self, Entity as MediaPeople},
+        media_streams::{self, Entity as MediaStreams},
+        media_studios::{self, Entity as MediaStudios},
+        media_tags::{self, Entity as MediaTags},
+        provider_ids::{self, Entity as ProviderIds},
+        trickplay_images::{self, Entity as TrickplayImages},
+        user_data::{self, Entity as UserData},
     },
     jellyfin::common::internal_error,
     jellyfin::system,
@@ -413,35 +424,33 @@ pub async fn refresh_library(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn virtual_folders_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>> {
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            r#"SELECT libraries.id, libraries.name, libraries.collection_type, library_paths.path FROM libraries LEFT JOIN library_paths ON library_paths.library_id = libraries.id ORDER BY libraries.name ASC, library_paths.path ASC"#,
-            vec![],
-        ))
+    let libraries = Libraries::find()
+        .order_by_asc(libraries::Column::Name)
+        .all(db)
         .await
         .context("failed to list virtual folders")?;
-
-    let mut folders = Vec::<VirtualFolder>::new();
-    for row in &rows {
-        let id: String = row.get_str("id")?;
-        let name: String = row.get_str("name")?;
-        let collection_type: String = row.get_str("collection_type")?;
-        let path: Option<String> = row.get_opt_str("path")?;
-
-        if let Some(folder) = folders.iter_mut().find(|folder| folder.id == id) {
-            if let Some(path) = path {
-                folder.paths.push(path);
-            }
-            continue;
-        }
-
-        folders.push(VirtualFolder {
-            id,
-            name,
-            collection_type,
-            paths: path.into_iter().collect(),
-        });
+    let paths = LibraryPaths::find()
+        .order_by_asc(library_paths::Column::Path)
+        .all(db)
+        .await
+        .context("failed to list virtual folder paths")?;
+    let mut paths_by_library = HashMap::<String, Vec<String>>::new();
+    for path in paths {
+        paths_by_library
+            .entry(path.library_id)
+            .or_default()
+            .push(path.path);
     }
+
+    let folders = libraries
+        .into_iter()
+        .map(|library| VirtualFolder {
+            id: library.id.clone(),
+            name: library.name,
+            collection_type: library.collection_type,
+            paths: paths_by_library.remove(&library.id).unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
 
     let folder_ids = folders
         .iter()
@@ -570,69 +579,97 @@ async fn delete_virtual_folder_inner(db: &DatabaseConnection, name: &str) -> any
         return Ok(false);
     }
 
-    let item_rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            "SELECT id FROM media_items WHERE library_id = ?",
-            vec![library_id.clone().into()],
-        ))
+    let item_ids: Vec<String> = MediaItems::find()
+        .filter(media_items::Column::LibraryId.eq(&library_id))
+        .all(db)
         .await
-        .context("failed to list library media items")?;
-    let item_ids: Vec<String> = item_rows
-        .iter()
-        .filter_map(|row| row.get_str("id").ok())
+        .context("failed to list library media items")?
+        .into_iter()
+        .map(|item| item.id)
         .collect();
 
     if !item_ids.is_empty() {
-        let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let params: Vec<sea_orm::Value> = item_ids.iter().map(|id| id.as_str().into()).collect();
-        for table in [
-            "media_genres",
-            "media_tags",
-            "media_studios",
-            "media_people",
-            "media_game_genres",
-            "media_streams",
-            "user_data",
-            "image_assets",
-            "provider_ids",
-            "chapters",
-            "trickplay_images",
-        ] {
-            db.execute(crate::db::helpers::pg_statement(
-                &format!("DELETE FROM {table} WHERE item_id IN ({placeholders})"),
-                params.clone(),
-            ))
+        MediaGenres::delete_many()
+            .filter(media_genres::Column::ItemId.is_in(item_ids.clone()))
+            .exec(db)
             .await
-            .with_context(|| format!("failed to delete {table} for library: {name}"))?;
-        }
-        for column in ["item_id", "parent_id"] {
-            db.execute(crate::db::helpers::pg_statement(
-                &format!("DELETE FROM linked_children WHERE {column} IN ({placeholders})"),
-                params.clone(),
-            ))
+            .with_context(|| format!("failed to delete media_genres for library: {name}"))?;
+        MediaTags::delete_many()
+            .filter(media_tags::Column::ItemId.is_in(item_ids.clone()))
+            .exec(db)
+            .await
+            .with_context(|| format!("failed to delete media_tags for library: {name}"))?;
+        MediaStudios::delete_many()
+            .filter(media_studios::Column::ItemId.is_in(item_ids.clone()))
+            .exec(db)
+            .await
+            .with_context(|| format!("failed to delete media_studios for library: {name}"))?;
+        MediaPeople::delete_many()
+            .filter(media_people::Column::ItemId.is_in(item_ids.clone()))
+            .exec(db)
+            .await
+            .with_context(|| format!("failed to delete media_people for library: {name}"))?;
+        MediaGameGenres::delete_many()
+            .filter(media_game_genres::Column::ItemId.is_in(item_ids.clone()))
+            .exec(db)
+            .await
+            .with_context(|| format!("failed to delete media_game_genres for library: {name}"))?;
+        MediaStreams::delete_many()
+            .filter(media_streams::Column::ItemId.is_in(item_ids.clone()))
+            .exec(db)
+            .await
+            .with_context(|| format!("failed to delete media_streams for library: {name}"))?;
+        UserData::delete_many()
+            .filter(user_data::Column::ItemId.is_in(item_ids.clone()))
+            .exec(db)
+            .await
+            .with_context(|| format!("failed to delete user_data for library: {name}"))?;
+        ImageAssets::delete_many()
+            .filter(image_assets::Column::ItemId.is_in(item_ids.clone()))
+            .exec(db)
+            .await
+            .with_context(|| format!("failed to delete image_assets for library: {name}"))?;
+        ProviderIds::delete_many()
+            .filter(provider_ids::Column::ItemId.is_in(item_ids.clone()))
+            .exec(db)
+            .await
+            .with_context(|| format!("failed to delete provider_ids for library: {name}"))?;
+        Chapters::delete_many()
+            .filter(chapters::Column::ItemId.is_in(item_ids.clone()))
+            .exec(db)
+            .await
+            .with_context(|| format!("failed to delete chapters for library: {name}"))?;
+        TrickplayImages::delete_many()
+            .filter(trickplay_images::Column::ItemId.is_in(item_ids.clone()))
+            .exec(db)
+            .await
+            .with_context(|| format!("failed to delete trickplay_images for library: {name}"))?;
+        LinkedChildren::delete_many()
+            .filter(linked_children::Column::ItemId.is_in(item_ids.clone()))
+            .exec(db)
             .await
             .context("failed to delete linked children for library")?;
-        }
-        db.execute(crate::db::helpers::pg_statement(
-            &format!("DELETE FROM media_items WHERE id IN ({placeholders})"),
-            params,
-        ))
-        .await
-        .context("failed to delete library media items")?;
+        LinkedChildren::delete_many()
+            .filter(linked_children::Column::ParentId.is_in(item_ids.clone()))
+            .exec(db)
+            .await
+            .context("failed to delete linked children for library")?;
+        MediaItems::delete_many()
+            .filter(media_items::Column::Id.is_in(item_ids))
+            .exec(db)
+            .await
+            .context("failed to delete library media items")?;
     }
 
-    db.execute(crate::db::helpers::pg_statement(
-        "DELETE FROM library_paths WHERE library_id = ?",
-        vec![library_id.clone().into()],
-    ))
-    .await
-    .context("failed to delete library paths")?;
-    db.execute(crate::db::helpers::pg_statement(
-        "DELETE FROM libraries WHERE id = ?",
-        vec![library_id.into()],
-    ))
-    .await
-    .context("failed to delete library")?;
+    LibraryPaths::delete_many()
+        .filter(library_paths::Column::LibraryId.eq(&library_id))
+        .exec(db)
+        .await
+        .context("failed to delete library paths")?;
+    Libraries::delete_by_id(library_id)
+        .exec(db)
+        .await
+        .context("failed to delete library")?;
     Ok(true)
 }
 
@@ -658,17 +695,17 @@ async fn rename_virtual_folder_inner(
 ) -> anyhow::Result<bool> {
     let name = normalize_library_name(name)?;
     let new_name = normalize_library_name(new_name)?;
-    let result = db
-        .execute(crate::db::helpers::pg_statement(
-            "UPDATE libraries SET name = ?, updated_at = ? WHERE id = ?",
-            vec![
-                new_name.into(),
-                now_unix().into(),
-                library_id_for_name(&name).into(),
-            ],
-        ))
-        .await?;
-    Ok(result.rows_affected() > 0)
+    let Some(library) = Libraries::find_by_id(library_id_for_name(&name))
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let mut active: libraries::ActiveModel = library.into();
+    active.name = Set(new_name);
+    active.updated_at = Set(now_unix());
+    active.update(db).await?;
+    Ok(true)
 }
 
 async fn update_virtual_folder_path_inner(
@@ -681,18 +718,20 @@ async fn update_virtual_folder_path_inner(
     let path = path_utils::canonicalize_path(&normalize_library_path_text(path)?)?;
     let target_path =
         path_utils::validate_library_path(&normalize_library_path_text(target_path)?)?;
-    let result = db
-        .execute(crate::db::helpers::pg_statement(
-            "UPDATE library_paths SET path = ?, library_id = ? WHERE library_id = ? AND path = ?",
-            vec![
-                target_path.into(),
-                library_id_for_name(&name).into(),
-                library_id_for_name(&name).into(),
-                path.into(),
-            ],
-        ))
-        .await?;
-    Ok(result.rows_affected() > 0)
+    let library_id = library_id_for_name(&name);
+    let Some(model) = LibraryPaths::find()
+        .filter(library_paths::Column::LibraryId.eq(&library_id))
+        .filter(library_paths::Column::Path.eq(path))
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let mut active: library_paths::ActiveModel = model.into();
+    active.path = Set(target_path);
+    active.library_id = Set(library_id);
+    active.update(db).await?;
+    Ok(true)
 }
 
 async fn update_library_options_inner(
@@ -928,8 +967,13 @@ mod tests {
         update_library_options_inner, update_virtual_folder_path_inner,
         update_virtual_folder_path_request, virtual_folder_request,
     };
+    use crate::entities::{
+        libraries::{self, Entity as Libraries},
+        library_paths::{self, Entity as LibraryPaths},
+        media_items::{self, Entity as MediaItems},
+    };
     use axum::body::Bytes;
-    use sea_orm::{ConnectionTrait, DatabaseConnection};
+    use sea_orm::{DatabaseConnection, EntityTrait, Set};
     use std::collections::HashMap;
 
     #[test]
@@ -1165,23 +1209,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         insert_library(&db, "movies", "Movies").await;
         insert_library_path(&db, "movies", &dir.to_string_lossy()).await;
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'movies', '', 'Movie', 0, 1, 1, 1)",
-            vec![
-                "m1".into(),
-                "Movie".into(),
-                dir.join("movie.mkv").to_string_lossy().to_string().into(),
-            ],
-        ))
-        .await
-        .unwrap();
+        insert_media_item(&db, "m1", &dir.join("movie.mkv").to_string_lossy()).await;
 
         assert!(delete_virtual_folder_inner(&db, "Movies").await.unwrap());
-        let remaining = db
-            .query_one(crate::db::helpers::pg_statement(
-                "SELECT id FROM media_items WHERE id = ?",
-                vec!["m1".into()],
-            ))
+        let remaining = MediaItems::find_by_id("m1".to_string())
+            .one(&db)
             .await
             .unwrap();
         assert!(remaining.is_none());
@@ -1193,25 +1225,46 @@ mod tests {
     }
 
     async fn insert_library(db: &DatabaseConnection, id: &str, name: &str) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES (?, ?, 'movies', 1, 1)",
-            vec![id.into(), name.into()],
-        ))
+        Libraries::insert(libraries::ActiveModel {
+            id: Set(id.to_string()),
+            name: Set(name.to_string()),
+            collection_type: Set("movies".to_string()),
+            created_at: Set(1),
+            updated_at: Set(1),
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
 
     async fn insert_library_path(db: &DatabaseConnection, library_id: &str, path: &str) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO library_paths (id, library_id, path, created_at) VALUES (?, ?, ?, 1)",
-            vec![
-                crate::util::stable_text_id(&format!("library-path:{path}")).into(),
-                library_id.into(),
-                crate::library::path_utils::canonicalize_path(path)
-                    .unwrap()
-                    .into(),
-            ],
-        ))
+        let canonical_path = crate::library::path_utils::canonicalize_path(path).unwrap();
+        LibraryPaths::insert(library_paths::ActiveModel {
+            id: Set(crate::util::stable_text_id(&format!("library-path:{path}"))),
+            library_id: Set(library_id.to_string()),
+            path: Set(canonical_path),
+            created_at: Set(1),
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_media_item(db: &DatabaseConnection, id: &str, path: &str) {
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set("Movie".to_string()),
+            path: Set(path.to_string()),
+            library_id: Set("movies".to_string()),
+            parent_id: Set(String::new()),
+            item_type: Set("Movie".to_string()),
+            is_folder: Set(0),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }

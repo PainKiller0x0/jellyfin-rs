@@ -2,10 +2,12 @@ use std::{path::Path, sync::OnceLock};
 
 use anyhow::Context;
 use regex::Regex;
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+};
 
 use crate::{
-    db::row_ext::QueryResultExt,
+    entities::media_streams::{self, Entity as MediaStreams},
     util::{now_unix, stable_text_id},
 };
 
@@ -34,25 +36,27 @@ pub async fn upsert_sidecar_subtitles(
 }
 
 pub async fn clear_sidecar_subtitles(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<()> {
-    db.execute(crate::db::helpers::pg_statement(
-        r#"DELETE FROM media_streams
-           WHERE item_id = ?
-             AND is_external = 1
-             AND (
-                 stream_type = 'Subtitle'
-                 OR LOWER(path) LIKE '%.srt'
-                 OR LOWER(path) LIKE '%.ass'
-                 OR LOWER(path) LIKE '%.ssa'
-                 OR LOWER(path) LIKE '%.vtt'
-                 OR LOWER(path) LIKE '%.sub'
-                 OR LOWER(path) LIKE '%.smi'
-                 OR LOWER(path) LIKE '%.sami'
-                 OR LOWER(path) LIKE '%.mpl'
-             )"#,
-        vec![item_id.into()],
-    ))
-    .await
-    .context("failed to clear existing subtitle streams")?;
+    let streams = MediaStreams::find()
+        .filter(media_streams::Column::ItemId.eq(item_id))
+        .filter(media_streams::Column::IsExternal.eq(1))
+        .all(db)
+        .await
+        .context("failed to read existing subtitle streams")?;
+
+    for stream in streams {
+        if stream.stream_type == "Subtitle"
+            || stream
+                .path
+                .as_deref()
+                .map(is_subtitle_path_str)
+                .unwrap_or(false)
+        {
+            MediaStreams::delete_by_id(stream.id)
+                .exec(db)
+                .await
+                .context("failed to clear existing subtitle stream")?;
+        }
+    }
     Ok(())
 }
 
@@ -60,17 +64,14 @@ async fn next_external_subtitle_index(
     db: &DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<i64> {
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT COALESCE(MAX(stream_index), -1) + 1 AS next_index FROM media_streams WHERE item_id = ?",
-            vec![item_id.into()],
-        ))
+    let stream = MediaStreams::find()
+        .filter(media_streams::Column::ItemId.eq(item_id))
+        .order_by_desc(media_streams::Column::StreamIndex)
+        .one(db)
         .await
         .context("failed to find next subtitle stream index")?;
-    Ok(row
-        .as_ref()
-        .map(|row| row.get_i64("next_index"))
-        .transpose()?
+    Ok(stream
+        .map(|stream| stream.stream_index.saturating_add(1))
         .unwrap_or(0))
 }
 
@@ -91,34 +92,67 @@ async fn upsert_subtitle_stream(
         .and_then(|name| name.to_str())
         .unwrap_or("Subtitle")
         .to_string();
-    db.execute(crate::db::helpers::pg_statement(
-        r#"INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, title, path, is_external, created_at) VALUES (?, ?, ?, 'Subtitle', ?, ?, ?, ?, 1, ?) ON CONFLICT(item_id, stream_index) DO UPDATE SET stream_type = 'Subtitle', codec = excluded.codec, language = excluded.language, title = excluded.title, path = excluded.path, is_external = excluded.is_external"#,
-        vec![
-            stable_text_id(&format!("subtitle:{item_id}:{path_string}")).into(),
-            item_id.into(),
-            stream_index.into(),
-            codec.into(),
-            infer_subtitle_language(path).into(),
-            title.into(),
-            path_string.into(),
-            now_unix().into(),
-        ],
-    ))
-    .await
-    .with_context(|| format!("failed to upsert subtitle stream: {}", path.display()))?;
+    let language = infer_subtitle_language(path);
+
+    if let Some(existing) = MediaStreams::find()
+        .filter(media_streams::Column::ItemId.eq(item_id))
+        .filter(media_streams::Column::StreamIndex.eq(stream_index))
+        .one(db)
+        .await
+        .with_context(|| format!("failed to read subtitle stream: {}", path.display()))?
+    {
+        let mut active: media_streams::ActiveModel = existing.into();
+        active.stream_type = Set("Subtitle".to_string());
+        active.codec = Set(Some(codec));
+        active.language = Set(language);
+        active.title = Set(Some(title));
+        active.path = Set(Some(path_string));
+        active.is_external = Set(1);
+        active
+            .update(db)
+            .await
+            .with_context(|| format!("failed to update subtitle stream: {}", path.display()))?;
+    } else {
+        MediaStreams::insert(media_streams::ActiveModel {
+            id: Set(stable_text_id(&format!("subtitle:{item_id}:{path_string}"))),
+            item_id: Set(item_id.to_string()),
+            stream_index: Set(stream_index),
+            stream_type: Set("Subtitle".to_string()),
+            codec: Set(Some(codec)),
+            language: Set(language),
+            title: Set(Some(title)),
+            path: Set(Some(path_string)),
+            is_external: Set(1),
+            created_at: Set(now_unix()),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .with_context(|| format!("failed to insert subtitle stream: {}", path.display()))?;
+    }
     Ok(())
 }
 
 fn is_subtitle_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .map(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "srt" | "ass" | "ssa" | "vtt" | "sub" | "smi" | "sami" | "mpl"
-            )
-        })
+        .map(is_subtitle_extension)
         .unwrap_or_default()
+}
+
+fn is_subtitle_path_str(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(is_subtitle_extension)
+        .unwrap_or(false)
+}
+
+fn is_subtitle_extension(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "srt" | "ass" | "ssa" | "vtt" | "sub" | "smi" | "sami" | "mpl"
+    )
 }
 
 fn is_sidecar_for_media(path: &Path, media_stem: &str) -> bool {
@@ -225,7 +259,12 @@ fn infer_subtitle_language(path: &Path) -> Option<String> {
 mod tests {
     use std::fs;
 
-    use sea_orm::ConnectionTrait;
+    use crate::entities::{
+        libraries::{self, Entity as Libraries},
+        media_items::{self, Entity as MediaItems},
+        media_streams::{self, Entity as MediaStreams},
+    };
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
     use uuid::Uuid;
 
     use super::*;
@@ -248,16 +287,31 @@ mod tests {
             return;
         };
 
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO libraries (id, name, collection_type, created_at, updated_at) VALUES ('lib', 'Movies', 'movies', 1, 1)",
-            vec![],
-        ))
+        Libraries::insert(libraries::ActiveModel {
+            id: Set("lib".to_string()),
+            name: Set("Movies".to_string()),
+            collection_type: Set("movies".to_string()),
+            created_at: Set(1),
+            updated_at: Set(1),
+        })
+        .exec_without_returning(&db)
         .await
         .unwrap();
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES ('movie', 'Movie', '/tmp/movie.mkv', 'lib', 'lib', 'Movie', 0, 1, 1, 1, 1)",
-            vec![],
-        ))
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set("movie".to_string()),
+            title: Set("Movie".to_string()),
+            path: Set("/tmp/movie.mkv".to_string()),
+            library_id: Set("lib".to_string()),
+            parent_id: Set("lib".to_string()),
+            item_type: Set("Movie".to_string()),
+            is_folder: Set(0),
+            is_public: Set(1),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
         .await
         .unwrap();
 
@@ -274,25 +328,36 @@ mod tests {
                 0_i64,
             ),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, title, is_external, created_at) VALUES (?, 'movie', ?, ?, ?, ?, ?, ?, 1)",
-                vec![
-                    id.into(),
-                    index.into(),
-                    stream_type.into(),
-                    codec.into(),
-                    language.into(),
-                    title.into(),
-                    is_external.into(),
-                ],
-            ))
+            MediaStreams::insert(media_streams::ActiveModel {
+                id: Set(id.to_string()),
+                item_id: Set("movie".to_string()),
+                stream_index: Set(index),
+                stream_type: Set(stream_type.to_string()),
+                codec: Set(Some(codec.to_string())),
+                language: Set(language.map(ToString::to_string)),
+                title: Set(title.map(ToString::to_string)),
+                is_external: Set(is_external),
+                created_at: Set(1),
+                ..Default::default()
+            })
+            .exec_without_returning(&db)
             .await
             .unwrap();
         }
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_streams (id, item_id, stream_index, stream_type, codec, language, title, path, is_external, created_at) VALUES ('bad-old-external-subtitle', 'movie', 7, 'Audio', 'srt', 'eng', 'Old bad subtitle', '/tmp/movie.old.srt', 1, 1)",
-            vec![],
-        ))
+        MediaStreams::insert(media_streams::ActiveModel {
+            id: Set("bad-old-external-subtitle".to_string()),
+            item_id: Set("movie".to_string()),
+            stream_index: Set(7),
+            stream_type: Set("Audio".to_string()),
+            codec: Set(Some("srt".to_string())),
+            language: Set(Some("eng".to_string())),
+            title: Set(Some("Old bad subtitle".to_string())),
+            path: Set(Some("/tmp/movie.old.srt".to_string())),
+            is_external: Set(1),
+            created_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
         .await
         .unwrap();
 
@@ -309,23 +374,22 @@ mod tests {
             .await
             .unwrap();
 
-        let rows = db
-            .query_all(crate::db::helpers::pg_statement(
-                "SELECT stream_index, stream_type, codec, language, title, is_external FROM media_streams WHERE item_id = 'movie' ORDER BY stream_index",
-                vec![],
-            ))
+        let rows = MediaStreams::find()
+            .filter(media_streams::Column::ItemId.eq("movie"))
+            .order_by_asc(media_streams::Column::StreamIndex)
+            .all(&db)
             .await
             .unwrap();
         let streams = rows
             .iter()
             .map(|row| {
                 (
-                    row.get_i64("stream_index").unwrap(),
-                    row.get_str("stream_type").unwrap(),
-                    row.get_str("codec").unwrap(),
-                    row.get_opt_str("language").unwrap(),
-                    row.get_opt_str("title").unwrap(),
-                    row.get_i64("is_external").unwrap(),
+                    row.stream_index,
+                    row.stream_type.clone(),
+                    row.codec.clone(),
+                    row.language.clone(),
+                    row.title.clone(),
+                    row.is_external,
                 )
             })
             .collect::<Vec<_>>();

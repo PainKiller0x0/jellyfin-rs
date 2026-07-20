@@ -437,12 +437,17 @@ mod tests {
     use super::{
         next_up_inner, search_hints, search_hints_inner, shows_next_up, similar_items_inner,
     };
+    use crate::entities::{
+        genres::{self, Entity as Genres},
+        media_genres::{self, Entity as MediaGenres},
+        media_items::{self, Entity as MediaItems},
+    };
     use axum::{
         body::to_bytes,
         extract::{Extension, Query, State},
         response::IntoResponse,
     };
-    use sea_orm::{ConnectionTrait, DatabaseConnection};
+    use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
     use serde_json::Value;
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
@@ -639,12 +644,8 @@ mod tests {
         title: &str,
         is_public: i64,
     ) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', '', 'Movie', 0, ?, 1, 1, 1)",
-            vec![id.into(), title.into(), id.into(), is_public.into()],
-        ))
-        .await
-        .unwrap();
+        insert_media_item_typed(db, id, title, "", "Movie", 0, None).await;
+        update_item_visibility(db, id, is_public).await;
     }
 
     async fn insert_media_item_typed(
@@ -656,45 +657,54 @@ mod tests {
         is_folder: i64,
         episode_number: Option<i64>,
     ) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, episode_number, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?, ?, 1, ?, 1, 1, 1)",
-            vec![
-                id.into(),
-                title.into(),
-                id.into(),
-                parent_id.into(),
-                item_type.into(),
-                is_folder.into(),
-                episode_number.into(),
-            ],
-        ))
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(id.to_string()),
+            library_id: Set(String::new()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set(item_type.to_string()),
+            is_folder: Set(is_folder),
+            is_public: Set(1),
+            episode_number: Set(episode_number),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
 
     async fn update_item_visibility(db: &sea_orm::DatabaseConnection, id: &str, is_public: i64) {
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE media_items SET is_public = ? WHERE id = ?",
-            vec![is_public.into(), id.into()],
-        ))
-        .await
-        .unwrap();
+        let mut active: media_items::ActiveModel = MediaItems::find_by_id(id.to_string())
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        active.is_public = Set(is_public);
+        active.update(db).await.unwrap();
     }
 
     async fn insert_genre(db: &sea_orm::DatabaseConnection, id: &str, name: &str) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO genres (id, name, created_at) VALUES (?, ?, 1)",
-            vec![id.into(), name.into()],
-        ))
+        Genres::insert(genres::ActiveModel {
+            id: Set(id.to_string()),
+            name: Set(name.to_string()),
+            created_at: Set(1),
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
 
     async fn link_genre(db: &sea_orm::DatabaseConnection, item_id: &str, genre_id: &str) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_genres (item_id, genre_id) VALUES (?, ?)",
-            vec![item_id.into(), genre_id.into()],
-        ))
+        MediaGenres::insert(media_genres::ActiveModel {
+            item_id: Set(item_id.to_string()),
+            genre_id: Set(genre_id.to_string()),
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }

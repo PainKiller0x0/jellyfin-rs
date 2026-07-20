@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::Context;
 use axum::{
@@ -7,12 +10,20 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+    sea_query::OnConflict,
+};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
     app::state::AppState,
-    db::row_ext::QueryResultExt,
+    entities::{
+        libraries::{self, Entity as Libraries},
+        linked_children::{self, Entity as LinkedChildren},
+        media_items::{self, Entity as MediaItems},
+        users::{self, Entity as Users},
+    },
     jellyfin::{
         auth::request_user_id_and_admin_or_default,
         common::internal_error,
@@ -25,12 +36,6 @@ const MAX_COLLECTION_PLAYLIST_NAME_LEN: usize = 256;
 const MAX_COLLECTION_PLAYLIST_IDS: usize = 1000;
 const MAX_COLLECTION_PLAYLIST_ID_LEN: usize = 256;
 
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
-}
-
 /// Filter IDs to only those that exist in media_items.
 async fn filter_existing_ids(
     db: &DatabaseConnection,
@@ -39,14 +44,17 @@ async fn filter_existing_ids(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!("SELECT id FROM media_items WHERE id IN ({placeholders})");
-    let vals: Vec<sea_orm::Value> = ids.iter().map(|id| id.as_str().into()).collect();
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, vals))
+    let rows = MediaItems::find()
+        .filter(media_items::Column::Id.is_in(ids.to_vec()))
+        .all(db)
         .await
         .context("failed to filter media item ids")?;
-    Ok(rows.iter().filter_map(|r| r.get_str("id").ok()).collect())
+    let existing = rows.into_iter().map(|item| item.id).collect::<HashSet<_>>();
+    Ok(ids
+        .iter()
+        .filter(|id| existing.contains(*id))
+        .cloned()
+        .collect())
 }
 
 fn ids_query(
@@ -214,30 +222,39 @@ async fn create_collection_inner(
     let now = now_unix();
     let id = stable_text_id(&format!("boxset:{}:{}", name.to_ascii_lowercase(), now));
 
-    db.execute(crate::db::helpers::pg_statement(
-        "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, created_at, modified_at, updated_at) VALUES (?, ?, ?, '', '', 'BoxSet', 1, ?, ?, ?)",
-        vec![
-            id.clone().into(),
-            name.into(),
-            id.clone().into(),
-            now.into(),
-            now.into(),
-            now.into(),
-        ],
-    ))
+    MediaItems::insert(media_items::ActiveModel {
+        id: Set(id.clone()),
+        title: Set(name.to_string()),
+        path: Set(id.clone()),
+        library_id: Set(String::new()),
+        parent_id: Set(String::new()),
+        item_type: Set("BoxSet".to_string()),
+        is_folder: Set(1),
+        created_at: Set(now),
+        modified_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    })
+    .exec_without_returning(db)
     .await
     .context("failed to create collection")?;
 
     let valid_ids = filter_existing_ids(db, ids).await?;
     for (index, item_id) in valid_ids.iter().enumerate() {
-        let _ = db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?) ON CONFLICT(parent_id, item_id) DO NOTHING",
-            vec![
-                id.clone().into(),
-                item_id.clone().into(),
-                i64::try_from(index).unwrap_or(0).into(),
-            ],
-        ))
+        let _ = LinkedChildren::insert(linked_children::ActiveModel {
+            parent_id: Set(id.clone()),
+            item_id: Set(item_id.clone()),
+            sort_order: Set(i64::try_from(index).unwrap_or(0)),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                linked_children::Column::ParentId,
+                linked_children::Column::ItemId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(db)
         .await;
     }
 
@@ -278,19 +295,28 @@ async fn item_collections_inner(
     db: &DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Vec<JsonValue>> {
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            r#"SELECT mi.id, mi.title, mi.production_year, mi.overview
-               FROM linked_children lc
-               JOIN media_items mi ON mi.id = lc.parent_id
-               WHERE lc.item_id = ? AND mi.item_type = 'BoxSet'
-               ORDER BY mi.title ASC"#,
-            vec![item_id.into()],
-        ))
+    let parent_ids = LinkedChildren::find()
+        .filter(linked_children::Column::ItemId.eq(item_id))
+        .all(db)
+        .await
+        .context("failed to list item collections")?
+        .into_iter()
+        .map(|child| child.parent_id)
+        .collect::<Vec<_>>();
+
+    if parent_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let collections = MediaItems::find()
+        .filter(media_items::Column::Id.is_in(parent_ids))
+        .filter(media_items::Column::ItemType.eq("BoxSet"))
+        .order_by_asc(media_items::Column::Title)
+        .all(db)
         .await
         .context("failed to list item collections")?;
 
-    Ok(rows.iter().map(collection_row_json).collect())
+    Ok(collections.iter().map(collection_model_json).collect())
 }
 
 fn item_collections_result(items: Vec<JsonValue>) -> JsonValue {
@@ -313,14 +339,20 @@ async fn add_children(
     let valid_ids = filter_existing_ids(db, ids).await?;
     let max_order = max_child_sort_order(db, parent_id).await?;
     for (index, item_id) in valid_ids.iter().enumerate() {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?) ON CONFLICT(parent_id, item_id) DO NOTHING",
-            vec![
-                parent_id.into(),
-                item_id.as_str().into(),
-                (max_order + 1 + i64::try_from(index).unwrap_or(0)).into(),
-            ],
-        ))
+        LinkedChildren::insert(linked_children::ActiveModel {
+            parent_id: Set(parent_id.to_string()),
+            item_id: Set(item_id.clone()),
+            sort_order: Set(max_order + 1 + i64::try_from(index).unwrap_or(0)),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                linked_children::Column::ParentId,
+                linked_children::Column::ItemId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(db)
         .await
         .context("failed to add linked child")?;
     }
@@ -340,14 +372,12 @@ async fn remove_children(
     if ids.is_empty() {
         return Ok(true);
     }
-    for item_id in ids {
-        db.execute(crate::db::helpers::pg_statement(
-            "DELETE FROM linked_children WHERE parent_id = ? AND item_id = ?",
-            vec![parent_id.into(), item_id.as_str().into()],
-        ))
+    LinkedChildren::delete_many()
+        .filter(linked_children::Column::ParentId.eq(parent_id))
+        .filter(linked_children::Column::ItemId.is_in(ids.to_vec()))
+        .exec(db)
         .await
         .context("failed to remove linked child")?;
-    }
     touch_media_item(db, parent_id).await?;
     Ok(true)
 }
@@ -357,46 +387,49 @@ async fn media_item_exists(
     item_id: &str,
     item_type: &str,
 ) -> anyhow::Result<bool> {
-    Ok(db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT id FROM media_items WHERE id = ? AND item_type = ?",
-            vec![item_id.into(), item_type.into()],
-        ))
+    Ok(MediaItems::find()
+        .filter(media_items::Column::Id.eq(item_id))
+        .filter(media_items::Column::ItemType.eq(item_type))
+        .one(db)
         .await
         .context("failed to find media item")?
         .is_some())
 }
 
 async fn max_child_sort_order(db: &DatabaseConnection, parent_id: &str) -> anyhow::Result<i64> {
-    Ok(db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT COALESCE(MAX(sort_order), -1) AS max_order FROM linked_children WHERE parent_id = ?",
-            vec![parent_id.into()],
-        ))
+    Ok(LinkedChildren::find()
+        .filter(linked_children::Column::ParentId.eq(parent_id))
+        .order_by_desc(linked_children::Column::SortOrder)
+        .one(db)
         .await?
-        .and_then(|row| row.get_i64("max_order").ok())
+        .map(|child| child.sort_order)
         .unwrap_or(-1))
 }
 
 async fn touch_media_item(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<()> {
     let now = now_unix();
-    db.execute(crate::db::helpers::pg_statement(
-        "UPDATE media_items SET modified_at = ?, updated_at = ? WHERE id = ?",
-        vec![now.into(), now.into(), item_id.into()],
-    ))
-    .await
-    .context("failed to update media item timestamp")?;
+    if let Some(item) = MediaItems::find_by_id(item_id.to_string())
+        .one(db)
+        .await
+        .context("failed to find media item for timestamp update")?
+    {
+        let mut active: media_items::ActiveModel = item.into();
+        active.modified_at = Set(now);
+        active.updated_at = Set(now);
+        active
+            .update(db)
+            .await
+            .context("failed to update media item timestamp")?;
+    }
     Ok(())
 }
 
-fn collection_row_json(row: &sea_orm::QueryResult) -> JsonValue {
-    let id = row.get_str("id").unwrap_or_default();
-    let name = row.get_str("title").unwrap_or_default();
+fn collection_model_json(item: &media_items::Model) -> JsonValue {
     collection_item_json(
-        &id,
-        &name,
-        row.get_opt_str("overview").ok().flatten(),
-        row.get_opt_i64("production_year").ok().flatten(),
+        &item.id,
+        &item.title,
+        item.overview.clone(),
+        item.production_year,
     )
 }
 
@@ -521,30 +554,39 @@ async fn create_playlist_inner(
     let now = now_unix();
     let id = stable_text_id(&format!("playlist:{}:{}", name.to_ascii_lowercase(), now));
 
-    db.execute(crate::db::helpers::pg_statement(
-        "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, created_at, modified_at, updated_at) VALUES (?, ?, ?, '', '', 'Playlist', 1, ?, ?, ?)",
-        vec![
-            id.clone().into(),
-            name.into(),
-            format!("playlist:{id}").into(),
-            now.into(),
-            now.into(),
-            now.into(),
-        ],
-    ))
+    MediaItems::insert(media_items::ActiveModel {
+        id: Set(id.clone()),
+        title: Set(name.to_string()),
+        path: Set(format!("playlist:{id}")),
+        library_id: Set(String::new()),
+        parent_id: Set(String::new()),
+        item_type: Set("Playlist".to_string()),
+        is_folder: Set(1),
+        created_at: Set(now),
+        modified_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    })
+    .exec_without_returning(db)
     .await
     .context("failed to create playlist")?;
 
     let valid_ids = filter_existing_ids(db, ids).await?;
     for (index, item_id) in valid_ids.iter().enumerate() {
-        let _ = db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?) ON CONFLICT(parent_id, item_id) DO NOTHING",
-            vec![
-                id.clone().into(),
-                item_id.clone().into(),
-                i64::try_from(index).unwrap_or(0).into(),
-            ],
-        ))
+        let _ = LinkedChildren::insert(linked_children::ActiveModel {
+            parent_id: Set(id.clone()),
+            item_id: Set(item_id.clone()),
+            sort_order: Set(i64::try_from(index).unwrap_or(0)),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                linked_children::Column::ParentId,
+                linked_children::Column::ItemId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(db)
         .await;
     }
 
@@ -773,31 +815,37 @@ async fn update_playlist_inner(
     }
     let now = now_unix();
     if let Some(name) = name {
-        db.execute(crate::db::helpers::pg_statement(
-            "UPDATE media_items SET title = ?, updated_at = ? WHERE id = ? AND item_type = 'Playlist'",
-            vec![name.into(), now.into(), playlist_id.into()],
-        ))
-        .await
-        .context("failed to update playlist")?;
+        if let Some(item) = MediaItems::find()
+            .filter(media_items::Column::Id.eq(playlist_id))
+            .filter(media_items::Column::ItemType.eq("Playlist"))
+            .one(db)
+            .await
+            .context("failed to find playlist for update")?
+        {
+            let mut active: media_items::ActiveModel = item.into();
+            active.title = Set(name.to_string());
+            active.updated_at = Set(now);
+            active
+                .update(db)
+                .await
+                .context("failed to update playlist")?;
+        }
     }
 
     if let Some(ids) = ids {
         let valid_ids = filter_existing_ids(db, ids).await?;
-        db.execute(crate::db::helpers::pg_statement(
-            "DELETE FROM linked_children WHERE parent_id = ?",
-            vec![playlist_id.into()],
-        ))
-        .await
-        .context("failed to clear playlist items")?;
+        LinkedChildren::delete_many()
+            .filter(linked_children::Column::ParentId.eq(playlist_id))
+            .exec(db)
+            .await
+            .context("failed to clear playlist items")?;
         for (index, item_id) in valid_ids.iter().enumerate() {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO linked_children (parent_id, item_id, sort_order) VALUES (?, ?, ?)",
-                vec![
-                    playlist_id.into(),
-                    item_id.as_str().into(),
-                    i64::try_from(index).unwrap_or(0).into(),
-                ],
-            ))
+            LinkedChildren::insert(linked_children::ActiveModel {
+                parent_id: Set(playlist_id.to_string()),
+                item_id: Set(item_id.clone()),
+                sort_order: Set(i64::try_from(index).unwrap_or(0)),
+            })
+            .exec_without_returning(db)
             .await
             .context("failed to insert playlist item")?;
         }
@@ -817,38 +865,22 @@ async fn get_playlist_inner(
     playlist_id: &str,
     include_private: bool,
 ) -> anyhow::Result<Option<JsonValue>> {
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT id, title FROM media_items WHERE id = ? AND item_type = 'Playlist'",
-            vec![playlist_id.into()],
-        ))
+    let playlist = MediaItems::find()
+        .filter(media_items::Column::Id.eq(playlist_id))
+        .filter(media_items::Column::ItemType.eq("Playlist"))
+        .one(db)
         .await
         .context("failed to find playlist")?;
 
-    let Some(row) = row else {
+    let Some(playlist) = playlist else {
         return Ok(None);
     };
-    let title: String = row.get_str("title")?;
 
-    let child_sql = if include_private {
-        "SELECT lc.item_id FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC".to_string()
-    } else {
-        format!(
-            "SELECT lc.item_id FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? AND {} ORDER BY lc.sort_order ASC",
-            visible_media_item_sql("mi")
-        )
-    };
-    let child_rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            &child_sql,
-            vec![playlist_id.into()],
-        ))
+    let item_ids: Vec<String> = playlist_item_models(db, playlist_id, include_private)
         .await
-        .context("failed to list playlist items")?;
-
-    let item_ids: Vec<String> = child_rows
+        .context("failed to list playlist items")?
         .iter()
-        .filter_map(|row| row.get_str("item_id").ok())
+        .map(|(item, _)| item.id.clone())
         .collect();
 
     let permissions = playlist_permissions(db, playlist_id).await;
@@ -858,7 +890,7 @@ async fn get_playlist_inner(
         .collect::<Vec<_>>();
 
     Ok(Some(json!({
-        "Name": title,
+        "Name": playlist.title,
         "Id": playlist_id,
         "OpenAccess": false,
         "Shares": shares,
@@ -873,23 +905,21 @@ async fn playlist_users_inner(
     if !playlist_exists(db, playlist_id).await? {
         return Ok(None);
     }
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            "SELECT id FROM users ORDER BY username",
-            vec![],
-        ))
+    let users = Users::find()
+        .order_by_asc(users::Column::Username)
+        .all(db)
         .await
         .context("failed to list playlist users")?;
 
     let permissions = playlist_permissions(db, playlist_id).await;
     Ok(Some(
-        rows.iter()
-            .filter_map(|row| {
-                let id = row.get_str("id").ok()?;
-                Some(playlist_user_permissions_json(
-                    &id,
-                    permissions.get(&id).copied().unwrap_or(false),
-                ))
+        users
+            .iter()
+            .map(|user| {
+                playlist_user_permissions_json(
+                    &user.id,
+                    permissions.get(&user.id).copied().unwrap_or(false),
+                )
             })
             .collect(),
     ))
@@ -903,29 +933,19 @@ async fn playlist_user_inner(
     if !playlist_exists(db, playlist_id).await? {
         return Ok(None);
     }
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT id FROM users WHERE id = ?",
-            vec![user_id.into()],
-        ))
+    let user = Users::find_by_id(user_id.to_string())
+        .one(db)
         .await
         .context("failed to find playlist user")?;
 
     let permissions = playlist_permissions(db, playlist_id).await;
-    Ok(row.map(|_| {
+    Ok(user.map(|_| {
         playlist_user_permissions_json(user_id, permissions.get(user_id).copied().unwrap_or(false))
     }))
 }
 
 async fn playlist_exists(db: &DatabaseConnection, playlist_id: &str) -> anyhow::Result<bool> {
-    Ok(db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT id FROM media_items WHERE id = ? AND item_type = 'Playlist'",
-            vec![playlist_id.into()],
-        ))
-        .await
-        .context("failed to find playlist")?
-        .is_some())
+    media_item_exists(db, playlist_id, "Playlist").await
 }
 
 pub(crate) async fn playlist_write_access(
@@ -993,11 +1013,8 @@ async fn remove_playlist_user_permission(
 }
 
 async fn user_exists(db: &DatabaseConnection, user_id: &str) -> anyhow::Result<bool> {
-    Ok(db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT id FROM users WHERE id = ?",
-            vec![user_id.into()],
-        ))
+    Ok(Users::find_by_id(user_id.to_string())
+        .one(db)
         .await?
         .is_some())
 }
@@ -1129,65 +1146,122 @@ async fn playlist_items_inner(
     limit: usize,
     include_private: bool,
 ) -> anyhow::Result<(Vec<JsonValue>, usize)> {
-    let count_sql = if include_private {
-        "SELECT COUNT(*) AS cnt FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ?".to_string()
-    } else {
-        format!(
-            "SELECT COUNT(*) AS cnt FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? AND {}",
-            visible_media_item_sql("mi")
-        )
-    };
-    let count_row = db
-        .query_one(crate::db::helpers::pg_statement(
-            &count_sql,
-            vec![playlist_id.into()],
-        ))
-        .await
-        .context("failed to count playlist items")?;
-    let total = count_row
-        .and_then(|row| row.get_i64("cnt").ok())
-        .and_then(|count| usize::try_from(count).ok())
-        .unwrap_or(0);
-
-    let item_sql = if include_private {
-        r#"SELECT mi.id, mi.title, mi.item_type, mi.production_year, mi.premiere_date, mi.runtime_ticks, lc.sort_order FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? ORDER BY lc.sort_order ASC LIMIT ? OFFSET ?"#.to_string()
-    } else {
-        format!(
-            "SELECT mi.id, mi.title, mi.item_type, mi.production_year, mi.premiere_date, mi.runtime_ticks, lc.sort_order FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id WHERE lc.parent_id = ? AND {} ORDER BY lc.sort_order ASC LIMIT ? OFFSET ?",
-            visible_media_item_sql("mi")
-        )
-    };
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            &item_sql,
-            vec![
-                playlist_id.into(),
-                i64::try_from(limit).unwrap_or(50).into(),
-                i64::try_from(offset).unwrap_or(0).into(),
-            ],
-        ))
+    let playlist_items = playlist_item_models(db, playlist_id, include_private)
         .await
         .context("failed to list playlist items")?;
-
-    let items = rows
-        .iter()
-        .map(|row| {
-            let id: String = row.get_str("id").unwrap_or_default();
-            let title: String = row.get_str("title").unwrap_or_default();
-            let sort_order: i64 = row.get_i64("sort_order").unwrap_or_default();
-            json!({
-                "Id": id,
-                "Name": title,
-                "PlaylistItemId": id,
-                "Type": row.get_str("item_type").unwrap_or_default(),
-                "ProductionYear": row.get_opt_i64("production_year").ok().flatten(),
-                "PremiereDate": row.get_opt_str("premiere_date").ok().flatten().and_then(|date| crate::util::yyyy_mm_dd_to_jellyfin_date(&date)),
-                "RunTimeTicks": row.get_opt_i64("runtime_ticks").ok().flatten(),
-                "IndexNumber": sort_order,
-            })
-        })
+    let total = playlist_items.len();
+    let items = playlist_items
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(item, sort_order)| playlist_item_json(&item, sort_order))
         .collect();
     Ok((items, total))
+}
+
+async fn playlist_item_models(
+    db: &DatabaseConnection,
+    playlist_id: &str,
+    include_private: bool,
+) -> anyhow::Result<Vec<(media_items::Model, i64)>> {
+    let children = LinkedChildren::find()
+        .filter(linked_children::Column::ParentId.eq(playlist_id))
+        .order_by_asc(linked_children::Column::SortOrder)
+        .all(db)
+        .await?;
+    if children.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let item_ids = children
+        .iter()
+        .map(|child| child.item_id.clone())
+        .collect::<Vec<_>>();
+    let mut items_by_id = MediaItems::find()
+        .filter(media_items::Column::Id.is_in(item_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|item| (item.id.clone(), item))
+        .collect::<HashMap<_, _>>();
+
+    let mut items = children
+        .into_iter()
+        .filter_map(|child| {
+            items_by_id
+                .remove(&child.item_id)
+                .map(|item| (item, child.sort_order))
+        })
+        .collect::<Vec<_>>();
+
+    if !include_private {
+        let visible_items =
+            visible_media_items(db, items.iter().map(|(item, _)| item.clone()).collect()).await?;
+        let visible_ids = visible_items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<HashSet<_>>();
+        items.retain(|(item, _)| visible_ids.contains(&item.id));
+    }
+
+    Ok(items)
+}
+
+async fn visible_media_items(
+    db: &DatabaseConnection,
+    items: Vec<media_items::Model>,
+) -> anyhow::Result<Vec<media_items::Model>> {
+    let parent_ids = items
+        .iter()
+        .filter(|item| item.is_public == 1 && !item.parent_id.is_empty())
+        .map(|item| item.parent_id.clone())
+        .collect::<HashSet<_>>();
+    if parent_ids.is_empty() {
+        return Ok(items
+            .into_iter()
+            .filter(|item| item.is_public == 1 && item.parent_id.is_empty())
+            .collect());
+    }
+
+    let parent_ids_vec = parent_ids.iter().cloned().collect::<Vec<_>>();
+    let library_parent_ids = Libraries::find()
+        .filter(libraries::Column::Id.is_in(parent_ids_vec.clone()))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|library| library.id)
+        .collect::<HashSet<_>>();
+    let media_parent_ids = MediaItems::find()
+        .filter(media_items::Column::Id.is_in(parent_ids_vec))
+        .filter(media_items::Column::IsPublic.eq(1))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|item| item.id)
+        .collect::<HashSet<_>>();
+
+    Ok(items
+        .into_iter()
+        .filter(|item| {
+            item.is_public == 1
+                && (item.parent_id.is_empty()
+                    || library_parent_ids.contains(&item.parent_id)
+                    || media_parent_ids.contains(&item.parent_id))
+        })
+        .collect())
+}
+
+fn playlist_item_json(item: &media_items::Model, sort_order: i64) -> JsonValue {
+    json!({
+        "Id": item.id.clone(),
+        "Name": item.title.clone(),
+        "PlaylistItemId": item.id.clone(),
+        "Type": item.item_type.clone(),
+        "ProductionYear": item.production_year,
+        "PremiereDate": item.premiere_date.as_deref().and_then(crate::util::yyyy_mm_dd_to_jellyfin_date),
+        "RunTimeTicks": item.runtime_ticks,
+        "IndexNumber": sort_order,
+    })
 }
 
 /// POST /Collections/{id}/Items/Delete — batch remove items from collection
@@ -1252,7 +1326,11 @@ mod tests {
         playlist_write_access, remove_children, set_playlist_user_permission,
         update_playlist_inner,
     };
-    use sea_orm::ConnectionTrait;
+    use crate::entities::{
+        media_items::{self, Entity as MediaItems},
+        users::{self, Entity as Users},
+    };
+    use sea_orm::{EntityTrait, Set};
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -1558,10 +1636,17 @@ mod tests {
     }
 
     async fn insert_user(db: &sea_orm::DatabaseConnection, id: &str) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, ?, ?, 0, 0, 1, 1)",
-            vec![id.into(), id.into(), id.into()],
-        ))
+        Users::insert(users::ActiveModel {
+            id: Set(id.to_string()),
+            username: Set(id.to_string()),
+            display_name: Set(id.to_string()),
+            is_admin: Set(0),
+            is_disabled: Set(0),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
@@ -1593,17 +1678,21 @@ mod tests {
         parent_id: &str,
         is_public: i64,
     ) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?, 1, ?, 1, 1, 1)",
-            vec![
-                id.into(),
-                title.into(),
-                id.into(),
-                parent_id.into(),
-                item_type.into(),
-                is_public.into(),
-            ],
-        ))
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(id.to_string()),
+            library_id: Set(String::new()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set(item_type.to_string()),
+            is_folder: Set(1),
+            is_public: Set(is_public),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }

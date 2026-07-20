@@ -475,12 +475,21 @@ mod tests {
     use super::{
         NamedRelation, filters2_inner, named_item_by_name_inner, named_item_json, shows_upcoming,
     };
+    use crate::entities::{
+        game_genres::{self, Entity as GameGenres},
+        genres::{self, Entity as Genres},
+        media_game_genres::{self, Entity as MediaGameGenres},
+        media_genres::{self, Entity as MediaGenres},
+        media_items::{self, Entity as MediaItems},
+        media_studios::{self, Entity as MediaStudios},
+        studios::{self, Entity as Studios},
+    };
     use axum::{
         body::to_bytes,
         extract::{Extension, Query, State},
         response::IntoResponse,
     };
-    use sea_orm::{ConnectionTrait, DatabaseConnection};
+    use sea_orm::{DatabaseConnection, EntityTrait, Set};
     use serde_json::Value;
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
@@ -685,18 +694,23 @@ mod tests {
         year: i64,
         rating: &str,
     ) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, production_year, official_rating, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Movie', 0, ?, ?, ?, 1, 1, 1)",
-            vec![
-                id.into(),
-                title.into(),
-                id.into(),
-                parent_id.into(),
-                is_public.into(),
-                year.into(),
-                rating.into(),
-            ],
-        ))
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(id.to_string()),
+            library_id: Set(String::new()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set("Movie".to_string()),
+            is_folder: Set(0),
+            is_public: Set(is_public),
+            production_year: Set(Some(year)),
+            official_rating: Set(Some(rating.to_string())),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
@@ -719,28 +733,53 @@ mod tests {
         is_public: i64,
         created_at: i64,
     ) {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, 'Episode', 0, ?, 1, ?, 1)",
-            vec![
-                id.into(),
-                title.into(),
-                id.into(),
-                parent_id.into(),
-                is_public.into(),
-                created_at.into(),
-            ],
-        ))
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(id.to_string()),
+            library_id: Set(String::new()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set("Episode".to_string()),
+            is_folder: Set(0),
+            is_public: Set(is_public),
+            modified_at: Set(1),
+            created_at: Set(created_at),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
         .await
         .unwrap();
     }
 
     async fn insert_named(db: &sea_orm::DatabaseConnection, table: &str, id: &str, name: &str) {
-        db.execute(crate::db::helpers::pg_statement(
-            &format!("INSERT INTO {table} (id, name, created_at) VALUES (?, ?, 1)"),
-            vec![id.into(), name.into()],
-        ))
-        .await
-        .unwrap();
+        match table {
+            "genres" => Genres::insert(genres::ActiveModel {
+                id: Set(id.to_string()),
+                name: Set(name.to_string()),
+                created_at: Set(1),
+            })
+            .exec_without_returning(db)
+            .await
+            .unwrap(),
+            "studios" => Studios::insert(studios::ActiveModel {
+                id: Set(id.to_string()),
+                name: Set(name.to_string()),
+                created_at: Set(1),
+            })
+            .exec_without_returning(db)
+            .await
+            .unwrap(),
+            "game_genres" => GameGenres::insert(game_genres::ActiveModel {
+                id: Set(id.to_string()),
+                name: Set(name.to_string()),
+                created_at: Set(1),
+            })
+            .exec_without_returning(db)
+            .await
+            .unwrap(),
+            _ => panic!("unsupported named test table: {table}"),
+        };
     }
 
     async fn link_named(
@@ -750,12 +789,36 @@ mod tests {
         item_id: &str,
         value_id: &str,
     ) {
-        db.execute(crate::db::helpers::pg_statement(
-            &format!("INSERT INTO {table} (item_id, {column}) VALUES (?, ?)"),
-            vec![item_id.into(), value_id.into()],
-        ))
-        .await
-        .unwrap();
+        match (table, column) {
+            ("media_genres", "genre_id") => {
+                MediaGenres::insert(media_genres::ActiveModel {
+                    item_id: Set(item_id.to_string()),
+                    genre_id: Set(value_id.to_string()),
+                })
+                .exec_without_returning(db)
+                .await
+                .unwrap();
+            }
+            ("media_studios", "studio_id") => {
+                MediaStudios::insert(media_studios::ActiveModel {
+                    item_id: Set(item_id.to_string()),
+                    studio_id: Set(value_id.to_string()),
+                })
+                .exec_without_returning(db)
+                .await
+                .unwrap();
+            }
+            ("media_game_genres", "game_genre_id") => {
+                MediaGameGenres::insert(media_game_genres::ActiveModel {
+                    item_id: Set(item_id.to_string()),
+                    game_genre_id: Set(value_id.to_string()),
+                })
+                .exec_without_returning(db)
+                .await
+                .unwrap();
+            }
+            _ => panic!("unsupported named test relation: {table}.{column}"),
+        }
     }
 
     fn test_state(db: DatabaseConnection) -> crate::app::state::AppState {

@@ -1,12 +1,19 @@
-use std::{cmp::Ordering, collections::HashMap, path::Path};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use anyhow::Context;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use serde_json::Value as JsonValue;
 
 use crate::{
-    db::row_ext::QueryResultExt,
-    entities::media_streams::{Entity as MediaStreams, Model as MediaStreamModel},
+    entities::{
+        libraries::Entity as Libraries,
+        media_items::{self, Entity as MediaItems},
+        media_streams::{Entity as MediaStreams, Model as MediaStreamModel},
+    },
     library::models::{MediaItem, MediaStreamRow, child_video_source_json_for_item},
 };
 
@@ -22,10 +29,42 @@ struct VideoSourceRow {
     size_bytes: Option<i64>,
 }
 
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
+impl From<media_items::Model> for VideoSourceRow {
+    fn from(item: media_items::Model) -> Self {
+        Self {
+            id: item.id,
+            title: item.title,
+            path: item.path,
+            container: item.container.unwrap_or_else(|| "bin".to_string()),
+            runtime_ticks: item.runtime_ticks,
+            size_bytes: item.size_bytes,
+        }
+    }
+}
+
+async fn visible_media_item(
+    db: &sea_orm::DatabaseConnection,
+    item: &media_items::Model,
+) -> anyhow::Result<bool> {
+    if item.is_public == 0 {
+        return Ok(false);
+    }
+    if item.parent_id.is_empty() {
+        return Ok(true);
+    }
+    if Libraries::find_by_id(item.parent_id.clone())
+        .one(db)
+        .await
+        .context("failed to check parent library visibility")?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    Ok(MediaItems::find_by_id(item.parent_id.clone())
+        .one(db)
+        .await
+        .context("failed to check parent item visibility")?
+        .is_some_and(|parent| parent.is_public != 0))
 }
 
 pub(crate) async fn media_streams_for_item(
@@ -129,33 +168,26 @@ pub(crate) async fn child_video_sources(
     parent_id: &str,
     include_private: bool,
 ) -> anyhow::Result<Vec<JsonValue>> {
-    let visibility = if include_private {
-        String::new()
-    } else {
-        format!(" AND {}", visible_media_item_sql("media_items"))
-    };
-    let sql = format!(
-        "SELECT media_items.id, media_items.title, media_items.path, media_items.container, media_items.runtime_ticks, media_items.size_bytes FROM media_items WHERE media_items.parent_id = ? AND media_items.item_type = 'Video'{visibility} ORDER BY media_items.title ASC"
-    );
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            &sql,
-            vec![parent_id.into()],
-        ))
+    let rows = MediaItems::find()
+        .filter(media_items::Column::ParentId.eq(parent_id))
+        .filter(media_items::Column::ItemType.eq("Video"))
+        .order_by_asc(media_items::Column::Title)
+        .all(db)
         .await
         .with_context(|| format!("failed to find video children for: {parent_id}"))?;
 
     let mut sources = Vec::new();
-    for row in &rows {
-        let video_id: String = row.get_str("id")?;
-        let title: String = row.get_str("title")?;
-        let path: String = row.get_str("path")?;
+    for row in rows {
+        if !include_private && !visible_media_item(db, &row).await? {
+            continue;
+        }
+        let video_id = row.id;
+        let title = row.title;
+        let path = row.path;
         let source_name = media_source_file_name(&path, &title);
-        let container = row
-            .get_opt_str("container")?
-            .unwrap_or_else(|| "bin".to_string());
-        let size = row.get_opt_i64("size_bytes")?;
-        let runtime_ticks = row.get_opt_i64("runtime_ticks")?;
+        let container = row.container.unwrap_or_else(|| "bin".to_string());
+        let size = row.size_bytes;
+        let runtime_ticks = row.runtime_ticks;
 
         // Add media streams for this video
         let streams = media_streams_for_item(db, &video_id)
@@ -192,40 +224,19 @@ pub(crate) async fn batch_child_video_sources(
 
     let mut source_rows: Vec<(String, VideoSourceRow)> = Vec::new();
     for chunk in parent_ids.chunks(500) {
-        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let visibility = if include_private {
-            String::new()
-        } else {
-            format!(" AND {}", visible_media_item_sql("media_items"))
-        };
-        let sql = format!(
-            "SELECT media_items.parent_id, media_items.id, media_items.title, media_items.path, media_items.container, media_items.runtime_ticks, media_items.size_bytes \
-             FROM media_items \
-             WHERE media_items.parent_id IN ({placeholders}) AND media_items.item_type = 'Video'{visibility} \
-             ORDER BY media_items.parent_id ASC, media_items.title ASC"
-        );
-        let values = chunk
-            .iter()
-            .map(|id| id.as_str().into())
-            .collect::<Vec<sea_orm::Value>>();
-        let rows = db
-            .query_all(crate::db::helpers::pg_statement(&sql, values))
+        let rows = MediaItems::find()
+            .filter(media_items::Column::ParentId.is_in(chunk.iter().cloned()))
+            .filter(media_items::Column::ItemType.eq("Video"))
+            .order_by_asc(media_items::Column::ParentId)
+            .order_by_asc(media_items::Column::Title)
+            .all(db)
             .await
             .with_context(|| "failed to batch find child video sources")?;
-        for row in &rows {
-            source_rows.push((
-                row.get_str("parent_id")?,
-                VideoSourceRow {
-                    id: row.get_str("id")?,
-                    title: row.get_str("title")?,
-                    path: row.get_str("path")?,
-                    container: row
-                        .get_opt_str("container")?
-                        .unwrap_or_else(|| "bin".to_string()),
-                    runtime_ticks: row.get_opt_i64("runtime_ticks")?,
-                    size_bytes: row.get_opt_i64("size_bytes")?,
-                },
-            ));
+        for row in rows {
+            if !include_private && !visible_media_item(db, &row).await? {
+                continue;
+            }
+            source_rows.push((row.parent_id.clone(), VideoSourceRow::from(row)));
         }
     }
 
@@ -273,48 +284,41 @@ pub(crate) async fn episode_version_sources(
         return Ok(Vec::new());
     }
 
-    let visibility = if include_private {
-        String::new()
+    let mut query = MediaItems::find()
+        .filter(media_items::Column::ParentId.eq(&item.parent_id))
+        .filter(media_items::Column::ItemType.eq("Episode"))
+        .filter(media_items::Column::EpisodeNumber.eq(item.episode_number.unwrap_or_default()));
+    query = if let Some(season_number) = item.season_number {
+        query.filter(media_items::Column::SeasonNumber.eq(season_number))
     } else {
-        format!(" AND {}", visible_media_item_sql("media_items"))
+        query.filter(media_items::Column::SeasonNumber.is_null())
     };
-    let season_clause = if item.season_number.is_some() {
-        "media_items.season_number = ?"
-    } else {
-        "media_items.season_number IS NULL"
-    };
-    let sql = format!(
-        "SELECT media_items.id, media_items.title, media_items.path, media_items.container, media_items.runtime_ticks, media_items.size_bytes \
-         FROM media_items \
-         WHERE media_items.parent_id = ? \
-           AND media_items.item_type = 'Episode' \
-           AND {season_clause} \
-           AND media_items.episode_number = ?{visibility} \
-         ORDER BY CASE WHEN media_items.id = ? THEN 0 ELSE 1 END, media_items.size_bytes DESC NULLS LAST, media_items.path ASC"
-    );
-    let mut values: Vec<sea_orm::Value> = vec![item.parent_id.as_str().into()];
-    if let Some(season_number) = item.season_number {
-        values.push(season_number.into());
-    }
-    values.push(item.episode_number.unwrap_or_default().into());
-    values.push(item.id.as_str().into());
-
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, values))
+    let rows = query
+        .all(db)
         .await
         .with_context(|| format!("failed to find episode versions for: {}", item.id))?;
+    let mut visible_rows = Vec::new();
+    for row in rows {
+        if include_private || visible_media_item(db, &row).await? {
+            visible_rows.push(row);
+        }
+    }
+
+    let mut rows = visible_rows
+        .into_iter()
+        .map(VideoSourceRow::from)
+        .collect::<Vec<_>>();
+    sort_episode_version_sources_for_item(&mut rows, &item.id);
 
     let mut sources = Vec::new();
-    for row in &rows {
-        let source_id = row.get_str("id")?;
-        let title = row.get_str("title")?;
-        let path = row.get_str("path")?;
+    for row in rows {
+        let source_id = row.id;
+        let title = row.title;
+        let path = row.path;
         let source_name = media_source_file_name(&path, &title);
-        let container = row
-            .get_opt_str("container")?
-            .unwrap_or_else(|| "bin".to_string());
-        let size = row.get_opt_i64("size_bytes")?;
-        let runtime_ticks = row.get_opt_i64("runtime_ticks")?;
+        let container = row.container;
+        let size = row.size_bytes;
+        let runtime_ticks = row.runtime_ticks;
         let streams = media_streams_for_item(db, &source_id)
             .await
             .unwrap_or_default();
@@ -356,59 +360,33 @@ pub(crate) async fn batch_episode_version_sources(
     episode_keys.sort();
     episode_keys.dedup();
 
-    let visibility = if include_private {
-        String::new()
-    } else {
-        format!(" AND {}", visible_media_item_sql("media_items"))
-    };
-    let placeholders = episode_keys
+    let episode_key_set = episode_keys.iter().cloned().collect::<HashSet<_>>();
+    let parent_ids = episode_keys
         .iter()
-        .map(|_| "(?::text, ?::bigint, ?::bigint)")
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "WITH wanted(parent_id, season_number, episode_number) AS (VALUES {placeholders}) \
-         SELECT media_items.id, media_items.title, media_items.path, media_items.container, \
-                media_items.runtime_ticks, media_items.size_bytes, media_items.parent_id, \
-                media_items.season_number, media_items.episode_number \
-         FROM media_items \
-         JOIN wanted ON media_items.parent_id = wanted.parent_id \
-              AND media_items.episode_number = wanted.episode_number \
-              AND (media_items.season_number = wanted.season_number \
-                   OR (media_items.season_number IS NULL AND wanted.season_number IS NULL)) \
-         WHERE media_items.item_type = 'Episode'{visibility} \
-         ORDER BY media_items.parent_id ASC, media_items.season_number ASC NULLS FIRST, \
-                  media_items.episode_number ASC, media_items.size_bytes DESC NULLS LAST, \
-                  media_items.path ASC"
-    );
-    let mut values = Vec::with_capacity(episode_keys.len() * 3);
-    for (parent_id, season_number, episode_number) in &episode_keys {
-        values.push(parent_id.as_str().into());
-        values.push((*season_number).into());
-        values.push((*episode_number).into());
-    }
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, values))
+        .map(|(parent_id, _, _)| parent_id.clone())
+        .collect::<HashSet<_>>();
+    let rows = MediaItems::find()
+        .filter(media_items::Column::ParentId.is_in(parent_ids))
+        .filter(media_items::Column::ItemType.eq("Episode"))
+        .all(db)
         .await
         .with_context(|| "failed to batch find episode versions")?;
 
     let mut grouped: HashMap<EpisodeVersionKey, Vec<VideoSourceRow>> = HashMap::new();
-    for row in &rows {
-        let parent_id = row.get_str("parent_id")?;
-        let Some(episode_number) = row.get_opt_i64("episode_number")? else {
+    for row in rows {
+        if !include_private && !visible_media_item(db, &row).await? {
+            continue;
+        }
+        let Some(episode_number) = row.episode_number else {
             continue;
         };
-        let key = (parent_id, row.get_opt_i64("season_number")?, episode_number);
-        grouped.entry(key).or_default().push(VideoSourceRow {
-            id: row.get_str("id")?,
-            title: row.get_str("title")?,
-            path: row.get_str("path")?,
-            container: row
-                .get_opt_str("container")?
-                .unwrap_or_else(|| "bin".to_string()),
-            runtime_ticks: row.get_opt_i64("runtime_ticks")?,
-            size_bytes: row.get_opt_i64("size_bytes")?,
-        });
+        let key = (row.parent_id.clone(), row.season_number, episode_number);
+        if episode_key_set.contains(&key) {
+            grouped
+                .entry(key)
+                .or_default()
+                .push(VideoSourceRow::from(row));
+        }
     }
 
     let stream_map = if include_streams {
@@ -516,8 +494,9 @@ pub async fn subtitle_stream_path(
 #[cfg(test)]
 mod tests {
     use super::{batch_episode_version_sources, child_video_sources, episode_version_sources};
+    use crate::entities::media_items::{self, Entity as MediaItems};
     use crate::library::models::MediaItem;
-    use sea_orm::ConnectionTrait;
+    use sea_orm::{DatabaseConnection, EntityTrait, Set};
 
     #[tokio::test]
     async fn child_video_sources_hide_private_versions_unless_requested() {
@@ -531,20 +510,21 @@ mod tests {
             ("private-parent", "", "Movie", 1_i64, 0_i64),
             ("hidden-child", "private-parent", "Video", 0_i64, 1_i64),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, modified_at, created_at, updated_at) VALUES (?, ?, ?, '', ?, ?, ?, ?, 'mkv', 1, 1, 1)",
-                vec![
-                    id.into(),
-                    id.into(),
-                    format!("/tmp/{id}.mkv").into(),
-                    parent_id.into(),
-                    item_type.into(),
-                    is_folder.into(),
-                    is_public.into(),
-                ],
-            ))
-            .await
-            .unwrap();
+            insert_test_media_item(
+                &db,
+                id,
+                id,
+                &format!("/tmp/{id}.mkv"),
+                "",
+                parent_id,
+                item_type,
+                is_folder,
+                is_public,
+                None,
+                None,
+                None,
+            )
+            .await;
         }
 
         assert_eq!(
@@ -637,23 +617,21 @@ mod tests {
                 Some(400),
             ),
         ] {
-            db.execute(crate::db::helpers::pg_statement(
-                "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, container, size_bytes, season_number, episode_number, modified_at, created_at, updated_at) VALUES (?, ?, ?, 'tv', ?, ?, ?, ?, 'mkv', ?, ?, ?, 1, 1, 1)",
-                vec![
-                    id.into(),
-                    title.into(),
-                    path.into(),
-                    parent_id.into(),
-                    item_type.into(),
-                    (if item_type == "Season" { 1_i64 } else { 0_i64 }).into(),
-                    is_public.into(),
-                    size.into(),
-                    season.into(),
-                    episode.into(),
-                ],
-            ))
-            .await
-            .unwrap();
+            insert_test_media_item(
+                &db,
+                id,
+                title,
+                path,
+                "tv",
+                parent_id,
+                item_type,
+                if item_type == "Season" { 1 } else { 0 },
+                is_public,
+                size,
+                season,
+                episode,
+            )
+            .await;
         }
 
         let item = episode_item("ep-1080", 100);
@@ -738,5 +716,43 @@ mod tests {
             last_played_at: None,
             image_tags: None,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_test_media_item(
+        db: &DatabaseConnection,
+        id: &str,
+        title: &str,
+        path: &str,
+        library_id: &str,
+        parent_id: &str,
+        item_type: &str,
+        is_folder: i64,
+        is_public: i64,
+        size_bytes: Option<i64>,
+        season_number: Option<i64>,
+        episode_number: Option<i64>,
+    ) {
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(path.to_string()),
+            library_id: Set(library_id.to_string()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set(item_type.to_string()),
+            is_folder: Set(is_folder),
+            is_public: Set(is_public),
+            container: Set(Some("mkv".to_string())),
+            size_bytes: Set(size_bytes),
+            season_number: Set(season_number),
+            episode_number: Set(episode_number),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
     }
 }

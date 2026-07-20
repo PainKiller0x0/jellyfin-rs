@@ -12,16 +12,30 @@ use crate::{
 
 static EPISODE_TMDB_BATCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-/// Extract TMDb ID from `{tmdb-XXXXX}` or `[tmdbid=XXXXX]` in the path
+/// Extract TMDb ID from `{tmdb-XXXXX}`, `{tmdbid-XXXXX}`, or `[tmdbid=XXXXX]` in the path
 pub fn extract_tmdb_id(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     for (open, close) in [('{', '}'), ('[', ']'), ('(', ')')] {
-        if let Some(tag) = name.split(open).nth(1)?.split(close).next() {
-            let tag = tag.to_ascii_lowercase();
-            if let Some(id) = tag.strip_prefix("tmdb-") {
-                return Some(id.to_string());
-            }
-            if let Some(id) = tag.strip_prefix("tmdbid=") {
+        let Some((_, after_open)) = name.rsplit_once(open) else {
+            continue;
+        };
+        let Some((tag, _)) = after_open.split_once(close) else {
+            continue;
+        };
+        if let Some(id) = tmdb_id_from_tag(tag) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn tmdb_id_from_tag(tag: &str) -> Option<String> {
+    let tag = tag.trim();
+    let lower = tag.to_ascii_lowercase();
+    for prefix in ["tmdb-", "tmdbid-", "tmdbid="] {
+        if lower.starts_with(prefix) {
+            let id = tag[prefix.len()..].trim();
+            if !id.is_empty() {
                 return Some(id.to_string());
             }
         }
@@ -29,14 +43,17 @@ pub fn extract_tmdb_id(path: &Path) -> Option<String> {
     None
 }
 
-/// Clean title by removing `{tmdb-XXXXX}`, `[tmdbid=XXXXX]`, and `(YYYY)` tags
+/// Clean title by removing `{tmdb-XXXXX}`, `{tmdbid-XXXXX}`, `[tmdbid=XXXXX]`, and `(YYYY)` tags
 pub fn clean_provider_tags(title: &str) -> String {
     let mut result = title.to_string();
     for (open, close) in [('{', '}'), ('[', ']'), ('(', ')')] {
         if let (Some(start), Some(end)) = (result.rfind(open), result.rfind(close)) {
             if start < end {
                 let tag = &result[start + 1..end].to_ascii_lowercase();
-                if tag.starts_with("tmdb-") || tag.starts_with("tmdbid=") {
+                if tag.starts_with("tmdb-")
+                    || tag.starts_with("tmdbid-")
+                    || tag.starts_with("tmdbid=")
+                {
                     result.replace_range(start..=end, "");
                 } else if tag.len() == 4 && tag.chars().all(|c| c.is_ascii_digit()) {
                     if let Ok(y) = tag.parse::<i64>() {
@@ -1542,9 +1559,11 @@ pub async fn batch_fetch_person_tmdb(
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_title_with_year, episode_title_candidate, local_episode_title_from_path,
-        parse_season_number, should_skip_name_based_tmdb_lookup, tmdb_image_extension,
+        clean_title_with_year, episode_title_candidate, extract_tmdb_id,
+        local_episode_title_from_path, parse_season_number, should_skip_name_based_tmdb_lookup,
+        tmdb_image_extension,
     };
+    use std::path::Path;
 
     #[test]
     fn tmdb_image_extension_allows_known_image_types() {
@@ -1579,6 +1598,22 @@ mod tests {
         assert_eq!(
             clean_title_with_year("Movie Name (2024) {tmdb-123}"),
             ("Movie Name".to_string(), Some(2024))
+        );
+    }
+
+    #[test]
+    fn tmdb_id_parser_accepts_common_folder_tags() {
+        assert_eq!(
+            extract_tmdb_id(Path::new("4 in love (2012) {tmdbid-42026}")).as_deref(),
+            Some("42026")
+        );
+        assert_eq!(
+            extract_tmdb_id(Path::new("Movie Name [tmdbid=123]")).as_deref(),
+            Some("123")
+        );
+        assert_eq!(
+            extract_tmdb_id(Path::new("Movie Name {edition} {tmdb-456}")).as_deref(),
+            Some("456")
         );
     }
 

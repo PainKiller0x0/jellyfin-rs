@@ -26,7 +26,7 @@ fn database_url() -> String {
 pub async fn backup_info(State(_state): State<Arc<AppState>>) -> Response {
     let backup_dir = backup_dir();
     let backup_filename = "jellyfin-rs-backup.sql";
-    let backup_path = backup_dir.join(&backup_filename);
+    let backup_path = backup_dir.join(backup_filename);
 
     let db_location = database_url()
         .split('@')

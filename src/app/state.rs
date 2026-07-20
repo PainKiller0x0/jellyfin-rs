@@ -710,8 +710,8 @@ fn normalize_remote_ip(value: &str) -> Option<String> {
             return Some(ip.to_string());
         }
     }
-    if value.starts_with('[') {
-        if let Some((ip, _)) = value[1..].split_once(']') {
+    if let Some(value) = value.strip_prefix('[') {
+        if let Some((ip, _)) = value.split_once(']') {
             if ip.parse::<IpAddr>().is_ok() {
                 return Some(ip.to_string());
             }

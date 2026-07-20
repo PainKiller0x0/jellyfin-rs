@@ -35,18 +35,7 @@ pub async fn similar_items(
         .unwrap_or(12);
     match similar_items_inner(&state.db, &item_id, limit).await {
         Ok(mut items) => {
-            if !items.is_empty() {
-                let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-                if let Ok(tags_map) =
-                    crate::jellyfin::item_queries::batch_item_image_tags(&state.db, &ids).await
-                {
-                    for item in &mut items {
-                        if let Some(tags) = tags_map.get(&item.id) {
-                            item.image_tags = Some(tags.clone());
-                        }
-                    }
-                }
-            }
+            let _ = item_queries::attach_item_image_tags(&state.db, &mut items).await;
             media_list_response(items)
         }
         Err(error) => internal_error(error),
@@ -211,9 +200,11 @@ async fn search_hints_inner(
 
     let items = item_queries::decode_media_items(&rows)?;
 
-    // Batch load image tags for PrimaryImageTag
     let image_tags_map = if !items.is_empty() {
-        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        let ids = items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
         item_queries::batch_item_image_tags(db, &ids)
             .await
             .unwrap_or_default()

@@ -206,7 +206,7 @@ fn system_info_value(
         let local_address = local_address.unwrap_or_else(|| "http://127.0.0.1:8096".to_string());
         let http_port = base_url_port(&local_address).unwrap_or(8096);
         let supports_https = local_address.starts_with("https://");
-        value["LocalAddress"] = json!(local_address.clone());
+        value["LocalAddress"] = json!(local_address);
         value["WanAddress"] = json!(local_address);
         value["OperatingSystemDisplayName"] = json!(format!(
             "{}/{}",
@@ -725,7 +725,7 @@ pub struct ParentPathQuery {
     path: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(default)]
 pub struct ValidatePathRequest {
     #[serde(rename = "Path", alias = "path")]
@@ -741,16 +741,6 @@ pub struct ValidatePathRequest {
         default
     )]
     validate_writable: bool,
-}
-
-impl Default for ValidatePathRequest {
-    fn default() -> Self {
-        Self {
-            path: None,
-            is_file: None,
-            validate_writable: false,
-        }
-    }
 }
 
 pub async fn default_directory_browser() -> impl IntoResponse {
@@ -3246,7 +3236,7 @@ pub async fn system_log_download(Path(name): Path<String>) -> Response {
 }
 
 fn log_file_response(name: &str) -> Response {
-    match safe_log_path(&name).and_then(|path| std::fs::read(path).ok()) {
+    match safe_log_path(name).and_then(|path| std::fs::read(path).ok()) {
         Some(data) => (
             StatusCode::OK,
             [(
@@ -4477,7 +4467,7 @@ async fn reports_items_result(
             let user_id = query_value(query, "UserId").unwrap_or_default();
             let has_subtitles = row.get_i64("subtitle_count").unwrap_or_default() > 0;
             Ok(report_row(
-                id.clone(),
+                id,
                 &item_type,
                 &user_id,
                 has_subtitles,

@@ -15,6 +15,7 @@ use crate::{
     jellyfin::{
         auth::query_user_id_or_request,
         common::{internal_error, strip_nulls},
+        item_queries,
     },
 };
 
@@ -301,10 +302,12 @@ pub async fn user_suggestions(
             let total = items.len();
             items = items.into_iter().skip(start).take(limit).collect();
 
-            // Batch load image tags
             let image_tags_map = if !items.is_empty() {
-                let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-                crate::jellyfin::item_queries::batch_item_image_tags(&state.db, &ids)
+                let ids = items
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>();
+                item_queries::batch_item_image_tags(&state.db, &ids)
                     .await
                     .unwrap_or_default()
             } else {
@@ -415,18 +418,7 @@ pub async fn home_section_items(
             all_items.sort_by_key(|i| std::cmp::Reverse(i.modified_at));
             all_items.truncate(limit);
 
-            if !all_items.is_empty() {
-                let ids: Vec<String> = all_items.iter().map(|i| i.id.clone()).collect();
-                if let Ok(tags_map) =
-                    crate::jellyfin::item_queries::batch_item_image_tags(&state.db, &ids).await
-                {
-                    for item in &mut all_items {
-                        if let Some(tags) = tags_map.get(&item.id) {
-                            item.image_tags = Some(tags.clone());
-                        }
-                    }
-                }
-            }
+            let _ = item_queries::attach_item_image_tags(&state.db, &mut all_items).await;
 
             let json_items =
                 crate::jellyfin::items::enrich_episode_list(&state.db, &user_id, all_items).await;

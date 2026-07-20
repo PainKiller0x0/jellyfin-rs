@@ -941,8 +941,8 @@ fn authentication_session_info(
             "IsPaused": false,
             "CanSeek": true
         },
-        "PlayableMediaTypes": playable_media_types.clone(),
-        "SupportedCommands": supported_commands.clone(),
+        "PlayableMediaTypes": playable_media_types,
+        "SupportedCommands": supported_commands,
         "SupportsMediaControl": capabilities.supports_media_control,
         "SupportsRemoteControl": capabilities.supports_media_control,
         "SupportsPersistentIdentifier": capabilities.supports_persistent_identifier,
@@ -959,9 +959,11 @@ fn authentication_session_info(
 }
 
 fn string_or_default(value: String, default: &str) -> String {
-    (!value.trim().is_empty())
-        .then_some(value)
-        .unwrap_or_else(|| default.to_string())
+    if value.trim().is_empty() {
+        default.to_string()
+    } else {
+        value
+    }
 }
 
 fn vec_or_default(values: Vec<String>, default: &[&str]) -> Vec<String> {

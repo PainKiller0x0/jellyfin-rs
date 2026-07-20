@@ -687,17 +687,7 @@ async fn fetch_items_by_ids(
 }
 
 async fn attach_image_tags(db: &DatabaseConnection, items: &mut [MediaItem]) {
-    if items.is_empty() {
-        return;
-    }
-    let ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
-    if let Ok(tags_map) = item_queries::batch_item_image_tags(db, &ids).await {
-        for item in items {
-            if let Some(tags) = tags_map.get(&item.id) {
-                item.image_tags = Some(tags.clone());
-            }
-        }
-    }
+    let _ = item_queries::attach_item_image_tags(db, items).await;
 }
 
 async fn resolve_named_id(

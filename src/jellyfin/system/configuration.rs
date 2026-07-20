@@ -115,7 +115,7 @@ pub async fn update_startup_user(
     };
 
     let now = now_unix();
-    let password_hash = match hash_password(&password) {
+    let password_hash = match hash_password(password) {
         Ok(hash) => hash,
         Err(error) => return internal_error(error),
     };

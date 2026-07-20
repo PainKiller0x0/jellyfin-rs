@@ -13,7 +13,7 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::app::state::{AppState, PlaybackSession, session_timeout_seconds};
+use crate::app::state::{AppState, session_timeout_seconds};
 use crate::db::row_ext::QueryResultExt;
 use crate::jellyfin::auth::request_token;
 use crate::util::now_unix;
@@ -336,10 +336,9 @@ async fn build_sessions_data(state: &AppState) -> Value {
     let timeout = session_timeout_seconds();
     let mut sessions_guard = state.playback_sessions.write().await;
     sessions_guard.retain(|_, session| now - session.last_activity_unix <= timeout);
-    let sessions: Vec<&PlaybackSession> = sessions_guard.values().collect();
     Value::Array(
-        sessions
-            .into_iter()
+        sessions_guard
+            .values()
             .map(|s| serde_json::to_value(s).unwrap_or(Value::Null))
             .collect(),
     )

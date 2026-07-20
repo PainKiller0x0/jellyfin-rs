@@ -440,7 +440,7 @@ fn parse_mobile_subject_html(douban_id: &str, html: &str, fallback_type: &str) -
         .or_else(|| first_tag_attr_after(html, "class=\"sub-cover\"", "src"))
         .map(clean_image_url);
     let facts = text_between(html, "<div class=\"sub-meta\">", "</div>")
-        .map(|value| parse_fact_text(&strip_tags(&value)))
+        .map(|value| parse_fact_text(&strip_tags(value)))
         .unwrap_or_default();
     let backdrop_url = first_subject_pic_url(html)
         .map(clean_image_url)
@@ -918,9 +918,7 @@ fn parse_people_text(value: &str) -> Vec<Value> {
 }
 
 fn clean_title_year(value: &str) -> (String, Option<i64>) {
-    let mut title = clean_text(value)
-        .replace('\u{200e}', "")
-        .replace('\u{200f}', "");
+    let mut title = clean_text(value).replace(['\u{200e}', '\u{200f}'], "");
     for suffix in [" - 电视剧", " - 电影", "- 电视剧", "- 电影"] {
         if let Some(stripped) = title.strip_suffix(suffix) {
             title = stripped.trim().to_string();
@@ -1011,9 +1009,13 @@ fn meta_content(html: &str, marker: &str) -> Option<String> {
 fn attr_value(tag: &str, attr: &str) -> Option<String> {
     for quote in ['"', '\''] {
         let marker = format!("{attr}={quote}");
-        let start = tag.find(&marker)? + marker.len();
+        let Some(start) = tag.find(&marker).map(|start| start + marker.len()) else {
+            continue;
+        };
         let tail = &tag[start..];
-        let end = tail.find(quote)?;
+        let Some(end) = tail.find(quote) else {
+            continue;
+        };
         return Some(decode_html_entities(&tail[..end]));
     }
     None

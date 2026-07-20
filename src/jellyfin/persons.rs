@@ -984,7 +984,7 @@ async fn serve_person_image(
     // Find image asset
     let model = match find_person_image_asset(db, &person.id, image_type, image_index).await {
         Ok(m) => m,
-        Err(e) => return internal_error(e.into()),
+        Err(e) => return internal_error(e),
     };
 
     let Some(model) = model else {

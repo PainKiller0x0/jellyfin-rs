@@ -66,7 +66,7 @@ pub async fn playback_info(
                         // No child videos, return the item itself (e.g. Episode folder is the video)
                         match super::media_streams_for_item(&state.db, &item.id).await {
                             Ok(streams) => {
-                                let mut ms = media_source_json_with_streams(&item, streams.clone());
+                                let mut ms = media_source_json_with_streams(&item, streams);
                                 let playback_streams = media_source_streams(&ms);
                                 dlna::apply_playback_profile(&mut ms, &profile, &playback_streams, &query);
                                 vec![ms]
@@ -88,7 +88,7 @@ pub async fn playback_info(
                     Ok(_) => match super::media_streams_for_item(&state.db, &item.id).await {
                         Ok(streams) => {
                             let mut media_source =
-                                media_source_json_with_streams(&item, streams.clone());
+                                media_source_json_with_streams(&item, streams);
                             let playback_streams = media_source_streams(&media_source);
                             dlna::apply_playback_profile(
                                 &mut media_source,
@@ -105,7 +105,7 @@ pub async fn playback_info(
             } else {
                 match super::media_streams_for_item(&state.db, &item.id).await {
                     Ok(streams) => {
-                        let mut media_source = media_source_json_with_streams(&item, streams.clone());
+                        let mut media_source = media_source_json_with_streams(&item, streams);
                         let playback_streams = media_source_streams(&media_source);
                         dlna::apply_playback_profile(&mut media_source, &profile, &playback_streams, &query);
                         vec![media_source]
@@ -759,7 +759,12 @@ async fn record_playback_watch_event(
             device_name.map(str::to_string).into(),
             position_ticks.unwrap_or_default().max(0).into(),
             runtime_ticks.filter(|value| *value > 0).into(),
-            (is_paused || event == PlaybackEvent::Stopped).then_some(1_i64).unwrap_or(0).into(),
+            if is_paused || event == PlaybackEvent::Stopped {
+                1_i64
+            } else {
+                0
+            }
+            .into(),
             now.into(),
             now.into(),
             ended_at.into(),

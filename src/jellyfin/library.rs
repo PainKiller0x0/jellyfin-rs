@@ -75,16 +75,20 @@ fn query_string(query: &HashMap<String, String>, keys: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-fn parse_json_body(body: Bytes) -> Result<Option<Value>, Response> {
+type RequestParseResult<T> = Result<T, Box<Response>>;
+
+fn parse_json_body(body: Bytes) -> RequestParseResult<Option<Value>> {
     if body.is_empty() {
         return Ok(None);
     }
     serde_json::from_slice(&body).map(Some).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "Error": format!("invalid JSON body: {error}") })),
+        Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "Error": format!("invalid JSON body: {error}") })),
+            )
+                .into_response(),
         )
-            .into_response()
     })
 }
 
@@ -197,7 +201,7 @@ fn normalize_library_id(id: &str) -> anyhow::Result<String> {
 fn virtual_folder_request(
     mut query: VirtualFolderQuery,
     body: Bytes,
-) -> Result<VirtualFolderQuery, Response> {
+) -> RequestParseResult<VirtualFolderQuery> {
     if let Some(body) = parse_json_body(body)? {
         query.name = json_string(&body, &["Name", "name"]).or(query.name);
         query.collection_type =
@@ -212,7 +216,7 @@ fn virtual_folder_request(
 fn library_path_request(
     query: HashMap<String, String>,
     body: Bytes,
-) -> Result<LibraryPathQuery, Response> {
+) -> RequestParseResult<LibraryPathQuery> {
     let mut query = LibraryPathQuery {
         name: query_string(&query, &["name", "Name"]),
         path: query_string(&query, &["path", "Path"]),
@@ -233,7 +237,7 @@ fn library_path_request(
 fn rename_virtual_folder_request(
     query: &HashMap<String, String>,
     body: Bytes,
-) -> Result<(String, String), Response> {
+) -> RequestParseResult<(String, String)> {
     let mut name = query
         .get("name")
         .or_else(|| query.get("Name"))
@@ -258,7 +262,7 @@ fn rename_virtual_folder_request(
 fn update_virtual_folder_path_request(
     query: &HashMap<String, String>,
     body: Bytes,
-) -> Result<(String, String, String), Response> {
+) -> RequestParseResult<(String, String, String)> {
     let mut name = query
         .get("name")
         .or_else(|| query.get("Name"))
@@ -322,7 +326,7 @@ pub async fn create_virtual_folder(
 ) -> Response {
     let query = match virtual_folder_request(query, body) {
         Ok(query) => query,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     match create_virtual_folder_inner(&state.db, query).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -355,7 +359,7 @@ pub async fn add_virtual_folder_path(
 ) -> Response {
     let query = match library_path_request(query, body) {
         Ok(query) => query,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     match upsert_library_path(&state.db, &query.name, &query.path, None).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -441,7 +445,7 @@ async fn virtual_folders_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<Va
 
     let folder_ids = folders
         .iter()
-        .map(|folder| folder.id.clone())
+        .map(|folder| folder.id.as_str())
         .collect::<Vec<_>>();
     let image_tags_by_id = crate::jellyfin::item_queries::batch_item_image_tags(db, &folder_ids)
         .await
@@ -760,7 +764,7 @@ pub async fn rename_virtual_folder(
 ) -> Response {
     let (name, new_name) = match rename_virtual_folder_request(&query, body) {
         Ok(values) => values,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let name = match normalize_library_name(&name) {
         Ok(name) => name,
@@ -798,7 +802,7 @@ pub async fn update_virtual_folder_path(
 ) -> Response {
     let (name, path, new_path) = match update_virtual_folder_path_request(&query, body) {
         Ok(values) => values,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let name = match normalize_library_name(&name) {
         Ok(name) => name,

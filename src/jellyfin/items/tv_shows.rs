@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
+    jellyfin::item_queries::{attach_item_image_tags, batch_item_provider_ids},
     jellyfin::{
         auth::query_user_id_or_request,
         common::{internal_error, strip_nulls},
@@ -248,7 +249,7 @@ async fn enrich_season_list(
         }
     }
 
-    let provider_map = crate::jellyfin::item_queries::batch_item_provider_ids(db, &season_ids)
+    let provider_map = batch_item_provider_ids(db, &season_ids)
         .await
         .unwrap_or_default();
 
@@ -304,35 +305,18 @@ async fn child_items_by_type(
         .collect::<Result<Vec<_>, _>>()
         .context("failed to decode show child items")?;
     let mut provider_map = HashMap::new();
-    let mut image_tags_loaded = false;
     if !items.is_empty() {
-        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-        if let Ok(tags_map) = crate::jellyfin::item_queries::batch_item_image_tags(db, &ids).await {
-            for item in &mut items {
-                if let Some(tags) = tags_map.get(&item.id) {
-                    item.image_tags = Some(tags.clone());
-                }
-            }
-            image_tags_loaded = true;
-        }
+        let _ = attach_item_image_tags(db, &mut items).await;
         if item_type == "Episode" {
-            provider_map = crate::jellyfin::item_queries::batch_item_provider_ids(db, &ids)
-                .await
-                .unwrap_or_default();
+            let ids = items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>();
+            provider_map = batch_item_provider_ids(db, &ids).await.unwrap_or_default();
         }
     }
     if item_type == "Episode" && items.len() > 1 {
         items = deduplicate_episodes(items, &provider_map);
-    }
-    if !image_tags_loaded && !items.is_empty() {
-        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-        if let Ok(tags_map) = crate::jellyfin::item_queries::batch_item_image_tags(db, &ids).await {
-            for item in &mut items {
-                if let Some(tags) = tags_map.get(&item.id) {
-                    item.image_tags = Some(tags.clone());
-                }
-            }
-        }
     }
     Ok(items)
 }
@@ -362,33 +346,16 @@ async fn descendant_episodes(
         .collect::<Result<Vec<_>, _>>()
         .context("failed to decode show episodes")?;
     let mut provider_map = HashMap::new();
-    let mut image_tags_loaded = false;
     if !items.is_empty() {
-        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-        if let Ok(tags_map) = crate::jellyfin::item_queries::batch_item_image_tags(db, &ids).await {
-            for item in &mut items {
-                if let Some(tags) = tags_map.get(&item.id) {
-                    item.image_tags = Some(tags.clone());
-                }
-            }
-            image_tags_loaded = true;
-        }
-        provider_map = crate::jellyfin::item_queries::batch_item_provider_ids(db, &ids)
-            .await
-            .unwrap_or_default();
+        let _ = attach_item_image_tags(db, &mut items).await;
+        let ids = items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
+        provider_map = batch_item_provider_ids(db, &ids).await.unwrap_or_default();
     }
     if items.len() > 1 {
         items = deduplicate_episodes(items, &provider_map);
-    }
-    if !image_tags_loaded && !items.is_empty() {
-        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-        if let Ok(tags_map) = crate::jellyfin::item_queries::batch_item_image_tags(db, &ids).await {
-            for item in &mut items {
-                if let Some(tags) = tags_map.get(&item.id) {
-                    item.image_tags = Some(tags.clone());
-                }
-            }
-        }
     }
     Ok(items)
 }

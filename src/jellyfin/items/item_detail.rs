@@ -276,7 +276,7 @@ async fn item_json_with_provider_ids(
             .unwrap_or_default();
         if !streams.is_empty() {
             // Rebuild MediaSources with streams included
-            let source = media_source_json_with_streams(&item, streams.clone());
+            let source = media_source_json_with_streams(&item, streams);
             attach_media_sources(&mut value, vec![source]);
         }
     }
@@ -1026,10 +1026,8 @@ pub async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>)
         }
     }
 
-    // Also batch load media sources for resume items (to get RunTimeTicks, MediaStreams)
-    let item_ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
     let mut source_map: HashMap<String, Vec<Value>> = HashMap::new();
-    if !item_ids.is_empty() {
+    if !items.is_empty() {
         for item in &items {
             if item.is_folder {
                 // Folder items (Movie/Episode) - load child video sources

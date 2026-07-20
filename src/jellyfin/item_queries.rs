@@ -55,17 +55,17 @@ pub async fn library_views(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>
             let primary_image_tag = image_tag(&image_tags, "Primary").unwrap_or_default();
             let backdrop_tags = backdrop_image_tags(&image_tags);
             Ok(json!({
-                "Name": name.clone(),
-                "Id": id.clone(),
+                "Name": name,
+                "Id": id,
                 "ServerId": "jellyfin-rs",
                 "Etag": stable_text_id(&format!("library:{id}:{updated_at}")),
-                "CollectionType": collection_type.clone(),
+                "CollectionType": collection_type,
                 "Type": "CollectionFolder",
                 "MediaType": "Unknown",
                 "IsFolder": true,
-                "Path": path.clone(),
+                "Path": path,
                 "ParentId": "",
-                "LibraryId": id.clone(),
+                "LibraryId": id,
                 "SortName": name,
                 "LocationType": if path.is_empty() { "Virtual" } else { "FileSystem" },
                 "CanDelete": false,
@@ -136,20 +136,20 @@ pub async fn find_library_as_item(
             let primary_image_tag = image_tag(&image_tags, "Primary").unwrap_or_default();
             let backdrop_tags = backdrop_image_tags(&image_tags);
             let mut value = json!({
-                "Name": name.clone(),
-                "Id": id.clone(),
+                "Name": name,
+                "Id": id,
                 "ServerId": "jellyfin-rs",
                 "Etag": stable_text_id(&format!("library:{id}:{updated_at}")),
-                "CollectionType": collection_type.clone(),
+                "CollectionType": collection_type,
                 "Type": "CollectionFolder",
                 "MediaType": "Unknown",
                 "SortName": name,
                 "ProviderIds": {},
                 "PlayAccess": "Full",
                 "IsFolder": true,
-                "Path": path.clone(),
+                "Path": path,
                 "ParentId": "",
-                "LibraryId": id.clone(),
+                "LibraryId": id,
                 "LocationType": if path.is_empty() { "Virtual" } else { "FileSystem" },
                 "ChildCount": child_count,
                 "RecursiveItemCount": recursive_count,
@@ -356,17 +356,7 @@ pub async fn list_media_items(
         deduplicate_episode_versions(db, &mut items).await;
         sort_media_items(&mut items, query);
         let mut items: Vec<_> = items.into_iter().collect();
-        // Batch load image tags
-        if !items.is_empty() {
-            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-            if let Ok(tags_map) = batch_item_image_tags(db, &ids).await {
-                for item in &mut items {
-                    if let Some(tags) = tags_map.get(&item.id) {
-                        item.image_tags = Some(tags.clone());
-                    }
-                }
-            }
-        }
+        let _ = attach_item_image_tags(db, &mut items).await;
         let total = items.len();
         (items, total)
     } else {
@@ -490,17 +480,7 @@ pub async fn list_media_items(
         sort_media_items(&mut items, query);
         let total_count = items.len();
         let mut items: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
-        // Batch load image tags
-        if !items.is_empty() {
-            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-            if let Ok(tags_map) = batch_item_image_tags(db, &ids).await {
-                for item in &mut items {
-                    if let Some(tags) = tags_map.get(&item.id) {
-                        item.image_tags = Some(tags.clone());
-                    }
-                }
-            }
-        }
+        let _ = attach_item_image_tags(db, &mut items).await;
         (items, total_count)
     };
 
@@ -590,16 +570,7 @@ pub async fn latest_media_items(
             .await
             .context("failed to list latest media items")?,
         )?;
-        if !items.is_empty() {
-            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-            if let Ok(tags_map) = batch_item_image_tags(db, &ids).await {
-                for item in &mut items {
-                    if let Some(tags) = tags_map.get(&item.id) {
-                        item.image_tags = Some(tags.clone());
-                    }
-                }
-            }
-        }
+        let _ = attach_item_image_tags(db, &mut items).await;
         Ok(items)
     } else {
         // No parent specified: query each library separately and merge
@@ -640,17 +611,7 @@ pub async fn latest_media_items(
         all_items.sort_by_key(|i| std::cmp::Reverse(i.modified_at));
         all_items.truncate(16);
 
-        // Batch load image tags
-        if !all_items.is_empty() {
-            let ids: Vec<String> = all_items.iter().map(|i| i.id.clone()).collect();
-            if let Ok(tags_map) = batch_item_image_tags(db, &ids).await {
-                for item in &mut all_items {
-                    if let Some(tags) = tags_map.get(&item.id) {
-                        item.image_tags = Some(tags.clone());
-                    }
-                }
-            }
-        }
+        let _ = attach_item_image_tags(db, &mut all_items).await;
         Ok(all_items)
     }
 }
@@ -678,17 +639,7 @@ pub async fn resume_media_items(
     )?;
     deduplicate_episode_versions(db, &mut items).await;
     items.truncate(50);
-    // Batch load image tags
-    if !items.is_empty() {
-        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-        if let Ok(tags_map) = batch_item_image_tags(db, &ids).await {
-            for item in &mut items {
-                if let Some(tags) = tags_map.get(&item.id) {
-                    item.image_tags = Some(tags.clone());
-                }
-            }
-        }
-    }
+    let _ = attach_item_image_tags(db, &mut items).await;
     Ok(items)
 }
 
@@ -770,16 +721,16 @@ pub fn decode_media_items(rows: &[sea_orm::QueryResult]) -> anyhow::Result<Vec<M
         .collect())
 }
 
-pub(crate) async fn batch_item_image_tags(
+pub(crate) async fn batch_item_image_tags<S: AsRef<str>>(
     db: &DatabaseConnection,
-    item_ids: &[String],
+    item_ids: &[S],
 ) -> anyhow::Result<HashMap<String, serde_json::Value>> {
     use crate::entities::image_assets::{Column, Entity as ImageAssets};
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
     let mut map = HashMap::new();
     for chunk in item_ids.chunks(100) {
         let models = ImageAssets::find()
-            .filter(Column::ItemId.is_in(chunk.iter().map(|s| s.as_str())))
+            .filter(Column::ItemId.is_in(chunk.iter().map(|id| id.as_ref())))
             .order_by_asc(Column::ImageType)
             .order_by_asc(Column::ImageIndex)
             .all(db)
@@ -803,9 +754,31 @@ pub(crate) async fn batch_item_image_tags(
     Ok(map)
 }
 
-pub(super) async fn batch_item_provider_ids(
+pub(crate) async fn attach_item_image_tags(
     db: &DatabaseConnection,
-    item_ids: &[String],
+    items: &mut [MediaItem],
+) -> anyhow::Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let item_ids = items
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<Vec<_>>();
+    let mut tags_map = batch_item_image_tags(db, &item_ids).await?;
+    drop(item_ids);
+    for item in items {
+        if let Some(tags) = tags_map.remove(item.id.as_str()) {
+            item.image_tags = Some(tags);
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn batch_item_provider_ids<S: AsRef<str>>(
+    db: &DatabaseConnection,
+    item_ids: &[S],
 ) -> anyhow::Result<HashMap<String, serde_json::Value>> {
     let mut map = HashMap::new();
     for chunk in item_ids.chunks(100) {
@@ -813,7 +786,7 @@ pub(super) async fn batch_item_provider_ids(
         let sql = format!(
             "SELECT item_id, provider, provider_item_id FROM provider_ids WHERE item_id IN ({placeholders})"
         );
-        let values: Vec<sea_orm::Value> = chunk.iter().map(|id| id.as_str().into()).collect();
+        let values: Vec<sea_orm::Value> = chunk.iter().map(|id| id.as_ref().into()).collect();
         let rows = db
             .query_all(crate::db::helpers::pg_statement(&sql, values))
             .await?;
@@ -1000,10 +973,10 @@ async fn deduplicate_episode_versions(db: &DatabaseConnection, items: &mut Vec<M
         return;
     }
 
-    if let Ok(tags_map) = batch_item_image_tags(db, &episode_ids).await {
+    if let Ok(mut tags_map) = batch_item_image_tags(db, &episode_ids).await {
         for item in items.iter_mut().filter(|item| item.item_type == "Episode") {
-            if let Some(tags) = tags_map.get(&item.id) {
-                item.image_tags = Some(tags.clone());
+            if let Some(tags) = tags_map.remove(item.id.as_str()) {
+                item.image_tags = Some(tags);
             }
         }
     }

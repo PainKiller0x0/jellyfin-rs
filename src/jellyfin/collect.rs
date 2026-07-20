@@ -782,7 +782,7 @@ async fn update_playlist_inner(
     }
 
     if let Some(ids) = ids {
-        let valid_ids = filter_existing_ids(db, &ids).await?;
+        let valid_ids = filter_existing_ids(db, ids).await?;
         db.execute(crate::db::helpers::pg_statement(
             "DELETE FROM linked_children WHERE parent_id = ?",
             vec![playlist_id.into()],

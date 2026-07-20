@@ -610,7 +610,7 @@ pub async fn get_user_item_data(
     let user_id = request_user_id_or_default(&state, &headers, &query).await;
     match user_data_json(&state.db, &user_id, &item_id).await {
         Ok(data) => Json(data).into_response(),
-        Err(error) => internal_error(error.into()),
+        Err(error) => internal_error(error),
     }
 }
 

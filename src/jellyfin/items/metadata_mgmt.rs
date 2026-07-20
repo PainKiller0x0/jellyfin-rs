@@ -408,11 +408,9 @@ fn parse_lrc_metadata(line: &str, metadata: &mut Map<String, Value>) -> bool {
         "offset" => value
             .parse::<i64>()
             .ok()
-            .map(|offset_ms| metadata.insert("Offset".to_string(), json!(offset_ms * 10_000)))
-            .flatten(),
+            .and_then(|offset_ms| metadata.insert("Offset".to_string(), json!(offset_ms * 10_000))),
         "length" => parse_lrc_length(value)
-            .map(|ticks| metadata.insert("Length".to_string(), json!(ticks)))
-            .flatten(),
+            .and_then(|ticks| metadata.insert("Length".to_string(), json!(ticks))),
         _ => None,
     };
     true
@@ -456,12 +454,9 @@ fn parse_lrc_timestamp(token: &str) -> Option<i64> {
         ),
         _ => return None,
     };
-    let (seconds, fraction) = seconds_part
-        .split_once('.')
-        .map(|(seconds, fraction)| (seconds, fraction))
-        .unwrap_or((seconds_part, ""));
+    let (seconds, fraction) = seconds_part.split_once('.').unwrap_or((seconds_part, ""));
     let seconds = seconds.parse::<i64>().ok()?;
-    if hours < 0 || minutes < 0 || seconds < 0 || seconds >= 60 {
+    if hours < 0 || minutes < 0 || !(0..60).contains(&seconds) {
         return None;
     }
     let fraction = fraction

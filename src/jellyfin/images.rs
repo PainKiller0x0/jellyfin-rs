@@ -44,6 +44,18 @@ const MAX_REMOTE_IMAGE_URL_BODY_BYTES: usize = 4096;
 const MAX_IMAGE_INDEX: i64 = 255;
 const MAX_IMAGE_ID_BYTES: usize = 128;
 
+type LegacyItemImagePath = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
 fn visible_media_item_sql(alias: &str) -> String {
     format!(
         "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
@@ -126,17 +138,7 @@ pub async fn get_item_image_legacy_path(
         max_height,
         _percent_played,
         _unplayed_count,
-    )): Path<(
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-    )>,
+    )): Path<LegacyItemImagePath>,
 ) -> Response {
     if let Err(response) = ensure_visible_item_or_library(&state, &headers, &query, &item_id).await
     {
@@ -173,7 +175,7 @@ pub async fn upload_item_image(
         }
     };
     if let Some(image_url) = parse_image_url_body(&body) {
-        match remote::download_and_cache_image(&state, &item_id, &image_type, &image_url).await {
+        match remote::download_and_cache_image(&state, &item_id, image_type, &image_url).await {
             Ok(()) => return StatusCode::NO_CONTENT.into_response(),
             Err(error) if remote::is_rejected_remote_image_url(&error) => {
                 return (
@@ -185,7 +187,7 @@ pub async fn upload_item_image(
             Err(error) => return internal_error(error),
         }
     }
-    match save_item_image(&state.db, &headers, &item_id, &image_type, 0, body).await {
+    match save_item_image(&state.db, &headers, &item_id, image_type, 0, body).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => image_write_error(error),
     }
@@ -202,7 +204,7 @@ pub async fn upload_item_image_with_index(
         Err(error) => return image_write_error(error),
     };
     if let Some(image_url) = parse_image_url_body(&body) {
-        match remote::download_and_cache_image(&state, &item_id, &image_type, &image_url).await {
+        match remote::download_and_cache_image(&state, &item_id, image_type, &image_url).await {
             Ok(()) => return StatusCode::NO_CONTENT.into_response(),
             Err(error) if remote::is_rejected_remote_image_url(&error) => {
                 return (
@@ -214,16 +216,7 @@ pub async fn upload_item_image_with_index(
             Err(error) => return internal_error(error),
         }
     }
-    match save_item_image(
-        &state.db,
-        &headers,
-        &item_id,
-        &image_type,
-        image_index,
-        body,
-    )
-    .await
-    {
+    match save_item_image(&state.db, &headers, &item_id, image_type, image_index, body).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => image_write_error(error),
     }
@@ -244,7 +237,7 @@ pub async fn delete_item_image_with_index(
         Ok(value) => value,
         Err(error) => return image_write_error(error),
     };
-    delete_item_image_inner(&state.db, &item_id, &image_type, index).await
+    delete_item_image_inner(&state.db, &item_id, image_type, index).await
 }
 
 pub async fn user_avatar(Path(path): Path<UserImagePath>) -> Response {

@@ -66,6 +66,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(system::server_configuration).post(system::update_server_configuration),
         )
         .route(
+            "/system/configuration",
+            get(system::server_configuration),
+        )
+        .route(
             "/System/Configuration/MetadataOptions/Default",
             get(system::default_metadata_options),
         )
@@ -378,6 +382,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/System/Shutdown", post(system::shutdown_handler))
         .route("/System/Restart", post(system::shutdown_handler))
         .route("/Library/MediaFolders", get(library::media_folders))
+        .route("/library/mediafolders", get(library::media_folders))
         .route(
             "/Library/SelectableMediaFolders",
             get(library::selectable_media_folders),
@@ -433,6 +438,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(auth::authenticate_by_name),
         )
         .route("/Users", get(auth::list_users).post(auth::update_user_legacy))
+        .route("/users", get(auth::list_users))
         .route("/Users/Query", get(auth::users_query))
         .route("/Users/Prefixes", get(filters::users_prefixes))
         .route(
@@ -457,10 +463,17 @@ pub fn api_routes() -> Router<Arc<AppState>> {
                 .post(auth::update_user)
                 .delete(auth::delete_user),
         )
+        .route("/users/{user_id}", get(auth::user_by_id))
         .route("/Users/{user_id}/Views", get(items::views))
+        .route("/users/{user_id}/views", get(items::views))
         .route("/Users/{user_id}/Items", get(items::user_items))
+        .route("/users/{user_id}/items", get(items::user_items))
         .route("/Users/{user_id}/Items/Latest", get(items::latest_items))
+        .route("/Users/{user_id}/Items/latest", get(items::latest_items))
+        .route("/users/{user_id}/items/latest", get(items::latest_items))
         .route("/Users/{user_id}/Items/Resume", get(items::resume_items))
+        .route("/Users/{user_id}/Items/resume", get(items::resume_items))
+        .route("/users/{user_id}/items/resume", get(items::resume_items))
         .route("/Users/{user_id}/Suggestions", get(items::user_suggestions))
         .route("/Users/{user_id}/HomeSections", get(items::home_sections))
         .route(
@@ -468,6 +481,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(items::home_section_items),
         )
         .route("/Users/{user_id}/Items/{item_id}", get(items::item_by_id))
+        .route("/users/{user_id}/items/{item_id}", get(items::item_by_id))
         .route(
             "/Users/{user_id}/Items/{item_id}/Intros",
             get(super::user_extras::user_item_intros),
@@ -536,6 +550,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/Users/{user_id}/Policy", post(auth::update_user_policy))
         .route("/Items", get(items::items).delete(items::delete_items))
+        .route("/items", get(items::items))
         .route("/Items/File", get(super::user_extras::item_by_file))
         .route("/Items/Latest", get(items::latest_items_root))
         .route("/Items/Root", get(items::items_root))
@@ -551,6 +566,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
                 .post(items::update_item)
                 .delete(items::delete_single_item),
         )
+        .route("/items/{item_id}", get(items::item_by_id_public))
         .route(
             "/Items/{item_id}/Ancestors",
             get(super::user_extras::item_ancestors),
@@ -647,6 +663,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/Items/{item_id}/Refresh", post(items::scan_handler))
         .route("/Items/{item_id}/Similar", get(items::similar_items))
+        .route("/items/{item_id}/similar", get(items::similar_items))
         .route("/Albums/{item_id}/Similar", get(items::similar_items))
         .route("/Games/{item_id}/Similar", get(items::similar_items))
         .route("/Artists/{item_id}/Similar", get(items::similar_items))
@@ -700,6 +717,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Items/{item_id}/DeleteInfo", get(items::delete_info))
         .route("/Items/Delete", post(items::delete_items))
         .route("/Items/Prefixes", get(filters::items_prefixes))
+        .route("/items/prefixes", get(filters::items_prefixes))
         .route("/Items/{item_id}/Tags/Add", post(items::add_item_tag))
         .route("/Items/{item_id}/Tags/Delete", post(items::delete_item_tag))
         .route(
@@ -906,9 +924,20 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/Videos/{item_id}/index.bif", get(common::not_found))
         .route("/Videos/{item_id}/live.m3u8", get(common::not_found))
-        .route("/Videos/{item_id}/main.m3u8", get(common::not_found))
+        .route(
+            "/Videos/{item_id}/main.m3u8",
+            get(common::not_found).head(common::not_found),
+        )
+        .route(
+            "/videos/{item_id}/main.m3u8",
+            get(common::not_found).head(common::not_found),
+        )
         .route(
             "/Videos/{item_id}/master.m3u8",
+            get(common::not_found).head(common::not_found),
+        )
+        .route(
+            "/videos/{item_id}/master.m3u8",
             get(common::not_found).head(common::not_found),
         )
         .route(
@@ -917,6 +946,18 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/Videos/{item_id}/hls1/{playlist_id}/{segment_file}",
+            get(common::not_found).head(common::not_found),
+        )
+        .route(
+            "/Videos/{item_id}/hls1/{playlist_id}/main.m3u8",
+            get(common::not_found).head(common::not_found),
+        )
+        .route(
+            "/videos/{item_id}/hls1/{playlist_id}/{segment_file}",
+            get(common::not_found).head(common::not_found),
+        )
+        .route(
+            "/videos/{item_id}/hls1/{playlist_id}/main.m3u8",
             get(common::not_found).head(common::not_found),
         )
         .route(
@@ -1016,6 +1057,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(super::user_extras::item_instant_mix),
         )
         .route("/Sessions", get(sessions::sessions))
+        .route("/sessions", get(sessions::sessions))
         .route("/Sessions/Capabilities", post(sessions::capabilities))
         .route(
             "/Sessions/Capabilities/Full",
@@ -1031,6 +1073,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(playback::playback_progress),
         )
         .route("/Sessions/Logout", post(sessions::logout))
+        .route("/sessions/logout", post(sessions::logout))
         .route("/Sessions/Viewing", post(sessions::report_viewing))
         .route("/Sessions/Playing/Ping", post(sessions::playback_ping))
         .route("/Sessions/PlayQueue", get(super::user_extras::play_queue))
@@ -1117,7 +1160,9 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/Users/{user_id}/PlayingItems/{item_id}",
-            post(playback::playing_item_start).delete(playback::playing_item_stop),
+            get(playback::playing_item_start)
+                .post(playback::playing_item_start)
+                .delete(playback::playing_item_stop),
         )
         .route(
             "/Users/{user_id}/PlayingItems/{item_id}/Progress",
@@ -1582,9 +1627,17 @@ mod tests {
         let routes = include_str!("routes.rs");
 
         assert!(routes.contains("/system/info/public"));
+        assert!(routes.contains("/system/configuration"));
         assert!(routes.contains("/web/manifest.json"));
         assert!(routes.contains("/embywebsocket"));
         assert!(routes.contains("/socket"));
+        assert!(routes.contains("/users/{user_id}/items/{item_id}"));
+        assert!(routes.contains("/users/{user_id}/items/latest"));
+        assert!(routes.contains("/items/{item_id}/similar"));
+        assert!(routes.contains("/sessions/logout"));
+        assert!(routes.contains("/videos/{item_id}/master.m3u8"));
+        assert!(routes.contains("/videos/{item_id}/hls1/{playlist_id}/main.m3u8"));
+        assert!(routes.contains("/videos/{item_id}/hls1/{playlist_id}/{segment_file}"));
     }
 
     #[test]

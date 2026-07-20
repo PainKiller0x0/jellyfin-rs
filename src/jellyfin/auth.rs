@@ -242,9 +242,19 @@ pub async fn authenticate_by_name(
 
 pub async fn list_users(
     State(state): State<Arc<AppState>>,
+    request_user: Option<Extension<String>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    match list_users_inner(&state.db).await {
+    let users_result = match request_user.as_ref().map(|user| user.0.as_str()) {
+        Some(user_id) => match user_by_id_inner(&state.db, user_id).await {
+            Ok(Some(user)) if user.is_admin => list_users_inner(&state.db).await,
+            Ok(Some(user)) => Ok(vec![user_json_with_config(&state.db, &user).await]),
+            Ok(None) => Ok(vec![]),
+            Err(error) => Err(error),
+        },
+        None => list_users_inner(&state.db).await,
+    };
+    match users_result {
         Ok(users) => Json(filter_users(users, &query)).into_response(),
         Err(error) => internal_error(error),
     }
@@ -1742,7 +1752,13 @@ fn is_public_request(method: &Method, path: &str) -> bool {
 
 fn admin_required(method: &Method, path: &str) -> bool {
     let path = api_path(path);
-    if matches!(path, "/Users" | "/Users/Query" | "/Users/Prefixes") {
+    if method == Method::GET
+        && (path.eq_ignore_ascii_case("/Users")
+            || path.eq_ignore_ascii_case("/System/Configuration"))
+    {
+        return false;
+    }
+    if path.eq_ignore_ascii_case("/Users/Query") || path.eq_ignore_ascii_case("/Users/Prefixes") {
         return true;
     }
     if method == Method::GET {
@@ -1860,6 +1876,12 @@ fn strip_path_prefix_ascii_case<'a>(path: &'a str, prefix: &str) -> Option<&'a s
         .then(|| &path[prefix.len()..])
 }
 
+fn matches_ignore_ascii_case(value: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+}
+
 fn stream_file_name(file: &str) -> bool {
     let file = file.to_ascii_lowercase();
     file == "stream"
@@ -1939,10 +1961,10 @@ fn sessions_read_requires_admin(
     user_id: &str,
 ) -> bool {
     let path = api_path(path);
-    if method != Method::GET || path != "/Sessions" {
+    if method != Method::GET || !path.eq_ignore_ascii_case("/Sessions") {
         return false;
     }
-    query_value(query, "ControllableByUserId").is_none_or(|target| target != user_id)
+    query_value(query, "ControllableByUserId").is_some_and(|target| target != user_id)
 }
 
 fn session_user_management_write(path: &str) -> bool {
@@ -2039,37 +2061,39 @@ fn api_path(path: &str) -> &str {
 }
 
 fn user_path_target(path: &str) -> Option<&str> {
-    if let Some(target) = path
-        .strip_prefix("/UserSettings/")
-        .and_then(|rest| rest.split('/').next())
+    if let Some(target) =
+        strip_path_prefix_ascii_case(path, "/UserSettings/").and_then(|rest| rest.split('/').next())
     {
         return (!target.is_empty()).then_some(target);
     }
-    if let Some(target) = path
-        .strip_prefix("/Notifications/")
+    if let Some(target) = strip_path_prefix_ascii_case(path, "/Notifications/")
         .and_then(|rest| rest.split('/').next())
     {
-        if !matches!(target, "Admin" | "Services" | "Types") {
+        if !matches_ignore_ascii_case(target, &["Admin", "Services", "Types"]) {
             return (!target.is_empty()).then_some(target);
         }
     }
 
-    let target = path.strip_prefix("/Users/")?.split('/').next()?;
-    if matches!(
+    let target = strip_path_prefix_ascii_case(path, "/Users/")?
+        .split('/')
+        .next()?;
+    if matches_ignore_ascii_case(
         target,
-        "AuthenticateByName"
-            | "AuthenticateWithQuickConnect"
-            | "Configuration"
-            | "ForgotPassword"
-            | "ItemAccess"
-            | "Me"
-            | "New"
-            | "Password"
-            | "Prefixes"
-            | "Public"
-            | "Query"
-            | "authenticatebyname"
-            | "public"
+        &[
+            "AuthenticateByName",
+            "AuthenticateWithQuickConnect",
+            "Configuration",
+            "ForgotPassword",
+            "ItemAccess",
+            "Me",
+            "New",
+            "Password",
+            "Prefixes",
+            "Public",
+            "Query",
+            "authenticatebyname",
+            "public",
+        ],
     ) {
         return None;
     }
@@ -2077,11 +2101,11 @@ fn user_path_target(path: &str) -> Option<&str> {
 }
 
 fn user_password_path_target(path: &str) -> Option<&str> {
-    let rest = path.strip_prefix("/Users/")?;
+    let rest = strip_path_prefix_ascii_case(path, "/Users/")?;
     let mut parts = rest.split('/');
     let user_id = parts.next()?;
     let action = parts.next()?;
-    matches!(action, "Password" | "EasyPassword").then_some(user_id)
+    matches_ignore_ascii_case(action, &["Password", "EasyPassword"]).then_some(user_id)
 }
 
 fn request_user_target<'a>(path: &'a str, query: &'a HashMap<String, String>) -> Option<&'a str> {
@@ -2121,26 +2145,28 @@ fn query_user_target(query: &HashMap<String, String>) -> Option<&str> {
 }
 
 fn query_scoped_user_path(path: &str) -> bool {
-    matches!(
+    matches_ignore_ascii_case(
         path,
-        "/Artists/InstantMix"
-            | "/AudioBooks/NextUp"
-            | "/Items"
-            | "/Items/Latest"
-            | "/Items/Root"
-            | "/Items/Counts"
-            | "/Items/Suggestions"
-            | "/Movies/Recommendations"
-            | "/Persons"
-            | "/MusicGenres/InstantMix"
-            | "/Search/Hints"
-            | "/Shows/NextUp"
-            | "/Shows/Upcoming"
-            | "/Sync/Options"
-            | "/Sync/Targets"
-            | "/Trailers"
-            | "/UserItems/Resume"
-            | "/UserViews"
+        &[
+            "/Artists/InstantMix",
+            "/AudioBooks/NextUp",
+            "/Items",
+            "/Items/Latest",
+            "/Items/Root",
+            "/Items/Counts",
+            "/Items/Suggestions",
+            "/Movies/Recommendations",
+            "/Persons",
+            "/MusicGenres/InstantMix",
+            "/Search/Hints",
+            "/Shows/NextUp",
+            "/Shows/Upcoming",
+            "/Sync/Options",
+            "/Sync/Targets",
+            "/Trailers",
+            "/UserItems/Resume",
+            "/UserViews",
+        ],
     ) || item_query_scoped_user_path(path)
         || media_query_scoped_user_path(path)
         || playlist_query_scoped_user_path(path)
@@ -2150,39 +2176,41 @@ fn query_scoped_user_path(path: &str) -> bool {
 }
 
 fn item_query_scoped_user_path(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/Items/") else {
+    let Some(rest) = strip_path_prefix_ascii_case(path, "/Items/") else {
         return false;
     };
-    matches!(
-        rest.split('/').collect::<Vec<_>>().as_slice(),
-        [_, "Ancestors"]
-            | [_, "InstantMix"]
-            | [_, "LocalTrailers"]
-            | [_, "PlaybackInfo"]
-            | [_, "SpecialFeatures"]
-            | [_, "ThemeMedia"]
-            | [_, "ThemeSongs"]
-            | [_, "ThemeVideos"]
-    )
+    let parts = rest.split('/').collect::<Vec<_>>();
+    matches!(parts.as_slice(), [_, action] if matches_ignore_ascii_case(
+        action,
+        &[
+            "Ancestors",
+            "InstantMix",
+            "LocalTrailers",
+            "PlaybackInfo",
+            "SpecialFeatures",
+            "ThemeMedia",
+            "ThemeSongs",
+            "ThemeVideos",
+        ],
+    ))
 }
 
 fn playlist_query_scoped_user_path(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/Playlists/") else {
+    let Some(rest) = strip_path_prefix_ascii_case(path, "/Playlists/") else {
         return false;
     };
-    matches!(
-        rest.split('/').collect::<Vec<_>>().as_slice(),
-        [_, "AddToPlaylistInfo"] | [_, "InstantMix"]
-    )
+    let parts = rest.split('/').collect::<Vec<_>>();
+    matches!(parts.as_slice(), [_, action] if matches_ignore_ascii_case(
+        action,
+        &["AddToPlaylistInfo", "InstantMix"],
+    ))
 }
 
 fn media_query_scoped_user_path(path: &str) -> bool {
     ["/Albums/", "/Songs/"].iter().any(|prefix| {
-        path.strip_prefix(prefix).is_some_and(|rest| {
-            matches!(
-                rest.split('/').collect::<Vec<_>>().as_slice(),
-                [_, "InstantMix"]
-            )
+        strip_path_prefix_ascii_case(path, prefix).is_some_and(|rest| {
+            let parts = rest.split('/').collect::<Vec<_>>();
+            matches!(parts.as_slice(), [_, action] if action.eq_ignore_ascii_case("InstantMix"))
         })
     })
 }
@@ -2191,41 +2219,34 @@ fn person_query_scoped_user_path(path: &str) -> bool {
     if path == "/Artists" || path == "/Artists/AlbumArtists" {
         return true;
     }
-    if path.strip_prefix("/Persons/").is_some_and(|rest| {
-        matches!(
-            rest.split('/').collect::<Vec<_>>().as_slice(),
-            [_] | [_, "Items"]
-        )
+    if strip_path_prefix_ascii_case(path, "/Persons/").is_some_and(|rest| {
+        let parts = rest.split('/').collect::<Vec<_>>();
+        matches!(parts.as_slice(), [_])
+            || matches!(parts.as_slice(), [_, action] if action.eq_ignore_ascii_case("Items"))
     }) {
         return true;
     }
-    let Some(rest) = path
-        .strip_prefix("/Artists/")
-        .or_else(|| path.strip_prefix("/MusicGenres/"))
+    let Some(rest) = strip_path_prefix_ascii_case(path, "/Artists/")
+        .or_else(|| strip_path_prefix_ascii_case(path, "/MusicGenres/"))
     else {
         return false;
     };
-    matches!(
-        rest.split('/').collect::<Vec<_>>().as_slice(),
-        [_] | [_, "InstantMix"]
-    )
+    let parts = rest.split('/').collect::<Vec<_>>();
+    matches!(parts.as_slice(), [_])
+        || matches!(parts.as_slice(), [_, action] if action.eq_ignore_ascii_case("InstantMix"))
 }
 
 fn video_query_scoped_user_path(path: &str) -> bool {
-    path.strip_prefix("/Videos/").is_some_and(|rest| {
-        matches!(
-            rest.split('/').collect::<Vec<_>>().as_slice(),
-            [_, "AdditionalParts"]
-        )
+    strip_path_prefix_ascii_case(path, "/Videos/").is_some_and(|rest| {
+        let parts = rest.split('/').collect::<Vec<_>>();
+        matches!(parts.as_slice(), [_, action] if action.eq_ignore_ascii_case("AdditionalParts"))
     })
 }
 
 fn show_query_scoped_user_path(path: &str) -> bool {
-    path.strip_prefix("/Shows/").is_some_and(|rest| {
-        matches!(
-            rest.split('/').collect::<Vec<_>>().as_slice(),
-            [_, "Seasons"] | [_, "Episodes"]
-        )
+    strip_path_prefix_ascii_case(path, "/Shows/").is_some_and(|rest| {
+        let parts = rest.split('/').collect::<Vec<_>>();
+        matches!(parts.as_slice(), [_, action] if matches_ignore_ascii_case(action, &["Seasons", "Episodes"]))
     })
 }
 
@@ -2949,7 +2970,10 @@ mod tests {
         assert!(admin_required(&Method::POST, "/Users/abc"));
         assert!(admin_required(&Method::DELETE, "/Items/abc"));
         assert!(admin_required(&Method::POST, "/System/Configuration"));
-        assert!(admin_required(&Method::GET, "/Users"));
+        assert!(!admin_required(&Method::GET, "/Users"));
+        assert!(!admin_required(&Method::GET, "/users"));
+        assert!(!admin_required(&Method::GET, "/System/Configuration"));
+        assert!(!admin_required(&Method::GET, "/system/configuration"));
         assert!(admin_required(&Method::GET, "/Backup"));
         assert!(admin_required(&Method::GET, "/Auth/Providers"));
         assert!(admin_required(&Method::GET, "/Auth/PasswordResetProviders"));
@@ -3073,7 +3097,7 @@ mod tests {
 
     #[test]
     fn sessions_list_requires_admin_except_own_control_query() {
-        assert!(sessions_read_requires_admin(
+        assert!(!sessions_read_requires_admin(
             &Method::GET,
             "/Sessions",
             &HashMap::new(),
@@ -3107,8 +3131,11 @@ mod tests {
     #[test]
     fn user_path_target_detects_only_user_scoped_paths() {
         assert_eq!(user_path_target("/Users/u1"), Some("u1"));
+        assert_eq!(user_path_target("/users/u1"), Some("u1"));
         assert_eq!(user_path_target("/Users/u1/Items/i1"), Some("u1"));
+        assert_eq!(user_path_target("/users/u1/items/i1"), Some("u1"));
         assert_eq!(user_path_target("/UserSettings/u1"), Some("u1"));
+        assert_eq!(user_path_target("/users/me"), None);
         assert_eq!(user_path_target("/Notifications/u1"), Some("u1"));
         assert_eq!(user_path_target("/Notifications/u1/Summary"), Some("u1"));
         assert_eq!(user_path_target("/Users/Public"), None);
@@ -3117,6 +3144,10 @@ mod tests {
         assert_eq!(user_path_target(api_path("/Users/u1/Items/i1")), Some("u1"));
         assert_eq!(
             request_user_target("/Users/u2/Items/i1", &HashMap::new()),
+            Some("u2")
+        );
+        assert_eq!(
+            request_user_target("/users/u2/items/i1", &HashMap::new()),
             Some("u2")
         );
     }
@@ -3138,6 +3169,11 @@ mod tests {
             Some("u1")
         );
         assert_eq!(request_user_target("/Items/i1", &query), None);
+        assert_eq!(request_user_target("/items", &query), Some("u1"));
+        assert_eq!(
+            request_user_target("/items/i1/playbackinfo", &query),
+            Some("u1")
+        );
     }
 
     #[test]

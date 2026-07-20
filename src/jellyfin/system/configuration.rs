@@ -2,14 +2,14 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 
 use crate::{
     app::state::{AppState, DEFAULT_USER_NAME, SERVER_NAME},
@@ -182,8 +182,17 @@ pub async fn complete_startup(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-pub async fn server_configuration(State(state): State<Arc<AppState>>) -> Response {
-    let saved_config = super::server_config_json(&state.db).await;
+pub async fn server_configuration(
+    State(state): State<Arc<AppState>>,
+    request_user: Option<Extension<String>>,
+) -> Response {
+    let is_admin =
+        request_user_is_admin(&state.db, request_user.as_ref().map(|user| user.0.as_str())).await;
+    let saved_config = if is_admin {
+        super::server_config_json(&state.db).await
+    } else {
+        json!({})
+    };
     Json(server_configuration_value(
         saved_config,
         super::app_setting(&state.db, "ServerName", SERVER_NAME).await,
@@ -191,6 +200,7 @@ pub async fn server_configuration(State(state): State<Arc<AppState>>) -> Respons
         super::app_setting(&state.db, "MetadataCountryCode", "CN").await,
         super::app_setting(&state.db, "PreferredMetadataLanguage", "zh-CN").await,
         super::app_setting_bool(&state.db, "EnableRemoteAccess", false).await,
+        super::app_setting_bool(&state.db, "StartupWizardCompleted", true).await,
     ))
     .into_response()
 }
@@ -393,6 +403,7 @@ fn server_configuration_value(
     metadata_country_code: String,
     preferred_metadata_language: String,
     enable_remote_access: bool,
+    startup_completed: bool,
 ) -> Value {
     let mut config = default_server_configuration();
     if let (Some(config), Some(saved)) = (config.as_object_mut(), saved_config.as_object()) {
@@ -416,6 +427,10 @@ fn server_configuration_value(
         "EnableRemoteAccess".to_string(),
         json!(enable_remote_access),
     );
+    object.insert(
+        "IsStartupWizardCompleted".to_string(),
+        json!(startup_completed),
+    );
     if !object
         .get("ContentTypes")
         .is_some_and(|value| value.is_array())
@@ -436,6 +451,32 @@ fn server_configuration_value(
 
 fn default_server_configuration() -> Value {
     json!({
+        "EnableCaseSensitiveItemIds": true,
+        "EnableMetrics": false,
+        "IsStartupWizardCompleted": true,
+        "MetadataPath": "",
+        "MetadataNetworkPath": "",
+        "PreferredMetadataLanguage": "zh-CN",
+        "MetadataCountryCode": "CN",
+        "SortReplaceCharacters": [".", "+", "%"],
+        "SortRemoveCharacters": [",", "&", "-", "{", "}", "'"],
+        "SortRemoveWords": ["the", "a", "an"],
+        "MinResumePct": 5,
+        "MaxResumePct": 90,
+        "MinResumeDurationSeconds": 300,
+        "UICulture": "zh-CN",
+        "EnableDashboardResponseCaching": true,
+        "EnableExternalContentInSuggestions": false,
+        "RequireHttps": false,
+        "EnableNewOmdbSupport": false,
+        "DisableLiveTvChannelUserDataName": true,
+        "EnableFolderView": false,
+        "EnableGroupingIntoCollections": false,
+        "DisplaySpecialsWithinSeasons": true,
+        "EnableExternalServiceDiscovery": true,
+        "IgnoreVirtualInterfaces": true,
+        "CachePath": "",
+        "CodecsUsed": [],
         "ContentTypes": [],
         "CastReceiverApplications": default_cast_receiver_applications(),
         "PluginRepositories": [],
@@ -444,6 +485,19 @@ fn default_server_configuration() -> Value {
         "KnownProxies": [],
         "PublishedServerUriBySubnet": []
     })
+}
+
+async fn request_user_is_admin(db: &DatabaseConnection, user_id: Option<&str>) -> bool {
+    let Some(user_id) = user_id.filter(|value| !value.trim().is_empty()) else {
+        return false;
+    };
+    Users::find()
+        .filter(users::Column::Id.eq(user_id))
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|user| user.is_admin != 0)
 }
 
 fn default_cast_receiver_applications() -> Value {
@@ -640,17 +694,23 @@ mod tests {
             json!({
                 "ContentTypes": [{ "Name": "/media", "Value": "movies" }],
                 "KnownProxies": ["127.0.0.1"],
-                "EnableRemoteAccess": true
+                "EnableRemoteAccess": true,
+                "IsStartupWizardCompleted": false
             }),
             "Home Server".to_string(),
             "en-US".to_string(),
             "US".to_string(),
             "en".to_string(),
             false,
+            true,
         );
 
         assert_eq!(value["ServerName"], "Home Server");
         assert_eq!(value["EnableRemoteAccess"], false);
+        assert_eq!(value["IsStartupWizardCompleted"], true);
+        assert_eq!(value["MinResumePct"], 5);
+        assert_eq!(value["MaxResumePct"], 90);
+        assert_eq!(value["MetadataCountryCode"], "US");
         assert_eq!(value["ContentTypes"][0]["Value"], "movies");
         assert_eq!(value["KnownProxies"][0], "127.0.0.1");
         assert!(value["CastReceiverApplications"].as_array().is_some());

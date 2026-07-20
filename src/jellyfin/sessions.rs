@@ -2,11 +2,11 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, EntityTrait};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -15,7 +15,7 @@ use crate::{
         AppState, PlaybackSession, PlaybackState, SessionCapabilities, SessionUserInfo,
         session_timeout_seconds,
     },
-    entities::users::Entity as Users,
+    entities::users::{self, Entity as Users},
     jellyfin::{
         auth::{auth_header_value_field, request_token, request_user_id_or_default},
         common::internal_error,
@@ -52,14 +52,45 @@ pub struct SessionsQuery {
 
 pub async fn sessions(
     State(state): State<Arc<AppState>>,
+    request_user: Option<Extension<String>>,
     Query(query): Query<SessionsQuery>,
 ) -> Response {
     let now = now_unix();
     let timeout = session_timeout_seconds();
     let mut sessions_guard = state.playback_sessions.write().await;
     sessions_guard.retain(|_, session| now - session.last_activity_unix <= timeout);
-    let sessions = sessions_guard.values().cloned().collect::<Vec<_>>();
+    let request_user_id = request_user.as_ref().map(|user| user.0.as_str());
+    let is_admin = request_user_is_admin(&state.db, request_user_id).await;
+    let mut sessions = sessions_guard.values().cloned().collect::<Vec<_>>();
+    if !is_admin {
+        if let Some(user_id) = request_user_id {
+            sessions.retain(|session| session_user_matches(session, user_id));
+        } else {
+            sessions.clear();
+        }
+    }
     Json(filter_sessions(sessions, &query, now)).into_response()
+}
+
+async fn request_user_is_admin(db: &sea_orm::DatabaseConnection, user_id: Option<&str>) -> bool {
+    let Some(user_id) = user_id.filter(|value| !value.trim().is_empty()) else {
+        return false;
+    };
+    Users::find()
+        .filter(users::Column::Id.eq(user_id))
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|user| user.is_admin != 0)
+}
+
+fn session_user_matches(session: &PlaybackSession, user_id: &str) -> bool {
+    session.user_id == user_id
+        || session
+            .additional_users
+            .iter()
+            .any(|user| user.user_id == user_id)
 }
 
 fn filter_sessions(

@@ -76,7 +76,7 @@ pub use localization::{
 
 pub async fn system_info(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let server_name = app_setting(&state.db, "ServerName", SERVER_NAME).await;
-    let startup_completed = app_setting_bool(&state.db, "StartupWizardCompleted", false).await;
+    let startup_completed = app_setting_bool(&state.db, "StartupWizardCompleted", true).await;
     Json(system_info_value(
         server_name,
         startup_completed,
@@ -91,7 +91,7 @@ pub async fn public_system_info(
     headers: HeaderMap,
 ) -> Response {
     let server_name = app_setting(&state.db, "ServerName", SERVER_NAME).await;
-    let startup_completed = app_setting_bool(&state.db, "StartupWizardCompleted", false).await;
+    let startup_completed = app_setting_bool(&state.db, "StartupWizardCompleted", true).await;
     Json(system_info_value(
         server_name,
         startup_completed,

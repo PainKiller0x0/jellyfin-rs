@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use sea_orm::ConnectionTrait;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use walkdir::WalkDir;
 
 use crate::{
@@ -90,12 +90,11 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
         start_media_probe_pipeline(state.db.clone(), force_probe.then(|| state.db.clone()));
     let mut tasks = tokio::task::JoinSet::new();
     let api_key = state.tmdb_api_key.read().await.clone().unwrap_or_default();
-    let tmdb_client = state.tmdb_http_client().await;
     let douban_cookie = state.douban_cookie.read().await.clone();
     let metadata_tx = start_metadata_fetch_pipeline(
         state.db.clone(),
         api_key.clone(),
-        tmdb_client,
+        state.tmdb_http_client.clone(),
         douban_cookie,
     );
     for (root, library_id, collection_type) in roots {
@@ -447,7 +446,7 @@ fn start_media_probe_pipeline(
 fn start_metadata_fetch_pipeline(
     db: sea_orm::DatabaseConnection,
     api_key: String,
-    tmdb_client: reqwest::Client,
+    tmdb_http_client: Arc<RwLock<reqwest::Client>>,
     douban_cookie: Option<String>,
 ) -> mpsc::UnboundedSender<MetadataFetchJob> {
     let (tx, mut rx) = mpsc::unbounded_channel::<MetadataFetchJob>();
@@ -470,10 +469,11 @@ fn start_metadata_fetch_pipeline(
             }
             let db = db.clone();
             let api_key = api_key.clone();
-            let tmdb_client = tmdb_client.clone();
-            pending.spawn(
-                async move { run_metadata_fetch_job(db, job, &api_key, &tmdb_client).await },
-            );
+            let tmdb_http_client = tmdb_http_client.clone();
+            pending.spawn(async move {
+                let tmdb_client = tmdb_http_client.read().await.clone();
+                run_metadata_fetch_job(db, job, &api_key, &tmdb_client).await
+            });
         }
 
         while let Some(result) = pending.join_next().await {
@@ -484,6 +484,7 @@ fn start_metadata_fetch_pipeline(
             }
         }
 
+        let tmdb_client = tmdb_http_client.read().await.clone();
         run_post_scan_metadata_tasks(&db, &api_key, &tmdb_client, douban_cookie.as_deref()).await;
         tracing::info!(
             "metadata fetch pipeline completed {completed}/{queued} item(s); failed={failed}"

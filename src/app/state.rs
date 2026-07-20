@@ -35,7 +35,7 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub tmdb_api_key: RwLock<Option<String>>,
     pub tmdb_proxy_url: RwLock<Option<String>>,
-    pub tmdb_http_client: RwLock<reqwest::Client>,
+    pub tmdb_http_client: Arc<RwLock<reqwest::Client>>,
     pub douban_cookie: RwLock<Option<String>>,
     pub scan_lock: Mutex<()>,
     pub playback_sessions: RwLock<HashMap<String, PlaybackSession>>,

@@ -97,7 +97,10 @@ pub async fn remote_search(
 
         match search_result {
             Ok(results) => combined_results.extend(results),
-            Err(error) => tracing::warn!("TMDb search failed for {item_type}: {error:#}"),
+            Err(error) => tracing::warn!(
+                "TMDb search failed for {item_type}: {}",
+                crate::library::tmdb_metadata::redact_tmdb_error(&error)
+            ),
         }
     }
 
@@ -228,7 +231,10 @@ async fn enrich_remote_search_result(state: &AppState, item_id: &str, body: Valu
     match details {
         Ok(details) => merge_remote_search_values(body, details),
         Err(error) => {
-            tracing::warn!("TMDb details failed: {error:#}");
+            tracing::warn!(
+                "TMDb details failed: {}",
+                crate::library::tmdb_metadata::redact_tmdb_error(&error)
+            );
             body
         }
     }

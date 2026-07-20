@@ -11,6 +11,7 @@ use crate::{
 };
 
 static EPISODE_TMDB_BATCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const TMDB_API_KEY_QUERY: &str = "api_key=";
 
 /// Extract TMDb ID from `{tmdb-XXXXX}`, `{tmdbid-XXXXX}`, or `[tmdbid=XXXXX]` in the path
 pub fn extract_tmdb_id(path: &Path) -> Option<String> {
@@ -27,6 +28,27 @@ pub fn extract_tmdb_id(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+pub(crate) fn redact_tmdb_error(error: &anyhow::Error) -> String {
+    redact_tmdb_api_key(&format!("{error:#}"))
+}
+
+fn redact_tmdb_api_key(message: &str) -> String {
+    let mut redacted = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(index) = rest.find(TMDB_API_KEY_QUERY) {
+        let value_start = index + TMDB_API_KEY_QUERY.len();
+        redacted.push_str(&rest[..value_start]);
+        redacted.push_str("<redacted>");
+        let value = &rest[value_start..];
+        let value_end = value
+            .find(|ch: char| matches!(ch, '&' | ')' | ' ' | '\n' | '\r'))
+            .unwrap_or(value.len());
+        rest = &value[value_end..];
+    }
+    redacted.push_str(rest);
+    redacted
 }
 
 fn tmdb_id_from_tag(tag: &str) -> Option<String> {
@@ -846,7 +868,10 @@ pub async fn fill_missing_tmdb(
                 tracing::warn!("fill_missing_tmdb: no match for '{name}' (type: {item_type})");
             }
             Err(e) => {
-                tracing::warn!("fill_missing_tmdb: search failed for '{name}': {e:#}");
+                tracing::warn!(
+                    "fill_missing_tmdb: search failed for '{name}': {}",
+                    redact_tmdb_error(&e)
+                );
             }
         }
     }
@@ -898,7 +923,10 @@ pub async fn fetch_and_apply_tmdb_metadata(
                     return Ok(());
                 }
                 Err(e) => {
-                    tracing::warn!("TMDb name search failed for '{name}': {e:#}");
+                    tracing::warn!(
+                        "TMDb name search failed for '{name}': {}",
+                        redact_tmdb_error(&e)
+                    );
                     return Ok(());
                 }
             }
@@ -917,7 +945,10 @@ pub async fn fetch_and_apply_tmdb_metadata(
     let metadata = match metadata {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!("TMDb API call failed for {tmdb_id} (type: {item_type}): {e:#}");
+            tracing::warn!(
+                "TMDb API call failed for {tmdb_id} (type: {item_type}): {}",
+                redact_tmdb_error(&e)
+            );
             return Ok(());
         }
     };
@@ -1557,8 +1588,8 @@ pub async fn batch_fetch_person_tmdb(
 mod tests {
     use super::{
         clean_title_with_year, episode_title_candidate, extract_tmdb_id,
-        local_episode_title_from_path, parse_season_number, should_skip_name_based_tmdb_lookup,
-        tmdb_image_extension,
+        local_episode_title_from_path, parse_season_number, redact_tmdb_api_key,
+        should_skip_name_based_tmdb_lookup, tmdb_image_extension,
     };
     use std::path::Path;
 
@@ -1588,6 +1619,14 @@ mod tests {
             tmdb_image_extension("https://image.tmdb.org/t/p/w500/poster"),
             "jpg"
         );
+    }
+
+    #[test]
+    fn tmdb_error_redaction_hides_api_key_query_values() {
+        let message = "error sending request for url (https://api.themoviedb.org/3/movie/1?api_key=secret123&language=zh-CN)";
+        let redacted = redact_tmdb_api_key(message);
+        assert!(!redacted.contains("secret123"));
+        assert!(redacted.contains("api_key=<redacted>&language=zh-CN"));
     }
 
     #[test]

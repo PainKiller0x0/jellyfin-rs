@@ -95,7 +95,10 @@ pub async fn remote_images(
                 match images_result {
                     Ok(images) => all_images.extend(images),
                     Err(error) => {
-                        tracing::warn!("TMDb images fetch failed for {item_id}: {error:#}")
+                        tracing::warn!(
+                            "TMDb images fetch failed for {item_id}: {}",
+                            crate::library::tmdb_metadata::redact_tmdb_error(&error)
+                        )
                     }
                 }
                 Some(tmdb_id.clone())
@@ -113,7 +116,10 @@ pub async fn remote_images(
                     {
                         Ok(images) => all_images.extend(images),
                         Err(error) => {
-                            tracing::warn!("TMDb images search failed for {item_id}: {error:#}")
+                            tracing::warn!(
+                                "TMDb images search failed for {item_id}: {}",
+                                crate::library::tmdb_metadata::redact_tmdb_error(&error)
+                            )
                         }
                     }
                     Some(found)
@@ -578,7 +584,10 @@ async fn fetch_remote_images_by_type(
                 {
                     Ok(season_images) => images.extend(season_images),
                     Err(error) => {
-                        tracing::warn!("TMDb season images fetch failed for {item_id}: {error:#}")
+                        tracing::warn!(
+                            "TMDb season images fetch failed for {item_id}: {}",
+                            crate::library::tmdb_metadata::redact_tmdb_error(&error)
+                        )
                     }
                 }
             }
@@ -590,7 +599,8 @@ async fn fetch_remote_images_by_type(
                     Ok(series_images) => images.extend(series_images),
                     Err(error) => {
                         tracing::warn!(
-                            "TMDb parent series images fetch failed for {item_id}: {error:#}"
+                            "TMDb parent series images fetch failed for {item_id}: {}",
+                            crate::library::tmdb_metadata::redact_tmdb_error(&error)
                         )
                     }
                 }

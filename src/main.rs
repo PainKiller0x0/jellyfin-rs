@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
         http_client,
         tmdb_api_key: RwLock::new(tmdb_api_key),
         tmdb_proxy_url: RwLock::new(tmdb_proxy_url),
-        tmdb_http_client: RwLock::new(tmdb_http_client),
+        tmdb_http_client: Arc::new(RwLock::new(tmdb_http_client)),
         douban_cookie: RwLock::new(douban_cookie),
         scan_lock: tokio::sync::Mutex::new(()),
         playback_sessions: RwLock::new(HashMap::new()),

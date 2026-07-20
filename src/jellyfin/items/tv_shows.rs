@@ -735,7 +735,7 @@ mod tests {
             media_dirs: Vec::new(),
             http_client: reqwest::Client::new(),
             tmdb_api_key: RwLock::new(None),
-            tmdb_proxy_url: RwLock::new(None),
+            tmdb_proxy_url: Arc::new(RwLock::new(None)),
             tmdb_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             douban_cookie: RwLock::new(None),
             scan_lock: tokio::sync::Mutex::new(()),

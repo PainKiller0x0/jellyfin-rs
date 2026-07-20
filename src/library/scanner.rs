@@ -94,6 +94,7 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
     let metadata_tx = start_metadata_fetch_pipeline(
         state.db.clone(),
         api_key.clone(),
+        state.tmdb_proxy_url.clone(),
         state.tmdb_http_client.clone(),
         douban_cookie,
     );
@@ -446,6 +447,7 @@ fn start_media_probe_pipeline(
 fn start_metadata_fetch_pipeline(
     db: sea_orm::DatabaseConnection,
     api_key: String,
+    tmdb_proxy_url: Arc<RwLock<Option<String>>>,
     tmdb_http_client: Arc<RwLock<reqwest::Client>>,
     douban_cookie: Option<String>,
 ) -> mpsc::UnboundedSender<MetadataFetchJob> {
@@ -469,10 +471,13 @@ fn start_metadata_fetch_pipeline(
             }
             let db = db.clone();
             let api_key = api_key.clone();
+            let tmdb_proxy_url = tmdb_proxy_url.clone();
             let tmdb_http_client = tmdb_http_client.clone();
             pending.spawn(async move {
+                let tmdb_base_url = tmdb_proxy_url.read().await.clone();
                 let tmdb_client = tmdb_http_client.read().await.clone();
-                run_metadata_fetch_job(db, job, &api_key, &tmdb_client).await
+                run_metadata_fetch_job(db, job, &api_key, &tmdb_client, tmdb_base_url.as_deref())
+                    .await
             });
         }
 
@@ -484,8 +489,16 @@ fn start_metadata_fetch_pipeline(
             }
         }
 
+        let tmdb_base_url = tmdb_proxy_url.read().await.clone();
         let tmdb_client = tmdb_http_client.read().await.clone();
-        run_post_scan_metadata_tasks(&db, &api_key, &tmdb_client, douban_cookie.as_deref()).await;
+        run_post_scan_metadata_tasks(
+            &db,
+            &api_key,
+            &tmdb_client,
+            tmdb_base_url.as_deref(),
+            douban_cookie.as_deref(),
+        )
+        .await;
         tracing::info!(
             "metadata fetch pipeline completed {completed}/{queued} item(s); failed={failed}"
         );
@@ -515,6 +528,7 @@ async fn run_metadata_fetch_job(
     job: MetadataFetchJob,
     api_key: &str,
     tmdb_client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<()> {
     if api_key.is_empty() {
         return Ok(());
@@ -532,6 +546,7 @@ async fn run_metadata_fetch_job(
         &job.path,
         api_key,
         tmdb_client,
+        tmdb_base_url,
     )
     .await
 }
@@ -540,11 +555,17 @@ async fn run_post_scan_metadata_tasks(
     db: &sea_orm::DatabaseConnection,
     api_key: &str,
     tmdb_client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
     douban_cookie: Option<&str>,
 ) {
     if !api_key.is_empty() {
-        if let Err(error) =
-            crate::library::tmdb_metadata::batch_fetch_episode_tmdb(db, api_key, tmdb_client).await
+        if let Err(error) = crate::library::tmdb_metadata::batch_fetch_episode_tmdb(
+            db,
+            api_key,
+            tmdb_client,
+            tmdb_base_url,
+        )
+        .await
         {
             tracing::warn!("episode TMDb fetch failed: {error:#}");
         }

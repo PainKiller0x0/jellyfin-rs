@@ -34,7 +34,7 @@ pub struct AppState {
     pub media_dirs: Vec<PathBuf>,
     pub http_client: reqwest::Client,
     pub tmdb_api_key: RwLock<Option<String>>,
-    pub tmdb_proxy_url: RwLock<Option<String>>,
+    pub tmdb_proxy_url: Arc<RwLock<Option<String>>>,
     pub tmdb_http_client: Arc<RwLock<reqwest::Client>>,
     pub douban_cookie: RwLock<Option<String>>,
     pub scan_lock: Mutex<()>,
@@ -327,31 +327,7 @@ pub async fn load_tmdb_proxy_url(db: &sea_orm::DatabaseConnection) -> Option<Str
 }
 
 pub fn normalize_tmdb_proxy_url(proxy_url: &str) -> anyhow::Result<Option<String>> {
-    let proxy_url = proxy_url.trim();
-    if proxy_url.is_empty() {
-        return Ok(None);
-    }
-    if proxy_url.len() > 2048 {
-        anyhow::bail!("TMDb proxy URL is too long");
-    }
-    if proxy_url
-        .chars()
-        .any(|ch| ch.is_control() || ch.is_whitespace())
-    {
-        anyhow::bail!("TMDb proxy URL contains invalid characters");
-    }
-
-    let normalized = if proxy_url.contains("://") {
-        proxy_url.to_string()
-    } else {
-        format!("http://{proxy_url}")
-    };
-    let parsed = reqwest::Url::parse(&normalized)?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        anyhow::bail!("TMDb proxy URL must be an http(s) URL");
-    }
-    reqwest::Proxy::all(parsed.as_str())?;
-    Ok(Some(normalized))
+    crate::tmdb::normalize_base_url(proxy_url)
 }
 
 impl AppState {
@@ -375,7 +351,6 @@ impl AppState {
     pub async fn set_tmdb_proxy_url(&self, proxy_url: &str) -> anyhow::Result<()> {
         use sea_orm::ConnectionTrait;
         let proxy_url = normalize_tmdb_proxy_url(proxy_url)?;
-        let http_client = crate::util::http_client_with_proxy(proxy_url.as_deref())?;
         let now = crate::util::now_unix();
         self.db
             .execute(crate::db::helpers::pg_statement(
@@ -384,7 +359,6 @@ impl AppState {
             ))
             .await?;
         *self.tmdb_proxy_url.write().await = proxy_url;
-        *self.tmdb_http_client.write().await = http_client;
         Ok(())
     }
 
@@ -912,26 +886,27 @@ mod tests {
     }
 
     #[test]
-    fn tmdb_proxy_url_normalization_accepts_host_port() {
+    fn tmdb_proxy_url_normalization_accepts_mirror_base_url() {
         assert_eq!(
-            normalize_tmdb_proxy_url("proxy.local:7890")
+            normalize_tmdb_proxy_url("tmdb.qb.edu.kg")
                 .unwrap()
                 .as_deref(),
-            Some("http://proxy.local:7890")
+            Some("https://tmdb.qb.edu.kg")
         );
         assert_eq!(
-            normalize_tmdb_proxy_url(" https://proxy.local:7890 ")
+            normalize_tmdb_proxy_url(" https://tmdb.qb.edu.kg/3/ ")
                 .unwrap()
                 .as_deref(),
-            Some("https://proxy.local:7890")
+            Some("https://tmdb.qb.edu.kg/3")
         );
         assert!(normalize_tmdb_proxy_url("").unwrap().is_none());
     }
 
     #[test]
     fn tmdb_proxy_url_normalization_rejects_invalid_urls() {
-        assert!(normalize_tmdb_proxy_url("http://proxy local:7890").is_err());
-        assert!(normalize_tmdb_proxy_url("ftp://proxy.local:7890").is_err());
+        assert!(normalize_tmdb_proxy_url("https://tmdb qb edu kg").is_err());
+        assert!(normalize_tmdb_proxy_url("ftp://tmdb.qb.edu.kg").is_err());
+        assert!(normalize_tmdb_proxy_url("https://tmdb.qb.edu.kg/?x=1").is_err());
     }
 
     #[test]

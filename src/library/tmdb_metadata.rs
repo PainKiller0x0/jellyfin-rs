@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use crate::{
     db::row_ext::QueryResultExt,
     jellyfin::providers,
+    tmdb,
     util::{normalize_yyyy_mm_dd, now_unix, year_from_yyyy_mm_dd},
 };
 
@@ -133,6 +134,7 @@ async fn download_season_images(
     db: &sea_orm::DatabaseConnection,
     api_key: &str,
     client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
 ) {
     let rows = db
         .query_all(crate::db::helpers::pg_statement(
@@ -173,30 +175,47 @@ async fn download_season_images(
     let mut downloaded = 0usize;
 
     for chunk in rows.chunks(10) {
-        let futures: Vec<_> = chunk.iter().map(|row| {
-            let client = client;
-            async move {
-                let Ok(season_id) = row.get_str("season_id") else { return None };
-                let title: String = row.get_str("title").ok()?;
-                let stored_season_number = row.get_opt_i64("season_number").ok().flatten();
-                let Ok(series_tmdb) = row.get_str("series_tmdb_id") else { return None };
-                let has_primary = row.get_i64("has_primary").unwrap_or(0) != 0;
-                let sn = stored_season_number.or_else(|| parse_season_number(&title)).unwrap_or(0);
-                let url = format!("https://api.themoviedb.org/3/tv/{series_tmdb}/season/{sn}?api_key={api_key}&language=zh-CN");
-                let resp = client.get(&url).send().await.ok()?;
-                let resp = resp.error_for_status().ok()?;
-                #[derive(serde::Deserialize)]
-                struct SeasonResp {
-                    id: Option<i64>,
-                    poster_path: Option<String>,
-                    name: Option<String>,
-                    overview: Option<String>,
-                    air_date: Option<String>,
+        let futures: Vec<_> = chunk
+            .iter()
+            .map(|row| {
+                let client = client;
+                async move {
+                    let Ok(season_id) = row.get_str("season_id") else {
+                        return None;
+                    };
+                    let title: String = row.get_str("title").ok()?;
+                    let stored_season_number = row.get_opt_i64("season_number").ok().flatten();
+                    let Ok(series_tmdb) = row.get_str("series_tmdb_id") else {
+                        return None;
+                    };
+                    let has_primary = row.get_i64("has_primary").unwrap_or(0) != 0;
+                    let sn = stored_season_number
+                        .or_else(|| parse_season_number(&title))
+                        .unwrap_or(0);
+                    let url = crate::tmdb::api_url(
+                        tmdb_base_url,
+                        &format!("tv/{series_tmdb}/season/{sn}"),
+                    );
+                    let resp = client
+                        .get(&url)
+                        .query(&[("api_key", api_key), ("language", "zh-CN")])
+                        .send()
+                        .await
+                        .ok()?;
+                    let resp = resp.error_for_status().ok()?;
+                    #[derive(serde::Deserialize)]
+                    struct SeasonResp {
+                        id: Option<i64>,
+                        poster_path: Option<String>,
+                        name: Option<String>,
+                        overview: Option<String>,
+                        air_date: Option<String>,
+                    }
+                    let season: SeasonResp = resp.json().await.ok()?;
+                    Some((season_id, sn, has_primary, season))
                 }
-                let season: SeasonResp = resp.json().await.ok()?;
-                Some((season_id, sn, has_primary, season))
-            }
-        }).collect();
+            })
+            .collect();
 
         let results = futures_util::future::join_all(futures).await;
         for (season_id, season_number, has_primary, season) in results.into_iter().flatten() {
@@ -248,7 +267,7 @@ async fn download_season_images(
                 let Some(poster_path) = season.poster_path else {
                     continue;
                 };
-                let img_url = format!("https://image.tmdb.org/t/p/w500{}", poster_path);
+                let img_url = crate::tmdb::image_url(tmdb_base_url, "w500", &poster_path);
                 if download_and_save_tmdb_image(db, client, &season_id, &img_url, "Primary")
                     .await
                     .is_ok()
@@ -360,6 +379,7 @@ pub async fn batch_fetch_episode_tmdb(
     db: &sea_orm::DatabaseConnection,
     api_key: &str,
     client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<usize> {
     let lock = EPISODE_TMDB_BATCH_LOCK.get_or_init(|| Mutex::new(()));
     let Ok(_guard) = lock.try_lock() else {
@@ -372,7 +392,7 @@ pub async fn batch_fetch_episode_tmdb(
     normalize_episode_years_from_premiere_dates(db).await;
 
     // First: download season images for all seasons
-    download_season_images(db, api_key, client).await;
+    download_season_images(db, api_key, client, tmdb_base_url).await;
 
     let rows = db.query_all(crate::db::helpers::pg_statement(
         r#"SELECT e.id as episode_id,
@@ -463,9 +483,12 @@ pub async fn batch_fetch_episode_tmdb(
                 let task = task.clone();
                 let client = (*client).clone();
                 async move {
-                    let url = format!(
-                        "https://api.themoviedb.org/3/tv/{}/season/{}/episode/{}",
-                        task.tmdb_id, task.season_number, task.episode_number
+                    let url = crate::tmdb::api_url(
+                        tmdb_base_url,
+                        &format!(
+                            "tv/{}/season/{}/episode/{}",
+                            task.tmdb_id, task.season_number, task.episode_number
+                        ),
                     );
                     let resp = client
                         .get(&url)
@@ -543,7 +566,7 @@ pub async fn batch_fetch_episode_tmdb(
                 }
 
                 if let Some(ref still) = ep.still_path {
-                    let img = format!("https://image.tmdb.org/t/p/w500{still}");
+                    let img = crate::tmdb::image_url(tmdb_base_url, "w500", still);
                     let _ = download_and_save_tmdb_image(
                         db,
                         &client,
@@ -771,18 +794,18 @@ fn parse_folder_name(path: &Path) -> Option<(String, Option<i64>)> {
 async fn lookup_tmdb_id_by_name(
     client: &reqwest::Client,
     api_key: &str,
+    tmdb_base_url: Option<&str>,
     name: &str,
     year: Option<i64>,
     is_tv: bool,
 ) -> anyhow::Result<Option<String>> {
-    let url = if is_tv {
-        "https://api.themoviedb.org/3/search/tv"
-    } else {
-        "https://api.themoviedb.org/3/search/movie"
-    };
+    let url = tmdb::api_url(
+        tmdb_base_url,
+        if is_tv { "search/tv" } else { "search/movie" },
+    );
     let mut request =
         client
-            .get(url)
+            .get(&url)
             .query(&[("api_key", api_key), ("query", name), ("language", "zh-CN")]);
     let year_param: String;
     if let Some(year) = year {
@@ -812,6 +835,7 @@ pub async fn fill_missing_tmdb(
     db: &sea_orm::DatabaseConnection,
     api_key: &str,
     client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<usize> {
     let rows = db.query_all(crate::db::helpers::pg_statement(
         r#"SELECT mi.id, mi.title, mi.path, mi.item_type FROM media_items mi WHERE mi.is_folder = 1 AND mi.item_type IN ('Movie', 'Series') AND NOT EXISTS (SELECT 1 FROM provider_ids p WHERE p.item_id = mi.id AND p.provider = 'Tmdb')"#,
@@ -844,7 +868,7 @@ pub async fn fill_missing_tmdb(
             continue;
         }
 
-        match lookup_tmdb_id_by_name(client, api_key, &name, year, is_tv).await {
+        match lookup_tmdb_id_by_name(client, api_key, tmdb_base_url, &name, year, is_tv).await {
             Ok(Some(tmdb_id)) => {
                 let _ = db.execute(crate::db::helpers::pg_statement(
                     "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
@@ -860,6 +884,7 @@ pub async fn fill_missing_tmdb(
                     Path::new(&path_str),
                     api_key,
                     client,
+                    tmdb_base_url,
                 )
                 .await;
                 count += 1;
@@ -888,6 +913,7 @@ pub async fn fetch_and_apply_tmdb_metadata(
     path: &Path,
     api_key: &str,
     client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<()> {
     let is_tv = item_type == "Series" || item_type == "Season" || item_type == "Episode";
 
@@ -905,7 +931,7 @@ pub async fn fetch_and_apply_tmdb_metadata(
                 tracing::debug!("TMDb name search skipped generic folder name '{name}'");
                 return Ok(());
             }
-            match lookup_tmdb_id_by_name(client, api_key, &name, year, is_tv).await {
+            match lookup_tmdb_id_by_name(client, api_key, tmdb_base_url, &name, year, is_tv).await {
                 Ok(Some(id)) => {
                     tmdb_id = Some(id);
                     // Store the found TMDb ID so next time we don't need to search
@@ -937,9 +963,9 @@ pub async fn fetch_and_apply_tmdb_metadata(
     };
 
     let metadata = if is_tv {
-        providers::tmdb_tv_details(client, api_key, &tmdb_id).await
+        providers::tmdb_tv_details(client, api_key, &tmdb_id, tmdb_base_url).await
     } else {
-        providers::tmdb_movie_details(client, api_key, &tmdb_id).await
+        providers::tmdb_movie_details(client, api_key, &tmdb_id, tmdb_base_url).await
     };
 
     let metadata = match metadata {
@@ -1176,27 +1202,26 @@ pub async fn fetch_and_apply_tmdb_metadata(
 
     // Fetch additional images (logo, banner, art) from TMDb /images endpoint
     let images_url = if is_tv {
-        format!(
-            "https://api.themoviedb.org/3/tv/{}/images?api_key={}",
-            tmdb_id, api_key
-        )
+        tmdb::api_url(tmdb_base_url, &format!("tv/{tmdb_id}/images"))
     } else {
-        format!(
-            "https://api.themoviedb.org/3/movie/{}/images?api_key={}",
-            tmdb_id, api_key
-        )
+        tmdb::api_url(tmdb_base_url, &format!("movie/{tmdb_id}/images"))
     };
-    if let Ok(resp) = client.get(&images_url).send().await {
+    if let Ok(resp) = client
+        .get(&images_url)
+        .query(&[("api_key", api_key)])
+        .send()
+        .await
+    {
         if let Ok(images) = resp.json::<TmdbImagesResponse>().await {
             // Download logo (clearlogo)
             if let Some(logo) = images.preferred_logo() {
-                let url = format!("https://image.tmdb.org/t/p/w500{}", logo.file_path);
+                let url = tmdb::image_url(tmdb_base_url, "w500", &logo.file_path);
                 let _ = download_and_save_tmdb_image(db, client, item_id, &url, "Logo").await;
             }
             // Download banner
             if let Some(banner) = images.backdrops.first() {
                 // Use first backdrop as banner fallback
-                let url = format!("https://image.tmdb.org/t/p/w1280{}", banner.file_path);
+                let url = tmdb::image_url(tmdb_base_url, "w1280", &banner.file_path);
                 let _ = download_and_save_tmdb_image(db, client, item_id, &url, "Banner").await;
                 let _ = download_and_save_tmdb_image(db, client, item_id, &url, "Art").await;
             }
@@ -1208,9 +1233,9 @@ pub async fn fetch_and_apply_tmdb_metadata(
         if let Some(season_number) = extract_season_number(path) {
             // Get the parent series TMDb ID
             if let Some(series_tmdb_id) = get_parent_series_tmdb_id(db, item_id).await {
-                let season_url = format!(
-                    "https://api.themoviedb.org/3/tv/{}/season/{}",
-                    series_tmdb_id, season_number
+                let season_url = tmdb::api_url(
+                    tmdb_base_url,
+                    &format!("tv/{series_tmdb_id}/season/{season_number}"),
                 );
                 #[derive(serde::Deserialize)]
                 struct TmdbSeason {
@@ -1224,7 +1249,7 @@ pub async fn fetch_and_apply_tmdb_metadata(
                 {
                     if let Ok(season) = resp.json::<TmdbSeason>().await {
                         if let Some(poster) = season.poster_path {
-                            let img_url = format!("https://image.tmdb.org/t/p/w500{}", poster);
+                            let img_url = tmdb::image_url(tmdb_base_url, "w500", &poster);
                             let _ = download_and_save_tmdb_image(
                                 db, client, item_id, &img_url, "Primary",
                             )
@@ -1457,8 +1482,9 @@ pub async fn search_person_tmdb(
     name: &str,
     api_key: &str,
     client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
-    let url = "https://api.themoviedb.org/3/search/person";
+    let url = tmdb::api_url(tmdb_base_url, "search/person");
     #[derive(serde::Deserialize)]
     struct TmdbSearchResults {
         results: Vec<TmdbSearchPerson>,
@@ -1468,7 +1494,7 @@ pub async fn search_person_tmdb(
         id: i64,
     }
     let resp: TmdbSearchResults = client
-        .get(url)
+        .get(&url)
         .query(&[("api_key", api_key), ("query", name)])
         .send()
         .await?
@@ -1485,8 +1511,9 @@ pub async fn fetch_person_tmdb(
     tmdb_id: &str,
     api_key: &str,
     client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<()> {
-    let url = format!("https://api.themoviedb.org/3/person/{tmdb_id}");
+    let url = tmdb::api_url(tmdb_base_url, &format!("person/{tmdb_id}"));
     #[derive(serde::Deserialize)]
     struct TmdbPerson {
         biography: Option<String>,
@@ -1513,7 +1540,7 @@ pub async fn fetch_person_tmdb(
         .await?;
     }
     // Also try to fetch TMDb image
-    let img_url = format!("https://api.themoviedb.org/3/person/{tmdb_id}/images?api_key={api_key}");
+    let img_url = tmdb::api_url(tmdb_base_url, &format!("person/{tmdb_id}/images"));
     #[derive(serde::Deserialize)]
     struct TmdbPersonImages {
         profiles: Vec<TmdbPersonProfile>,
@@ -1524,13 +1551,14 @@ pub async fn fetch_person_tmdb(
     }
     if let Ok(resp) = client
         .get(&img_url)
+        .query(&[("api_key", api_key)])
         .send()
         .await
         .and_then(|r| r.error_for_status())
     {
         if let Ok(images) = resp.json::<TmdbPersonImages>().await {
             if let Some(img) = images.profiles.first() {
-                let img_url = format!("https://image.tmdb.org/t/p/w780{}", img.file_path);
+                let img_url = tmdb::image_url(tmdb_base_url, "w780", &img.file_path);
                 let _ =
                     download_and_save_tmdb_image(db, client, person_id, &img_url, "Primary").await;
             }
@@ -1546,13 +1574,15 @@ pub async fn try_fetch_person_tmdb(
     person_name: &str,
     api_key: &str,
     client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
 ) {
     if api_key.is_empty() {
         return;
     }
-    match search_person_tmdb(person_name, api_key, client).await {
+    match search_person_tmdb(person_name, api_key, client, tmdb_base_url).await {
         Ok(Some(tmdb_id)) => {
-            let _ = fetch_person_tmdb(db, person_id, &tmdb_id, api_key, client).await;
+            let _ =
+                fetch_person_tmdb(db, person_id, &tmdb_id, api_key, client, tmdb_base_url).await;
         }
         Ok(None) => {}
         Err(e) => tracing::debug!("failed to search TMDb for person {person_name}: {e:#}"),
@@ -1565,6 +1595,7 @@ pub async fn batch_fetch_person_tmdb(
     db: &sea_orm::DatabaseConnection,
     api_key: &str,
     client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<usize> {
     let rows = db
         .query_all(crate::db::helpers::pg_statement(
@@ -1578,7 +1609,7 @@ pub async fn batch_fetch_person_tmdb(
     for row in &rows {
         let id: String = row.get_str("id")?;
         let name: String = row.get_str("name")?;
-        let _ = try_fetch_person_tmdb(db, &id, &name, api_key, client).await;
+        try_fetch_person_tmdb(db, &id, &name, api_key, client, tmdb_base_url).await;
         count += 1;
     }
     Ok(count)

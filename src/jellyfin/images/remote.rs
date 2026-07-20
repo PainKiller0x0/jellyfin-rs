@@ -279,7 +279,8 @@ pub(super) async fn download_and_cache_image(
     image_type: &str,
     image_url: &str,
 ) -> anyhow::Result<()> {
-    let image_url = validate_remote_image_url(image_url)?;
+    let tmdb_base_url = state.tmdb_proxy_url.read().await.clone();
+    let image_url = validate_remote_image_url(image_url, tmdb_base_url.as_deref())?;
     let response = remote_image_request(state, image_url.clone())
         .await
         .send()
@@ -334,7 +335,8 @@ async fn fetch_remote_image(
     state: &AppState,
     image_url: &str,
 ) -> anyhow::Result<(Bytes, &'static str)> {
-    let image_url = validate_remote_image_url(image_url)?;
+    let tmdb_base_url = state.tmdb_proxy_url.read().await.clone();
+    let image_url = validate_remote_image_url(image_url, tmdb_base_url.as_deref())?;
     let response = remote_image_request(state, image_url)
         .await
         .send()
@@ -382,13 +384,13 @@ fn remote_image_content_type(headers: &HeaderMap) -> &'static str {
     }
 }
 
-fn validate_remote_image_url(image_url: &str) -> anyhow::Result<reqwest::Url> {
+fn validate_remote_image_url(
+    image_url: &str,
+    tmdb_base_url: Option<&str>,
+) -> anyhow::Result<reqwest::Url> {
     let url = reqwest::Url::parse(image_url.trim()).context("invalid remote image url")?;
-    let allowed = url.scheme() == "https"
-        && url.host_str().is_some_and(|host| {
-            (host.eq_ignore_ascii_case("image.tmdb.org") && url.path().starts_with("/t/"))
-                || is_douban_image_host(host)
-        });
+    let allowed = url.scheme() == "https" && url.host_str().is_some_and(is_douban_image_host);
+    let allowed = allowed || crate::tmdb::is_allowed_image_url(&url, tmdb_base_url);
     if !allowed {
         bail!("remote image url is not allowed");
     }
@@ -399,9 +401,8 @@ async fn remote_image_request(
     state: &AppState,
     image_url: reqwest::Url,
 ) -> reqwest::RequestBuilder {
-    let is_tmdb_image = image_url
-        .host_str()
-        .is_some_and(|host| host.eq_ignore_ascii_case("image.tmdb.org"));
+    let tmdb_base_url = state.tmdb_proxy_url.read().await.clone();
+    let is_tmdb_image = crate::tmdb::is_allowed_image_url(&image_url, tmdb_base_url.as_deref());
     let client = if is_tmdb_image {
         state.tmdb_http_client().await
     } else {
@@ -512,11 +513,26 @@ async fn search_tmdb_id_by_item(state: &AppState, item_id: &str) -> anyhow::Resu
         return lookup_episode_series_tmdb_id(&state.db, item_id).await;
     }
 
+    let tmdb_base_url = state.tmdb_proxy_url.read().await.clone();
     let tmdb_client = state.tmdb_http_client().await;
     let results = if item_type.eq_ignore_ascii_case("Series") {
-        providers::tmdb_tv_search(&tmdb_client, &api_key, &name, year).await?
+        providers::tmdb_tv_search(
+            &tmdb_client,
+            &api_key,
+            &name,
+            year,
+            tmdb_base_url.as_deref(),
+        )
+        .await?
     } else {
-        providers::tmdb_movie_search(&tmdb_client, &api_key, &name, year).await?
+        providers::tmdb_movie_search(
+            &tmdb_client,
+            &api_key,
+            &name,
+            year,
+            tmdb_base_url.as_deref(),
+        )
+        .await?
     };
 
     Ok(results
@@ -547,10 +563,12 @@ async fn fetch_remote_images_by_type(
         return Ok(Vec::new());
     };
 
+    let tmdb_base_url = state.tmdb_proxy_url.read().await.clone();
     let tmdb_client = state.tmdb_http_client().await;
     let item_type: String = row.get_str("item_type").unwrap_or_default();
     if item_type.eq_ignore_ascii_case("Series") {
-        return fetch_tmdb_tv_images(&tmdb_client, api_key, tmdb_id).await;
+        return fetch_tmdb_tv_images(&tmdb_client, api_key, tmdb_id, tmdb_base_url.as_deref())
+            .await;
     }
 
     if item_type.eq_ignore_ascii_case("Season") {
@@ -579,6 +597,7 @@ async fn fetch_remote_images_by_type(
                     api_key,
                     series_tmdb_id,
                     season_number,
+                    tmdb_base_url.as_deref(),
                 )
                 .await
                 {
@@ -595,7 +614,14 @@ async fn fetch_remote_images_by_type(
 
         if !requested_type.eq_ignore_ascii_case("Primary") || images.is_empty() {
             if let Some(series_tmdb_id) = series_tmdb_id.as_deref() {
-                match fetch_tmdb_tv_images(&tmdb_client, api_key, series_tmdb_id).await {
+                match fetch_tmdb_tv_images(
+                    &tmdb_client,
+                    api_key,
+                    series_tmdb_id,
+                    tmdb_base_url.as_deref(),
+                )
+                .await
+                {
                     Ok(series_images) => images.extend(series_images),
                     Err(error) => {
                         tracing::warn!(
@@ -612,11 +638,17 @@ async fn fetch_remote_images_by_type(
 
     if item_type.eq_ignore_ascii_case("Episode") {
         if let Some(series_tmdb_id) = lookup_episode_series_tmdb_id(&state.db, item_id).await? {
-            return fetch_tmdb_tv_images(&tmdb_client, api_key, &series_tmdb_id).await;
+            return fetch_tmdb_tv_images(
+                &tmdb_client,
+                api_key,
+                &series_tmdb_id,
+                tmdb_base_url.as_deref(),
+            )
+            .await;
         }
     }
 
-    providers::tmdb_movie_images(&tmdb_client, api_key, tmdb_id).await
+    providers::tmdb_movie_images(&tmdb_client, api_key, tmdb_id, tmdb_base_url.as_deref()).await
 }
 
 async fn lookup_episode_series_tmdb_id(
@@ -642,32 +674,12 @@ async fn fetch_tmdb_tv_images(
     client: &reqwest::Client,
     api_key: &str,
     tmdb_id: &str,
+    tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
     let response: TmdbTvImageResponse = client
-        .get(format!("https://api.themoviedb.org/3/tv/{tmdb_id}/images"))
-        .query(&[("api_key", api_key)])
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-
-    let mut images = Vec::new();
-    append_remote_images(&mut images, "Primary", &response.posters);
-    append_remote_images(&mut images, "Backdrop", &response.backdrops);
-    append_remote_images(&mut images, "Logo", &response.logos);
-    Ok(images)
-}
-
-async fn fetch_tmdb_tv_season_images(
-    client: &reqwest::Client,
-    api_key: &str,
-    series_tmdb_id: &str,
-    season_number: i64,
-) -> anyhow::Result<Vec<Value>> {
-    let response: TmdbTvSeasonImageResponse = client
-        .get(format!(
-            "https://api.themoviedb.org/3/tv/{series_tmdb_id}/season/{season_number}/images"
+        .get(crate::tmdb::api_url(
+            tmdb_base_url,
+            &format!("tv/{tmdb_id}/images"),
         ))
         .query(&[("api_key", api_key)])
         .send()
@@ -677,11 +689,42 @@ async fn fetch_tmdb_tv_season_images(
         .await?;
 
     let mut images = Vec::new();
-    append_remote_images(&mut images, "Primary", &response.posters);
+    append_remote_images(&mut images, "Primary", &response.posters, tmdb_base_url);
+    append_remote_images(&mut images, "Backdrop", &response.backdrops, tmdb_base_url);
+    append_remote_images(&mut images, "Logo", &response.logos, tmdb_base_url);
     Ok(images)
 }
 
-fn append_remote_images(images: &mut Vec<Value>, image_type: &str, entries: &[TmdbTvImage]) {
+async fn fetch_tmdb_tv_season_images(
+    client: &reqwest::Client,
+    api_key: &str,
+    series_tmdb_id: &str,
+    season_number: i64,
+    tmdb_base_url: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
+    let response: TmdbTvSeasonImageResponse = client
+        .get(crate::tmdb::api_url(
+            tmdb_base_url,
+            &format!("tv/{series_tmdb_id}/season/{season_number}/images"),
+        ))
+        .query(&[("api_key", api_key)])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let mut images = Vec::new();
+    append_remote_images(&mut images, "Primary", &response.posters, tmdb_base_url);
+    Ok(images)
+}
+
+fn append_remote_images(
+    images: &mut Vec<Value>,
+    image_type: &str,
+    entries: &[TmdbTvImage],
+    tmdb_base_url: Option<&str>,
+) {
     for entry in entries {
         images.push(build_remote_image(
             image_type,
@@ -691,6 +734,7 @@ fn append_remote_images(images: &mut Vec<Value>, image_type: &str, entries: &[Tm
             entry.vote_average,
             entry.vote_count,
             entry.iso_639_1.as_deref(),
+            tmdb_base_url,
         ));
     }
 }
@@ -703,13 +747,14 @@ fn build_remote_image(
     vote_average: Option<f64>,
     vote_count: Option<i64>,
     iso_639_1: Option<&str>,
+    tmdb_base_url: Option<&str>,
 ) -> Value {
     let thumbnail_url = match image_type {
-        "Primary" => format!("https://image.tmdb.org/t/p/w342{file_path}"),
-        "Logo" => format!("https://image.tmdb.org/t/p/w500{file_path}"),
-        _ => format!("https://image.tmdb.org/t/p/w780{file_path}"),
+        "Primary" => crate::tmdb::image_url(tmdb_base_url, "w342", file_path),
+        "Logo" => crate::tmdb::image_url(tmdb_base_url, "w500", file_path),
+        _ => crate::tmdb::image_url(tmdb_base_url, "w780", file_path),
     };
-    let full_url = format!("https://image.tmdb.org/t/p/original{file_path}");
+    let full_url = crate::tmdb::image_url(tmdb_base_url, "original", file_path);
     let mut image = json!({
         "ProviderName": "TheMovieDb",
         "Url": full_url,
@@ -765,20 +810,35 @@ mod tests {
 
     #[test]
     fn remote_image_url_allows_tmdb_cdn() {
-        assert!(validate_remote_image_url("https://image.tmdb.org/t/p/w500/poster.jpg").is_ok());
+        assert!(
+            validate_remote_image_url("https://image.tmdb.org/t/p/w500/poster.jpg", None).is_ok()
+        );
+    }
+
+    #[test]
+    fn remote_image_url_allows_configured_tmdb_mirror() {
+        assert!(
+            validate_remote_image_url(
+                "https://tmdb.qb.edu.kg/t/p/w500/poster.jpg",
+                Some("https://tmdb.qb.edu.kg")
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn remote_image_url_allows_douban_image_cdn() {
         assert!(
             validate_remote_image_url(
-                "https://img9.doubanio.com/view/photo/s_ratio_poster/public/p2916595576.jpg"
+                "https://img9.doubanio.com/view/photo/s_ratio_poster/public/p2916595576.jpg",
+                None
             )
             .is_ok()
         );
         assert!(
             validate_remote_image_url(
-                "https://qnmob3.doubanio.com/view/photo/large/public/p2916595576.jpg"
+                "https://qnmob3.doubanio.com/view/photo/large/public/p2916595576.jpg",
+                None
             )
             .is_ok()
         );
@@ -786,10 +846,10 @@ mod tests {
 
     #[test]
     fn remote_image_url_rejects_private_or_unexpected_hosts() {
-        assert!(validate_remote_image_url("http://127.0.0.1/admin.png").is_err());
-        assert!(validate_remote_image_url("https://example.com/poster.jpg").is_err());
-        assert!(validate_remote_image_url("https://image.tmdb.org/metadata").is_err());
-        assert!(validate_remote_image_url("https://evil-doubanio.com/poster.jpg").is_err());
+        assert!(validate_remote_image_url("http://127.0.0.1/admin.png", None).is_err());
+        assert!(validate_remote_image_url("https://example.com/poster.jpg", None).is_err());
+        assert!(validate_remote_image_url("https://image.tmdb.org/metadata", None).is_err());
+        assert!(validate_remote_image_url("https://evil-doubanio.com/poster.jpg", None).is_err());
     }
 
     #[test]

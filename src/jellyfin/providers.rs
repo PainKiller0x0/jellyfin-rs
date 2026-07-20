@@ -1,16 +1,17 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::util::normalize_yyyy_mm_dd;
+use crate::{tmdb, util::normalize_yyyy_mm_dd};
 
 pub async fn tmdb_movie_search(
     client: &reqwest::Client,
     api_key: &str,
     name: &str,
     year: Option<i64>,
+    base_url: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
     let mut request = client
-        .get("https://api.themoviedb.org/3/search/movie")
+        .get(tmdb::api_url(base_url, "search/movie"))
         .query(&[("api_key", api_key), ("query", name)]);
     let year_string;
     if let Some(year) = year {
@@ -42,7 +43,7 @@ pub async fn tmdb_movie_search(
                 "PremiereDate": movie.release_date.as_deref().and_then(normalize_yyyy_mm_dd),
                 "SearchProviderName": "TheMovieDb",
                 "ProviderIds": { "Tmdb": movie.id.to_string() },
-                "ImageUrl": movie.poster_path.map(|path| format!("https://image.tmdb.org/t/p/w342{path}")),
+                "ImageUrl": movie.poster_path.map(|path| tmdb::image_url(base_url, "w342", &path)),
                 "Overview": movie.overview,
             })
         })
@@ -53,9 +54,10 @@ pub async fn tmdb_movie_details(
     client: &reqwest::Client,
     api_key: &str,
     tmdb_id: &str,
+    base_url: Option<&str>,
 ) -> anyhow::Result<Value> {
     let response = client
-        .get(format!("https://api.themoviedb.org/3/movie/{tmdb_id}"))
+        .get(tmdb::api_url(base_url, &format!("movie/{tmdb_id}")))
         .query(&[
             ("api_key", api_key),
             ("language", "zh-CN"),
@@ -82,7 +84,7 @@ pub async fn tmdb_movie_details(
             let mut entry =
                 json!({ "Name": person.name, "Role": person.character, "Type": "Actor" });
             if let Some(ref profile) = person.profile_path {
-                entry["ImageUrl"] = json!(format!("https://image.tmdb.org/t/p/w185{profile}"));
+                entry["ImageUrl"] = json!(tmdb::image_url(base_url, "w185", profile));
             }
             entry
         })
@@ -137,8 +139,8 @@ pub async fn tmdb_movie_details(
         "Genres": response.genres.into_iter().map(|genre| genre.name).collect::<Vec<_>>(),
         "Studios": response.production_companies.into_iter().map(|company| company.name).collect::<Vec<_>>(),
         "People": cast,
-        "ImageUrl": response.poster_path.map(|p| format!("https://image.tmdb.org/t/p/w500{p}")),
-        "BackdropUrl": response.backdrop_path.map(|p| format!("https://image.tmdb.org/t/p/w1280{p}")),
+        "ImageUrl": response.poster_path.map(|p| tmdb::image_url(base_url, "w500", &p)),
+        "BackdropUrl": response.backdrop_path.map(|p| tmdb::image_url(base_url, "w1280", &p)),
     }))
 }
 
@@ -147,9 +149,10 @@ pub async fn tmdb_tv_search(
     api_key: &str,
     name: &str,
     year: Option<i64>,
+    base_url: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
     let mut request = client
-        .get("https://api.themoviedb.org/3/search/tv")
+        .get(tmdb::api_url(base_url, "search/tv"))
         .query(&[("api_key", api_key), ("query", name)]);
     let year_string;
     if let Some(year) = year {
@@ -181,7 +184,7 @@ pub async fn tmdb_tv_search(
                 "PremiereDate": show.first_air_date.as_deref().and_then(normalize_yyyy_mm_dd),
                 "SearchProviderName": "TheMovieDb",
                 "ProviderIds": { "Tmdb": show.id.to_string() },
-                "ImageUrl": show.poster_path.map(|path| format!("https://image.tmdb.org/t/p/w342{path}")),
+                "ImageUrl": show.poster_path.map(|path| tmdb::image_url(base_url, "w342", &path)),
                 "Overview": show.overview,
             })
         })
@@ -192,9 +195,10 @@ pub async fn tmdb_tv_details(
     client: &reqwest::Client,
     api_key: &str,
     tmdb_id: &str,
+    base_url: Option<&str>,
 ) -> anyhow::Result<Value> {
     let response = client
-        .get(format!("https://api.themoviedb.org/3/tv/{tmdb_id}"))
+        .get(tmdb::api_url(base_url, &format!("tv/{tmdb_id}")))
         .query(&[
             ("api_key", api_key),
             ("language", "zh-CN"),
@@ -220,7 +224,7 @@ pub async fn tmdb_tv_details(
         .map(|person| {
             let mut entry = json!({ "Name": person.name, "Role": person.character.or_else(|| person.roles.first().map(|r| r.character.clone())).unwrap_or_default(), "Type": "Actor" });
             if let Some(ref profile) = person.profile_path {
-                entry["ImageUrl"] = json!(format!("https://image.tmdb.org/t/p/w185{profile}"));
+                entry["ImageUrl"] = json!(tmdb::image_url(base_url, "w185", profile));
             }
             entry
         })
@@ -277,8 +281,8 @@ pub async fn tmdb_tv_details(
         "Genres": response.genres.into_iter().map(|genre| genre.name).collect::<Vec<_>>(),
         "Studios": response.networks.into_iter().map(|network| network.name).collect::<Vec<_>>(),
         "People": cast,
-        "ImageUrl": response.poster_path.map(|p| format!("https://image.tmdb.org/t/p/w500{p}")),
-        "BackdropUrl": response.backdrop_path.map(|p| format!("https://image.tmdb.org/t/p/w1280{p}")),
+        "ImageUrl": response.poster_path.map(|p| tmdb::image_url(base_url, "w500", &p)),
+        "BackdropUrl": response.backdrop_path.map(|p| tmdb::image_url(base_url, "w1280", &p)),
         "Status": response.status,
         "AirDays": runtime_minutes,
         "SeasonCount": response.number_of_seasons,
@@ -290,9 +294,10 @@ pub async fn tmdb_person_search(
     client: &reqwest::Client,
     api_key: &str,
     name: &str,
+    base_url: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
     let response = client
-        .get("https://api.themoviedb.org/3/search/person")
+        .get(tmdb::api_url(base_url, "search/person"))
         .query(&[("api_key", api_key), ("query", name)])
         .send()
         .await?
@@ -310,7 +315,7 @@ pub async fn tmdb_person_search(
                 "Type": "Person",
                 "SearchProviderName": "TheMovieDb",
                 "ProviderIds": { "Tmdb": person.id.to_string() },
-                "ImageUrl": person.profile_path.map(|path| format!("https://image.tmdb.org/t/p/w185{path}")),
+                "ImageUrl": person.profile_path.map(|path| tmdb::image_url(base_url, "w185", &path)),
                 "Overview": person.known_for_department,
             })
         })
@@ -321,9 +326,10 @@ pub async fn tmdb_person_details(
     client: &reqwest::Client,
     api_key: &str,
     tmdb_id: &str,
+    base_url: Option<&str>,
 ) -> anyhow::Result<Value> {
     let response = client
-        .get(format!("https://api.themoviedb.org/3/person/{tmdb_id}"))
+        .get(tmdb::api_url(base_url, &format!("person/{tmdb_id}")))
         .query(&[
             ("api_key", api_key),
             ("append_to_response", "external_ids,combined_credits"),
@@ -371,7 +377,7 @@ pub async fn tmdb_person_details(
             "Tmdb": response.id.to_string(),
             "IMDB": response.imdb_id.unwrap_or_default(),
         },
-        "ImageUrl": response.profile_path.map(|path| format!("https://image.tmdb.org/t/p/w342{path}")),
+        "ImageUrl": response.profile_path.map(|path| tmdb::image_url(base_url, "w342", &path)),
         "BirthDate": response.birthday,
         "DeathDate": response.deathday,
         "PlaceOfBirth": response.place_of_birth,
@@ -386,6 +392,7 @@ pub async fn tmdb_person_images(
     client: &reqwest::Client,
     api_key: &str,
     tmdb_id: &str,
+    base_url: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
     #[derive(Deserialize)]
     struct TmdbPersonImages {
@@ -404,9 +411,7 @@ pub async fn tmdb_person_images(
     }
 
     let response = client
-        .get(format!(
-            "https://api.themoviedb.org/3/person/{tmdb_id}/images"
-        ))
+        .get(tmdb::api_url(base_url, &format!("person/{tmdb_id}/images")))
         .query(&[("api_key", api_key)])
         .send()
         .await?
@@ -418,8 +423,8 @@ pub async fn tmdb_person_images(
         .profiles
         .into_iter()
         .map(|profile| {
-            let thumbnail_url = format!("https://image.tmdb.org/t/p/w185{}", profile.file_path);
-            let full_url = format!("https://image.tmdb.org/t/p/original{}", profile.file_path);
+            let thumbnail_url = tmdb::image_url(base_url, "w185", &profile.file_path);
+            let full_url = tmdb::image_url(base_url, "original", &profile.file_path);
             let mut image = json!({
                 "ProviderName": "TheMovieDb",
                 "Url": full_url,
@@ -657,6 +662,7 @@ pub async fn tmdb_movie_images(
     client: &reqwest::Client,
     api_key: &str,
     tmdb_id: &str,
+    base_url: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
     #[derive(Deserialize)]
     struct TmdbImages {
@@ -678,9 +684,7 @@ pub async fn tmdb_movie_images(
     }
 
     let response = client
-        .get(format!(
-            "https://api.themoviedb.org/3/movie/{tmdb_id}/images"
-        ))
+        .get(tmdb::api_url(base_url, &format!("movie/{tmdb_id}/images")))
         .query(&[("api_key", api_key)])
         .send()
         .await?
@@ -691,8 +695,8 @@ pub async fn tmdb_movie_images(
     let mut images: Vec<Value> = Vec::new();
 
     for poster in &response.posters {
-        let thumbnail_url = format!("https://image.tmdb.org/t/p/w342{}", poster.file_path);
-        let full_url = format!("https://image.tmdb.org/t/p/original{}", poster.file_path);
+        let thumbnail_url = tmdb::image_url(base_url, "w342", &poster.file_path);
+        let full_url = tmdb::image_url(base_url, "original", &poster.file_path);
         let mut image = json!({
             "ProviderName": "TheMovieDb",
             "Url": full_url,
@@ -712,8 +716,8 @@ pub async fn tmdb_movie_images(
     }
 
     for backdrop in &response.backdrops {
-        let thumbnail_url = format!("https://image.tmdb.org/t/p/w342{}", backdrop.file_path);
-        let full_url = format!("https://image.tmdb.org/t/p/original{}", backdrop.file_path);
+        let thumbnail_url = tmdb::image_url(base_url, "w342", &backdrop.file_path);
+        let full_url = tmdb::image_url(base_url, "original", &backdrop.file_path);
         let mut image = json!({
             "ProviderName": "TheMovieDb",
             "Url": full_url,
@@ -733,8 +737,8 @@ pub async fn tmdb_movie_images(
     }
 
     for logo in &response.logos {
-        let thumbnail_url = format!("https://image.tmdb.org/t/p/w500{}", logo.file_path);
-        let full_url = format!("https://image.tmdb.org/t/p/original{}", logo.file_path);
+        let thumbnail_url = tmdb::image_url(base_url, "w500", &logo.file_path);
+        let full_url = tmdb::image_url(base_url, "original", &logo.file_path);
         let mut image = json!({
             "ProviderName": "TheMovieDb",
             "Url": full_url,

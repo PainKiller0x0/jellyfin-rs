@@ -304,7 +304,7 @@ onMounted(loadSettings);
                   {{ tmdbEnabled ? '已启用' : '未配置' }}
                 </ElTag>
                 <ElTag :type="tmdbHasProxy ? 'success' : 'info'" effect="plain">
-                  {{ tmdbHasProxy ? '代理已配置' : '直连' }}
+                  {{ tmdbHasProxy ? '反代已配置' : '直连' }}
                 </ElTag>
               </div>
             </div>
@@ -314,8 +314,8 @@ onMounted(loadSettings);
               <ElButton :loading="savingTmdb" type="primary" @click="saveTmdbApiKey">保存</ElButton>
             </div>
             <div class="settings-page__inline-control">
-              <ElInput v-model.trim="tmdbProxyUrl" clearable maxlength="2048" placeholder="http://host.docker.internal:7890" />
-              <ElButton :loading="savingTmdbProxy" type="primary" @click="saveTmdbProxyUrl">保存代理</ElButton>
+              <ElInput v-model.trim="tmdbProxyUrl" clearable maxlength="2048" placeholder="https://tmdb.qb.edu.kg" />
+              <ElButton :loading="savingTmdbProxy" type="primary" @click="saveTmdbProxyUrl">保存反代</ElButton>
             </div>
           </section>
 

@@ -5982,14 +5982,14 @@ mod tests {
 
     #[test]
     fn tmdb_client_configuration_reports_compatible_enabled_fields() {
-        let enabled = tmdb_client_configuration_value(true, Some("http://proxy:7890"));
+        let enabled = tmdb_client_configuration_value(true, Some("https://tmdb.qb.edu.kg"));
         assert_eq!(enabled["IsTmdbEnabled"], true);
         assert_eq!(enabled["IsEnabled"], true);
         assert_eq!(enabled["Enabled"], true);
         assert_eq!(enabled["HasApiKey"], true);
         assert_eq!(enabled["HasProxy"], true);
-        assert_eq!(enabled["ProxyUrl"], "http://proxy:7890");
-        assert_eq!(enabled["TmdbProxyUrl"], "http://proxy:7890");
+        assert_eq!(enabled["ProxyUrl"], "https://tmdb.qb.edu.kg");
+        assert_eq!(enabled["TmdbProxyUrl"], "https://tmdb.qb.edu.kg");
 
         let disabled = tmdb_client_configuration_value(false, None);
         assert_eq!(disabled["IsTmdbEnabled"], false);
@@ -6014,12 +6014,14 @@ mod tests {
     #[test]
     fn tmdb_proxy_url_request_accepts_common_field_names() {
         let request: TmdbProxyUrlRequest =
-            serde_json::from_value(serde_json::json!({ "ProxyUrl": "http://proxy:7890" })).unwrap();
-        assert_eq!(request.tmdb_proxy_url, "http://proxy:7890");
+            serde_json::from_value(serde_json::json!({ "ProxyUrl": "https://tmdb.qb.edu.kg" }))
+                .unwrap();
+        assert_eq!(request.tmdb_proxy_url, "https://tmdb.qb.edu.kg");
 
         let request: TmdbProxyUrlRequest =
-            serde_json::from_value(serde_json::json!({ "tmdbProxyUrl": "proxy:7890" })).unwrap();
-        assert_eq!(request.tmdb_proxy_url, "proxy:7890");
+            serde_json::from_value(serde_json::json!({ "tmdbProxyUrl": "tmdb.qb.edu.kg" }))
+                .unwrap();
+        assert_eq!(request.tmdb_proxy_url, "tmdb.qb.edu.kg");
     }
 
     #[test]
@@ -6656,7 +6658,7 @@ mod tests {
             media_dirs: Vec::new(),
             http_client: reqwest::Client::new(),
             tmdb_api_key: RwLock::new(None),
-            tmdb_proxy_url: RwLock::new(None),
+            tmdb_proxy_url: Arc::new(RwLock::new(None)),
             tmdb_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             douban_cookie: RwLock::new(None),
             scan_lock: tokio::sync::Mutex::new(()),

@@ -34,6 +34,7 @@ mod mediainfo;
 mod playback;
 mod queue;
 mod strm;
+mod tmdb;
 mod util;
 mod ws;
 
@@ -84,8 +85,7 @@ async fn main() -> anyhow::Result<()> {
 
     let tmdb_api_key = app::state::load_tmdb_api_key(&db).await;
     let tmdb_proxy_url = app::state::load_tmdb_proxy_url(&db).await;
-    let tmdb_http_client = util::http_client_with_proxy(tmdb_proxy_url.as_deref())
-        .context("failed to build TMDb HTTP client")?;
+    let tmdb_http_client = util::http_client().context("failed to build TMDb HTTP client")?;
     let douban_cookie = app::state::load_douban_cookie(&db).await;
 
     let state = Arc::new(AppState {
@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
         media_dirs: app::state::media_dirs_from_env(),
         http_client,
         tmdb_api_key: RwLock::new(tmdb_api_key),
-        tmdb_proxy_url: RwLock::new(tmdb_proxy_url),
+        tmdb_proxy_url: Arc::new(RwLock::new(tmdb_proxy_url)),
         tmdb_http_client: Arc::new(RwLock::new(tmdb_http_client)),
         douban_cookie: RwLock::new(douban_cookie),
         scan_lock: tokio::sync::Mutex::new(()),
@@ -130,9 +130,15 @@ async fn main() -> anyhow::Result<()> {
         let ep_state = state.clone();
         tokio::spawn(async move {
             // First: fill in missing TMDb IDs for movies/series without tags
+            let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
             let tmdb_client = ep_state.tmdb_http_client().await;
-            match library::tmdb_metadata::fill_missing_tmdb(&ep_state.db, &api_key, &tmdb_client)
-                .await
+            match library::tmdb_metadata::fill_missing_tmdb(
+                &ep_state.db,
+                &api_key,
+                &tmdb_client,
+                tmdb_base_url.as_deref(),
+            )
+            .await
             {
                 Ok(0) => {
                     tracing::info!("No missing TMDb metadata to fill");
@@ -146,11 +152,13 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Fetch person biographies and images in background
+            let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
             let tmdb_client = ep_state.tmdb_http_client().await;
             match library::tmdb_metadata::batch_fetch_person_tmdb(
                 &ep_state.db,
                 &api_key,
                 &tmdb_client,
+                tmdb_base_url.as_deref(),
             )
             .await
             {
@@ -167,11 +175,13 @@ async fn main() -> anyhow::Result<()> {
 
             // Then: fetch episode details once after startup scan has had time to populate rows.
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
             let tmdb_client = ep_state.tmdb_http_client().await;
             match library::tmdb_metadata::batch_fetch_episode_tmdb(
                 &ep_state.db,
                 &api_key,
                 &tmdb_client,
+                tmdb_base_url.as_deref(),
             )
             .await
             {

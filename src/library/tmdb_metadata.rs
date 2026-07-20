@@ -205,15 +205,7 @@ async fn download_season_images(
                         .await
                         .ok()?;
                     let resp = resp.error_for_status().ok()?;
-                    #[derive(serde::Deserialize)]
-                    struct SeasonResp {
-                        id: Option<i64>,
-                        poster_path: Option<String>,
-                        name: Option<String>,
-                        overview: Option<String>,
-                        air_date: Option<String>,
-                    }
-                    let season: SeasonResp = resp.json().await.ok()?;
+                    let season: SeasonTmdbResponse = resp.json().await.ok()?;
                     Some((season_id, sn, has_primary, season))
                 }
             })
@@ -221,61 +213,19 @@ async fn download_season_images(
 
         let results = futures_util::future::join_all(futures).await;
         for (season_id, season_number, has_primary, season) in results.into_iter().flatten() {
-            let premiere_date = season.air_date.as_deref().and_then(normalize_yyyy_mm_dd);
-            let production_year = premiere_date.as_deref().and_then(year_from_yyyy_mm_dd);
-            if let Some(tmdb_season_id) = season.id {
-                let _ = db
-                    .execute(crate::db::helpers::pg_statement(
-                        "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
-                        vec![season_id.as_str().into(), tmdb_season_id.to_string().into()],
-                    ))
-                    .await;
-            }
-            if let Some(n) = season.name.as_ref().filter(|s| !s.is_empty()) {
-                let _ = db
-                    .execute(crate::db::helpers::pg_statement(
-                        "UPDATE media_items SET title = ?, season_number = ?, production_year = COALESCE(?, production_year), premiere_date = COALESCE(?, premiere_date) WHERE id = ?",
-                        vec![
-                            n.as_str().into(),
-                            season_number.into(),
-                            production_year.into(),
-                            premiere_date.as_deref().into(),
-                            season_id.as_str().into(),
-                        ],
-                    ))
-                    .await;
-            } else {
-                let _ = db
-                    .execute(crate::db::helpers::pg_statement(
-                        "UPDATE media_items SET season_number = ?, production_year = COALESCE(?, production_year), premiere_date = COALESCE(?, premiere_date) WHERE id = ?",
-                        vec![
-                            season_number.into(),
-                            production_year.into(),
-                            premiere_date.as_deref().into(),
-                            season_id.as_str().into(),
-                        ],
-                    ))
-                    .await;
-            }
-            if let Some(o) = season.overview.as_ref().filter(|s| !s.is_empty()) {
-                let _ = db
-                    .execute(crate::db::helpers::pg_statement(
-                        "UPDATE media_items SET overview = ? WHERE id = ?",
-                        vec![o.as_str().into(), season_id.as_str().into()],
-                    ))
-                    .await;
-            }
-            if !has_primary {
-                let Some(poster_path) = season.poster_path else {
-                    continue;
-                };
-                let img_url = crate::tmdb::image_url(tmdb_base_url, "w500", &poster_path);
-                if download_and_save_tmdb_image(db, client, &season_id, &img_url, "Primary")
-                    .await
-                    .is_ok()
-                {
-                    downloaded += 1;
-                }
+            if apply_season_tmdb_response(
+                db,
+                client,
+                tmdb_base_url,
+                &season_id,
+                season_number,
+                has_primary,
+                &season,
+            )
+            .await
+            .unwrap_or(false)
+            {
+                downloaded += 1;
             }
         }
     }
@@ -347,6 +297,15 @@ struct EpisodeTmdbResponse {
     vote_average: Option<f64>,
 }
 
+#[derive(serde::Deserialize)]
+struct SeasonTmdbResponse {
+    id: Option<i64>,
+    poster_path: Option<String>,
+    name: Option<String>,
+    overview: Option<String>,
+    air_date: Option<String>,
+}
+
 async fn normalize_episode_years_from_premiere_dates(db: &sea_orm::DatabaseConnection) {
     match db
         .execute(crate::db::helpers::pg_statement(
@@ -376,7 +335,337 @@ async fn normalize_episode_years_from_premiere_dates(db: &sea_orm::DatabaseConne
     }
 }
 
-/// Batch fetch TMDb episode metadata for all episodes after scan completes
+pub async fn fetch_and_apply_season_tmdb_metadata(
+    db: &sea_orm::DatabaseConnection,
+    item_id: &str,
+    api_key: &str,
+    client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
+) -> anyhow::Result<bool> {
+    let Some(row) = db
+        .query_one(crate::db::helpers::pg_statement(
+            r#"SELECT s.id AS season_id,
+                      s.title,
+                      s.path,
+                      s.season_number,
+                      s.production_year,
+                      s.premiere_date,
+                      p.provider_item_id AS series_tmdb_id,
+                      sp.provider_item_id AS season_tmdb_id,
+                      CASE WHEN EXISTS (
+                          SELECT 1 FROM image_assets ia
+                          WHERE ia.item_id = s.id AND ia.image_type = 'Primary'
+                      ) THEN 1 ELSE 0 END AS has_primary
+               FROM media_items s
+               LEFT JOIN media_items series ON series.id = s.parent_id
+               LEFT JOIN provider_ids p ON p.item_id = series.id AND p.provider = 'Tmdb'
+               LEFT JOIN provider_ids sp ON sp.item_id = s.id AND sp.provider = 'Tmdb'
+               WHERE s.id = ? AND s.item_type = 'Season'"#,
+            vec![item_id.into()],
+        ))
+        .await?
+    else {
+        return Ok(true);
+    };
+
+    let Some(series_tmdb_id) = row.get_opt_str("series_tmdb_id").ok().flatten() else {
+        return Ok(false);
+    };
+
+    let title = row.get_str("title").unwrap_or_default();
+    let path = row.get_str("path").unwrap_or_default();
+    let stored_season_number = row.get_opt_i64("season_number").ok().flatten();
+    let Some(season_number) = stored_season_number
+        .or_else(|| parse_season_number(&title))
+        .or_else(|| extract_season_number(Path::new(&path)))
+    else {
+        tracing::debug!("TMDb season fetch skipped because season number is unknown for {item_id}");
+        return Ok(true);
+    };
+
+    let has_primary = row.get_i64("has_primary").unwrap_or(0) != 0;
+    let season_is_current = row.get_opt_str("season_tmdb_id").ok().flatten().is_some()
+        && stored_season_number.is_some()
+        && row.get_opt_i64("production_year").ok().flatten().is_some()
+        && row.get_opt_str("premiere_date").ok().flatten().is_some()
+        && has_primary;
+    if season_is_current {
+        return Ok(true);
+    }
+
+    let url = tmdb::api_url(
+        tmdb_base_url,
+        &format!("tv/{series_tmdb_id}/season/{season_number}"),
+    );
+    let season: SeasonTmdbResponse = client
+        .get(&url)
+        .query(&[("api_key", api_key), ("language", "zh-CN")])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    apply_season_tmdb_response(
+        db,
+        client,
+        tmdb_base_url,
+        item_id,
+        season_number,
+        has_primary,
+        &season,
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn apply_season_tmdb_response(
+    db: &sea_orm::DatabaseConnection,
+    client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
+    season_id: &str,
+    season_number: i64,
+    has_primary: bool,
+    season: &SeasonTmdbResponse,
+) -> anyhow::Result<bool> {
+    let premiere_date = season.air_date.as_deref().and_then(normalize_yyyy_mm_dd);
+    let production_year = premiere_date.as_deref().and_then(year_from_yyyy_mm_dd);
+    let mut primary_downloaded = false;
+    if let Some(tmdb_season_id) = season.id {
+        db.execute(crate::db::helpers::pg_statement(
+            "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
+            vec![season_id.into(), tmdb_season_id.to_string().into()],
+        ))
+        .await?;
+    }
+    if let Some(name) = season
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        db.execute(crate::db::helpers::pg_statement(
+            "UPDATE media_items SET title = ?, season_number = ?, production_year = COALESCE(?, production_year), premiere_date = COALESCE(?, premiere_date), updated_at = ? WHERE id = ?",
+            vec![
+                name.into(),
+                season_number.into(),
+                production_year.into(),
+                premiere_date.as_deref().into(),
+                now_unix().into(),
+                season_id.into(),
+            ],
+        ))
+        .await?;
+    } else {
+        db.execute(crate::db::helpers::pg_statement(
+            "UPDATE media_items SET season_number = ?, production_year = COALESCE(?, production_year), premiere_date = COALESCE(?, premiere_date), updated_at = ? WHERE id = ?",
+            vec![
+                season_number.into(),
+                production_year.into(),
+                premiere_date.as_deref().into(),
+                now_unix().into(),
+                season_id.into(),
+            ],
+        ))
+        .await?;
+    }
+    if let Some(overview) = season
+        .overview
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        db.execute(crate::db::helpers::pg_statement(
+            "UPDATE media_items SET overview = ?, updated_at = ? WHERE id = ?",
+            vec![overview.into(), now_unix().into(), season_id.into()],
+        ))
+        .await?;
+    }
+    if !has_primary {
+        if let Some(poster_path) = season.poster_path.as_deref() {
+            let img_url = tmdb::image_url(tmdb_base_url, "w500", poster_path);
+            if let Err(error) =
+                download_and_save_tmdb_image(db, client, season_id, &img_url, "Primary").await
+            {
+                tracing::warn!("failed to download season image for {season_id}: {error:#}");
+            } else {
+                primary_downloaded = true;
+            }
+        }
+    }
+    Ok(primary_downloaded)
+}
+
+pub async fn fetch_and_apply_episode_tmdb_metadata(
+    db: &sea_orm::DatabaseConnection,
+    item_id: &str,
+    api_key: &str,
+    client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
+) -> anyhow::Result<bool> {
+    let Some(row) = db
+        .query_one(crate::db::helpers::pg_statement(
+            r#"SELECT e.id AS episode_id,
+                      e.title AS episode_title,
+                      e.path AS episode_path,
+                      COALESCE(e.season_number, se.season_number) AS season_number,
+                      e.episode_number,
+                      e.production_year,
+                      e.premiere_date,
+                      s.title AS series_title,
+                      s.production_year AS series_year,
+                      p.provider_item_id AS tmdb_id,
+                      ep.provider_item_id AS episode_tmdb_id
+               FROM media_items e
+               LEFT JOIN media_items se ON se.id = e.parent_id
+               LEFT JOIN media_items s ON s.id = se.parent_id
+               LEFT JOIN provider_ids p ON p.item_id = s.id AND p.provider = 'Tmdb'
+               LEFT JOIN provider_ids ep ON ep.item_id = e.id AND ep.provider = 'Tmdb'
+               WHERE e.id = ? AND e.item_type = 'Episode'"#,
+            vec![item_id.into()],
+        ))
+        .await?
+    else {
+        return Ok(true);
+    };
+
+    let Some(tmdb_id) = row.get_opt_str("tmdb_id").ok().flatten() else {
+        return Ok(false);
+    };
+    let Some(season_number) = row.get_opt_i64("season_number").ok().flatten() else {
+        tracing::debug!(
+            "TMDb episode fetch skipped because season number is unknown for {item_id}"
+        );
+        return Ok(true);
+    };
+    let Some(episode_number) = row.get_opt_i64("episode_number").ok().flatten() else {
+        tracing::debug!(
+            "TMDb episode fetch skipped because episode number is unknown for {item_id}"
+        );
+        return Ok(true);
+    };
+
+    let current_title = row.get_str("episode_title").unwrap_or_default();
+    let series_title = row.get_str("series_title").unwrap_or_default();
+    let series_year = row.get_opt_i64("series_year").ok().flatten();
+    let episode_is_current = row.get_opt_str("episode_tmdb_id").ok().flatten().is_some()
+        && row.get_opt_i64("production_year").ok().flatten().is_some()
+        && row.get_opt_str("premiere_date").ok().flatten().is_some()
+        && !is_generic_series_episode_title(&current_title, &series_title, series_year);
+    if episode_is_current {
+        return Ok(true);
+    }
+
+    let url = tmdb::api_url(
+        tmdb_base_url,
+        &format!("tv/{tmdb_id}/season/{season_number}/episode/{episode_number}"),
+    );
+    let episode: EpisodeTmdbResponse = client
+        .get(&url)
+        .query(&[("api_key", api_key), ("language", "zh-CN")])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let target = EpisodeTmdbTarget {
+        episode_id: row.get_str("episode_id")?,
+        current_title,
+        path: row.get_str("episode_path").unwrap_or_default(),
+        series_title,
+        series_year,
+        episode_number,
+    };
+    apply_episode_tmdb_response(db, client, tmdb_base_url, &episode, &target).await?;
+    Ok(true)
+}
+
+async fn apply_episode_tmdb_response(
+    db: &sea_orm::DatabaseConnection,
+    client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
+    episode: &EpisodeTmdbResponse,
+    target: &EpisodeTmdbTarget,
+) -> anyhow::Result<()> {
+    if let Some(tmdb_episode_id) = episode.id {
+        db.execute(crate::db::helpers::pg_statement(
+            "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
+            vec![
+                target.episode_id.as_str().into(),
+                tmdb_episode_id.to_string().into(),
+            ],
+        ))
+        .await?;
+    }
+
+    if let Some(title) = episode_title_candidate(
+        episode.name.as_deref(),
+        &target.current_title,
+        &target.series_title,
+        target.series_year,
+        target.episode_number,
+        &target.path,
+    ) {
+        db.execute(crate::db::helpers::pg_statement(
+            "UPDATE media_items SET title = ?, updated_at = ? WHERE id = ?",
+            vec![
+                title.into(),
+                now_unix().into(),
+                target.episode_id.as_str().into(),
+            ],
+        ))
+        .await?;
+    }
+
+    if let Some(overview) = episode
+        .overview
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        db.execute(crate::db::helpers::pg_statement(
+            "UPDATE media_items SET overview = ?, updated_at = ? WHERE id = ?",
+            vec![
+                overview.into(),
+                now_unix().into(),
+                target.episode_id.as_str().into(),
+            ],
+        ))
+        .await?;
+    }
+
+    let premiere_date = episode.air_date.as_deref().and_then(normalize_yyyy_mm_dd);
+    let production_year = premiere_date.as_deref().and_then(year_from_yyyy_mm_dd);
+    let community_rating = episode.vote_average.filter(|rating| *rating > 0.0);
+    if production_year.is_some() || premiere_date.is_some() || community_rating.is_some() {
+        db.execute(crate::db::helpers::pg_statement(
+            "UPDATE media_items SET production_year = COALESCE(?, production_year), premiere_date = COALESCE(?, premiere_date), community_rating = COALESCE(?, community_rating), updated_at = ? WHERE id = ?",
+            vec![
+                production_year.into(),
+                premiere_date.as_deref().into(),
+                community_rating.into(),
+                now_unix().into(),
+                target.episode_id.as_str().into(),
+            ],
+        ))
+        .await?;
+    }
+
+    if let Some(still) = episode.still_path.as_deref() {
+        let img = tmdb::image_url(tmdb_base_url, "w500", still);
+        if let Err(error) =
+            download_and_save_tmdb_image(db, client, &target.episode_id, &img, "Primary").await
+        {
+            tracing::warn!(
+                "failed to download episode image for {}: {error:#}",
+                target.episode_id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Batch fetch missing TMDb episode metadata for existing rows.
 pub async fn batch_fetch_episode_tmdb(
     db: &sea_orm::DatabaseConnection,
     api_key: &str,
@@ -509,74 +798,13 @@ pub async fn batch_fetch_episode_tmdb(
         for result in results.into_iter().flatten() {
             let (ep, task) = result;
             for target in &task.targets {
-                if let Some(tmdb_episode_id) = ep.id {
-                    let _ = db
-                        .execute(crate::db::helpers::pg_statement(
-                            "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
-                            vec![
-                                target.episode_id.as_str().into(),
-                                tmdb_episode_id.to_string().into(),
-                            ],
-                        ))
-                        .await;
-                }
-
-                if let Some(title) = episode_title_candidate(
-                    ep.name.as_deref(),
-                    &target.current_title,
-                    &target.series_title,
-                    target.series_year,
-                    target.episode_number,
-                    &target.path,
-                ) {
-                    let _ = db
-                        .execute(crate::db::helpers::pg_statement(
-                            "UPDATE media_items SET title = ? WHERE id = ?",
-                            vec![title.into(), target.episode_id.as_str().into()],
-                        ))
-                        .await;
-                }
-
-                if let Some(ref overview) = ep.overview {
-                    if !overview.is_empty() {
-                        let _ = db
-                            .execute(crate::db::helpers::pg_statement(
-                                "UPDATE media_items SET overview = ? WHERE id = ?",
-                                vec![overview.as_str().into(), target.episode_id.as_str().into()],
-                            ))
-                            .await;
-                    }
-                }
-
-                let premiere_date = ep.air_date.as_deref().and_then(normalize_yyyy_mm_dd);
-                let production_year = premiere_date.as_deref().and_then(year_from_yyyy_mm_dd);
-                if production_year.is_some()
-                    || premiere_date.is_some()
-                    || ep.vote_average.is_some_and(|rating| rating > 0.0)
+                if let Err(error) =
+                    apply_episode_tmdb_response(db, client, tmdb_base_url, &ep, target).await
                 {
-                    let _ = db
-                        .execute(crate::db::helpers::pg_statement(
-                            "UPDATE media_items SET production_year = COALESCE(?, production_year), premiere_date = COALESCE(?, premiere_date), community_rating = COALESCE(?, community_rating) WHERE id = ?",
-                            vec![
-                                production_year.into(),
-                                premiere_date.as_deref().into(),
-                                ep.vote_average.into(),
-                                target.episode_id.as_str().into(),
-                            ],
-                        ))
-                        .await;
-                }
-
-                if let Some(ref still) = ep.still_path {
-                    let img = crate::tmdb::image_url(tmdb_base_url, "w500", still);
-                    let _ = download_and_save_tmdb_image(
-                        db,
-                        &client,
-                        &target.episode_id,
-                        &img,
-                        "Primary",
-                    )
-                    .await;
+                    tracing::warn!(
+                        "failed to apply episode TMDb metadata for {}: {error:#}",
+                        target.episode_id
+                    );
                 }
             }
             count += 1;

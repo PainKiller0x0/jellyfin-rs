@@ -119,7 +119,8 @@ async fn main() -> anyhow::Result<()> {
     }
     library::watcher::start_watching(state.clone());
 
-    // Fetch episode TMDb metadata in background (retries until data is available)
+    // Backfill existing TMDb metadata in the background. New scan results queue
+    // Season/Episode metadata from the scanner as each item is ingested.
     if let Some(api_key) = state
         .tmdb_api_key
         .read()
@@ -190,8 +191,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Then: fetch episode details once after startup scan has had time to populate rows.
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            // Backfill older or missed episode rows; scan-time items use the metadata pipeline.
             let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
             let tmdb_client = ep_state.tmdb_http_client().await;
             match library::tmdb_metadata::batch_fetch_episode_tmdb(

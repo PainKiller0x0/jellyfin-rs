@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use sea_orm::ConnectionTrait;
@@ -33,6 +33,8 @@ const DEFAULT_MEDIA_PROBE_QUEUE_CAPACITY: usize = 1024;
 const DEFAULT_INGEST_CONCURRENCY: usize = 1;
 const DEFAULT_INGEST_QUEUE_CAPACITY: usize = 4096;
 const DEFAULT_METADATA_FETCH_CONCURRENCY: usize = 2;
+const METADATA_FETCH_MAX_ATTEMPTS: usize = 30;
+const METADATA_FETCH_RETRY_DELAY_SECS: u64 = 2;
 
 struct ScanRootResult {
     scanned: usize,
@@ -79,6 +81,7 @@ struct MetadataFetchJob {
     item_id: String,
     item_type: String,
     path: PathBuf,
+    attempts: usize,
 }
 
 #[derive(Default)]
@@ -639,6 +642,7 @@ fn start_metadata_fetch_pipeline(
     douban_cookie: Option<String>,
 ) -> mpsc::UnboundedSender<MetadataFetchJob> {
     let (tx, mut rx) = mpsc::unbounded_channel::<MetadataFetchJob>();
+    let retry_tx = tx.downgrade();
     tokio::spawn(async move {
         let concurrency = metadata_fetch_concurrency();
         let mut pending = tokio::task::JoinSet::new();
@@ -660,11 +664,19 @@ fn start_metadata_fetch_pipeline(
             let api_key = api_key.clone();
             let tmdb_proxy_url = tmdb_proxy_url.clone();
             let tmdb_http_client = tmdb_http_client.clone();
+            let retry_tx = retry_tx.clone();
             pending.spawn(async move {
                 let tmdb_base_url = tmdb_proxy_url.read().await.clone();
                 let tmdb_client = tmdb_http_client.read().await.clone();
-                run_metadata_fetch_job(db, job, &api_key, &tmdb_client, tmdb_base_url.as_deref())
-                    .await
+                run_metadata_fetch_job(
+                    db,
+                    job,
+                    &api_key,
+                    &tmdb_client,
+                    tmdb_base_url.as_deref(),
+                    retry_tx,
+                )
+                .await
             });
         }
 
@@ -676,16 +688,7 @@ fn start_metadata_fetch_pipeline(
             }
         }
 
-        let tmdb_base_url = tmdb_proxy_url.read().await.clone();
-        let tmdb_client = tmdb_http_client.read().await.clone();
-        run_post_scan_metadata_tasks(
-            &db,
-            &api_key,
-            &tmdb_client,
-            tmdb_base_url.as_deref(),
-            douban_cookie.as_deref(),
-        )
-        .await;
+        run_post_scan_metadata_tasks(&db, douban_cookie.as_deref()).await;
         tracing::info!(
             "metadata fetch pipeline completed {completed}/{queued} item(s); failed={failed}"
         );
@@ -699,7 +702,10 @@ fn metadata_job_finished(
     match result {
         Some(Ok(Ok(()))) => true,
         Some(Ok(Err(error))) => {
-            tracing::warn!("metadata fetch job failed: {error:#}");
+            tracing::warn!(
+                "metadata fetch job failed: {}",
+                crate::library::tmdb_metadata::redact_tmdb_error(&error)
+            );
             false
         }
         Some(Err(error)) => {
@@ -716,47 +722,109 @@ async fn run_metadata_fetch_job(
     api_key: &str,
     tmdb_client: &reqwest::Client,
     tmdb_base_url: Option<&str>,
+    retry_tx: mpsc::WeakUnboundedSender<MetadataFetchJob>,
 ) -> anyhow::Result<()> {
     if api_key.is_empty() {
         return Ok(());
     }
-    if job.item_type != "Movie" && job.item_type != "Series" {
-        return Ok(());
+
+    let metadata_ready = match job.item_type.as_str() {
+        "Movie" | "Series" => {
+            if tmdb_metadata_is_current(&db, &job.item_id).await {
+                return Ok(());
+            }
+            crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(
+                &db,
+                &job.item_id,
+                &job.item_type,
+                &job.path,
+                api_key,
+                tmdb_client,
+                tmdb_base_url,
+            )
+            .await?;
+            true
+        }
+        "Season" => {
+            crate::library::tmdb_metadata::fetch_and_apply_season_tmdb_metadata(
+                &db,
+                &job.item_id,
+                api_key,
+                tmdb_client,
+                tmdb_base_url,
+            )
+            .await?
+        }
+        "Episode" => {
+            crate::library::tmdb_metadata::fetch_and_apply_episode_tmdb_metadata(
+                &db,
+                &job.item_id,
+                api_key,
+                tmdb_client,
+                tmdb_base_url,
+            )
+            .await?
+        }
+        _ => true,
+    };
+
+    if !metadata_ready {
+        schedule_metadata_fetch_retry(job, retry_tx);
     }
-    if tmdb_metadata_is_current(&db, &job.item_id).await {
-        return Ok(());
+    Ok(())
+}
+
+fn schedule_metadata_fetch_retry(
+    mut job: MetadataFetchJob,
+    retry_tx: mpsc::WeakUnboundedSender<MetadataFetchJob>,
+) {
+    if job.attempts >= METADATA_FETCH_MAX_ATTEMPTS {
+        tracing::warn!(
+            "TMDb metadata dependency was not ready after {} attempt(s) for {} {} ({})",
+            METADATA_FETCH_MAX_ATTEMPTS,
+            job.item_type,
+            job.item_id,
+            job.path.display()
+        );
+        return;
     }
-    crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(
-        &db,
-        &job.item_id,
-        &job.item_type,
-        &job.path,
-        api_key,
-        tmdb_client,
-        tmdb_base_url,
-    )
-    .await
+
+    job.attempts += 1;
+    let retry_number = job.attempts;
+    let path = job.path.clone();
+    let item_type = job.item_type.clone();
+    let Some(retry_tx) = retry_tx.upgrade() else {
+        tracing::debug!(
+            "metadata fetch retry skipped because pipeline closed for {} {} ({})",
+            item_type,
+            job.item_id,
+            path.display()
+        );
+        return;
+    };
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(METADATA_FETCH_RETRY_DELAY_SECS)).await;
+        match retry_tx.send(job) {
+            Ok(()) => {
+                tracing::debug!(
+                    "metadata fetch retry queued for {item_type} after dependency wait attempt {retry_number}"
+                );
+            }
+            Err(error) => {
+                tracing::debug!(
+                    "metadata fetch queue closed before retry could be scheduled for {}",
+                    error.0.path.display()
+                );
+            }
+        }
+    });
 }
 
 async fn run_post_scan_metadata_tasks(
     db: &sea_orm::DatabaseConnection,
-    api_key: &str,
-    tmdb_client: &reqwest::Client,
-    tmdb_base_url: Option<&str>,
     douban_cookie: Option<&str>,
 ) {
-    if !api_key.is_empty() {
-        if let Err(error) = crate::library::tmdb_metadata::batch_fetch_episode_tmdb(
-            db,
-            api_key,
-            tmdb_client,
-            tmdb_base_url,
-        )
-        .await
-        {
-            tracing::warn!("episode TMDb fetch failed: {error:#}");
-        }
-    }
     if let Err(error) =
         crate::library::douban_metadata::fill_missing_douban(db, douban_cookie).await
     {
@@ -842,13 +910,15 @@ fn queue_metadata_fetch(
     item: &ScannedMediaItem,
     path: &std::path::Path,
 ) -> bool {
-    if item.item_type != "Movie" && item.item_type != "Series" {
-        return false;
+    match item.item_type.as_str() {
+        "Movie" | "Series" | "Season" | "Episode" => {}
+        _ => return false,
     }
     match metadata_tx.send(MetadataFetchJob {
         item_id: item.id.clone(),
         item_type: item.item_type.clone(),
         path: path.to_path_buf(),
+        attempts: 0,
     }) {
         Ok(()) => true,
         Err(error) => {

@@ -581,9 +581,11 @@ async fn update_playback_session(
     let supported_commands = session_info.supported_commands;
     let supports_media_control = session_info.supports_media_control;
     let supports_persistent_identifier = session_info.supports_persistent_identifier;
+    let user_name = crate::jellyfin::sessions::session_user_name(state, user_id).await;
     let session = PlaybackSession {
         id: play_session_id.clone(),
         user_id: user_id.to_string(),
+        user_name,
         play_session_id: play_session_id.clone(),
         item_id: item_id.to_string(),
         item_name,

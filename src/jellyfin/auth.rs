@@ -873,6 +873,7 @@ async fn register_login_session(
     let session = PlaybackSession {
         id: session_id.to_string(),
         user_id: user.id.clone(),
+        user_name: user.username.clone(),
         play_session_id: session_id.to_string(),
         item_id: String::new(),
         item_name: None,
@@ -4172,6 +4173,7 @@ mod tests {
         PlaybackSession {
             id: "s1".to_string(),
             user_id: "u1".to_string(),
+            user_name: "alice".to_string(),
             play_session_id: "s1".to_string(),
             item_id: "i1".to_string(),
             item_name: None,

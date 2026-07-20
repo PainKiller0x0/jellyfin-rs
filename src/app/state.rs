@@ -134,6 +134,8 @@ pub struct PlaybackSession {
     pub id: String,
     #[serde(rename = "UserId")]
     pub user_id: String,
+    #[serde(rename = "UserName")]
+    pub user_name: String,
     #[serde(rename = "PlaySessionId")]
     pub play_session_id: String,
     #[serde(rename = "NowPlayingItemId")]

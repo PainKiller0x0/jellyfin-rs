@@ -313,6 +313,7 @@ pub async fn report_viewing(
         .and_then(|value| normalize_session_text(value, MAX_SESSION_ID_LEN))
         .unwrap_or_else(|| session_key(&headers, &query, &device.device_id));
     let session_info = session_info(&state, &headers, &query).await;
+    let user_name = session_user_name(&state, &user_id).await;
     let now = now_unix();
     let last_activity_date = unix_to_jellyfin_date(now);
     let client = session_info.client;
@@ -327,6 +328,7 @@ pub async fn report_viewing(
     let session = PlaybackSession {
         id: session_id.clone(),
         user_id: user_id.clone(),
+        user_name,
         play_session_id: session_id.clone(),
         item_id,
         item_name: query_text(&query, &["itemName", "ItemName"], MAX_SESSION_TEXT_LEN),
@@ -715,6 +717,13 @@ async fn session_user_info(state: &AppState, user_id: &str) -> Option<SessionUse
         })
 }
 
+pub(crate) async fn session_user_name(state: &AppState, user_id: &str) -> String {
+    session_user_info(state, user_id)
+        .await
+        .map(|user| user.user_name)
+        .unwrap_or_else(|| user_id.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -858,6 +867,7 @@ mod tests {
     fn session_serializes_additional_users() {
         let session = test_session();
         let value = serde_json::to_value(session).unwrap();
+        assert_eq!(value["UserName"], "alice");
         assert_eq!(
             value["AdditionalUsers"],
             json!([{ "UserId": "u2", "UserName": "guest" }])
@@ -1066,6 +1076,7 @@ mod tests {
         PlaybackSession {
             id: "s1".to_string(),
             user_id: "u1".to_string(),
+            user_name: "alice".to_string(),
             play_session_id: "p1".to_string(),
             item_id: "i1".to_string(),
             item_name: None,

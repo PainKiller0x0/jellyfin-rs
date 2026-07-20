@@ -5270,6 +5270,7 @@ mod tests {
         let session = PlaybackSession {
             id: "s1".to_string(),
             user_id: "u1".to_string(),
+            user_name: "alice".to_string(),
             play_session_id: "p1".to_string(),
             item_id: "i1".to_string(),
             item_name: None,
@@ -5971,6 +5972,7 @@ mod tests {
         let session = PlaybackSession {
             id: "s1".to_string(),
             user_id: "u1".to_string(),
+            user_name: "alice".to_string(),
             play_session_id: "p1".to_string(),
             item_id: "m1".to_string(),
             item_name: Some("Movie".to_string()),

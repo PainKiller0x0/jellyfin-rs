@@ -1,6 +1,6 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::util::stable_item_id;
+use crate::{library::naming::parse_media_name, util::stable_item_id};
 
 pub fn classify_media_path(path: &Path, collection_type: &str) -> Option<String> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -71,36 +71,20 @@ pub fn tv_folder_type(path: &Path, root: &Path, collection_type: &str) -> &'stat
     if collection_type != "tvshows" && collection_type != "tv" {
         return "Folder";
     }
-    let norm_path = super::path_utils::normalize_path(&path.to_string_lossy());
-    let norm_root = super::path_utils::normalize_path(&root.to_string_lossy());
-    let depth = std::path::Path::new(&norm_path)
-        .strip_prefix(std::path::Path::new(&norm_root))
-        .ok()
-        .map(|relative| relative.components().count())
-        .unwrap_or_default();
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    if is_season_folder_name(name) {
+    if path_depth(path, root) > 1 && is_season_folder_name(name) {
         "Season"
     } else if directory_has_tv_content(path) || looks_like_series_folder_name(name) {
-        "Series"
-    } else if depth == 1 && !is_grouping_folder_name(name) {
         "Series"
     } else {
         "Folder"
     }
 }
 
-fn movie_folder_type(path: &Path, root: &Path) -> &'static str {
-    let norm_path = super::path_utils::normalize_path(&path.to_string_lossy());
-    let norm_root = super::path_utils::normalize_path(&root.to_string_lossy());
-    let depth = std::path::Path::new(&norm_path)
-        .strip_prefix(std::path::Path::new(&norm_root))
-        .ok()
-        .map(|relative| relative.components().count())
-        .unwrap_or_default();
+fn movie_folder_type(path: &Path, _root: &Path) -> &'static str {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -108,23 +92,77 @@ fn movie_folder_type(path: &Path, root: &Path) -> &'static str {
 
     if is_grouping_folder_name(name) {
         "Folder"
-    } else if directory_has_movie_content(path) || looks_like_movie_folder_name(name) {
-        "Movie"
-    } else if depth == 1 {
+    } else if directory_is_movie_folder(path) || looks_like_movie_folder_name(name) {
         "Movie"
     } else {
         "Folder"
     }
 }
 
-fn directory_has_movie_content(path: &Path) -> bool {
+fn path_depth(path: &Path, root: &Path) -> usize {
+    let norm_path = super::path_utils::normalize_path(&path.to_string_lossy());
+    let norm_root = super::path_utils::normalize_path(&root.to_string_lossy());
+    std::path::Path::new(&norm_path)
+        .strip_prefix(std::path::Path::new(&norm_root))
+        .ok()
+        .map(|relative| relative.components().count())
+        .unwrap_or_default()
+}
+
+fn directory_is_movie_folder(path: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         return false;
     };
-    entries.flatten().any(|entry| {
+    let mut videos = Vec::new();
+    let mut has_non_extra_subdir = false;
+    for entry in entries.flatten() {
         let child = entry.path();
-        child.is_file() && classify_media_path(&child, "movies").as_deref() == Some("Video")
-    })
+        if child.is_dir() {
+            if !child
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_extra_folder_name)
+            {
+                has_non_extra_subdir = true;
+            }
+            continue;
+        }
+        if child.is_file()
+            && classify_media_path(&child, "movies").as_deref() == Some("Video")
+            && !is_ignored_video_file(&child)
+        {
+            videos.push(child);
+        }
+    }
+    !has_non_extra_subdir && video_files_are_one_movie(&videos)
+}
+
+fn video_files_are_one_movie(videos: &[PathBuf]) -> bool {
+    match videos {
+        [] => false,
+        [_] => true,
+        _ => {
+            let parsed: Vec<_> = videos
+                .iter()
+                .map(|path| parse_media_name(path, "movies"))
+                .collect();
+            let first_stack = parsed.first().and_then(|value| value.stack_key.as_deref());
+            if first_stack.is_some()
+                && parsed
+                    .iter()
+                    .all(|value| value.stack_key.as_deref() == first_stack)
+            {
+                return true;
+            }
+            let Some(first_title) = parsed.first().map(|value| value.title.trim()) else {
+                return false;
+            };
+            !first_title.is_empty()
+                && parsed
+                    .iter()
+                    .all(|value| value.title.trim().eq_ignore_ascii_case(first_title))
+        }
+    }
 }
 
 fn directory_has_tv_content(path: &Path) -> bool {
@@ -139,7 +177,13 @@ fn directory_has_tv_content(path: &Path) -> bool {
                 .and_then(|name| name.to_str())
                 .is_some_and(is_season_folder_name);
         }
-        child.is_file() && classify_media_path(&child, "tvshows").as_deref() == Some("Episode")
+        child.is_file()
+            && (child
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("tvshow.nfo"))
+                || (classify_media_path(&child, "tvshows").as_deref() == Some("Episode")
+                    && parse_media_name(&child, "tvshows").episode_number.is_some()))
     })
 }
 
@@ -206,10 +250,47 @@ fn is_grouping_folder_name(name: &str) -> bool {
 }
 
 fn is_season_folder_name(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
+    let name = name
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '.' | '_' | '-'))
+        .to_ascii_lowercase();
+    if matches!(name.as_str(), "specials" | "extras") {
+        return true;
+    }
     name.starts_with("season ")
         || name.starts_with("season_")
+        || name.starts_with("season-")
         || name.starts_with('s') && name[1..].chars().all(|c| c.is_ascii_digit())
+        || name.starts_with('第') && name.ends_with('季')
+}
+
+fn is_extra_folder_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "extras"
+            | "extra"
+            | "trailers"
+            | "trailer"
+            | "samples"
+            | "sample"
+            | "behind the scenes"
+            | "behindthescenes"
+            | "deleted scenes"
+            | "deleted scene"
+            | "featurettes"
+            | "featurette"
+            | "interviews"
+            | "interview"
+            | "scenes"
+            | "scene"
+            | "shorts"
+            | "short"
+    )
+}
+
+fn is_ignored_video_file(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().contains("sample"))
 }
 
 #[cfg(test)]
@@ -276,6 +357,46 @@ mod tests {
     }
 
     #[test]
+    fn unknown_movie_grouping_folder_with_nested_content_stays_folder() {
+        let root = test_dir("unknown_movie_grouping_folder_with_nested_content_stays_folder");
+        let group = root.join("4K");
+        let movie = group.join("无间道");
+        fs::create_dir_all(&movie).unwrap();
+        fs::write(movie.join("无间道.mkv"), []).unwrap();
+
+        assert_eq!(tv_folder_type(&group, &root, "movies"), "Folder");
+        assert_eq!(tv_folder_type(&movie, &root, "movies"), "Movie");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mixed_movie_folder_with_different_videos_stays_folder() {
+        let root = test_dir("mixed_movie_folder_with_different_videos_stays_folder");
+        let group = root.join("动作");
+        fs::create_dir_all(&group).unwrap();
+        fs::write(group.join("Movie One.mkv"), []).unwrap();
+        fs::write(group.join("Movie Two.mkv"), []).unwrap();
+
+        assert_eq!(tv_folder_type(&group, &root, "movies"), "Folder");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stacked_movie_folder_stays_movie() {
+        let root = test_dir("stacked_movie_folder_stays_movie");
+        let movie = root.join("Bad Boys (2006)");
+        fs::create_dir_all(&movie).unwrap();
+        fs::write(movie.join("Bad Boys (2006) CD1.mkv"), []).unwrap();
+        fs::write(movie.join("Bad Boys (2006) CD2.mkv"), []).unwrap();
+
+        assert_eq!(tv_folder_type(&movie, &root, "movies"), "Movie");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn nested_tv_folder_with_episode_file_is_series() {
         let root = test_dir("nested_tv_folder_with_episode_file_is_series");
         let group = root.join("数");
@@ -285,6 +406,31 @@ mod tests {
 
         assert_eq!(tv_folder_type(&group, &root, "tvshows"), "Folder");
         assert_eq!(tv_folder_type(&series, &root, "tvshows"), "Series");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unknown_tv_grouping_folder_with_nested_series_stays_folder() {
+        let root = test_dir("unknown_tv_grouping_folder_with_nested_series_stays_folder");
+        let group = root.join("4K");
+        let series = group.join("Friends");
+        fs::create_dir_all(series.join("Season 1")).unwrap();
+
+        assert_eq!(tv_folder_type(&group, &root, "tvshows"), "Folder");
+        assert_eq!(tv_folder_type(&series, &root, "tvshows"), "Series");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tv_folder_with_unparsed_video_stays_folder() {
+        let root = test_dir("tv_folder_with_unparsed_video_stays_folder");
+        let group = root.join("字幕");
+        fs::create_dir_all(&group).unwrap();
+        fs::write(group.join("F字幕.mkv"), []).unwrap();
+
+        assert_eq!(tv_folder_type(&group, &root, "tvshows"), "Folder");
 
         let _ = fs::remove_dir_all(root);
     }

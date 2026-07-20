@@ -245,7 +245,8 @@ async fn scan_root(
             &collection_type,
             &parent_id,
             &library_id,
-            is_strm_file,
+            path,
+            &root,
         );
         let container = if is_strm_file {
             probe_path
@@ -595,14 +596,21 @@ fn normalize_scanned_file_type(
     collection_type: &str,
     parent_id: &str,
     library_id: &str,
-    is_strm_file: bool,
+    path: &std::path::Path,
+    root: &std::path::Path,
 ) -> String {
-    if is_strm_file
-        && collection_type == "movies"
-        && item_type == "Video"
-        && parent_id == library_id
-    {
-        "Movie".to_string()
+    if collection_type == "movies" && item_type == "Video" {
+        if parent_id == library_id {
+            return "Movie".to_string();
+        }
+        let parent_is_movie_folder = path
+            .parent()
+            .is_some_and(|parent| tv_folder_type(parent, root, collection_type) == "Movie");
+        if parent_is_movie_folder {
+            "Video".to_string()
+        } else {
+            "Movie".to_string()
+        }
     } else {
         item_type.to_string()
     }
@@ -783,6 +791,11 @@ async fn set_media_probe_cache_current(db: &sea_orm::DatabaseConnection) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[tokio::test]
     async fn media_probe_cache_version_is_persisted() {
@@ -803,5 +816,62 @@ mod tests {
     #[test]
     fn media_probe_queue_capacity_defaults_to_positive_value() {
         assert!(media_probe_queue_capacity() > 0);
+    }
+
+    #[test]
+    fn movie_library_root_video_file_is_movie() {
+        let root = test_dir("movie_library_root_video_file_is_movie");
+        let path = root.join("Movie One.mkv");
+        fs::write(&path, []).unwrap();
+
+        assert_eq!(
+            normalize_scanned_file_type("Video", "movies", "library", "library", &path, &root),
+            "Movie"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn movie_library_mixed_folder_video_file_is_movie() {
+        let root = test_dir("movie_library_mixed_folder_video_file_is_movie");
+        let group = root.join("动作");
+        fs::create_dir_all(&group).unwrap();
+        let path = group.join("Movie One.mkv");
+        fs::write(&path, []).unwrap();
+        fs::write(group.join("Movie Two.mkv"), []).unwrap();
+
+        assert_eq!(
+            normalize_scanned_file_type("Video", "movies", "group", "library", &path, &root),
+            "Movie"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn movie_library_movie_folder_video_file_stays_video() {
+        let root = test_dir("movie_library_movie_folder_video_file_stays_video");
+        let movie = root.join("Movie One");
+        fs::create_dir_all(&movie).unwrap();
+        let path = movie.join("Movie One.mkv");
+        fs::write(&path, []).unwrap();
+
+        assert_eq!(
+            normalize_scanned_file_type("Video", "movies", "movie", "library", &path, &root),
+            "Video"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("jellyfin-rs-scanner-{name}-{nonce}"));
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 }

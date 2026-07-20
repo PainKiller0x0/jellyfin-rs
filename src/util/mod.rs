@@ -78,13 +78,6 @@ pub fn http_client() -> anyhow::Result<reqwest::Client> {
     http_client_with_proxy(None)
 }
 
-pub fn http_client_no_proxy() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .no_proxy()
-        .build()?)
-}
-
 pub fn http_client_with_proxy(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
     if let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {

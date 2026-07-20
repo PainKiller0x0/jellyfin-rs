@@ -85,8 +85,7 @@ async fn main() -> anyhow::Result<()> {
 
     let tmdb_api_key = app::state::load_tmdb_api_key(&db).await;
     let tmdb_proxy_url = app::state::load_tmdb_proxy_url(&db).await;
-    let tmdb_http_client =
-        util::http_client_no_proxy().context("failed to build TMDb HTTP client")?;
+    let tmdb_http_client = util::http_client().context("failed to build TMDb HTTP client")?;
     let douban_cookie = app::state::load_douban_cookie(&db).await;
 
     let state = Arc::new(AppState {

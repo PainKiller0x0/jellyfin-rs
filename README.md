@@ -119,7 +119,9 @@ docker compose up --build
 | `JELLYFIN_RS_WATCH_POLL_SECONDS` | `60` | 文件监听轮询兜底间隔，设为 `0` 可关闭轮询 |
 | `JELLYFIN_RS_SESSION_TIMEOUT_SECONDS` | `120` | 播放会话超时秒数 |
 | `JELLYFIN_RS_MAX_WATCH_DELTA_SECONDS` | `43200` | 播放进度上报允许的最大时间跳变，单位秒 |
-| `JELLYFIN_RS_PROXY` | 无 | 通用外部 HTTP 请求代理 |
+| `JELLYFIN_RS_PROXY` | 无 | 通用外部 HTTP 请求代理，优先级高于标准代理变量 |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` | 无 | 标准代理变量，包括 TMDb 官方与 TMDb 反代请求 |
+| `NO_PROXY` | `localhost,127.0.0.1,::1` | 标准代理绕过列表 |
 | `JELLYFIN_RS_NO_PROXY` | 无 | 禁用通用代理 |
 | `JELLYFIN_RS_TMDB_API_KEY` | 无 | 启动时读取的 TMDb API Key，也可在后台设置 |
 | `JELLYFIN_RS_IP2REGION_V4_XDB` | 内置数据库 | 自定义 IPv4 离线归属地库路径 |

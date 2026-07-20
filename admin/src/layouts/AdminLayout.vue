@@ -28,6 +28,11 @@ const menuItems: MenuItem[] = [
     icon: 'FolderOpened'
   },
   {
+    path: '/metadata',
+    title: '元数据',
+    icon: 'MagicStick'
+  },
+  {
     path: '/playback-stats',
     title: '观影统计',
     icon: 'DataAnalysis'

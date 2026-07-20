@@ -31,6 +31,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '媒体库', icon: 'FolderOpened' }
       },
       {
+        path: 'metadata',
+        name: 'metadata',
+        component: () => import('@/views/metadata/MetadataToolsView.vue'),
+        meta: { title: '元数据', icon: 'MagicStick' }
+      },
+      {
         path: 'playback-stats',
         name: 'playback-stats',
         component: () => import('@/views/playback/PlaybackStatsView.vue'),

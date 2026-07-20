@@ -75,8 +75,14 @@ pub fn verify_password(password: &str, password_hash: &str) -> bool {
 }
 
 pub fn http_client() -> anyhow::Result<reqwest::Client> {
+    http_client_with_proxy(None)
+}
+
+pub fn http_client_with_proxy(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
-    if no_proxy_requested() {
+    if let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
+        builder = builder.no_proxy().proxy(reqwest::Proxy::all(proxy_url)?);
+    } else if no_proxy_requested() {
         builder = builder.no_proxy();
     } else if let Some(proxy_url) = configured_proxy_url() {
         builder = builder.no_proxy().proxy(reqwest::Proxy::all(&proxy_url)?);

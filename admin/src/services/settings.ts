@@ -15,6 +15,16 @@ export function updateTmdbApiKey(token: string, apiKey: string) {
   });
 }
 
+export function updateTmdbProxyUrl(token: string, proxyUrl: string) {
+  return request<void>('/System/Configuration/TmdbProxyUrl', {
+    method: 'POST',
+    token,
+    body: {
+      TmdbProxyUrl: proxyUrl
+    }
+  });
+}
+
 export function doubanClientConfiguration(token: string) {
   return request<DoubanClientConfiguration>('/Douban/ClientConfiguration', { token });
 }

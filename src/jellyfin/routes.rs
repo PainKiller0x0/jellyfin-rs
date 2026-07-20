@@ -240,6 +240,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(system::update_tmdb_api_key),
         )
         .route(
+            "/System/Configuration/TmdbProxyUrl",
+            post(system::update_tmdb_proxy_url),
+        )
+        .route(
             "/System/Configuration/DoubanCookie",
             post(system::update_douban_cookie),
         )

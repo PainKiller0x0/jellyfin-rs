@@ -16,11 +16,13 @@ const authStore = useAuthStore();
 const loading = ref(false);
 const savingServerName = ref(false);
 const savingTmdb = ref(false);
+const savingTmdbProxy = ref(false);
 const savingDouban = ref(false);
 const savingApiKey = ref(false);
 const apiKeyDialogVisible = ref(false);
 const serverName = ref('');
 const tmdbApiKey = ref('');
+const tmdbProxyUrl = ref('');
 const doubanCookie = ref('');
 const tmdbConfig = ref<TmdbClientConfiguration | null>(null);
 const doubanConfig = ref<DoubanClientConfiguration | null>(null);
@@ -36,6 +38,7 @@ const apiKeyRules: FormRules<ApiKeyForm> = {
 };
 
 const tmdbEnabled = computed(() => Boolean(tmdbConfig.value?.HasApiKey || tmdbConfig.value?.IsTmdbEnabled));
+const tmdbHasProxy = computed(() => Boolean(tmdbConfig.value?.HasProxy));
 const doubanHasCookie = computed(() => Boolean(doubanConfig.value?.HasCookie));
 const settingsStats = computed(() => [
   {
@@ -46,7 +49,7 @@ const settingsStats = computed(() => [
   {
     label: 'TMDb',
     value: tmdbEnabled.value ? '已启用' : '未配置',
-    hint: '元数据'
+    hint: tmdbHasProxy.value ? '代理' : '元数据'
   },
   {
     label: '豆瓣',
@@ -75,6 +78,7 @@ async function loadSettings() {
     ]);
     serverName.value = system.ServerName;
     tmdbConfig.value = tmdb;
+    tmdbProxyUrl.value = tmdb.ProxyUrl ?? tmdb.TmdbProxyUrl ?? '';
     doubanConfig.value = douban;
     keys.value = apiKeys.Items;
   } catch (error) {
@@ -116,6 +120,23 @@ async function saveTmdbApiKey() {
     ElMessage.error(error instanceof Error ? error.message : '保存 TMDb API Key 失败');
   } finally {
     savingTmdb.value = false;
+  }
+}
+
+async function saveTmdbProxyUrl() {
+  if (!authStore.token) {
+    return;
+  }
+
+  savingTmdbProxy.value = true;
+  try {
+    await settingsApi.updateTmdbProxyUrl(authStore.token, tmdbProxyUrl.value);
+    ElMessage.success('TMDb 代理已保存');
+    await loadSettings();
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存 TMDb 代理失败');
+  } finally {
+    savingTmdbProxy.value = false;
   }
 }
 
@@ -278,14 +299,23 @@ onMounted(loadSettings);
                 <h3>TMDb</h3>
                 <span>电影、剧集和人物元数据。</span>
               </div>
-              <ElTag :type="tmdbEnabled ? 'success' : 'info'" effect="plain">
-                {{ tmdbEnabled ? '已启用' : '未配置' }}
-              </ElTag>
+              <div class="settings-page__tag-group">
+                <ElTag :type="tmdbEnabled ? 'success' : 'info'" effect="plain">
+                  {{ tmdbEnabled ? '已启用' : '未配置' }}
+                </ElTag>
+                <ElTag :type="tmdbHasProxy ? 'success' : 'info'" effect="plain">
+                  {{ tmdbHasProxy ? '代理已配置' : '直连' }}
+                </ElTag>
+              </div>
             </div>
 
             <div class="settings-page__inline-control">
               <ElInput v-model.trim="tmdbApiKey" placeholder="TMDb API Key" show-password type="password" />
               <ElButton :loading="savingTmdb" type="primary" @click="saveTmdbApiKey">保存</ElButton>
+            </div>
+            <div class="settings-page__inline-control">
+              <ElInput v-model.trim="tmdbProxyUrl" clearable maxlength="2048" placeholder="http://host.docker.internal:7890" />
+              <ElButton :loading="savingTmdbProxy" type="primary" @click="saveTmdbProxyUrl">保存代理</ElButton>
             </div>
           </section>
 
@@ -579,6 +609,13 @@ onMounted(loadSettings);
   }
 }
 
+.settings-page__tag-group {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .settings-page__inline-control {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -681,6 +718,10 @@ onMounted(loadSettings);
   .settings-page__panel-head--split,
   .settings-page__source-head {
     display: grid;
+  }
+
+  .settings-page__tag-group {
+    justify-content: flex-start;
   }
 
   .settings-page__form-actions {

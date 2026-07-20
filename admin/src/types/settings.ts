@@ -5,6 +5,9 @@ export type TmdbClientConfiguration = {
   IsEnabled: boolean;
   Enabled: boolean;
   HasApiKey: boolean;
+  HasProxy: boolean;
+  ProxyUrl?: string | null;
+  TmdbProxyUrl?: string | null;
 };
 
 export type DoubanClientConfiguration = {

@@ -393,7 +393,15 @@ async fn remote_image_request(
     state: &AppState,
     image_url: reqwest::Url,
 ) -> reqwest::RequestBuilder {
-    let request = state.http_client.get(image_url.clone());
+    let is_tmdb_image = image_url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("image.tmdb.org"));
+    let client = if is_tmdb_image {
+        state.tmdb_http_client().await
+    } else {
+        state.http_client.clone()
+    };
+    let request = client.get(image_url.clone());
     let Some(host) = image_url
         .host_str()
         .filter(|host| is_douban_image_host(host))
@@ -498,10 +506,11 @@ async fn search_tmdb_id_by_item(state: &AppState, item_id: &str) -> anyhow::Resu
         return lookup_episode_series_tmdb_id(&state.db, item_id).await;
     }
 
+    let tmdb_client = state.tmdb_http_client().await;
     let results = if item_type.eq_ignore_ascii_case("Series") {
-        providers::tmdb_tv_search(&state.http_client, &api_key, &name, year).await?
+        providers::tmdb_tv_search(&tmdb_client, &api_key, &name, year).await?
     } else {
-        providers::tmdb_movie_search(&state.http_client, &api_key, &name, year).await?
+        providers::tmdb_movie_search(&tmdb_client, &api_key, &name, year).await?
     };
 
     Ok(results
@@ -532,9 +541,10 @@ async fn fetch_remote_images_by_type(
         return Ok(Vec::new());
     };
 
+    let tmdb_client = state.tmdb_http_client().await;
     let item_type: String = row.get_str("item_type").unwrap_or_default();
     if item_type.eq_ignore_ascii_case("Series") {
-        return fetch_tmdb_tv_images(&state.http_client, api_key, tmdb_id).await;
+        return fetch_tmdb_tv_images(&tmdb_client, api_key, tmdb_id).await;
     }
 
     if item_type.eq_ignore_ascii_case("Season") {
@@ -559,7 +569,7 @@ async fn fetch_remote_images_by_type(
                 (series_tmdb_id.as_deref(), season_number)
             {
                 match fetch_tmdb_tv_season_images(
-                    &state.http_client,
+                    &tmdb_client,
                     api_key,
                     series_tmdb_id,
                     season_number,
@@ -576,7 +586,7 @@ async fn fetch_remote_images_by_type(
 
         if !requested_type.eq_ignore_ascii_case("Primary") || images.is_empty() {
             if let Some(series_tmdb_id) = series_tmdb_id.as_deref() {
-                match fetch_tmdb_tv_images(&state.http_client, api_key, series_tmdb_id).await {
+                match fetch_tmdb_tv_images(&tmdb_client, api_key, series_tmdb_id).await {
                     Ok(series_images) => images.extend(series_images),
                     Err(error) => {
                         tracing::warn!(
@@ -592,11 +602,11 @@ async fn fetch_remote_images_by_type(
 
     if item_type.eq_ignore_ascii_case("Episode") {
         if let Some(series_tmdb_id) = lookup_episode_series_tmdb_id(&state.db, item_id).await? {
-            return fetch_tmdb_tv_images(&state.http_client, api_key, &series_tmdb_id).await;
+            return fetch_tmdb_tv_images(&tmdb_client, api_key, &series_tmdb_id).await;
         }
     }
 
-    providers::tmdb_movie_images(&state.http_client, api_key, tmdb_id).await
+    providers::tmdb_movie_images(&tmdb_client, api_key, tmdb_id).await
 }
 
 async fn lookup_episode_series_tmdb_id(

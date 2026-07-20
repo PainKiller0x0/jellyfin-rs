@@ -16,7 +16,9 @@ use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
-    app::state::{AppState, PlaybackSession, SERVER_NAME, SessionCapabilities},
+    app::state::{
+        AppState, PlaybackSession, SERVER_NAME, SessionCapabilities, normalize_tmdb_proxy_url,
+    },
     db::row_ext::QueryResultExt,
     entities::{
         access_tokens, access_tokens::Entity as AccessTokens, activity_log,
@@ -866,15 +868,24 @@ pub async fn tmdb_client_configuration(State(state): State<Arc<AppState>>) -> im
         .await
         .as_deref()
         .is_some_and(|key| !key.is_empty());
-    Json(tmdb_client_configuration_value(enabled))
+    let proxy_url = state.tmdb_proxy_url.read().await.clone();
+    Json(tmdb_client_configuration_value(
+        enabled,
+        proxy_url.as_deref(),
+    ))
 }
 
-fn tmdb_client_configuration_value(enabled: bool) -> JsonValue {
+fn tmdb_client_configuration_value(enabled: bool, proxy_url: Option<&str>) -> JsonValue {
+    let proxy_url = proxy_url.unwrap_or_default().trim();
+    let has_proxy = !proxy_url.is_empty();
     json!({
         "IsTmdbEnabled": enabled,
         "IsEnabled": enabled,
         "Enabled": enabled,
-        "HasApiKey": enabled
+        "HasApiKey": enabled,
+        "HasProxy": has_proxy,
+        "ProxyUrl": proxy_url,
+        "TmdbProxyUrl": proxy_url
     })
 }
 
@@ -894,6 +905,34 @@ pub async fn update_tmdb_api_key(
     Json(request): Json<TmdbApiKeyRequest>,
 ) -> Response {
     match state.set_tmdb_api_key(request.tmdb_api_key.trim()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TmdbProxyUrlRequest {
+    #[serde(
+        rename = "TmdbProxyUrl",
+        alias = "ProxyUrl",
+        alias = "proxyUrl",
+        alias = "tmdbProxyUrl"
+    )]
+    tmdb_proxy_url: String,
+}
+
+pub async fn update_tmdb_proxy_url(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TmdbProxyUrlRequest>,
+) -> Response {
+    if normalize_tmdb_proxy_url(&request.tmdb_proxy_url).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "Invalid TMDb proxy URL" })),
+        )
+            .into_response();
+    }
+    match state.set_tmdb_proxy_url(&request.tmdb_proxy_url).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error),
     }
@@ -5043,7 +5082,7 @@ mod tests {
     use super::channel_features_value;
     use super::{
         CameraUploadQuery, CustomQueryRequest, DeviceRecord, FALLBACK_FONTS_PATH,
-        TmdbApiKeyRequest, activity_log_entry_json, activity_log_query,
+        TmdbApiKeyRequest, TmdbProxyUrlRequest, activity_log_entry_json, activity_log_query,
         camera_upload_history_value, client_log_document, client_log_file_name,
         default_branding_options, default_plugin_repositories, default_scan_library_triggers,
         device_info, device_options_result, empty_query_result, fallback_font_entries,
@@ -5943,17 +5982,22 @@ mod tests {
 
     #[test]
     fn tmdb_client_configuration_reports_compatible_enabled_fields() {
-        let enabled = tmdb_client_configuration_value(true);
+        let enabled = tmdb_client_configuration_value(true, Some("http://proxy:7890"));
         assert_eq!(enabled["IsTmdbEnabled"], true);
         assert_eq!(enabled["IsEnabled"], true);
         assert_eq!(enabled["Enabled"], true);
         assert_eq!(enabled["HasApiKey"], true);
+        assert_eq!(enabled["HasProxy"], true);
+        assert_eq!(enabled["ProxyUrl"], "http://proxy:7890");
+        assert_eq!(enabled["TmdbProxyUrl"], "http://proxy:7890");
 
-        let disabled = tmdb_client_configuration_value(false);
+        let disabled = tmdb_client_configuration_value(false, None);
         assert_eq!(disabled["IsTmdbEnabled"], false);
         assert_eq!(disabled["IsEnabled"], false);
         assert_eq!(disabled["Enabled"], false);
         assert_eq!(disabled["HasApiKey"], false);
+        assert_eq!(disabled["HasProxy"], false);
+        assert_eq!(disabled["ProxyUrl"], "");
     }
 
     #[test]
@@ -5965,6 +6009,17 @@ mod tests {
         let request: TmdbApiKeyRequest =
             serde_json::from_value(serde_json::json!({ "tmdbApiKey": "def" })).unwrap();
         assert_eq!(request.tmdb_api_key, "def");
+    }
+
+    #[test]
+    fn tmdb_proxy_url_request_accepts_common_field_names() {
+        let request: TmdbProxyUrlRequest =
+            serde_json::from_value(serde_json::json!({ "ProxyUrl": "http://proxy:7890" })).unwrap();
+        assert_eq!(request.tmdb_proxy_url, "http://proxy:7890");
+
+        let request: TmdbProxyUrlRequest =
+            serde_json::from_value(serde_json::json!({ "tmdbProxyUrl": "proxy:7890" })).unwrap();
+        assert_eq!(request.tmdb_proxy_url, "proxy:7890");
     }
 
     #[test]
@@ -6601,6 +6656,8 @@ mod tests {
             media_dirs: Vec::new(),
             http_client: reqwest::Client::new(),
             tmdb_api_key: RwLock::new(None),
+            tmdb_proxy_url: RwLock::new(None),
+            tmdb_http_client: RwLock::new(reqwest::Client::new()),
             douban_cookie: RwLock::new(None),
             scan_lock: tokio::sync::Mutex::new(()),
             playback_sessions: RwLock::new(HashMap::new()),

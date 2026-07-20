@@ -84,12 +84,13 @@ pub async fn remote_search(
         .clone()
         .filter(|key| !key.is_empty())
     {
+        let tmdb_client = state.tmdb_http_client().await;
         let search_result = if item_type.eq_ignore_ascii_case("Movie") {
-            providers::tmdb_movie_search(&state.http_client, &api_key, name, production_year).await
+            providers::tmdb_movie_search(&tmdb_client, &api_key, name, production_year).await
         } else if item_type.eq_ignore_ascii_case("Series") {
-            providers::tmdb_tv_search(&state.http_client, &api_key, name, production_year).await
+            providers::tmdb_tv_search(&tmdb_client, &api_key, name, production_year).await
         } else if item_type.eq_ignore_ascii_case("Person") {
-            providers::tmdb_person_search(&state.http_client, &api_key, name).await
+            providers::tmdb_person_search(&tmdb_client, &api_key, name).await
         } else {
             Err(anyhow::anyhow!("unsupported item type"))
         };
@@ -215,12 +216,13 @@ async fn enrich_remote_search_result(state: &AppState, item_id: &str, body: Valu
         .await
         .unwrap_or_default();
 
+    let tmdb_client = state.tmdb_http_client().await;
     let details = if item_type.eq_ignore_ascii_case("Series") {
-        providers::tmdb_tv_details(&state.http_client, &api_key, tmdb_id).await
+        providers::tmdb_tv_details(&tmdb_client, &api_key, tmdb_id).await
     } else if item_type.eq_ignore_ascii_case("Person") {
-        providers::tmdb_person_details(&state.http_client, &api_key, tmdb_id).await
+        providers::tmdb_person_details(&tmdb_client, &api_key, tmdb_id).await
     } else {
-        providers::tmdb_movie_details(&state.http_client, &api_key, tmdb_id).await
+        providers::tmdb_movie_details(&tmdb_client, &api_key, tmdb_id).await
     };
 
     match details {

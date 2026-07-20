@@ -105,28 +105,26 @@ pub async fn search_hints(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let user_id = query_user_id_or_request(&query, &request_user_id);
-    let search_term = match query.get("SearchTerm").filter(|value| !value.is_empty()) {
-        Some(term) => term.clone(),
-        None => return Json(json!({ "SearchHints": [], "TotalRecordCount": 0 })).into_response(),
+    let start_index = query_usize(&query, &["StartIndex", "startIndex"], 0);
+    let search_term = match query_value(&query, &["SearchTerm", "searchTerm"]) {
+        Some(term) => term,
+        None => {
+            return Json(json!({
+                "SearchHints": [],
+                "TotalRecordCount": 0,
+                "StartIndex": start_index
+            }))
+            .into_response();
+        }
     };
-    let start_index = query
-        .get("StartIndex")
-        .or_else(|| query.get("startIndex"))
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let limit = query
-        .get("Limit")
-        .or_else(|| query.get("limit"))
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(25);
+    let limit = query_usize(&query, &["Limit", "limit"], 25);
 
-    let include_types = query
-        .get("IncludeItemTypes")
+    let include_types = query_value(&query, &["IncludeItemTypes", "includeItemTypes"])
         .map(|v| v.split(',').map(str::trim).collect::<Vec<_>>());
 
-    let parent_id = query.get("ParentId").map(String::as_str);
+    let parent_id = query_value(&query, &["ParentId", "parentId"]);
 
-    match search_hints_inner(&state.db, &user_id, &search_term, include_types, parent_id).await {
+    match search_hints_inner(&state.db, &user_id, search_term, include_types, parent_id).await {
         Ok(hints) => {
             let total = hints.len();
             let page = hints
@@ -134,7 +132,12 @@ pub async fn search_hints(
                 .skip(start_index)
                 .take(limit)
                 .collect::<Vec<_>>();
-            Json(json!({ "SearchHints": page, "TotalRecordCount": total })).into_response()
+            Json(json!({
+                "SearchHints": page,
+                "TotalRecordCount": total,
+                "StartIndex": start_index
+            }))
+            .into_response()
         }
         Err(error) => internal_error(error),
     }
@@ -431,7 +434,9 @@ fn query_usize(query: &HashMap<String, String>, keys: &[&str], default: usize) -
 
 #[cfg(test)]
 mod tests {
-    use super::{next_up_inner, search_hints_inner, shows_next_up, similar_items_inner};
+    use super::{
+        next_up_inner, search_hints, search_hints_inner, shows_next_up, similar_items_inner,
+    };
     use axum::{
         body::to_bytes,
         extract::{Extension, Query, State},
@@ -513,6 +518,32 @@ mod tests {
         assert_eq!(hints.len(), 2);
         assert_eq!(hints[0]["Name"], "Alpha One");
         assert_eq!(hints[1]["Name"], "Alpha Two");
+    }
+
+    #[tokio::test]
+    async fn search_hints_response_includes_start_index() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        insert_media_item(&db, "one", "Alpha One", 1).await;
+        insert_media_item(&db, "two", "Alpha Two", 1).await;
+
+        let state = Arc::new(test_state(db));
+        let mut query = HashMap::new();
+        query.insert("searchTerm".to_string(), "Alpha".to_string());
+        query.insert("startIndex".to_string(), "1".to_string());
+        query.insert("limit".to_string(), "1".to_string());
+        let response = search_hints(State(state), Extension("u1".to_string()), Query(query))
+            .await
+            .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["TotalRecordCount"], 2);
+        assert_eq!(value["StartIndex"], 1);
+        let hints = value["SearchHints"].as_array().unwrap();
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0]["Name"], "Alpha Two");
     }
 
     #[tokio::test]

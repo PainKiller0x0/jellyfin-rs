@@ -156,6 +156,12 @@ impl MediaItem {
         map.insert("CanDownload".into(), JsonValue::Bool(true));
         map.insert("HasSubtitles".into(), JsonValue::Null);
         map.insert("HasLyrics".into(), JsonValue::Null);
+        map.insert(
+            "SupportsResume".into(),
+            JsonValue::Bool(supports_resume(self)),
+        );
+        map.insert("SupportsSync".into(), JsonValue::Bool(false));
+        map.insert("DisplaySpecialsWithSeasons".into(), JsonValue::Bool(false));
         map.insert("PlayAccess".into(), JsonValue::String("Full".to_string()));
         map.insert("Size".into(), opt_i64(self.size_bytes));
         map.insert("Genres".into(), json!([]));
@@ -351,6 +357,14 @@ fn build_user_data(item: &MediaItem) -> JsonValue {
     map.insert("Likes".into(), JsonValue::Null);
     map.insert("UnplayedItemCount".into(), JsonValue::Null);
     JsonValue::Object(map)
+}
+
+fn supports_resume(item: &MediaItem) -> bool {
+    !item.is_folder
+        && matches!(
+            item.item_type.as_str(),
+            "Audio" | "Movie" | "Episode" | "Video" | "Trailer"
+        )
 }
 
 pub fn media_source_json(item: &MediaItem) -> JsonValue {
@@ -632,6 +646,8 @@ impl MediaStreamRow {
         map.insert("Title".into(), opt_str(&self.title));
         map.insert("Comment".into(), opt_str(&self.comment));
         map.insert("DisplayTitle".into(), JsonValue::String(display_title));
+        map.insert("DisplayLanguage".into(), opt_str(&self.language));
+        map.insert("Extradata".into(), JsonValue::String(String::new()));
         map.insert(
             "Path".into(),
             if self.is_external || self.stream_type.eq_ignore_ascii_case("Attachment") {
@@ -1123,6 +1139,9 @@ mod tests {
         assert_eq!(value["ChildCount"], 0);
         assert_eq!(value["RecursiveItemCount"], 0);
         assert_eq!(value["LocalTrailerCount"], 0);
+        assert_eq!(value["SupportsResume"], true);
+        assert_eq!(value["SupportsSync"], false);
+        assert_eq!(value["DisplaySpecialsWithSeasons"], false);
         assert_eq!(value["EnableMediaSourceDisplay"], false);
         assert_eq!(
             value["MediaSources"][0]["DirectStreamUrl"],
@@ -1136,6 +1155,8 @@ mod tests {
         assert_eq!(text["IsTextSubtitleStream"], true);
         assert_eq!(text["IsPgsSubtitleStream"], false);
         assert_eq!(text["IsExtractableSubtitleStream"], true);
+        assert_eq!(text["DisplayLanguage"], "eng");
+        assert_eq!(text["Extradata"], "");
 
         let pgs = subtitle_stream("hdmv_pgs_subtitle", false).to_jellyfin_json("movie");
         assert_eq!(pgs["IsTextSubtitleStream"], false);

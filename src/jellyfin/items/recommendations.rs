@@ -25,21 +25,29 @@ fn visible_media_item_sql(alias: &str) -> String {
     )
 }
 
+fn query_value<'a>(query: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
+    query
+        .iter()
+        .find(|(key, _)| keys.iter().any(|wanted| key.eq_ignore_ascii_case(wanted)))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+fn query_usize(query: &HashMap<String, String>, keys: &[&str], default: usize) -> usize {
+    query_value(query, keys)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 pub async fn movie_recommendations(
     State(state): State<Arc<AppState>>,
     Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let user_id = query_user_id_or_request(&query, &request_user_id);
-    let parent_id = query.get("ParentId").map(String::as_str);
-    let category_limit = query
-        .get("CategoryLimit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(5);
-    let item_limit = query
-        .get("ItemLimit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(8);
+    let parent_id = query_value(&query, &["ParentId", "parentId"]);
+    let category_limit = query_usize(&query, &["CategoryLimit", "categoryLimit"], 5);
+    let item_limit = query_usize(&query, &["ItemLimit", "itemLimit"], 8);
     match movie_recommendations_inner(&state.db, &user_id, parent_id, category_limit, item_limit)
         .await
     {
@@ -257,17 +265,9 @@ pub async fn user_suggestions(
     Path(user_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let limit = query
-        .get("Limit")
-        .or_else(|| query.get("limit"))
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16);
-    let start = query
-        .get("StartIndex")
-        .or_else(|| query.get("startIndex"))
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let parent_id = query.get("ParentId").map(String::as_str);
+    let limit = query_usize(&query, &["Limit", "limit"], 16);
+    let start = query_usize(&query, &["StartIndex", "startIndex"], 0);
+    let parent_id = query_value(&query, &["ParentId", "parentId"]);
 
     // Return recently added unplayed items as suggestions
     let visible = visible_media_item_sql("media_items");

@@ -944,11 +944,16 @@ fn authentication_session_info(
         "UserName": user.username,
         "Client": string_or_default(capabilities.client, "jellyfin-rs"),
         "DeviceName": string_or_default(capabilities.device_name, "Unknown Device"),
+        "DeviceType": "",
         "DeviceId": device_id,
         "ApplicationVersion": string_or_default(capabilities.application_version, "0.1.0"),
+        "RemoteEndPoint": "",
         "IsActive": true,
         "LastActivityDate": last_activity_date,
         "LastPlaybackCheckIn": last_activity_date,
+        "PlaylistItemId": "",
+        "UserPrimaryImageTag": "",
+        "AppIconUrl": "",
         "PlayState": {
             "PositionTicks": 0,
             "IsPaused": false,
@@ -2440,6 +2445,13 @@ fn user_json(
         "Name": name,
         "Id": user_id,
         "ServerId": "jellyfin-rs",
+        "ServerName": "jellyfin-rs",
+        "ConnectUserName": "",
+        "ConnectLinkType": "LinkedUser",
+        "PrimaryImageTag": "",
+        "PrimaryImageAspectRatio": null,
+        "LastLoginDate": null,
+        "LastActivityDate": null,
         "HasPassword": has_password,
         "HasConfiguredPassword": has_password,
         "HasConfiguredEasyPassword": false,
@@ -2537,6 +2549,7 @@ fn default_user_policy(is_admin: bool, is_disabled: bool) -> JsonValue {
     let mut policy = serde_json::Map::new();
     for key in [
         "IsHidden",
+        "IsHiddenRemotely",
         "EnableCollectionManagement",
         "EnableSubtitleManagement",
         "EnableLyricManagement",
@@ -2549,6 +2562,7 @@ fn default_user_policy(is_admin: bool, is_disabled: bool) -> JsonValue {
         "EnableSyncTranscoding",
         "EnableMediaConversion",
         "EnablePublicSharing",
+        "DisablePremiumFeatures",
     ] {
         policy.insert(key.to_string(), json!(false));
     }
@@ -2563,6 +2577,7 @@ fn default_user_policy(is_admin: bool, is_disabled: bool) -> JsonValue {
         "EnabledFolders",
         "BlockedMediaFolders",
         "BlockedChannels",
+        "ExcludedSubFolders",
     ] {
         policy.insert(key.to_string(), json!([]));
     }
@@ -3643,6 +3658,13 @@ mod tests {
         assert_eq!(user["HasConfiguredPassword"], false);
         assert_eq!(user["HasConfiguredEasyPassword"], false);
         assert_eq!(user["EnableAutoLogin"], false);
+        assert_eq!(user["ServerName"], "jellyfin-rs");
+        assert_eq!(user["ConnectUserName"], "");
+        assert_eq!(user["ConnectLinkType"], "LinkedUser");
+        assert_eq!(user["PrimaryImageTag"], "");
+        assert!(user["PrimaryImageAspectRatio"].is_null());
+        assert!(user["LastLoginDate"].is_null());
+        assert!(user["LastActivityDate"].is_null());
         assert_eq!(user["Configuration"]["DisplayCollectionsView"], false);
         assert_eq!(user["Configuration"]["EnableLocalPassword"], false);
         assert_eq!(
@@ -3656,6 +3678,14 @@ mod tests {
         assert_eq!(user["Policy"]["EnableAudioPlaybackTranscoding"], true);
         assert_eq!(user["Policy"]["EnableVideoPlaybackTranscoding"], true);
         assert_eq!(user["Policy"]["EnableSubtitleDownloading"], true);
+        assert_eq!(user["Policy"]["IsHiddenRemotely"], false);
+        assert_eq!(user["Policy"]["DisablePremiumFeatures"], false);
+        assert!(
+            user["Policy"]["ExcludedSubFolders"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(user["Policy"]["MaxActiveSessions"], 0);
         assert_eq!(user["Policy"]["MaxConcurrentStreams"], 0);
     }

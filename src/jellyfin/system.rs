@@ -197,6 +197,8 @@ fn system_info_value(
         "ServerName": server_name,
         "Version": EMBY_COMPAT_VERSION,
         "ProductName": "Emby Server",
+        "PackageName": "jellyfin-rs",
+        "SystemUpdateLevel": "Release",
         "OperatingSystem": std::env::consts::OS,
         "Id": "jellyfin-rs",
         "ServerId": "jellyfin-rs",
@@ -204,6 +206,7 @@ fn system_info_value(
     });
     if let Some(local_address) = local_address.as_ref() {
         value["LocalAddress"] = json!(local_address);
+        value["WanAddress"] = json!(local_address);
     }
     if include_private {
         let local_address = local_address.unwrap_or_else(|| "http://127.0.0.1:8096".to_string());
@@ -226,6 +229,8 @@ fn system_info_value(
         value["CanSelfRestart"] = json!(false);
         value["CanSelfUpdate"] = json!(false);
         value["CanLaunchWebBrowser"] = json!(false);
+        value["SupportsAutoRunAtStartup"] = json!(false);
+        value["HardwareAccelerationRequiresPremiere"] = json!(false);
         value["SupportsLibraryMonitor"] = json!(true);
         value["ProgramDataPath"] = json!("");
         value["ItemsByNamePath"] = json!("");
@@ -5165,11 +5170,16 @@ mod tests {
         assert_eq!(full["ServerId"], "jellyfin-rs");
         assert_eq!(full["ServerName"], "Home");
         assert_eq!(full["ProductName"], "Emby Server");
+        assert_eq!(full["PackageName"], "jellyfin-rs");
+        assert_eq!(full["SystemUpdateLevel"], "Release");
         assert_eq!(full["Version"], "4.8.0.0");
         assert_eq!(full["LocalAddress"], "http://media.local:8096");
+        assert_eq!(full["WanAddress"], "http://media.local:8096");
         assert_eq!(full["HttpServerPortNumber"], 8096);
         assert_eq!(full["WebSocketPortNumber"], 8096);
         assert_eq!(full["SupportsHttps"], false);
+        assert_eq!(full["SupportsAutoRunAtStartup"], false);
+        assert_eq!(full["HardwareAccelerationRequiresPremiere"], false);
         assert_eq!(full["HasPendingRestart"], false);
         assert_eq!(full["IsShuttingDown"], false);
         assert_eq!(full["EncoderLocation"], "System");
@@ -5184,6 +5194,7 @@ mod tests {
         assert_eq!(public["ServerId"], "jellyfin-rs");
         assert_eq!(public["ProductName"], "Emby Server");
         assert_eq!(public["LocalAddress"], "https://media.example");
+        assert_eq!(public["WanAddress"], "https://media.example");
     }
 
     #[tokio::test]

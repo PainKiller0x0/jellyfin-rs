@@ -729,12 +729,14 @@ async fn item_counts_response(
     let mut movie_count = 0;
     let mut series_count = 0;
     let mut episode_count = 0;
+    let mut game_count = 0;
     let mut trailer_count = 0;
     let mut song_count = 0;
     let mut album_count = 0;
     let mut music_video_count = 0;
     let mut box_set_count = 0;
     let mut book_count = 0;
+    let mut game_system_count = 0;
     let mut item_count = 0;
 
     for row in rows {
@@ -745,6 +747,8 @@ async fn item_counts_response(
             "Movie" => movie_count += count,
             "Series" => series_count += count,
             "Episode" => episode_count += count,
+            "Game" => game_count += count,
+            "GameSystem" => game_system_count += count,
             "Trailer" => trailer_count += count,
             "Audio" => song_count += count,
             "MusicAlbum" => album_count += count,
@@ -770,8 +774,10 @@ async fn item_counts_response(
         "MovieCount": movie_count,
         "SeriesCount": series_count,
         "EpisodeCount": episode_count,
+        "GameCount": game_count,
         "ArtistCount": artist_count,
         "ProgramCount": 0,
+        "GameSystemCount": game_system_count,
         "TrailerCount": trailer_count,
         "SongCount": song_count,
         "AlbumCount": album_count,
@@ -2176,6 +2182,8 @@ mod tests {
         assert_eq!(counts["MovieCount"], 1);
         assert_eq!(counts["SeriesCount"], 1);
         assert_eq!(counts["EpisodeCount"], 1);
+        assert_eq!(counts["GameCount"], 0);
+        assert_eq!(counts["GameSystemCount"], 0);
         assert_eq!(counts["SongCount"], 1);
         assert_eq!(counts["ArtistCount"], 1);
         assert_eq!(counts["ItemCount"], 4);

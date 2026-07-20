@@ -69,7 +69,11 @@ pub async fn sessions(
             sessions.clear();
         }
     }
-    Json(filter_sessions(sessions, &query, now)).into_response()
+    let sessions = filter_sessions(sessions, &query, now)
+        .into_iter()
+        .map(session_response_value)
+        .collect::<Vec<_>>();
+    Json(sessions).into_response()
 }
 
 async fn request_user_is_admin(db: &sea_orm::DatabaseConnection, user_id: Option<&str>) -> bool {
@@ -125,6 +129,59 @@ fn filter_sessions(
         });
     }
     sessions
+}
+
+fn session_response_value(session: PlaybackSession) -> Value {
+    let mut value = serde_json::to_value(session).unwrap_or_else(|_| json!({}));
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+
+    object
+        .entry("RemoteEndPoint".to_string())
+        .or_insert_with(|| json!(""));
+    object
+        .entry("DeviceType".to_string())
+        .or_insert_with(|| json!(""));
+    object
+        .entry("PlaylistItemId".to_string())
+        .or_insert_with(|| json!(""));
+    object
+        .entry("UserPrimaryImageTag".to_string())
+        .or_insert_with(|| json!(""));
+    object
+        .entry("AppIconUrl".to_string())
+        .or_insert_with(|| json!(""));
+    object
+        .entry("TranscodingInfo".to_string())
+        .or_insert_with(|| json!({}));
+
+    let now_playing_item_id = object
+        .get("NowPlayingItemId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let now_playing_item_name = object
+        .get("NowPlayingItemName")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    if !now_playing_item_id.trim().is_empty() {
+        object
+            .entry("NowPlayingItem".to_string())
+            .or_insert_with(|| {
+                json!({
+                    "Name": now_playing_item_name,
+                    "Id": now_playing_item_id,
+                    "ServerId": "jellyfin-rs",
+                    "Type": "Video"
+                })
+            });
+    }
+
+    value
 }
 
 pub async fn logout(
@@ -878,6 +935,20 @@ mod tests {
             value["Capabilities"]["PlayableMediaTypes"],
             json!(["Video"])
         );
+    }
+
+    #[test]
+    fn session_response_value_includes_emby_compat_fields() {
+        let session = test_session();
+        let value = super::session_response_value(session);
+        assert_eq!(value["RemoteEndPoint"], "");
+        assert_eq!(value["DeviceType"], "");
+        assert_eq!(value["PlaylistItemId"], "");
+        assert_eq!(value["UserPrimaryImageTag"], "");
+        assert_eq!(value["AppIconUrl"], "");
+        assert!(value["TranscodingInfo"].as_object().unwrap().is_empty());
+        assert_eq!(value["NowPlayingItem"]["Id"], "i1");
+        assert_eq!(value["NowPlayingItem"]["ServerId"], "jellyfin-rs");
     }
 
     #[test]

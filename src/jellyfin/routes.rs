@@ -479,6 +479,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Users/{user_id}/Items/resume", get(items::resume_items))
         .route("/users/{user_id}/items/resume", get(items::resume_items))
         .route("/Users/{user_id}/Suggestions", get(items::user_suggestions))
+        .route("/users/{user_id}/suggestions", get(items::user_suggestions))
         .route("/Users/{user_id}/HomeSections", get(items::home_sections))
         .route(
             "/Users/{user_id}/Sections/{section_id}/Items",
@@ -692,6 +693,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(persons::person_image_with_index).head(common::ok),
         )
         .route("/Movies/Recommendations", get(items::movie_recommendations))
+        .route("/movies/recommendations", get(items::movie_recommendations))
         .route("/Movies/{item_id}/Similar", get(items::similar_items))
         .route("/Shows/{item_id}/Similar", get(items::similar_items))
         .route("/Trailers/{item_id}/Similar", get(items::similar_items))
@@ -759,10 +761,12 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Shows/{show_id}/Episodes", get(items::show_episodes))
         .route("/Shows/{show_id}/Seasons", get(items::show_seasons))
         .route("/Shows/NextUp", get(items::shows_next_up))
+        .route("/shows/nextup", get(items::shows_next_up))
         .route("/Shows/Missing", get(items::shows_missing))
         .route("/Shows/Upcoming", get(super::user_extras::shows_upcoming))
         .route("/AudioBooks/NextUp", get(items::audiobooks_next_up))
         .route("/Search/Hints", get(items::search_hints))
+        .route("/search/hints", get(items::search_hints))
         .route("/Genres", get(filters::genres))
         .route("/Genres/{name}", get(super::user_extras::genre_by_name))
         .route(
@@ -1189,6 +1193,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(playback::set_rating).delete(playback::delete_rating),
         )
         .route("/Items/Counts", get(items::item_counts))
+        .route("/items/counts", get(items::item_counts))
         .route("/Collections", post(collect::create_collection))
         .route(
             "/Collections/{collection_id}/Items",
@@ -1637,7 +1642,13 @@ mod tests {
         assert!(routes.contains("/socket"));
         assert!(routes.contains("/users/{user_id}/items/{item_id}"));
         assert!(routes.contains("/users/{user_id}/items/latest"));
+        assert!(routes.contains("/users/{user_id}/items/resume"));
+        assert!(routes.contains("/users/{user_id}/suggestions"));
         assert!(routes.contains("/items/{item_id}/similar"));
+        assert!(routes.contains("/movies/recommendations"));
+        assert!(routes.contains("/shows/nextup"));
+        assert!(routes.contains("/search/hints"));
+        assert!(routes.contains("/items/counts"));
         assert!(routes.contains("/sessions/logout"));
         assert!(routes.contains("/videos/{item_id}/master.m3u8"));
         assert!(routes.contains("/videos/{item_id}/hls1/{playlist_id}/main.m3u8"));

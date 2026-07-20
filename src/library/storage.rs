@@ -296,15 +296,9 @@ pub async fn upsert_media_metadata(
     metadata: &ParsedMetadata,
 ) -> anyhow::Result<()> {
     for (provider, provider_item_id) in &metadata.provider_ids {
-        db.execute(crate::db::helpers::pg_statement(
-            r#"INSERT INTO provider_ids (item_id, provider, provider_item_id)
-               VALUES (?, ?, ?)
-               ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id
-               WHERE provider_ids.provider_item_id IS DISTINCT FROM excluded.provider_item_id"#,
-            vec![item_id.into(), provider.as_str().into(), provider_item_id.as_str().into()],
-        ))
-        .await
-        .with_context(|| format!("failed to upsert provider id for item: {item_id}"))?;
+        crate::db::provider_ids::upsert(db, item_id, provider, provider_item_id)
+            .await
+            .with_context(|| format!("failed to upsert provider id for item: {item_id}"))?;
     }
 
     upsert_named_relations(

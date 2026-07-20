@@ -6,12 +6,13 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, Value as SeaValue};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, QueryOrder, Value as SeaValue};
 use serde_json::json;
 
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
+    entities::{library_paths, library_paths::Entity as LibraryPaths},
     jellyfin::{
         auth::query_user_id_or_request,
         common::{internal_error, strip_nulls},
@@ -911,15 +912,11 @@ fn parse_trickplay_index(value: &str) -> Option<i64> {
 }
 
 async fn library_roots(db: &DatabaseConnection) -> anyhow::Result<Vec<String>> {
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            "SELECT path FROM library_paths",
-            vec![],
-        ))
+    let paths = LibraryPaths::find()
+        .order_by_asc(library_paths::Column::Path)
+        .all(db)
         .await?;
-    rows.iter()
-        .map(|row| row.get_str("path").map_err(Into::into))
-        .collect()
+    Ok(paths.into_iter().map(|path| path.path).collect())
 }
 
 /// GET /Items/{item_id}/RemoteSearch/Subtitles/{language} — search remote subtitles

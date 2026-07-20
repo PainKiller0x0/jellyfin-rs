@@ -173,16 +173,7 @@ fn remote_image_type(image_type: &str) -> &'static str {
 }
 
 async fn preferred_metadata_language(db: &DatabaseConnection) -> String {
-    db.query_one(crate::db::helpers::pg_statement(
-        "SELECT value FROM app_settings WHERE key = 'PreferredMetadataLanguage'",
-        vec![],
-    ))
-    .await
-    .ok()
-    .flatten()
-    .and_then(|row| row.get_opt_str("value").ok().flatten())
-    .filter(|language| !language.trim().is_empty())
-    .unwrap_or_else(|| "zh-CN".to_string())
+    crate::db::settings::get_non_empty_or_default(db, "PreferredMetadataLanguage", "zh-CN").await
 }
 
 fn should_keep_remote_image_language(language: Option<&str>, preferred_language: &str) -> bool {
@@ -442,14 +433,9 @@ fn image_url_query(query: &HashMap<String, String>) -> Option<&str> {
 }
 
 async fn lookup_tmdb_id(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Option<String>> {
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
-            vec![item_id.into()],
-        ))
+    crate::db::provider_ids::get(db, item_id, "Tmdb")
         .await
-        .context("failed to look up TMDb id")?;
-    Ok(row.and_then(|row| row.get_opt_str("provider_item_id").ok().flatten()))
+        .context("failed to look up TMDb id")
 }
 
 async fn search_tmdb_id_by_item(state: &AppState, item_id: &str) -> anyhow::Result<Option<String>> {

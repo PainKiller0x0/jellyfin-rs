@@ -1543,19 +1543,14 @@ mod tests {
         let user_id = state.user_id.to_string();
         seed_user_and_item(&state.db, &user_id, "m1").await;
         seed_user_and_item(&state.db, &user_id, "m2").await;
-        state
-            .db
-            .execute(crate::db::helpers::pg_statement(
-                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, 1)",
-                vec![
-                    format!("user_policy:{user_id}").into(),
-                    serde_json::json!({ "MaxConcurrentStreams": 1 })
-                        .to_string()
-                        .into(),
-                ],
-            ))
-            .await
-            .unwrap();
+        crate::db::settings::set_with_updated_at(
+            &state.db,
+            &format!("user_policy:{user_id}"),
+            &serde_json::json!({ "MaxConcurrentStreams": 1 }).to_string(),
+            1,
+        )
+        .await
+        .unwrap();
 
         let headers = HeaderMap::new();
         let query = HashMap::new();

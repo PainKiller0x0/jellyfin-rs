@@ -1071,31 +1071,16 @@ fn media_probe_queue_capacity() -> usize {
 }
 
 async fn media_probe_cache_is_current(db: &sea_orm::DatabaseConnection) -> anyhow::Result<bool> {
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT value FROM app_settings WHERE key = ?",
-            vec![MEDIA_PROBE_CACHE_VERSION_KEY.into()],
-        ))
+    let value = crate::db::settings::get(db, MEDIA_PROBE_CACHE_VERSION_KEY)
         .await
         .context("failed to read media probe cache version")?;
-    Ok(row
-        .as_ref()
-        .map(|row| row.get_str("value"))
-        .transpose()?
-        .is_some_and(|value| value == MEDIA_PROBE_CACHE_VERSION))
+    Ok(value.is_some_and(|value| value == MEDIA_PROBE_CACHE_VERSION))
 }
 
 async fn set_media_probe_cache_current(db: &sea_orm::DatabaseConnection) -> anyhow::Result<()> {
-    db.execute(crate::db::helpers::pg_statement(
-        "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        vec![
-            MEDIA_PROBE_CACHE_VERSION_KEY.into(),
-            MEDIA_PROBE_CACHE_VERSION.into(),
-            now_unix().into(),
-        ],
-    ))
-    .await
-    .context("failed to update media probe cache version")?;
+    crate::db::settings::set(db, MEDIA_PROBE_CACHE_VERSION_KEY, MEDIA_PROBE_CACHE_VERSION)
+        .await
+        .context("failed to update media probe cache version")?;
     Ok(())
 }
 

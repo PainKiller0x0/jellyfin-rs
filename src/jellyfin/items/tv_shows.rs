@@ -569,12 +569,9 @@ mod tests {
             Some("scraped overview"),
         )
         .await;
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', 'episode-tmdb')",
-            vec!["smaller-scraped".into()],
-        ))
-        .await
-        .unwrap();
+        crate::db::provider_ids::upsert(&db, "smaller-scraped", "Tmdb", "episode-tmdb")
+            .await
+            .unwrap();
         db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO image_assets (id, item_id, image_type, image_index, etag, created_at, updated_at) VALUES ('image-1', ?, 'Primary', 0, 'etag-1', 1, 1)",
             vec!["smaller-scraped".into()],

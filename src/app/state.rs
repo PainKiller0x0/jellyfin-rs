@@ -248,19 +248,10 @@ pub fn session_timeout_seconds() -> i64 {
 
 /// Load TMDB API key from database app_settings.
 pub async fn load_tmdb_api_key(db: &sea_orm::DatabaseConnection) -> Option<String> {
-    use crate::db::row_ext::QueryResultExt;
-    use sea_orm::ConnectionTrait;
-    if let Ok(Some(row)) = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT value FROM app_settings WHERE key = 'tmdb_api_key'",
-            vec![],
-        ))
-        .await
-    {
-        if let Ok(val) = row.get_str("value") {
-            if !val.is_empty() {
-                return Some(val);
-            }
+    if let Ok(Some(value)) = crate::db::settings::get(db, "tmdb_api_key").await {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
         }
     }
     std::env::var("JELLYFIN_RS_TMDB_API_KEY")
@@ -271,20 +262,10 @@ pub async fn load_tmdb_api_key(db: &sea_orm::DatabaseConnection) -> Option<Strin
 
 /// Load Douban cookie from database app_settings.
 pub async fn load_douban_cookie(db: &sea_orm::DatabaseConnection) -> Option<String> {
-    use crate::db::row_ext::QueryResultExt;
-    use sea_orm::ConnectionTrait;
-    if let Ok(Some(row)) = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT value FROM app_settings WHERE key = 'douban_cookie'",
-            vec![],
-        ))
-        .await
-    {
-        if let Ok(val) = row.get_str("value") {
-            let val = normalize_douban_cookie_value(&val);
-            if !val.is_empty() {
-                return Some(val);
-            }
+    if let Ok(Some(value)) = crate::db::settings::get(db, "douban_cookie").await {
+        let value = normalize_douban_cookie_value(&value);
+        if !value.is_empty() {
+            return Some(value);
         }
     }
     None
@@ -305,17 +286,10 @@ pub fn normalize_douban_cookie_value(cookie: &str) -> String {
 
 /// Load TMDb proxy URL from database app_settings.
 pub async fn load_tmdb_proxy_url(db: &sea_orm::DatabaseConnection) -> Option<String> {
-    use crate::db::row_ext::QueryResultExt;
-    use sea_orm::ConnectionTrait;
-    let value = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT value FROM app_settings WHERE key = 'tmdb_proxy_url'",
-            vec![],
-        ))
+    let value = crate::db::settings::get(db, "tmdb_proxy_url")
         .await
         .ok()
-        .flatten()
-        .and_then(|row| row.get_opt_str("value").ok().flatten())?;
+        .flatten()?;
 
     match normalize_tmdb_proxy_url(&value) {
         Ok(value) => value,
@@ -333,12 +307,7 @@ pub fn normalize_tmdb_proxy_url(proxy_url: &str) -> anyhow::Result<Option<String
 impl AppState {
     /// Update the TMDB API key in both database and runtime state.
     pub async fn set_tmdb_api_key(&self, key: &str) -> anyhow::Result<()> {
-        use sea_orm::ConnectionTrait;
-        let now = crate::util::now_unix();
-        self.db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO app_settings (key, value, updated_at) VALUES ('tmdb_api_key', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            vec![key.to_string().into(), now.into()],
-        )).await?;
+        crate::db::settings::set(&self.db, "tmdb_api_key", key).await?;
         *self.tmdb_api_key.write().await = if key.is_empty() {
             None
         } else {
@@ -349,15 +318,13 @@ impl AppState {
 
     /// Update the TMDb proxy URL in both database and runtime state.
     pub async fn set_tmdb_proxy_url(&self, proxy_url: &str) -> anyhow::Result<()> {
-        use sea_orm::ConnectionTrait;
         let proxy_url = normalize_tmdb_proxy_url(proxy_url)?;
-        let now = crate::util::now_unix();
-        self.db
-            .execute(crate::db::helpers::pg_statement(
-                "INSERT INTO app_settings (key, value, updated_at) VALUES ('tmdb_proxy_url', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-                vec![proxy_url.clone().unwrap_or_default().into(), now.into()],
-            ))
-            .await?;
+        crate::db::settings::set(
+            &self.db,
+            "tmdb_proxy_url",
+            &proxy_url.clone().unwrap_or_default(),
+        )
+        .await?;
         *self.tmdb_proxy_url.write().await = proxy_url;
         Ok(())
     }
@@ -368,15 +335,8 @@ impl AppState {
 
     /// Update the Douban cookie in both database and runtime state.
     pub async fn set_douban_cookie(&self, cookie: &str) -> anyhow::Result<()> {
-        use sea_orm::ConnectionTrait;
         let cookie = normalize_douban_cookie_value(cookie);
-        let now = crate::util::now_unix();
-        self.db
-            .execute(crate::db::helpers::pg_statement(
-                "INSERT INTO app_settings (key, value, updated_at) VALUES ('douban_cookie', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-                vec![cookie.clone().into(), now.into()],
-            ))
-            .await?;
+        crate::db::settings::set(&self.db, "douban_cookie", &cookie).await?;
         *self.douban_cookie.write().await = if cookie.is_empty() {
             None
         } else {

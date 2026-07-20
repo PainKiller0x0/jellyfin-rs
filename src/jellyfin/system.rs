@@ -22,8 +22,8 @@ use crate::{
     db::row_ext::QueryResultExt,
     entities::{
         access_tokens, access_tokens::Entity as AccessTokens, activity_log,
-        activity_log::Entity as ActivityLog, app_settings, app_settings::Entity as AppSettings,
-        task_results, task_results::Entity as TaskResults, users, users::Entity as Users,
+        activity_log::Entity as ActivityLog, task_results, task_results::Entity as TaskResults,
+        users, users::Entity as Users,
     },
     jellyfin::item_queries::library_views,
     jellyfin::{
@@ -1512,14 +1512,7 @@ pub async fn user_usage_stats_user_manage(
 type Response = axum::response::Response;
 
 pub(crate) async fn app_setting(db: &DatabaseConnection, key: &str, default: &str) -> String {
-    AppSettings::find_by_id(key)
-        .one(db)
-        .await
-        .ok()
-        .flatten()
-        .map(|model| model.value)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
+    crate::db::settings::get_non_empty_or_default(db, key, default).await
 }
 
 pub(crate) async fn server_config_json(db: &DatabaseConnection) -> JsonValue {
@@ -1528,15 +1521,7 @@ pub(crate) async fn server_config_json(db: &DatabaseConnection) -> JsonValue {
 }
 
 pub(crate) async fn app_setting_bool(db: &DatabaseConnection, key: &str, default: bool) -> bool {
-    match app_setting(db, key, if default { "true" } else { "false" })
-        .await
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "1" | "true" | "yes" => true,
-        "0" | "false" | "no" => false,
-        _ => default,
-    }
+    crate::db::settings::get_bool(db, key, default).await
 }
 
 pub(super) async fn set_app_setting(
@@ -1544,22 +1529,7 @@ pub(super) async fn set_app_setting(
     key: &str,
     value: &str,
 ) -> anyhow::Result<()> {
-    let now = now_unix();
-    let existing = AppSettings::find_by_id(key).one(db).await?;
-    if let Some(model) = existing {
-        let mut active: app_settings::ActiveModel = model.into();
-        active.value = Set(value.to_string());
-        active.updated_at = Set(now);
-        active.update(db).await?;
-    } else {
-        let active = app_settings::ActiveModel {
-            key: Set(key.to_string()),
-            value: Set(value.to_string()),
-            updated_at: Set(now),
-        };
-        AppSettings::insert(active).exec(db).await?;
-    }
-    Ok(())
+    crate::db::settings::set(db, key, value).await
 }
 
 pub(super) async fn first_admin_user(

@@ -928,7 +928,6 @@ mod tests {
         update_library_options_inner, update_virtual_folder_path_inner,
         update_virtual_folder_path_request, virtual_folder_request,
     };
-    use crate::db::row_ext::QueryResultExt;
     use axum::body::Bytes;
     use sea_orm::{ConnectionTrait, DatabaseConnection};
     use std::collections::HashMap;
@@ -1076,15 +1075,9 @@ mod tests {
             .await
             .unwrap()
         );
-        let saved = db
-            .query_one(crate::db::helpers::pg_statement(
-                "SELECT value FROM app_settings WHERE key = ?",
-                vec!["LibraryOptions.movies".into()],
-            ))
+        let saved = crate::db::settings::get(&db, "LibraryOptions.movies")
             .await
             .unwrap()
-            .unwrap()
-            .get_str("value")
             .unwrap();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&saved).unwrap()["EnableRealtimeMonitor"],

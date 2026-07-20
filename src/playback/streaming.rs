@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use sea_orm::ConnectionTrait;
+use sea_orm::{EntityTrait, QueryOrder};
 use serde_json::json;
 use tokio::{
     fs::File,
@@ -17,7 +17,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     app::state::AppState,
-    db::row_ext::QueryResultExt,
+    entities::{library_paths, library_paths::Entity as LibraryPaths},
     jellyfin::{
         auth::{request_user_id_and_admin_or_default, request_user_id_or_default},
         common::{ok_response, wants_json_response},
@@ -680,15 +680,11 @@ pub(crate) async fn readable_media_path(db: &sea_orm::DatabaseConnection, path: 
 }
 
 async fn library_roots(db: &sea_orm::DatabaseConnection) -> anyhow::Result<Vec<String>> {
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            "SELECT path FROM library_paths",
-            vec![],
-        ))
+    let paths = LibraryPaths::find()
+        .order_by_asc(library_paths::Column::Path)
+        .all(db)
         .await?;
-    rows.iter()
-        .map(|row| row.get_str("path").map_err(Into::into))
-        .collect()
+    Ok(paths.into_iter().map(|path| path.path).collect())
 }
 
 /// GET /Audio/{id}/stream — alias for stream_audio

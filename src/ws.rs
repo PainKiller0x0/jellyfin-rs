@@ -7,14 +7,14 @@ use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
-use sea_orm::ConnectionTrait;
+use sea_orm::{EntityTrait, QueryOrder, QuerySelect};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::app::state::{AppState, session_timeout_seconds};
-use crate::db::row_ext::QueryResultExt;
+use crate::entities::{activity_log, activity_log::Entity as ActivityLog};
 use crate::jellyfin::auth::request_token;
 use crate::util::now_unix;
 
@@ -345,25 +345,22 @@ async fn build_sessions_data(state: &AppState) -> Value {
 }
 
 async fn build_activity_data(state: &AppState) -> Value {
-    let rows = state
-        .db
-        .query_all(crate::db::helpers::pg_statement(
-            "SELECT name, log_type, created_at, user_id FROM activity_log ORDER BY created_at DESC LIMIT 15",
-            vec![],
-        ))
+    let rows = ActivityLog::find()
+        .order_by_desc(activity_log::Column::CreatedAt)
+        .limit(15)
+        .all(&state.db)
         .await;
 
     match rows {
         Ok(rows) => {
             let items: Vec<Value> = rows
-                .iter()
+                .into_iter()
                 .map(|row| {
-                    let created_at: i64 = row.get_i64("created_at").unwrap_or_default();
                     serde_json::json!({
-                        "Name": row.get_str("name").unwrap_or_default(),
-                        "Type": row.get_str("log_type").unwrap_or_default(),
-                        "Date": crate::util::unix_to_jellyfin_date(created_at),
-                        "UserId": row.get_opt_str("user_id").ok().flatten(),
+                        "Name": row.name,
+                        "Type": row.log_type,
+                        "Date": crate::util::unix_to_jellyfin_date(row.created_at),
+                        "UserId": row.user_id,
                         "Severity": "Info",
                     })
                 })

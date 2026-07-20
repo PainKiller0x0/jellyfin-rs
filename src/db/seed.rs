@@ -43,12 +43,7 @@ pub async fn seed_default_data(state: &AppState) -> anyhow::Result<()> {
         .await
         .context("failed to seed startup access token")?;
 
-    state
-        .db
-        .execute(crate::db::helpers::pg_statement(
-            r#"INSERT INTO app_settings (key, value, updated_at) VALUES ('StartupWizardCompleted', 'true', ?) ON CONFLICT(key) DO NOTHING"#,
-            vec![now.into()],
-        ))
+    crate::db::settings::insert_if_missing(&state.db, "StartupWizardCompleted", "true", now)
         .await
         .context("failed to seed startup wizard state")?;
 

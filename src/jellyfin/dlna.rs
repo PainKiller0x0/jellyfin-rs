@@ -7,7 +7,6 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use sea_orm::ConnectionTrait;
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -247,17 +246,9 @@ pub fn default_device_profile() -> Value {
 
 async fn profile_infos_inner(db: &sea_orm::DatabaseConnection) -> anyhow::Result<Vec<Value>> {
     let mut profiles = vec![profile_info(&default_device_profile(), "System")];
-    let rows = db
-        .query_all(crate::db::helpers::pg_statement(
-            "SELECT value FROM app_settings WHERE key LIKE 'dlna_profile:%' ORDER BY key ASC",
-            vec![],
-        ))
-        .await?;
-    for row in rows {
-        let Ok(value) = row.try_get_by::<String, _>("value") else {
-            continue;
-        };
-        if let Ok(profile) = serde_json::from_str::<Value>(&value) {
+    let settings = crate::db::settings::find_by_prefix(db, "dlna_profile:").await?;
+    for setting in settings {
+        if let Ok(profile) = serde_json::from_str::<Value>(&setting.value) {
             profiles.push(profile_info(&profile, "User"));
         }
     }
@@ -318,13 +309,8 @@ async fn delete_profile_inner(
     let Some(profile_id) = custom_profile_id(profile_id) else {
         return Ok(false);
     };
-    let result = db
-        .execute(crate::db::helpers::pg_statement(
-            "DELETE FROM app_settings WHERE key = ?",
-            vec![profile_key(profile_id).into()],
-        ))
-        .await?;
-    Ok(result.rows_affected() > 0)
+    let result = crate::db::settings::delete(db, &profile_key(profile_id)).await?;
+    Ok(result.rows_affected > 0)
 }
 
 fn profile_key(profile_id: impl AsRef<str>) -> String {

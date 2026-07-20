@@ -6,6 +6,7 @@ pub mod access_tokens;
 pub mod activity_log;
 pub mod api_keys;
 pub mod app_settings;
+pub mod chapters;
 pub mod display_preferences;
 pub mod game_genres;
 pub mod genres;

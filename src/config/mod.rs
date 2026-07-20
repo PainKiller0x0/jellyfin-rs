@@ -1,6 +1,3 @@
-use crate::db::row_ext::QueryResultExt;
-use sea_orm::ConnectionTrait;
-
 #[derive(Debug, Clone)]
 pub struct StrmAssistantConfig {
     pub enabled: bool,
@@ -109,23 +106,14 @@ impl StrmAssistantConfig {
         let mut cfg = Self::default();
 
         // Load all sa.* settings from DB in one query
-        let db_settings: std::collections::HashMap<String, String> = match db
-            .query_all(crate::db::helpers::pg_statement(
-                "SELECT key, value FROM app_settings WHERE key LIKE 'sa.%'",
-                vec![],
-            ))
-            .await
-        {
-            Ok(rows) => rows
-                .iter()
-                .filter_map(|row| {
-                    let key = row.get_str("key").ok()?;
-                    let val = row.get_str("value").ok()?;
-                    Some((key, val))
-                })
-                .collect(),
-            Err(_) => std::collections::HashMap::new(),
-        };
+        let db_settings: std::collections::HashMap<String, String> =
+            match crate::db::settings::find_by_prefix(db, "sa.").await {
+                Ok(settings) => settings
+                    .into_iter()
+                    .map(|setting| (setting.key, setting.value))
+                    .collect(),
+                Err(_) => std::collections::HashMap::new(),
+            };
 
         let get_db = |key: &str| -> Option<String> { db_settings.get(key).cloned() };
 

@@ -1865,12 +1865,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        state
-            .db
-            .execute(crate::db::helpers::pg_statement(
-                "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', '1')",
-                vec!["v1".into()],
-            ))
+        crate::db::provider_ids::upsert(&state.db, "v1", "Tmdb", "1")
             .await
             .unwrap();
 

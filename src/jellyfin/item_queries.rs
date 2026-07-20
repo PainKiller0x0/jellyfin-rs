@@ -1529,16 +1529,9 @@ mod tests {
             .await
             .unwrap();
         }
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, ?, ?)",
-            vec![
-                "episode-2-metadata".into(),
-                "Tmdb".into(),
-                "episode-2".into(),
-            ],
-        ))
-        .await
-        .unwrap();
+        crate::db::provider_ids::upsert(&db, "episode-2-metadata", "Tmdb", "episode-2")
+            .await
+            .unwrap();
 
         let mut query = HashMap::new();
         query.insert("ParentId".to_string(), "season".to_string());

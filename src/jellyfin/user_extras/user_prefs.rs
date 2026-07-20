@@ -29,24 +29,15 @@ pub async fn get_user_settings(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<String>,
 ) -> Response {
-    let rows = state
-        .db
-        .query_all(crate::db::helpers::pg_statement(
-            "SELECT key, value FROM app_settings WHERE key LIKE ?",
-            vec![format!("user_settings:{}:%", user_id).into()],
-        ))
-        .await;
+    let prefix = format!("user_settings:{}:", user_id);
+    let rows = crate::db::settings::find_by_prefix(&state.db, &prefix).await;
 
     match rows {
         Ok(rows) => {
             let mut settings = serde_json::Map::new();
-            for row in &rows {
-                if let (Ok(key), Ok(value)) = (row.get_str("key"), row.get_str("value")) {
-                    let short_key = key
-                        .strip_prefix(&format!("user_settings:{}:", user_id))
-                        .unwrap_or(&key);
-                    settings.insert(short_key.to_string(), json!(value));
-                }
+            for row in rows {
+                let short_key = row.key.strip_prefix(&prefix).unwrap_or(&row.key);
+                settings.insert(short_key.to_string(), json!(row.value));
             }
             Json(Value::Object(settings)).into_response()
         }
@@ -79,15 +70,7 @@ pub async fn update_user_settings(
             );
         };
         let full_key = format!("user_settings:{}:{}", user_id, key);
-        let now = crate::util::now_unix();
-        if let Err(error) = state
-            .db
-            .execute(crate::db::helpers::pg_statement(
-                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-                vec![full_key.into(), value_str.as_str().into(), now.into()],
-            ))
-            .await
-        {
+        if let Err(error) = crate::db::settings::set(&state.db, &full_key, &value_str).await {
             return internal_error(error.into());
         }
     }
@@ -101,20 +84,9 @@ pub async fn get_typed_setting(
     if !setting_key_allowed(&key, MAX_TYPED_SETTING_KEY_LEN) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match state
-        .db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT value FROM app_settings WHERE key = ?",
-            vec![typed_setting_key(&user_id, &key).into()],
-        ))
-        .await
-    {
-        Ok(Some(row)) => {
-            let value = row
-                .get_str("value")
-                .ok()
-                .and_then(|value| serde_json::from_str(&value).ok())
-                .unwrap_or(Value::Null);
+    match crate::db::settings::get(&state.db, &typed_setting_key(&user_id, &key)).await {
+        Ok(Some(stored)) => {
+            let value = serde_json::from_str(&stored).unwrap_or(Value::Null);
             Json(value).into_response()
         }
         Ok(None) => Json(json!({})).into_response(),
@@ -133,19 +105,7 @@ pub async fn update_typed_setting(
     let Ok(value) = serialize_json_value(&body, MAX_TYPED_SETTING_VALUE_BYTES) else {
         return validation_error_response(StatusCode::PAYLOAD_TOO_LARGE, "Setting is too large");
     };
-    let now = crate::util::now_unix();
-    match state
-        .db
-        .execute(crate::db::helpers::pg_statement(
-            "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            vec![
-                typed_setting_key(&user_id, &key).into(),
-                value.into(),
-                now.into(),
-            ],
-        ))
-        .await
-    {
+    match crate::db::settings::set(&state.db, &typed_setting_key(&user_id, &key), &value).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error.into()),
     }
@@ -361,16 +321,11 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let row = state
-            .db
-            .query_one(crate::db::helpers::pg_statement(
-                "SELECT value FROM app_settings WHERE key = 'user_settings:u1:theme'",
-                vec![],
-            ))
+        let saved = crate::db::settings::get(&state.db, "user_settings:u1:theme")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.get_str("value").unwrap(), "dark");
+        assert_eq!(saved, "dark");
     }
 
     #[tokio::test]

@@ -432,11 +432,7 @@ async fn apply_season_tmdb_response(
     let production_year = premiere_date.as_deref().and_then(year_from_yyyy_mm_dd);
     let mut primary_downloaded = false;
     if let Some(tmdb_season_id) = season.id {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
-            vec![season_id.into(), tmdb_season_id.to_string().into()],
-        ))
-        .await?;
+        crate::db::provider_ids::upsert(db, season_id, "Tmdb", &tmdb_season_id.to_string()).await?;
     }
     if let Some(name) = season
         .name
@@ -588,13 +584,12 @@ async fn apply_episode_tmdb_response(
     target: &EpisodeTmdbTarget,
 ) -> anyhow::Result<()> {
     if let Some(tmdb_episode_id) = episode.id {
-        db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
-            vec![
-                target.episode_id.as_str().into(),
-                tmdb_episode_id.to_string().into(),
-            ],
-        ))
+        crate::db::provider_ids::upsert(
+            db,
+            &target.episode_id,
+            "Tmdb",
+            &tmdb_episode_id.to_string(),
+        )
         .await?;
     }
 
@@ -962,13 +957,7 @@ pub async fn lookup_stored_tmdb_id(
     db: &sea_orm::DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Option<String>> {
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
-            vec![item_id.into()],
-        ))
-        .await?;
-    Ok(row.and_then(|r| r.get_opt_str("provider_item_id").ok().flatten()))
+    crate::db::provider_ids::get(db, item_id, "Tmdb").await
 }
 
 async fn fetch_tmdb_display_name(
@@ -1000,24 +989,11 @@ async fn fetch_tmdb_display_name(
 }
 
 async fn app_setting_is_true(db: &DatabaseConnection, key: &str) -> anyhow::Result<bool> {
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT value FROM app_settings WHERE key = ?",
-            vec![key.into()],
-        ))
-        .await?;
-    Ok(row
-        .and_then(|row| row.get_opt_str("value").ok().flatten())
-        .is_some_and(|value| value.eq_ignore_ascii_case("true")))
+    crate::db::settings::is_true(db, key).await
 }
 
 async fn set_app_setting(db: &DatabaseConnection, key: &str, value: &str) -> anyhow::Result<()> {
-    db.execute(crate::db::helpers::pg_statement(
-        "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        vec![key.into(), value.into(), now_unix().into()],
-    ))
-    .await?;
-    Ok(())
+    crate::db::settings::set(db, key, value).await
 }
 
 /// Parse a folder name into (title, optional year) by cleaning provider tags
@@ -1149,10 +1125,7 @@ pub async fn fill_missing_tmdb(
 
         match lookup_tmdb_id_by_name(client, api_key, tmdb_base_url, &name, year, is_tv).await {
             Ok(Some(tmdb_id)) => {
-                let _ = db.execute(crate::db::helpers::pg_statement(
-                    "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
-                    vec![item_id.clone().into(), tmdb_id.clone().into()],
-                )).await;
+                let _ = crate::db::provider_ids::upsert(db, &item_id, "Tmdb", &tmdb_id).await;
                 tracing::info!("fill_missing_tmdb: matched '{name}' → tmdb-{tmdb_id}");
 
                 // Now fetch full metadata
@@ -1287,10 +1260,13 @@ pub async fn fetch_and_apply_tmdb_metadata(
                 Ok(Some(id)) => {
                     tmdb_id = Some(id);
                     // Store the found TMDb ID so next time we don't need to search
-                    let _ = db.execute(crate::db::helpers::pg_statement(
-                        "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
-                        vec![item_id.into(), tmdb_id.as_ref().unwrap().into()],
-                    )).await;
+                    let _ = crate::db::provider_ids::upsert(
+                        db,
+                        item_id,
+                        "Tmdb",
+                        tmdb_id.as_ref().unwrap(),
+                    )
+                    .await;
                     tracing::info!(
                         "TMDb name search matched '{name}' → tmdb-{}",
                         tmdb_id.as_ref().unwrap()
@@ -1313,12 +1289,7 @@ pub async fn fetch_and_apply_tmdb_metadata(
     let Some(tmdb_id) = tmdb_id else {
         return Ok(());
     };
-    let _ = db
-        .execute(crate::db::helpers::pg_statement(
-            "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
-            vec![item_id.into(), tmdb_id.as_str().into()],
-        ))
-        .await;
+    let _ = crate::db::provider_ids::upsert(db, item_id, "Tmdb", &tmdb_id).await;
 
     let metadata = if is_tv {
         providers::tmdb_tv_details(client, api_key, &tmdb_id, tmdb_base_url).await
@@ -1439,11 +1410,7 @@ pub async fn fetch_and_apply_tmdb_metadata(
         if let Some(obj) = provider_ids.as_object() {
             for (provider, id) in obj {
                 if let Some(id_str) = id.as_str().filter(|s| !s.is_empty()) {
-                    let _ = db
-                        .execute(crate::db::helpers::pg_statement(
-                            "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, ?, ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
-                            vec![item_id.into(), provider.as_str().into(), id_str.into()],
-                        ))
+                    let _ = crate::db::provider_ids::upsert(db, item_id, provider.as_str(), id_str)
                         .await;
                 }
             }
@@ -1711,14 +1678,9 @@ async fn get_parent_series_tmdb_id(
         .ok()??;
     let parent_id: String = row.get_str("parent_id").ok()?;
     // Get the TMDb ID from provider_ids
-    let row = db
-        .query_one(crate::db::helpers::pg_statement(
-            "SELECT provider_item_id FROM provider_ids WHERE item_id = ? AND provider = 'Tmdb'",
-            vec![parent_id.into()],
-        ))
+    crate::db::provider_ids::get(db, &parent_id, "Tmdb")
         .await
-        .ok()??;
-    row.get_str("provider_item_id").ok()
+        .ok()?
 }
 
 fn should_skip_name_based_tmdb_lookup(name: &str) -> bool {

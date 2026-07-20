@@ -477,14 +477,9 @@ async fn apply_subject_metadata(
     subject: &DoubanSubject,
     cookie: Option<&str>,
 ) -> anyhow::Result<()> {
-    db.execute(crate::db::helpers::pg_statement(
-        r#"INSERT INTO provider_ids (item_id, provider, provider_item_id)
-           VALUES (?, 'Douban', ?)
-           ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id"#,
-        vec![item_id.into(), subject.id.as_str().into()],
-    ))
-    .await
-    .with_context(|| format!("failed to save Douban provider id for item: {item_id}"))?;
+    crate::db::provider_ids::upsert(db, item_id, "Douban", &subject.id)
+        .await
+        .with_context(|| format!("failed to save Douban provider id for item: {item_id}"))?;
 
     db.execute(crate::db::helpers::pg_statement(
         r#"UPDATE media_items

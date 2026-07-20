@@ -332,6 +332,7 @@ async fn scan_root(
         item.id = stored_item_id;
         upsert_media_metadata(&db, &item.id, &parsed_metadata).await?;
         upsert_sidecar_images(&db, path, &item.id).await?;
+        queue_metadata_fetch(&metadata_tx, &item, path);
         if cached_probe.is_some() {
             upsert_sidecar_subtitles(&db, path, &item.id).await?;
         } else {

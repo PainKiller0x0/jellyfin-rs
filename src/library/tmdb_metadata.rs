@@ -961,6 +961,12 @@ pub async fn fetch_and_apply_tmdb_metadata(
     let Some(tmdb_id) = tmdb_id else {
         return Ok(());
     };
+    let _ = db
+        .execute(crate::db::helpers::pg_statement(
+            "INSERT INTO provider_ids (item_id, provider, provider_item_id) VALUES (?, 'Tmdb', ?) ON CONFLICT(item_id, provider) DO UPDATE SET provider_item_id = excluded.provider_item_id",
+            vec![item_id.into(), tmdb_id.as_str().into()],
+        ))
+        .await;
 
     let metadata = if is_tv {
         providers::tmdb_tv_details(client, api_key, &tmdb_id, tmdb_base_url).await

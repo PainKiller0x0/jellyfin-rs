@@ -11,7 +11,7 @@ use crate::{
     library::{
         classify::{classify_media_path, parent_id_for_path, tv_folder_type},
         images::upsert_sidecar_images,
-        metadata::parse_sidecar_metadata,
+        metadata::{ParsedMetadata, parse_sidecar_metadata, provider_ids_from_path},
         naming::parse_media_name,
         path_utils,
         probe::probe_media,
@@ -217,6 +217,18 @@ async fn scan_root(
                 }
             };
             item.id = stored_item_id;
+            let provider_ids = provider_ids_from_path(path);
+            if !provider_ids.is_empty() {
+                upsert_media_metadata(
+                    &db,
+                    &item.id,
+                    &ParsedMetadata {
+                        provider_ids,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
             if folder_type == "Folder" {
                 clear_scraped_folder_metadata(&db, &item.id).await;
             }

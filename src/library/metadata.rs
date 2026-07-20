@@ -49,8 +49,56 @@ fn parse_filename_metadata(path: &Path) -> ParsedMetadata {
     ParsedMetadata {
         title: Some(title),
         production_year,
+        provider_ids: provider_ids_from_path(path),
         ..Default::default()
     }
+}
+
+pub fn provider_ids_from_path(path: &Path) -> Vec<(String, String)> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    for (open, close) in [('{', '}'), ('[', ']'), ('(', ')')] {
+        let mut rest = name;
+        while let Some((_, after_open)) = rest.split_once(open) {
+            let Some((tag, after_close)) = after_open.split_once(close) else {
+                break;
+            };
+            if let Some((provider, id)) = provider_id_from_tag(tag) {
+                upsert_provider_value(&mut ids, provider, id);
+            }
+            rest = after_close;
+        }
+    }
+    ids.sort();
+    ids
+}
+
+fn provider_id_from_tag(tag: &str) -> Option<(&'static str, String)> {
+    let tag = tag.trim();
+    let lower = tag.to_ascii_lowercase();
+    for (provider, prefixes) in [
+        ("Tmdb", ["tmdb-", "tmdbid-", "tmdbid="].as_slice()),
+        ("Douban", ["douban-", "doubanid-", "doubanid="].as_slice()),
+        ("IMDB", ["imdb-", "imdbid-", "imdbid="].as_slice()),
+        ("Tvdb", ["tvdb-", "tvdbid-", "tvdbid="].as_slice()),
+    ] {
+        for prefix in prefixes {
+            if lower.starts_with(prefix) {
+                let value = tag[prefix.len()..].trim();
+                if !value.is_empty() {
+                    return Some((provider, value.to_string()));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn upsert_provider_value(ids: &mut Vec<(String, String)>, provider: &str, value: String) {
+    ids.retain(|(existing, _)| existing != provider);
+    ids.push((provider.to_string(), value));
 }
 
 async fn read_sidecar_nfo(path: &Path) -> Option<String> {
@@ -84,7 +132,9 @@ fn merge_nfo_metadata(metadata: &mut ParsedMetadata, nfo: &str) {
     metadata.tags = tags(nfo, "tag");
     metadata.studios = tags(nfo, "studio");
     metadata.people = actor_blocks(nfo);
-    metadata.provider_ids = provider_ids(nfo);
+    for (provider, provider_item_id) in provider_ids(nfo) {
+        upsert_provider_value(&mut metadata.provider_ids, &provider, provider_item_id);
+    }
 }
 
 fn provider_ids(nfo: &str) -> Vec<(String, String)> {
@@ -206,6 +256,41 @@ fn decode_xml_text(value: &str) -> String {
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_provider_ids_from_path_tags() {
+        let ids = provider_ids_from_path(Path::new(
+            "/media/Movie (2024) [tmdbid-123] {douban-456}.strm",
+        ));
+        assert_eq!(
+            ids,
+            vec![
+                ("Douban".to_string(), "456".to_string()),
+                ("Tmdb".to_string(), "123".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn nfo_provider_ids_override_path_provider_ids() {
+        let mut metadata = ParsedMetadata {
+            provider_ids: provider_ids_from_path(Path::new("Movie {tmdb-1}.strm")),
+            ..Default::default()
+        };
+        merge_nfo_metadata(
+            &mut metadata,
+            r#"<movie><uniqueid type="tmdb">2</uniqueid></movie>"#,
+        );
+        assert_eq!(
+            metadata.provider_ids,
+            vec![("Tmdb".to_string(), "2".to_string())]
+        );
+    }
 }
 
 struct TagBlock {

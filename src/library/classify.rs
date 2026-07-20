@@ -77,6 +77,10 @@ pub fn tv_folder_type(path: &Path, root: &Path, collection_type: &str) -> &'stat
         .unwrap_or_default();
     if path_depth(path, root) > 1 && is_season_folder_name(name) {
         "Season"
+    } else if is_quality_or_range_folder_name(name)
+        || (is_grouping_folder_name(name) && !directory_has_direct_tv_episode_file(path))
+    {
+        "Folder"
     } else if directory_has_tv_content(path) || looks_like_series_folder_name(name) {
         "Series"
     } else {
@@ -166,17 +170,29 @@ fn video_files_are_one_movie(videos: &[PathBuf]) -> bool {
 }
 
 fn directory_has_tv_content(path: &Path) -> bool {
+    directory_has_season_folder(path) || directory_has_direct_tv_episode_file(path)
+}
+
+fn directory_has_season_folder(path: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         return false;
     };
     entries.flatten().any(|entry| {
         let child = entry.path();
-        if child.is_dir() {
-            return child
+        child.is_dir()
+            && child
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(is_season_folder_name);
-        }
+                .is_some_and(is_season_folder_name)
+    })
+}
+
+fn directory_has_direct_tv_episode_file(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let child = entry.path();
         child.is_file()
             && (child
                 .file_name()
@@ -253,14 +269,57 @@ fn is_season_folder_name(name: &str) -> bool {
     let name = name
         .trim_matches(|c: char| c.is_whitespace() || matches!(c, '.' | '_' | '-'))
         .to_ascii_lowercase();
+    let first_token = name
+        .split(|c: char| c.is_whitespace() || matches!(c, '.' | '_' | '-' | '|' | '｜'))
+        .next()
+        .unwrap_or_default();
     if matches!(name.as_str(), "specials" | "extras") {
         return true;
     }
     name.starts_with("season ")
         || name.starts_with("season_")
         || name.starts_with("season-")
-        || name.starts_with('s') && name[1..].chars().all(|c| c.is_ascii_digit())
+        || first_token.starts_with('s')
+            && first_token[1..].chars().all(|c| c.is_ascii_digit())
+            && first_token.len() > 1
         || name.starts_with('第') && name.ends_with('季')
+}
+
+fn is_quality_or_range_folder_name(name: &str) -> bool {
+    let trimmed = name
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '.' | '_' | '-'))
+        .to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let compact = trimmed
+        .chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '.' | '_' | '-' | '|' | '｜'))
+        .collect::<String>();
+    if matches!(
+        compact.as_str(),
+        "480p" | "720p" | "1080p" | "2160p" | "4k" | "uhd"
+    ) {
+        return true;
+    }
+    if compact.contains("高码")
+        || compact.contains("高码率")
+        || compact.contains("国语中字")
+        || compact.contains("中字")
+    {
+        return compact.contains("4k")
+            || compact.contains("1080")
+            || compact.contains("2160")
+            || compact.contains("sdr")
+            || compact.contains("hdr")
+            || compact.contains("dv")
+            || compact.contains("版");
+    }
+    let range = regex::Regex::new(
+        r#"(?i)^[0-9]{1,4}\s*-\s*[0-9]{1,4}\s*集?(?:[ ._\-]*(?:4k|2160p|1080p|720p))?$"#,
+    )
+    .expect("range folder regex must compile");
+    range.is_match(&trimmed)
 }
 
 fn is_extra_folder_name(name: &str) -> bool {
@@ -408,6 +467,33 @@ mod tests {
         assert_eq!(tv_folder_type(&series, &root, "tvshows"), "Series");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tv_quality_and_range_folders_stay_folders() {
+        let root = test_dir("tv_quality_and_range_folders_stay_folders");
+        let series = root.join("剧名 (2025){tmdb-123}");
+        let quality = series.join("4K DV 高码");
+        let range = series.join("001-020集.4K");
+        fs::create_dir_all(&quality).unwrap();
+        fs::create_dir_all(&range).unwrap();
+        fs::write(quality.join("剧名 S01E01.mkv"), []).unwrap();
+        fs::write(range.join("01.mkv"), []).unwrap();
+
+        assert_eq!(tv_folder_type(&series, &root, "tvshows"), "Series");
+        assert_eq!(tv_folder_type(&quality, &root, "tvshows"), "Folder");
+        assert_eq!(tv_folder_type(&range, &root, "tvshows"), "Folder");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn decorated_season_folder_stays_season() {
+        let root = Path::new("/media/电视剧");
+        assert_eq!(
+            tv_folder_type(&root.join("国产/剧名/S01 高码率"), root, "tvshows"),
+            "Season"
+        );
     }
 
     #[test]

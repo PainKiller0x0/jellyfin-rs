@@ -50,7 +50,8 @@ fn parse_episode_name(stem: &str, folder: &str) -> ParsedName {
 
             let title_part = captures.name("title").map(|value| value.as_str());
             parsed.title = match style {
-                EpisodeStyle::Named => clean_title(title_part.unwrap_or(stem)),
+                EpisodeStyle::Named => episode_title_after_marker(stem)
+                    .unwrap_or_else(|| clean_title(title_part.unwrap_or(stem))),
                 EpisodeStyle::TrailingTitle => clean_title(
                     captures
                         .name("name")
@@ -152,6 +153,10 @@ fn episode_patterns() -> Vec<(Regex, EpisodeStyle)> {
             r#"(?i)^\[(?P<episode>[0-9]{1,4})\].*$"#,
             EpisodeStyle::FolderTitle,
         ),
+        (
+            r#"(?i)^(?P<episode>[0-9]{1,4})$"#,
+            EpisodeStyle::TrailingTitle,
+        ),
     ]
     .into_iter()
     .map(|(pattern, style)| (Regex::new(pattern).expect("episode regex must compile"), style))
@@ -234,7 +239,17 @@ fn parse_extended_video_types(stem: &str) -> Vec<String> {
 }
 
 fn clean_title(value: &str) -> String {
-    let mut title = value.replace(['.', '_'], " ");
+    let mut title = replace_title_separators(value);
+    title = Regex::new(
+        r#"(?i)[\{\[\(]\s*(?:tmdb(?:id)?|douban(?:id)?|imdb(?:id)?|tvdb(?:id)?)\s*[-=]\s*[^\}\]\)]+[\}\]\)]"#,
+    )
+    .expect("provider tag regex must compile")
+    .replace_all(&title, " ")
+    .into_owned();
+    title = Regex::new(r#"[\{\[\(]\s*((?:18|19|20)[0-9]{2}|2100)\s*[\}\]\)]"#)
+        .expect("year tag regex must compile")
+        .replace_all(&title, " ")
+        .into_owned();
     for token in [
         "2160p",
         "4k",
@@ -244,14 +259,33 @@ fn clean_title(value: &str) -> String {
         "hdr10+",
         "hdr10",
         "hdr",
+        "dovi",
         "x264",
         "x265",
         "h264",
         "h265",
+        "h 264",
+        "h 265",
         "hevc",
+        "avc",
         "aac",
         "dts",
+        "dts hd",
+        "dts hd ma",
         "ac3",
+        "eac3",
+        "ddp",
+        "ddp5.1",
+        "ddp7.1",
+        "ddp2.0",
+        "truehd",
+        "truehd5.1",
+        "truehd7.1",
+        "truehd2.0",
+        "atmos",
+        "flac",
+        "mp3",
+        "pcm",
         "bluray",
         "blu ray",
         "bdrip",
@@ -260,6 +294,18 @@ fn clean_title(value: &str) -> String {
         "webrip",
         "hdtv",
         "remux",
+        "amzn",
+        "nf",
+        "hulu",
+        "hiveweb",
+        "pure@hiveweb",
+        "ctrlhd",
+        "mteam",
+        "hq",
+        "edr",
+        "telesync",
+        "10bit",
+        "8bit",
         "proper",
         "repack",
         "extended",
@@ -269,14 +315,21 @@ fn clean_title(value: &str) -> String {
         "subs",
     ] {
         let pattern = Regex::new(&format!(
-            r#"(?i)(^|[ ._\-\[\(]){}($|[ ._\-\]\)])"#,
+            r#"(?i)(^|[ ._\-\[\(\{{]){}($|[ ._\-\]\)\}}])"#,
             regex::escape(token)
         ))
         .expect("clean regex must compile");
         title = pattern.replace_all(&title, " ").into_owned();
     }
-    title = Regex::new(r#"\[[^\]]+\]|\([^\)]*\)"#)
-        .expect("bracket regex must compile")
+    title = remove_nonleading_year_tokens(&title);
+    title = Regex::new(
+        r#"(?i)(^|[ ._\-\[\(\{])(?:[257](?:[ .]1|[ .]0)|10\s*bit|8\s*bit)($|[ ._\-\]\)\}])"#,
+    )
+    .expect("audio channel regex must compile")
+    .replace_all(&title, " ")
+    .into_owned();
+    title = Regex::new(r#"(?i)(^|[ ._\-\[\(\{])[0-9]{3,4}x[0-9]{3,4}($|[ ._\-\]\)\}])"#)
+        .expect("dimension regex must compile")
         .replace_all(&title, " ")
         .into_owned();
     title = Regex::new(r#"\s+"#)
@@ -287,6 +340,74 @@ fn clean_title(value: &str) -> String {
         .trim_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '.' | '_' | ','))
         .trim()
         .to_string()
+}
+
+fn episode_title_after_marker(stem: &str) -> Option<String> {
+    for pattern in [
+        r#"(?i)s[0-9]{1,4}[ ._\-\]]*e[0-9]{1,3}(?:[ ._\-]*(?:e|x)?[0-9]{1,3})?"#,
+        r#"(?i)[0-9]{1,4}x[0-9]{1,3}(?:[ ._\-]*(?:x|e)?[0-9]{1,3})?"#,
+    ] {
+        let regex = Regex::new(pattern).ok()?;
+        if let Some(marker) = regex.find(stem) {
+            let tail = stem[marker.end()..]
+                .trim_matches(|c: char| c.is_whitespace() || ".-_[](){}".contains(c));
+            let title = clean_title(tail);
+            if !title.is_empty() {
+                return Some(title);
+            }
+        }
+    }
+    None
+}
+
+fn replace_title_separators(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '_' | '　' => result.push(' '),
+            '.' => {
+                let previous = value[..index].chars().next_back();
+                let next = chars.peek().map(|(_, next)| *next);
+                if previous.is_some_and(|c| c.is_ascii_digit())
+                    && next.is_some_and(|c| c.is_ascii_digit())
+                {
+                    result.push('.');
+                } else {
+                    result.push(' ');
+                }
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
+}
+
+fn remove_nonleading_year_tokens(value: &str) -> String {
+    let regex = Regex::new(r#"(?i)(^|[ ._\-\[\(\{])((?:18|19|20)[0-9]{2}|2100)($|[ ._\-\]\)\}])"#)
+        .expect("bare year regex must compile");
+    regex
+        .replace_all(value, |captures: &regex::Captures<'_>| {
+            let Some(matched) = captures.get(0) else {
+                return " ".to_string();
+            };
+            let has_title_before = value[..matched.start()]
+                .chars()
+                .any(|c| c.is_alphanumeric() || is_cjk(c));
+            if has_title_before {
+                " ".to_string()
+            } else {
+                matched.as_str().to_string()
+            }
+        })
+        .into_owned()
+}
+
+fn is_cjk(ch: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&ch)
+        || ('\u{3400}'..='\u{4dbf}').contains(&ch)
+        || ('\u{3040}'..='\u{30ff}').contains(&ch)
+        || ('\u{ac00}'..='\u{d7af}').contains(&ch)
 }
 
 fn normalize_separators(value: &str) -> String {
@@ -320,11 +441,12 @@ mod tests {
         let parsed = parse_media_name(Path::new("Show.Name.S01E02.Title.1080p.mkv"), "tvshows");
         assert_eq!(parsed.season_number, Some(1));
         assert_eq!(parsed.episode_number, Some(2));
-        assert_eq!(parsed.title, "Show Name");
+        assert_eq!(parsed.title, "Title");
 
         let parsed = parse_media_name(Path::new("Show - 1x03 - Name.mkv"), "tvshows");
         assert_eq!(parsed.season_number, Some(1));
         assert_eq!(parsed.episode_number, Some(3));
+        assert_eq!(parsed.title, "Name");
     }
 
     #[test]
@@ -349,6 +471,10 @@ mod tests {
         let parsed = parse_media_name(Path::new("[Group] Anime Name [04][1080p].mkv"), "tvshows");
         assert_eq!(parsed.episode_number, Some(4));
         assert_eq!(parsed.title, "Anime Name");
+
+        let parsed = parse_media_name(Path::new("01.strm"), "tvshows");
+        assert_eq!(parsed.episode_number, Some(1));
+        assert_eq!(parsed.title, "01");
     }
 
     #[test]
@@ -358,5 +484,22 @@ mod tests {
         assert_eq!(parsed.stack_key.as_deref(), Some("movie name"));
         assert_eq!(parsed.stack_part, Some(2));
         assert_eq!(parsed.version.as_deref(), Some("4K HDR Extended"));
+    }
+
+    #[test]
+    fn cleans_provider_and_technical_tokens_from_movie_names() {
+        let parsed = parse_media_name(
+            Path::new("1.89的凶手 (2024) 2160p.h265.AAC{tmdb-1249569}.strm"),
+            "movies",
+        );
+        assert_eq!(parsed.title, "1.89的凶手");
+
+        let parsed = parse_media_name(
+            Path::new(
+                "F1：狂飙飞车.F1.The.Movie.2025.2160p.BluRay.DoVi.x265.10bit.Atmos.TrueHD7.1{tmdb-911430}.strm",
+            ),
+            "movies",
+        );
+        assert_eq!(parsed.title, "F1：狂飙飞车 F1 The Movie");
     }
 }

@@ -10,13 +10,15 @@ use sea_orm::{ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
-    app::state::{AppState, PlaybackSession, PlaybackState, SessionCapabilities},
+    app::state::{
+        AppState, PlaybackSession, PlaybackState, SessionCapabilities, session_timeout_seconds,
+    },
     db::row_ext::QueryResultExt,
     entities::user_data::{self, Entity as UserData},
     jellyfin::{
         auth::{
             query_user_id_or_request, request_token, request_user_id_and_admin_or_default,
-            request_user_id_or_default,
+            request_user_id_or_default, user_concurrent_playback_limit,
         },
         common::{internal_error, strip_nulls},
         dlna,
@@ -322,6 +324,25 @@ async fn playback_progress_inner(
     let user_id = request_user_id_or_default(&state, &headers, &query).await;
     let persistence_item_id = playback_body_persistence_item_id(&body).unwrap_or(item_id);
     let runtime_ticks = body.get("RunTimeTicks").and_then(JsonValue::as_i64);
+    let play_session_id = playback_report_session_id(&query, Some(&body), &user_id, item_id);
+    if event != PlaybackEvent::Stopped {
+        match update_playback_session(
+            &state,
+            &headers,
+            &query,
+            &user_id,
+            item_id,
+            position_ticks.unwrap_or_default(),
+            &body,
+            event,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) => return playback_session_update_error_response(error),
+        }
+    }
+
     let result = match event {
         PlaybackEvent::Start => {
             if position_ticks.is_some_and(|value| value > 0) {
@@ -358,7 +379,6 @@ async fn playback_progress_inner(
         return internal_error(error);
     }
 
-    let play_session_id = playback_body_play_session_id(&body, &user_id, item_id);
     let is_paused = body
         .get("IsPaused")
         .and_then(JsonValue::as_bool)
@@ -435,11 +455,7 @@ async fn playback_progress_inner(
             .get("IsPaused")
             .and_then(JsonValue::as_bool)
             .unwrap_or(false);
-        let default_session_id = format!("{user_id}:{item_id}");
-        let play_session_id = body
-            .get("PlaySessionId")
-            .and_then(JsonValue::as_str)
-            .unwrap_or(&default_session_id);
+        let play_session_id = play_session_id.as_str();
         let client = body
             .get("Client")
             .and_then(JsonValue::as_str)
@@ -484,21 +500,25 @@ async fn playback_progress_inner(
         }
     }
 
-    match update_playback_session(
-        &state,
-        &headers,
-        &query,
-        &user_id,
-        item_id,
-        position_ticks.unwrap_or_default(),
-        &body,
-        event,
-    )
-    .await
-    {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error),
+    if event == PlaybackEvent::Stopped {
+        match update_playback_session(
+            &state,
+            &headers,
+            &query,
+            &user_id,
+            item_id,
+            position_ticks.unwrap_or_default(),
+            &body,
+            event,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) => return playback_session_update_error_response(error),
+        }
     }
+
+    StatusCode::NO_CONTENT.into_response()
 }
 
 fn playback_body_item_id(body: &JsonValue) -> Option<&str> {
@@ -523,9 +543,16 @@ fn playback_body_persistence_item_id(body: &JsonValue) -> Option<&str> {
         })
 }
 
-fn playback_body_play_session_id(body: &JsonValue, user_id: &str, item_id: &str) -> String {
-    body.get("PlaySessionId")
+fn playback_report_session_id(
+    query: &HashMap<String, String>,
+    body: Option<&JsonValue>,
+    user_id: &str,
+    item_id: &str,
+) -> String {
+    body.and_then(|value| value.get("PlaySessionId"))
         .and_then(JsonValue::as_str)
+        .or_else(|| query.get("PlaySessionId").map(String::as_str))
+        .or_else(|| query.get("playSessionId").map(String::as_str))
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| format!("{user_id}:{item_id}"))
@@ -541,13 +568,8 @@ async fn update_playback_session(
     position_ticks: i64,
     body: &JsonValue,
     event: PlaybackEvent,
-) -> anyhow::Result<()> {
-    let play_session_id = body
-        .get("PlaySessionId")
-        .and_then(JsonValue::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("{user_id}:{item_id}"));
+) -> Result<(), PlaybackSessionUpdateError> {
+    let play_session_id = playback_report_session_id(query, Some(body), user_id, item_id);
 
     if event == PlaybackEvent::Stopped {
         state
@@ -632,13 +654,75 @@ async fn update_playback_session(
             supports_persistent_identifier,
         },
     };
-    state
-        .playback_sessions
-        .write()
-        .await
-        .insert(play_session_id, session);
+    let limit = user_concurrent_playback_limit(&state.db, user_id).await?;
+    let mut sessions = state.playback_sessions.write().await;
+    prune_expired_playback_sessions(&mut sessions, now);
+    let existing_playback = sessions
+        .get(&play_session_id)
+        .is_some_and(|existing| existing.user_id == user_id && !existing.item_id.is_empty());
+    let active_playback_count = active_playback_session_count(&sessions, user_id, &play_session_id);
+    if !existing_playback && limit > 0 && active_playback_count as i64 >= limit {
+        return Err(PlaybackSessionUpdateError::ConcurrentLimitExceeded {
+            active_count: active_playback_count,
+            limit,
+        });
+    }
+    sessions.insert(play_session_id, session);
+    drop(sessions);
     let _ = state.ws_event_tx.send(crate::ws::WsEvent::SessionsChanged);
     Ok(())
+}
+
+#[derive(Debug)]
+enum PlaybackSessionUpdateError {
+    ConcurrentLimitExceeded { active_count: usize, limit: i64 },
+    Internal(anyhow::Error),
+}
+
+impl From<anyhow::Error> for PlaybackSessionUpdateError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Internal(error)
+    }
+}
+
+fn playback_session_update_error_response(error: PlaybackSessionUpdateError) -> Response {
+    match error {
+        PlaybackSessionUpdateError::ConcurrentLimitExceeded {
+            active_count,
+            limit,
+        } => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "Error": format!("Concurrent playback limit exceeded ({active_count}/{limit})"),
+                "ErrorCode": "ConcurrentPlaybackLimitExceeded",
+                "Limit": limit,
+                "ActiveCount": active_count
+            })),
+        )
+            .into_response(),
+        PlaybackSessionUpdateError::Internal(error) => internal_error(error),
+    }
+}
+
+fn prune_expired_playback_sessions(sessions: &mut HashMap<String, PlaybackSession>, now: i64) {
+    let timeout = session_timeout_seconds();
+    sessions.retain(|_, session| now - session.last_activity_unix <= timeout);
+}
+
+fn active_playback_session_count(
+    sessions: &HashMap<String, PlaybackSession>,
+    user_id: &str,
+    current_play_session_id: &str,
+) -> usize {
+    sessions
+        .values()
+        .filter(|session| {
+            session.user_id == user_id
+                && !session.item_id.is_empty()
+                && session.play_session_id != current_play_session_id
+                && session.id != current_play_session_id
+        })
+        .count()
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -1043,10 +1127,30 @@ pub async fn playing_item_start(
     Query(query): Query<HashMap<String, String>>,
     body: Option<Json<JsonValue>>,
 ) -> Response {
+    let empty_body = JsonValue::Null;
+    let body_value = body.as_ref().map(|Json(value)| value);
+    let session_body = body_value.unwrap_or(&empty_body);
     let position_ticks = body
         .as_ref()
         .and_then(|b| b.get("PositionTicks").and_then(JsonValue::as_i64))
         .filter(|value| *value > 0);
+    let play_session_id = playback_report_session_id(&query, body_value, &user_id, &item_id);
+
+    match update_playback_session(
+        &state,
+        &headers,
+        &query,
+        &user_id,
+        &item_id,
+        position_ticks.unwrap_or_default(),
+        session_body,
+        PlaybackEvent::Start,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(error) => return playback_session_update_error_response(error),
+    }
 
     if let Some(position_ticks) = position_ticks {
         let result = upsert_playback_position(&state.db, &user_id, &item_id, position_ticks).await;
@@ -1070,8 +1174,6 @@ pub async fn playing_item_start(
             .await;
     }
 
-    let body_value = body.as_ref().map(|Json(value)| value);
-    let play_session_id = legacy_play_session_id(&query, body_value, &user_id, &item_id);
     let is_paused = body_value
         .and_then(|value| value.get("IsPaused"))
         .and_then(JsonValue::as_bool)
@@ -1126,6 +1228,7 @@ pub async fn playing_item_start(
 pub async fn playing_item_stop(
     State(state): State<Arc<AppState>>,
     Path((user_id, item_id)): Path<(String, String)>,
+    headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let position_ticks = query
@@ -1140,7 +1243,8 @@ pub async fn playing_item_stop(
     {
         return internal_error(error);
     }
-    let play_session_id = legacy_play_session_id(&query, None, &user_id, &item_id);
+    let empty_body = JsonValue::Null;
+    let play_session_id = playback_report_session_id(&query, None, &user_id, &item_id);
     if let Err(error) = record_playback_watch_event(
         &state.db,
         &user_id,
@@ -1162,6 +1266,22 @@ pub async fn playing_item_stop(
         return internal_error(error);
     }
 
+    match update_playback_session(
+        &state,
+        &headers,
+        &query,
+        &user_id,
+        &item_id,
+        position_ticks.unwrap_or_default(),
+        &empty_body,
+        PlaybackEvent::Stopped,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(error) => return playback_session_update_error_response(error),
+    }
+
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -1169,6 +1289,7 @@ pub async fn playing_item_stop(
 pub async fn playing_item_progress(
     State(state): State<Arc<AppState>>,
     Path((user_id, item_id)): Path<(String, String)>,
+    headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
     body: Option<Json<JsonValue>>,
 ) -> Response {
@@ -1179,6 +1300,25 @@ pub async fn playing_item_progress(
             body.as_ref()
                 .and_then(|b| b.get("PositionTicks").and_then(JsonValue::as_i64))
         });
+    let empty_body = JsonValue::Null;
+    let body_value = body.as_ref().map(|Json(value)| value);
+    let session_body = body_value.unwrap_or(&empty_body);
+
+    match update_playback_session(
+        &state,
+        &headers,
+        &query,
+        &user_id,
+        &item_id,
+        position_ticks.unwrap_or_default(),
+        session_body,
+        PlaybackEvent::Progress,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(error) => return playback_session_update_error_response(error),
+    }
 
     if let Some(position_ticks) = position_ticks.filter(|value| *value > 0) {
         let result = upsert_playback_position(&state.db, &user_id, &item_id, position_ticks).await;
@@ -1187,8 +1327,7 @@ pub async fn playing_item_progress(
         }
     }
 
-    let body_value = body.as_ref().map(|Json(value)| value);
-    let play_session_id = legacy_play_session_id(&query, body_value, &user_id, &item_id);
+    let play_session_id = playback_report_session_id(&query, body_value, &user_id, &item_id);
     let is_paused = query
         .get("IsPaused")
         .or_else(|| query.get("isPaused"))
@@ -1234,21 +1373,6 @@ pub async fn playing_item_progress(
     StatusCode::NO_CONTENT.into_response()
 }
 
-fn legacy_play_session_id(
-    query: &HashMap<String, String>,
-    body: Option<&JsonValue>,
-    user_id: &str,
-    item_id: &str,
-) -> String {
-    body.and_then(|value| value.get("PlaySessionId"))
-        .and_then(JsonValue::as_str)
-        .or_else(|| query.get("PlaySessionId").map(String::as_str))
-        .or_else(|| query.get("playSessionId").map(String::as_str))
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("{user_id}:{item_id}"))
-}
-
 pub async fn current_user_playing_item_start(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1274,7 +1398,13 @@ pub async fn current_user_playing_item_stop(
     Path(item_id): Path<String>,
 ) -> Response {
     let user_id = request_user_id_or_default(&state, &headers, &query).await;
-    playing_item_stop(State(state), Path((user_id, item_id)), Query(query)).await
+    playing_item_stop(
+        State(state),
+        Path((user_id, item_id)),
+        headers,
+        Query(query),
+    )
+    .await
 }
 
 pub async fn current_user_playing_item_progress(
@@ -1285,14 +1415,22 @@ pub async fn current_user_playing_item_progress(
     body: Option<Json<JsonValue>>,
 ) -> Response {
     let user_id = request_user_id_or_default(&state, &headers, &query).await;
-    playing_item_progress(State(state), Path((user_id, item_id)), Query(query), body).await
+    playing_item_progress(
+        State(state),
+        Path((user_id, item_id)),
+        headers,
+        Query(query),
+        body,
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        append_access_token_to_media_sources, apply_max_streaming_bitrate_to_sources,
-        current_user_playing_item_start, playback_max_streaming_bitrate, watch_delta_seconds,
+        PlaybackEvent, PlaybackSessionUpdateError, append_access_token_to_media_sources,
+        apply_max_streaming_bitrate_to_sources, current_user_playing_item_start,
+        playback_max_streaming_bitrate, update_playback_session, watch_delta_seconds,
         watch_segment_day_slices,
     };
     use crate::app::state::{AppState, PlaybackSession};
@@ -1396,16 +1534,95 @@ mod tests {
         assert_eq!(row.get_i64("playback_position_ticks").unwrap(), 42);
     }
 
+    #[tokio::test]
+    async fn concurrent_playback_limit_blocks_new_play_session() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        let state = test_state(db);
+        let user_id = state.user_id.to_string();
+        seed_user_and_item(&state.db, &user_id, "m1").await;
+        seed_user_and_item(&state.db, &user_id, "m2").await;
+        state
+            .db
+            .execute(crate::db::helpers::pg_statement(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, 1)",
+                vec![
+                    format!("user_policy:{user_id}").into(),
+                    serde_json::json!({ "MaxConcurrentStreams": 1 })
+                        .to_string()
+                        .into(),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let headers = HeaderMap::new();
+        let query = HashMap::new();
+        update_playback_session(
+            &state,
+            &headers,
+            &query,
+            &user_id,
+            "m1",
+            0,
+            &serde_json::json!({ "PlaySessionId": "play-1" }),
+            PlaybackEvent::Start,
+        )
+        .await
+        .unwrap();
+
+        update_playback_session(
+            &state,
+            &headers,
+            &query,
+            &user_id,
+            "m1",
+            100,
+            &serde_json::json!({ "PlaySessionId": "play-1" }),
+            PlaybackEvent::Progress,
+        )
+        .await
+        .unwrap();
+
+        let error = update_playback_session(
+            &state,
+            &headers,
+            &query,
+            &user_id,
+            "m2",
+            0,
+            &serde_json::json!({ "PlaySessionId": "play-2" }),
+            PlaybackEvent::Start,
+        )
+        .await
+        .unwrap_err();
+
+        match error {
+            PlaybackSessionUpdateError::ConcurrentLimitExceeded {
+                active_count,
+                limit,
+            } => {
+                assert_eq!(active_count, 1);
+                assert_eq!(limit, 1);
+            }
+            PlaybackSessionUpdateError::Internal(error) => {
+                panic!("expected playback limit error, got {error:#}");
+            }
+        }
+    }
+
     async fn seed_user_and_item(db: &DatabaseConnection, user_id: &str, item_id: &str) {
         db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, 'test', 'Test', 0, 0, 1, 1)",
+            "INSERT INTO users (id, username, display_name, is_admin, is_disabled, created_at, updated_at) VALUES (?, 'test', 'Test', 0, 0, 1, 1) ON CONFLICT(id) DO NOTHING",
             vec![user_id.into()],
         ))
         .await
         .unwrap();
+        let path = format!("D:/{item_id}.mkv");
         db.execute(crate::db::helpers::pg_statement(
-            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, 'Movie', 'D:/movie.mkv', '', '', 'Movie', 0, 1, 1, 1, 1)",
-            vec![item_id.into()],
+            "INSERT INTO media_items (id, title, path, library_id, parent_id, item_type, is_folder, is_public, modified_at, created_at, updated_at) VALUES (?, 'Movie', ?, '', '', 'Movie', 0, 1, 1, 1, 1) ON CONFLICT(id) DO NOTHING",
+            vec![item_id.into(), path.into()],
         ))
         .await
         .unwrap();

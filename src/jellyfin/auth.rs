@@ -2518,6 +2518,17 @@ async fn user_policy(
     policy
 }
 
+pub(crate) async fn user_concurrent_playback_limit(
+    db: &DatabaseConnection,
+    user_id: &str,
+) -> anyhow::Result<i64> {
+    let user = user_by_id_inner(db, user_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("user not found"))?;
+    let policy = user_policy(db, user_id, user.is_admin, user.is_disabled).await;
+    Ok(concurrent_playback_limit_from_policy(&policy))
+}
+
 fn user_policy_key(user_id: &str) -> String {
     format!("user_policy:{user_id}")
 }
@@ -2574,6 +2585,7 @@ fn default_user_policy(is_admin: bool, is_disabled: bool) -> JsonValue {
         ("InvalidLoginAttemptCount", json!(0)),
         ("LoginAttemptsBeforeLockout", json!(-1)),
         ("MaxActiveSessions", json!(0)),
+        ("MaxConcurrentStreams", json!(0)),
         ("RemoteClientBitrateLimit", json!(0)),
         (
             "AuthenticationProviderId",
@@ -2588,6 +2600,24 @@ fn default_user_policy(is_admin: bool, is_disabled: bool) -> JsonValue {
         policy.insert(key.to_string(), value);
     }
     JsonValue::Object(policy)
+}
+
+fn concurrent_playback_limit_from_policy(policy: &JsonValue) -> i64 {
+    policy_positive_i64(policy, "MaxConcurrentStreams")
+        .or_else(|| policy_positive_i64(policy, "MaxActiveSessions"))
+        .unwrap_or(0)
+}
+
+fn policy_positive_i64(policy: &JsonValue, key: &str) -> Option<i64> {
+    policy_i64(policy, key).filter(|value| *value > 0)
+}
+
+fn policy_i64(policy: &JsonValue, key: &str) -> Option<i64> {
+    let value = policy.get(key)?;
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
 }
 
 fn merge_user_policy(mut base: JsonValue, saved: &JsonValue) -> JsonValue {
@@ -3626,6 +3656,26 @@ mod tests {
         assert_eq!(user["Policy"]["EnableAudioPlaybackTranscoding"], true);
         assert_eq!(user["Policy"]["EnableVideoPlaybackTranscoding"], true);
         assert_eq!(user["Policy"]["EnableSubtitleDownloading"], true);
+        assert_eq!(user["Policy"]["MaxActiveSessions"], 0);
+        assert_eq!(user["Policy"]["MaxConcurrentStreams"], 0);
+    }
+
+    #[test]
+    fn concurrent_playback_limit_prefers_dedicated_policy_field() {
+        let max_active_only = merge_user_policy(
+            default_user_policy(false, false),
+            &json!({ "MaxActiveSessions": 2 }),
+        );
+        assert_eq!(concurrent_playback_limit_from_policy(&max_active_only), 2);
+
+        let dedicated_limit = merge_user_policy(
+            default_user_policy(false, false),
+            &json!({
+                "MaxActiveSessions": 2,
+                "MaxConcurrentStreams": 3
+            }),
+        );
+        assert_eq!(concurrent_playback_limit_from_policy(&dedicated_limit), 3);
     }
 
     #[test]
@@ -3963,6 +4013,7 @@ mod tests {
             &json!({
                 "IsAdministrator": true,
                 "EnableAllFolders": false,
+                "MaxConcurrentStreams": 2,
                 "EnabledFolders": ["library-1"],
                 "Unexpected": true
             }),
@@ -3974,6 +4025,7 @@ mod tests {
         let dto = user_json_with_config(&db, &user).await;
         assert_eq!(dto["Policy"]["IsAdministrator"], true);
         assert_eq!(dto["Policy"]["EnableAllFolders"], false);
+        assert_eq!(dto["Policy"]["MaxConcurrentStreams"], 2);
         assert_eq!(dto["Policy"]["EnabledFolders"][0], "library-1");
         assert!(dto["Policy"].get("Unexpected").is_none());
     }

@@ -25,6 +25,7 @@ export type JellyfinUserPolicy = {
   EnableAllChannels?: boolean;
   EnableAllFolders?: boolean;
   MaxActiveSessions?: number;
+  MaxConcurrentStreams?: number;
   RemoteClientBitrateLimit?: number;
   LoginAttemptsBeforeLockout?: number;
   SyncPlayAccess?: string;

@@ -373,6 +373,7 @@ const OPENAPI_CONTRACT_EXTRA_FIELDS: &[&str] = &[
     "LibraryId",
     "LoginAttemptsBeforeLockout",
     "MaxActiveSessions",
+    "MaxConcurrentStreams",
     "MaxParentalSubRating",
     "MediaAttachments",
     "NowPlayingItemId",

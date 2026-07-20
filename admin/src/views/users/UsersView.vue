@@ -49,6 +49,7 @@ type PolicyForm = Required<
   >
 > & {
   MaxActiveSessions: number;
+  MaxConcurrentStreams: number;
   RemoteClientBitrateLimit: number;
   LoginAttemptsBeforeLockout: number;
   SyncPlayAccess: string;
@@ -122,6 +123,7 @@ const policyForm = reactive<PolicyForm>({
   EnableContentDeletion: false,
   ForceRemoteSourceTranscoding: false,
   MaxActiveSessions: 0,
+  MaxConcurrentStreams: 0,
   RemoteClientBitrateLimit: 0,
   LoginAttemptsBeforeLockout: -1,
   SyncPlayAccess: 'None'
@@ -390,13 +392,16 @@ function applyPolicyToForm(policy?: JellyfinUserPolicy) {
   policyForm.EnableLiveTvAccess = Boolean(policy?.EnableLiveTvAccess);
   policyForm.EnableContentDeletion = Boolean(policy?.EnableContentDeletion);
   policyForm.ForceRemoteSourceTranscoding = Boolean(policy?.ForceRemoteSourceTranscoding);
-  policyForm.MaxActiveSessions = policy?.MaxActiveSessions ?? 0;
+  policyForm.MaxConcurrentStreams = concurrentPlaybackLimit(policy);
+  policyForm.MaxActiveSessions = policyForm.MaxConcurrentStreams;
   policyForm.RemoteClientBitrateLimit = policy?.RemoteClientBitrateLimit ?? 0;
   policyForm.LoginAttemptsBeforeLockout = policy?.LoginAttemptsBeforeLockout ?? -1;
   policyForm.SyncPlayAccess = policy?.SyncPlayAccess ?? 'None';
 }
 
 function policyPayload(): usersApi.UpdateUserPolicyPayload {
+  const maxConcurrentStreams = policyNumber(policyForm.MaxConcurrentStreams, 0, 0);
+
   return {
     IsAdministrator: policyForm.IsAdministrator,
     IsDisabled: policyForm.IsDisabled,
@@ -423,11 +428,16 @@ function policyPayload(): usersApi.UpdateUserPolicyPayload {
     EnableLiveTvManagement: policyForm.EnableLiveTvManagement,
     EnableLiveTvAccess: policyForm.EnableLiveTvAccess,
     EnableContentDeletion: policyForm.EnableContentDeletion,
-    MaxActiveSessions: policyNumber(policyForm.MaxActiveSessions, 0, 0),
+    MaxActiveSessions: maxConcurrentStreams,
+    MaxConcurrentStreams: maxConcurrentStreams,
     RemoteClientBitrateLimit: policyNumber(policyForm.RemoteClientBitrateLimit, 0, 0),
     LoginAttemptsBeforeLockout: policyNumber(policyForm.LoginAttemptsBeforeLockout, -1, -1),
     SyncPlayAccess: policyForm.SyncPlayAccess || 'None'
   };
+}
+
+function concurrentPlaybackLimit(policy?: JellyfinUserPolicy) {
+  return policyNumber(policy?.MaxConcurrentStreams ?? policy?.MaxActiveSessions ?? 0, 0, 0);
 }
 
 function policyNumber(value: number, fallback: number, min: number) {
@@ -652,6 +662,12 @@ onMounted(loadUsers);
                 </ElIcon>
                 {{ user.Policy?.EnableContentDownloading ?? true ? '允许下载' : '禁止下载' }}
               </span>
+              <span>
+                <ElIcon>
+                  <VideoCamera />
+                </ElIcon>
+                {{ concurrentPlaybackLimit(user.Policy) > 0 ? `同时播放 ${concurrentPlaybackLimit(user.Policy)} 路` : '不限同时播放' }}
+              </span>
             </div>
           </div>
         </div>
@@ -782,13 +798,13 @@ onMounted(loadUsers);
         <section class="users-page__policy-group">
           <div class="users-page__policy-group-heading">
             <h3>限制</h3>
-            <p>后端支持会话数、远程码率、登录锁定次数和 SyncPlay 访问级别。</p>
+            <p>0 表示不限制同时播放数量。</p>
           </div>
 
           <div class="users-page__policy-limits">
             <label>
-              <span>最大活动会话</span>
-              <ElInputNumber v-model="policyForm.MaxActiveSessions" :min="0" :step="1" controls-position="right" />
+              <span>同时播放限制</span>
+              <ElInputNumber v-model="policyForm.MaxConcurrentStreams" :min="0" :step="1" controls-position="right" />
             </label>
             <label>
               <span>远程码率限制</span>

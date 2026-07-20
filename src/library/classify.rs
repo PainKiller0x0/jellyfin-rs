@@ -66,8 +66,7 @@ pub fn parent_id_for_path(path: &Path, root: &Path, library_id: &str) -> String 
 
 pub fn tv_folder_type(path: &Path, root: &Path, collection_type: &str) -> &'static str {
     if collection_type == "movies" {
-        // Movie libraries store each movie as a folder — classify as "Movie"
-        return "Movie";
+        return movie_folder_type(path, root);
     }
     if collection_type != "tvshows" && collection_type != "tv" {
         return "Folder";
@@ -94,6 +93,40 @@ pub fn tv_folder_type(path: &Path, root: &Path, collection_type: &str) -> &'stat
     }
 }
 
+fn movie_folder_type(path: &Path, root: &Path) -> &'static str {
+    let norm_path = super::path_utils::normalize_path(&path.to_string_lossy());
+    let norm_root = super::path_utils::normalize_path(&root.to_string_lossy());
+    let depth = std::path::Path::new(&norm_path)
+        .strip_prefix(std::path::Path::new(&norm_root))
+        .ok()
+        .map(|relative| relative.components().count())
+        .unwrap_or_default();
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+
+    if is_grouping_folder_name(name) {
+        "Folder"
+    } else if directory_has_movie_content(path) || looks_like_movie_folder_name(name) {
+        "Movie"
+    } else if depth == 1 {
+        "Movie"
+    } else {
+        "Folder"
+    }
+}
+
+fn directory_has_movie_content(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let child = entry.path();
+        child.is_file() && classify_media_path(&child, "movies").as_deref() == Some("Video")
+    })
+}
+
 fn directory_has_tv_content(path: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         return false;
@@ -111,6 +144,10 @@ fn directory_has_tv_content(path: &Path) -> bool {
 }
 
 fn looks_like_series_folder_name(name: &str) -> bool {
+    has_provider_tag(name) || has_year_tag(name)
+}
+
+fn looks_like_movie_folder_name(name: &str) -> bool {
     has_provider_tag(name) || has_year_tag(name)
 }
 
@@ -204,6 +241,38 @@ mod tests {
             ),
             "Series"
         );
+    }
+
+    #[test]
+    fn movie_grouping_folders_are_not_movies() {
+        let root = Path::new("/media/电影");
+        assert_eq!(tv_folder_type(&root.join("国产"), root, "movies"), "Folder");
+        assert_eq!(
+            tv_folder_type(&root.join("国产/数"), root, "movies"),
+            "Folder"
+        );
+        assert_eq!(
+            tv_folder_type(
+                &root.join("国产/数/Movie Name (2024) {tmdbid-123}"),
+                root,
+                "movies"
+            ),
+            "Movie"
+        );
+    }
+
+    #[test]
+    fn nested_movie_folder_with_video_file_is_movie() {
+        let root = test_dir("nested_movie_folder_with_video_file_is_movie");
+        let group = root.join("国产");
+        let movie = group.join("无间道");
+        fs::create_dir_all(&movie).unwrap();
+        fs::write(movie.join("无间道.mkv"), []).unwrap();
+
+        assert_eq!(tv_folder_type(&group, &root, "movies"), "Folder");
+        assert_eq!(tv_folder_type(&movie, &root, "movies"), "Movie");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -215,7 +215,7 @@ async fn item_extras(
         ORDER BY media_items.title ASC"#
     ));
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &sql,
             vec![user_id.into(), item_id.into()],
         ))
@@ -398,7 +398,7 @@ async fn public_item_runtime_ticks(
     let sql =
         format!("SELECT runtime_ticks FROM media_items WHERE media_items.id = ? AND {visible}");
     Ok(db
-        .query_one(crate::db::helpers::pg_statement(&sql, vec![item_id.into()]))
+        .query_one_raw(crate::db::helpers::pg_statement(&sql, vec![item_id.into()]))
         .await?
         .map(|row| row.get_i64("runtime_ticks").unwrap_or(0)))
 }
@@ -507,7 +507,7 @@ async fn seed_ids_for_item(db: &DatabaseConnection, item_id: &str) -> anyhow::Re
         "SELECT item_type, is_folder FROM media_items WHERE media_items.id = ? AND {visible}"
     );
     let row = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             &seed_sql,
             vec![item_id.into()],
         ))
@@ -675,7 +675,7 @@ async fn fetch_items_by_ids(
     push_values(&mut values, item_types);
 
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
         .await?;
     let mut items = item_queries::decode_media_items(&rows)?;
     items.sort_by_key(|item| {
@@ -698,7 +698,7 @@ async fn resolve_named_id(
 ) -> anyhow::Result<Option<String>> {
     let sql = format!("SELECT id FROM {table} WHERE id = ? OR name = ? LIMIT 1");
     let row = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             &sql,
             vec![id_or_name.into(), id_or_name.into()],
         ))
@@ -713,7 +713,7 @@ async fn query_string_column(
     column: &str,
 ) -> anyhow::Result<Vec<String>> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(sql, values))
         .await?;
     Ok(rows
         .iter()
@@ -894,7 +894,7 @@ async fn trickplay_info(
     width: i64,
 ) -> anyhow::Result<Option<TrickplayInfo>> {
     let row = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             "SELECT tp.width, tp.tile_count, tp.interval_ticks, tp.path FROM trickplay_images tp JOIN media_items mi ON mi.id = tp.item_id WHERE tp.item_id = ? AND tp.width = ? AND mi.is_public = 1 AND (mi.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = mi.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = mi.parent_id AND parent.is_public = 1))",
             vec![item_id.into(), width.into()],
         ))

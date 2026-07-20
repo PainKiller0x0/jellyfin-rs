@@ -21,7 +21,7 @@ struct LibraryItemCounts {
 
 pub async fn library_views(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             r#"SELECT l.id, l.name, l.collection_type, l.created_at, l.updated_at,
                       COALESCE(MIN(lp.path), '') AS path
                FROM libraries l
@@ -108,7 +108,7 @@ pub async fn find_library_as_item(
     library_id: &str,
 ) -> anyhow::Result<Option<Value>> {
     let row = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             r#"SELECT l.id, l.name, l.collection_type, l.created_at, l.updated_at,
                       COALESCE((SELECT MIN(path) FROM library_paths WHERE library_id = l.id), '') AS path
                FROM libraries l
@@ -261,7 +261,7 @@ async fn library_item_counts(
         .map(|id| id.as_str().into())
         .collect::<Vec<sea_orm::Value>>();
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
         .await
         .context("failed to count library items")?;
     for row in &rows {
@@ -348,7 +348,7 @@ pub async fn list_media_items(
             placeholders,
         );
         let rows = db
-            .query_all(crate::db::helpers::pg_statement(&sql, values))
+            .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
             .await
             .context("failed to list items by person ids")?;
         let mut items = decode_media_items(&rows)?;
@@ -392,7 +392,7 @@ pub async fn list_media_items(
                     vec![user_id.into(), parent_id.into()],
                 )
             };
-            db.query_all(crate::db::helpers::pg_statement( &sql, vals))
+            db.query_all_raw(crate::db::helpers::pg_statement( &sql, vals))
                 .await
         } else if needs_global_query {
             // Global search/filter: no parent_id constraint, use SQL LIKE or just global query
@@ -402,13 +402,13 @@ pub async fn list_media_items(
                 );
                 let mut vals: Vec<sea_orm::Value> = vec![user_id.into()];
                 vals.push(search_term.as_ref().unwrap().as_str().into());
-                db.query_all(crate::db::helpers::pg_statement( &sql, vals))
+                db.query_all_raw(crate::db::helpers::pg_statement( &sql, vals))
                     .await
             } else {
                 // Filters without SearchTerm, no ParentId — global query
                 let sql = media_item_select_sql("WHERE 1=1");
                 let vals: Vec<sea_orm::Value> = vec![user_id.into()];
-                db.query_all(crate::db::helpers::pg_statement( &sql, vals))
+                db.query_all_raw(crate::db::helpers::pg_statement( &sql, vals))
                     .await
             }
         } else if recursive {
@@ -443,7 +443,7 @@ pub async fn list_media_items(
                     ],
                 )
             };
-            db.query_all(crate::db::helpers::pg_statement( &sql, vals))
+            db.query_all_raw(crate::db::helpers::pg_statement( &sql, vals))
                 .await
         } else if has_list_item_ids {
             let (sql, vals) = if let Some(like) = like_clause {
@@ -455,7 +455,7 @@ pub async fn list_media_items(
             } else {
                 (media_item_select_sql(""), vec![user_id.into()])
             };
-            db.query_all(crate::db::helpers::pg_statement( &sql, vals))
+            db.query_all_raw(crate::db::helpers::pg_statement( &sql, vals))
                 .await
         } else {
             let (sql, vals) = (
@@ -469,7 +469,7 @@ pub async fn list_media_items(
                     parent_id.into(),
                 ],
             );
-            db.query_all(crate::db::helpers::pg_statement( &sql, vals))
+            db.query_all_raw(crate::db::helpers::pg_statement( &sql, vals))
                 .await
         }
         .context("failed to list media items")?;
@@ -493,7 +493,7 @@ pub async fn list_trailers(
     query: &HashMap<String, String>,
 ) -> anyhow::Result<(Vec<MediaItem>, usize)> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &media_item_select_sql(
                 "WHERE media_items.item_type = 'Trailer' ORDER BY media_items.title ASC",
             ),
@@ -522,7 +522,7 @@ fn media_item_select_sql_from_person(where_clause: &str) -> String {
 
 async fn is_collection_or_playlist(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<bool> {
     let row = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             "SELECT item_type FROM media_items WHERE id = ? AND item_type IN ('BoxSet', 'Playlist')",
             vec![item_id.into()],
         ))
@@ -543,7 +543,7 @@ pub async fn latest_media_items(
     if let Some(pid) = parent_id {
         // Determine the collection type for this library
         let collection_type = db
-            .query_one(crate::db::helpers::pg_statement(
+            .query_one_raw(crate::db::helpers::pg_statement(
                 "SELECT collection_type FROM libraries WHERE id = ?",
                 vec![pid.into()],
             ))
@@ -563,7 +563,7 @@ pub async fn latest_media_items(
             item_type_filter
         );
         let mut items = decode_media_items(
-            &db.query_all(crate::db::helpers::pg_statement(
+            &db.query_all_raw(crate::db::helpers::pg_statement(
                 &media_item_select_sql(&where_clause),
                 vec![user_id.into(), pid.into()],
             ))
@@ -575,7 +575,7 @@ pub async fn latest_media_items(
     } else {
         // No parent specified: query each library separately and merge
         let libraries = db
-            .query_all(crate::db::helpers::pg_statement(
+            .query_all_raw(crate::db::helpers::pg_statement(
                 "SELECT id, collection_type FROM libraries ORDER BY name ASC",
                 vec![],
             ))
@@ -598,7 +598,7 @@ pub async fn latest_media_items(
                 item_type_filter
             );
             let items = decode_media_items(
-                &db.query_all(crate::db::helpers::pg_statement(
+                &db.query_all_raw(crate::db::helpers::pg_statement(
                     &media_item_select_sql(&where_clause),
                     vec![user_id.into(), lib_id.clone().into()],
                 ))
@@ -621,7 +621,7 @@ pub async fn resume_media_items(
     user_id: &str,
 ) -> anyhow::Result<Vec<MediaItem>> {
     let mut items = decode_media_items(
-        &db.query_all(crate::db::helpers::pg_statement(
+        &db.query_all_raw(crate::db::helpers::pg_statement(
             r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.is_public, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.premiere_date, media_items.runtime_ticks, media_items.size_bytes, media_items.season_number, media_items.episode_number, media_items.community_rating, media_items.critic_rating, media_items.created_at, media_items.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at
                FROM user_data ud
                JOIN media_items ON media_items.id = ud.item_id
@@ -686,7 +686,7 @@ async fn find_media_item_with_clause(
     where_clause: &str,
 ) -> anyhow::Result<Option<MediaItem>> {
     let row = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             &media_item_select_sql(where_clause),
             vec![user_id.into(), id.into()],
         ))
@@ -788,7 +788,7 @@ pub(super) async fn batch_item_provider_ids<S: AsRef<str>>(
         );
         let values: Vec<sea_orm::Value> = chunk.iter().map(|id| id.as_ref().into()).collect();
         let rows = db
-            .query_all(crate::db::helpers::pg_statement(&sql, values))
+            .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
             .await?;
         for row in &rows {
             let item_id = row.get_str("item_id").unwrap_or_default();
@@ -1050,7 +1050,7 @@ async fn codec_item_ids(db: &DatabaseConnection, codecs: &[String]) -> anyhow::R
     );
     for codec in codecs {
         let rows = db
-            .query_all(crate::db::helpers::pg_statement(
+            .query_all_raw(crate::db::helpers::pg_statement(
                 &sql,
                 vec![codec.as_str().into()],
             ))
@@ -1094,7 +1094,7 @@ async fn width_item_ids(
     };
 
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
         .await
         .context("failed to filter by width")?;
     Ok(rows
@@ -1115,7 +1115,7 @@ async fn parent_item_ids(
     );
     for id in item_ids {
         let rows = db
-            .query_all(crate::db::helpers::pg_statement(
+            .query_all_raw(crate::db::helpers::pg_statement(
                 &sql,
                 vec![id.as_str().into()],
             ))
@@ -1143,7 +1143,7 @@ async fn relation_item_ids(
     );
     for id in ids {
         let rows = db
-            .query_all(crate::db::helpers::pg_statement(
+            .query_all_raw(crate::db::helpers::pg_statement(
                 &sql,
                 vec![id.as_str().into()],
             ))

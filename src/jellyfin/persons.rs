@@ -235,7 +235,7 @@ async fn artist_list(
 
     let rows = state
         .db
-        .query_all(crate::db::helpers::pg_statement(&sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
         .await?;
 
     let person_ids = rows
@@ -548,7 +548,7 @@ async fn fetch_tagged_items(
     values.push(limit.into());
     values.push(start_index.into());
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
         .await?;
 
     let item_ids: Vec<String> = rows
@@ -646,7 +646,7 @@ async fn count_tagged_items(
         }
     }
     let row = db
-        .query_one(crate::db::helpers::pg_statement(&sql, values))
+        .query_one_raw(crate::db::helpers::pg_statement(&sql, values))
         .await?;
     Ok(row.map(|row| row.get_i64("cnt").unwrap_or(0)).unwrap_or(0))
 }

@@ -813,7 +813,7 @@ async fn record_playback_watch_event(
             .unwrap_or_default()
     };
     let ended_at = (event == PlaybackEvent::Stopped).then_some(now);
-    db.execute(crate::db::helpers::pg_statement(
+    db.execute_raw(crate::db::helpers::pg_statement(
         r#"INSERT INTO playback_watch_sessions
            (play_session_id, user_id, item_id, media_source_id, client, device_name, position_ticks, runtime_ticks, is_paused, started_at, last_event_at, ended_at, watch_seconds, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -862,7 +862,7 @@ async fn watch_session_row(
     db: &DatabaseConnection,
     play_session_id: &str,
 ) -> anyhow::Result<Option<WatchSessionRow>> {
-    db.query_one(crate::db::helpers::pg_statement(
+    db.query_one_raw(crate::db::helpers::pg_statement(
         "SELECT item_id, position_ticks, is_paused, last_event_at, ended_at, watch_seconds FROM playback_watch_sessions WHERE play_session_id = ?",
         vec![play_session_id.into()],
     ))
@@ -959,7 +959,7 @@ async fn increment_watch_play_count(
     timestamp: i64,
 ) -> anyhow::Result<()> {
     let day = unix_day(timestamp);
-    db.execute(crate::db::helpers::pg_statement(
+    db.execute_raw(crate::db::helpers::pg_statement(
         r#"INSERT INTO playback_watch_days (day, user_id, item_id, watch_seconds, play_count, last_played_at)
            VALUES (?, ?, ?, 0, 1, ?)
            ON CONFLICT(day, user_id, item_id) DO UPDATE SET
@@ -983,7 +983,7 @@ async fn add_watch_segment(
     }
     let segment_end = segment_start.saturating_add(seconds);
     for (day, day_seconds, last_played_at) in watch_segment_day_slices(segment_start, segment_end) {
-        db.execute(crate::db::helpers::pg_statement(
+        db.execute_raw(crate::db::helpers::pg_statement(
             r#"INSERT INTO playback_watch_days (day, user_id, item_id, watch_seconds, play_count, last_played_at)
                VALUES (?, ?, ?, ?, 0, ?)
                ON CONFLICT(day, user_id, item_id) DO UPDATE SET
@@ -1096,7 +1096,7 @@ async fn playback_runtime_ticks(
     );
     let values: Vec<sea_orm::Value> = item_ids.iter().map(|id| id.as_str().into()).collect();
     Ok(db
-        .query_one(crate::db::helpers::pg_statement(&sql, values))
+        .query_one_raw(crate::db::helpers::pg_statement(&sql, values))
         .await?
         .and_then(|row| row.get_opt_i64("runtime_ticks").ok().flatten()))
 }

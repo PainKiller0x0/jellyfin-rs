@@ -184,7 +184,7 @@ async fn item_lyrics_inner(
 ) -> anyhow::Result<Option<Value>> {
     let visible = visible_media_item_sql("media_items");
     let Some(row) = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             &format!("SELECT title, path, runtime_ticks FROM media_items WHERE id = ? AND item_type = 'Audio' AND {visible}"),
             vec![item_id.into()],
         ))
@@ -260,7 +260,7 @@ async fn lyric_item_info(
     item_id: &str,
 ) -> anyhow::Result<Option<(String, Option<i64>, PathBuf)>> {
     let Some(row) = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             "SELECT title, path, runtime_ticks FROM media_items WHERE id = ? AND item_type = 'Audio'",
             vec![item_id.into()],
         ))
@@ -630,7 +630,7 @@ async fn subtitle_list_inner(
     item_id: &str,
 ) -> anyhow::Result<Vec<Value>> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             "SELECT ms.stream_index, ms.codec, ms.language, ms.title, ms.is_external FROM media_streams ms JOIN media_items mi ON mi.id = ms.item_id WHERE ms.item_id = ? AND ms.stream_type = 'Subtitle' AND mi.is_public = 1 AND (mi.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = mi.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = mi.parent_id AND parent.is_public = 1)) ORDER BY ms.stream_index ASC",
             vec![item_id.into()],
         ))
@@ -655,7 +655,7 @@ async fn subtitle_list_result_inner(
     item_id: &str,
 ) -> anyhow::Result<Option<Value>> {
     let exists = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             "SELECT 1 AS found FROM media_items WHERE id = ? AND is_public = 1 AND (media_items.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = media_items.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = media_items.parent_id AND parent.is_public = 1))",
             vec![item_id.into()],
         ))
@@ -729,7 +729,7 @@ async fn item_counts_inner(
     }
 
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &format!(
                 "SELECT mi.item_type, CASE WHEN mi.item_type = 'Episode' THEN COUNT(DISTINCT (mi.parent_id, COALESCE(mi.season_number, 0), COALESCE(mi.episode_number, 0))) ELSE COUNT(*) END AS count FROM media_items mi{join} WHERE {} GROUP BY mi.item_type",
                 filters.join(" AND ")
@@ -780,7 +780,7 @@ async fn item_counts_response(
     }
 
     let artist_count = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             "SELECT COUNT(DISTINCT person_id) AS count FROM media_people WHERE LOWER(person_type) IN ('artist', 'albumartist')",
             vec![],
         ))
@@ -899,7 +899,7 @@ async fn metadata_editor_info_inner(
     item_id: &str,
 ) -> anyhow::Result<Option<Value>> {
     let row = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             r#"SELECT media_items.item_type, libraries.collection_type
                FROM media_items
                LEFT JOIN libraries ON libraries.id = media_items.library_id
@@ -1345,7 +1345,7 @@ async fn alternate_sources_inner(
         item.parent_id.as_str()
     };
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &item_queries::media_item_select_sql(&format!(
                 "WHERE media_items.parent_id = ? AND media_items.id <> ? AND media_items.item_type = 'Video' AND {} ORDER BY media_items.title ASC",
                 visible_media_item_sql("media_items")
@@ -1395,7 +1395,7 @@ async fn audiobooks_next_up_inner(
     user_id: &str,
 ) -> anyhow::Result<Vec<crate::library::models::MediaItem>> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &item_queries::media_item_select_sql(&format!(
                 "WHERE media_items.item_type = 'Audio' AND media_items.is_folder = 0 AND {} AND COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) > 0 ORDER BY user_data.updated_at DESC",
                 visible_media_item_sql("media_items")

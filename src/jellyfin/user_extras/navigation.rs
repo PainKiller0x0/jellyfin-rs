@@ -100,7 +100,7 @@ async fn filter_values(
         where_clause
     );
     let genres: Vec<String> = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &genres_sql,
             values.clone(),
         ))
@@ -115,7 +115,7 @@ async fn filter_values(
         where_clause
     );
     let years: Vec<i64> = db
-        .query_all(crate::db::helpers::pg_statement(&years_sql, values.clone()))
+        .query_all_raw(crate::db::helpers::pg_statement(&years_sql, values.clone()))
         .await?
         .iter()
         .filter_map(|r| r.get_opt_i64("production_year").ok().flatten())
@@ -127,7 +127,7 @@ async fn filter_values(
         where_clause
     );
     let tags: Vec<String> = db
-        .query_all(crate::db::helpers::pg_statement(&tags_sql, values.clone()))
+        .query_all_raw(crate::db::helpers::pg_statement(&tags_sql, values.clone()))
         .await?
         .iter()
         .filter_map(|r| r.get_opt_str("name").ok().flatten())
@@ -139,7 +139,7 @@ async fn filter_values(
         where_clause
     );
     let studios: Vec<String> = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &studios_sql,
             values.clone(),
         ))
@@ -154,7 +154,7 @@ async fn filter_values(
         where_clause
     );
     let ratings: Vec<String> = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &ratings_sql,
             values.clone(),
         ))
@@ -248,7 +248,7 @@ async fn item_ancestors_inner(
     // Walk up the parent chain
     while let Some(id) = current_id {
         let row = db
-            .query_one(crate::db::helpers::pg_statement(
+            .query_one_raw(crate::db::helpers::pg_statement(
                 &item_queries::media_item_select_sql(
                     "WHERE media_items.id = ? AND media_items.is_public = 1 AND (media_items.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = media_items.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = media_items.parent_id AND parent.is_public = 1))",
                 ),
@@ -327,7 +327,7 @@ pub async fn shows_upcoming(
     );
     let rows = state
         .db
-        .query_all(crate::db::helpers::pg_statement(&sql, vec![user_id.into()]))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, vec![user_id.into()]))
         .await
         .unwrap_or_default();
 
@@ -456,7 +456,7 @@ async fn named_item_by_name_inner(
         relation.table, relation.relation_table, relation.relation_column
     );
     let row = db
-        .query_one(crate::db::helpers::pg_statement(&sql, vec![name.into()]))
+        .query_one_raw(crate::db::helpers::pg_statement(&sql, vec![name.into()]))
         .await?;
 
     Ok(row.map(|r| {

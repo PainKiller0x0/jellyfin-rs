@@ -63,7 +63,7 @@ async fn item_by_file_inner(
         "WHERE media_items.path = ? AND media_items.is_public = 1 AND (media_items.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = media_items.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = media_items.parent_id AND parent.is_public = 1))"
     };
     let row = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             &item_queries::media_item_select_sql(where_clause),
             vec![user_id.into(), path.into()],
         ))
@@ -417,7 +417,7 @@ async fn additional_parts(
     };
 
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &item_queries::media_item_select_sql(
                 "WHERE media_items.parent_id = ? AND media_items.item_type = ? AND media_items.id <> ? AND media_items.is_public = 1 AND (EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = ?) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = ? AND parent.is_public = 1)) ORDER BY media_items.title ASC",
             ),

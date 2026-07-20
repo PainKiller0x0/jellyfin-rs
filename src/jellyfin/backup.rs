@@ -115,7 +115,7 @@ async fn create_pg_backup(state: &AppState, backup_dir: &Path) -> Response {
     // Get all user tables from information_schema
     let tables = match state
         .db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name",
             vec![],
         ))
@@ -140,7 +140,7 @@ async fn create_pg_backup(state: &AppState, backup_dir: &Path) -> Response {
         // Get column names
         let columns = match state
             .db
-            .query_all(crate::db::helpers::pg_statement(
+            .query_all_raw(crate::db::helpers::pg_statement(
                 "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position",
                 vec![table_name.clone().into()],
             ))
@@ -166,7 +166,7 @@ async fn create_pg_backup(state: &AppState, backup_dir: &Path) -> Response {
         );
         let count = match state
             .db
-            .query_one(crate::db::helpers::pg_statement(&count_sql, vec![]))
+            .query_one_raw(crate::db::helpers::pg_statement(&count_sql, vec![]))
             .await
         {
             Ok(Some(row)) => crate::db::row_ext::QueryResultExt::get_i64(&row, "cnt").unwrap_or(0),
@@ -193,7 +193,7 @@ async fn create_pg_backup(state: &AppState, backup_dir: &Path) -> Response {
 
         let rows = match state
             .db
-            .query_all(crate::db::helpers::pg_statement(&select_sql, vec![]))
+            .query_all_raw(crate::db::helpers::pg_statement(&select_sql, vec![]))
             .await
         {
             Ok(r) => r,
@@ -335,14 +335,14 @@ async fn apply_pg_restore(
             .map(|table| format!("\"{}\"", table.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(", ");
-        txn.execute(Statement::from_string(
+        txn.execute_raw(Statement::from_string(
             DbBackend::Postgres,
             format!("TRUNCATE TABLE {table_list} RESTART IDENTITY CASCADE"),
         ))
         .await?;
     }
     for statement in sorted_pg_restore_statements(statements) {
-        txn.execute(Statement::from_string(
+        txn.execute_raw(Statement::from_string(
             DbBackend::Postgres,
             statement.sql.clone(),
         ))

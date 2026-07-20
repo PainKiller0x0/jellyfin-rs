@@ -110,7 +110,7 @@ async fn find_person_as_item(
             let image_tags = crate::jellyfin::persons::person_images(db, &m.id).await?;
             // Get favorite status from user_data
             let is_favorite = db
-                .query_one(crate::db::helpers::pg_statement(
+                .query_one_raw(crate::db::helpers::pg_statement(
                     "SELECT is_favorite FROM user_data WHERE user_id = ? AND item_id = ?",
                     vec![user_id.into(), m.id.clone().into()],
                 ))
@@ -175,7 +175,7 @@ async fn item_json_with_provider_ids(
 
     // Combine provider_ids and image_assets into one query
     let meta_rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             "SELECT 'provider' AS src, provider AS key, provider_item_id AS val, NULL AS etag FROM provider_ids WHERE item_id = ? UNION ALL SELECT 'image' AS src, image_type AS key, NULL AS val, etag FROM image_assets WHERE item_id = ?",
             vec![item.id.clone().into(), item.id.clone().into()],
         ))
@@ -213,7 +213,7 @@ async fn item_json_with_provider_ids(
 
     // Combine genres, tags, studios into one UNION ALL query
     let rel_rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             r#"SELECT 'genre' AS kind, g.id, g.name FROM genres g JOIN media_genres mg ON mg.genre_id = g.id WHERE mg.item_id = ?
                UNION ALL
                SELECT 'tag' AS kind, t.id, t.name FROM tags t JOIN media_tags mt ON mt.tag_id = t.id WHERE mt.item_id = ?
@@ -306,7 +306,7 @@ async fn item_json_with_provider_ids(
     if item.item_type == "Season" {
         let parent_visible = visible_media_item_sql("media_items");
         if let Ok(Some(row)) = db
-            .query_one(crate::db::helpers::pg_statement(
+            .query_one_raw(crate::db::helpers::pg_statement(
                 &format!("SELECT id, title FROM media_items WHERE id = ? AND {parent_visible}"),
                 vec![item.parent_id.clone().into()],
             ))
@@ -326,7 +326,7 @@ async fn item_json_with_provider_ids(
         // RecursiveItemCount for Season = episode count
         let episode_visible = visible_media_item_sql("media_items");
         if let Ok(Some(row)) = db
-            .query_one(crate::db::helpers::pg_statement(
+            .query_one_raw(crate::db::helpers::pg_statement(
                 &format!("SELECT COUNT(DISTINCT (COALESCE(season_number, 0), COALESCE(episode_number, 0))) AS cnt FROM media_items WHERE parent_id = ? AND item_type = 'Episode' AND {episode_visible}"),
                 vec![item.id.clone().into()],
             ))
@@ -338,7 +338,7 @@ async fn item_json_with_provider_ids(
             value["EpisodeCount"] = json!(cnt);
             // UnplayedItemCount = total - played episodes in this season
             if let Ok(Some(ud_row)) = db
-                .query_one(crate::db::helpers::pg_statement(
+                .query_one_raw(crate::db::helpers::pg_statement(
                     &format!("SELECT COUNT(DISTINCT (COALESCE(mi.season_number, 0), COALESCE(mi.episode_number, 0))) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id = ? AND mi.item_type = 'Episode' AND {} AND ud.user_id = ? AND ud.played = 1", visible_media_item_sql("mi")),
                     vec![item.id.clone().into(), user_id.into()],
                 ))
@@ -355,7 +355,7 @@ async fn item_json_with_provider_ids(
         // ChildCount = number of seasons
         let season_visible = visible_media_item_sql("media_items");
         if let Ok(Some(row)) = db
-            .query_one(crate::db::helpers::pg_statement(
+            .query_one_raw(crate::db::helpers::pg_statement(
                 &format!("SELECT COUNT(*) AS cnt FROM media_items WHERE parent_id = ? AND item_type = 'Season' AND {season_visible}"),
                 vec![item.id.clone().into()],
             ))
@@ -369,7 +369,7 @@ async fn item_json_with_provider_ids(
         let episode_visible = visible_media_item_sql("media_items");
         let season_visible = visible_media_item_sql("s");
         if let Ok(Some(row)) = db
-            .query_one(crate::db::helpers::pg_statement(
+            .query_one_raw(crate::db::helpers::pg_statement(
                 &format!("SELECT COUNT(DISTINCT (parent_id, COALESCE(season_number, 0), COALESCE(episode_number, 0))) AS cnt FROM media_items WHERE item_type = 'Episode' AND {episode_visible} AND parent_id IN (SELECT s.id FROM media_items s WHERE s.parent_id = ? AND s.item_type = 'Season' AND {season_visible})"),
                 vec![item.id.clone().into()],
             ))
@@ -381,7 +381,7 @@ async fn item_json_with_provider_ids(
             value["EpisodeCount"] = json!(total_eps);
             // UnplayedItemCount = episodes not played by user
             if let Ok(Some(ud_row)) = db
-                .query_one(crate::db::helpers::pg_statement(
+                .query_one_raw(crate::db::helpers::pg_statement(
                     &format!("SELECT COUNT(DISTINCT (mi.parent_id, COALESCE(mi.season_number, 0), COALESCE(mi.episode_number, 0))) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.item_type = 'Episode' AND {} AND mi.parent_id IN (SELECT s.id FROM media_items s WHERE s.parent_id = ? AND s.item_type = 'Season' AND {}) AND ud.user_id = ? AND ud.played = 1", visible_media_item_sql("mi"), visible_media_item_sql("s")),
                     vec![item.id.clone().into(), user_id.into()],
                 ))
@@ -634,7 +634,7 @@ async fn batch_episode_parent_info(
         .map(|id| (*id).into())
         .collect::<Vec<sea_orm::Value>>();
     let Ok(rows) = db
-        .query_all(crate::db::helpers::pg_statement(&sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
         .await
     else {
         return HashMap::new();
@@ -736,7 +736,7 @@ async fn relation_values(
         "SELECT {table}.id, {table}.name FROM {table} JOIN {relation_table} ON {relation_table}.{relation_column} = {table}.id WHERE {relation_table}.item_id = ? ORDER BY {table}.name ASC"
     );
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, vec![item_id.into()]))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, vec![item_id.into()]))
         .await
         .with_context(|| format!("failed to list {table} for item: {item_id}"))?;
     rows.iter()
@@ -755,7 +755,7 @@ async fn people_values(
     user_id: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             "SELECT people.id, people.name, media_people.role, media_people.person_type, ia.etag AS primary_image_tag FROM people JOIN media_people ON media_people.person_id = people.id LEFT JOIN image_assets ia ON ia.item_id = people.id AND ia.image_type = 'Primary' WHERE media_people.item_id = ? ORDER BY media_people.sort_order ASC, people.name ASC",
             vec![item_id.into()],
         ))
@@ -779,7 +779,7 @@ async fn people_values(
                 vals.push(pid.as_str().into());
             }
             let fav_rows = db
-                .query_all(crate::db::helpers::pg_statement(&sql, vals))
+                .query_all_raw(crate::db::helpers::pg_statement(&sql, vals))
                 .await?;
             let mut m: HashMap<String, bool> = HashMap::new();
             for r in &fav_rows {
@@ -892,7 +892,7 @@ pub async fn enrich_episode_list(
         );
         let values: Vec<sea_orm::Value> = parent_lookup_ids.iter().map(|id| (*id).into()).collect();
         if let Ok(rows) = db
-            .query_all(crate::db::helpers::pg_statement(&sql, values))
+            .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
             .await
         {
             for row in &rows {
@@ -915,7 +915,7 @@ pub async fn enrich_episode_list(
             parent_lookup_ids.iter().map(|id| (*id).into()).collect();
         values.push(user_id.into());
         if let Ok(rows) = db
-            .query_all(crate::db::helpers::pg_statement(&sql, values))
+            .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
             .await
         {
             for row in &rows {
@@ -937,7 +937,7 @@ pub async fn enrich_episode_list(
         );
         let values: Vec<sea_orm::Value> = series_ids.iter().map(|id| id.as_str().into()).collect();
         if let Ok(rows) = db
-            .query_all(crate::db::helpers::pg_statement(&sql, values))
+            .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
             .await
         {
             for row in &rows {
@@ -955,7 +955,7 @@ pub async fn enrich_episode_list(
         );
         let values: Vec<sea_orm::Value> = series_ids.iter().map(|id| id.as_str().into()).collect();
         if let Ok(rows) = db
-            .query_all(crate::db::helpers::pg_statement(&sql, values))
+            .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
             .await
         {
             for row in &rows {
@@ -975,7 +975,7 @@ pub async fn enrich_episode_list(
             series_ids.iter().map(|id| id.as_str().into()).collect();
         values.push(user_id.into());
         if let Ok(rows) = db
-            .query_all(crate::db::helpers::pg_statement(&sql, values))
+            .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
             .await
         {
             for row in &rows {

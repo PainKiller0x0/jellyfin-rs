@@ -13,8 +13,8 @@ use axum::{
     response::IntoResponse,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, DbBackend,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement,
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -1234,7 +1234,7 @@ pub async fn user_usage_stats_user_list(State(state): State<Arc<AppState>>) -> R
 pub async fn user_usage_stats_type_filter_list(State(state): State<Arc<AppState>>) -> Response {
     match state
         .db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             "SELECT item_type, COUNT(*) AS cnt FROM media_items GROUP BY item_type ORDER BY item_type",
             vec![],
         ))
@@ -2218,7 +2218,7 @@ fn image_by_name_info(name: &str, theme: &str, context: &str) -> JsonValue {
 
 async fn game_system_summary_rows(db: &DatabaseConnection) -> anyhow::Result<Vec<JsonValue>> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             "SELECT COALESCE(NULLIF(container, ''), 'unknown') AS system, COUNT(*) AS game_count FROM media_items WHERE item_type = 'Game' GROUP BY COALESCE(NULLIF(container, ''), 'unknown') ORDER BY system",
             vec![],
         ))
@@ -2321,7 +2321,7 @@ async fn play_activity_rows(
            LIMIT 500"#
     );
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
         .await
         .context("failed to load playback activity")?;
     rows.iter()
@@ -2364,7 +2364,7 @@ async fn playback_stats_overview(db: &DatabaseConnection, days: i64) -> anyhow::
     let today = unix_day(today_start);
 
     let totals = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             r#"SELECT COALESCE(SUM(watch_seconds), 0) AS watch_seconds,
                       COALESCE(SUM(play_count), 0) AS play_count,
                       COUNT(DISTINCT user_id) AS user_count,
@@ -2384,7 +2384,7 @@ async fn playback_stats_overview(db: &DatabaseConnection, days: i64) -> anyhow::
         .unwrap_or_default();
 
     let today_watch_seconds = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             "SELECT COALESCE(SUM(watch_seconds), 0) AS watch_seconds FROM playback_watch_days WHERE day = ?",
             vec![today.clone().into()],
         ))
@@ -2415,7 +2415,7 @@ async fn playback_stats_daily(
     days: i64,
 ) -> anyhow::Result<Vec<JsonValue>> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             r#"SELECT day, COALESCE(SUM(watch_seconds), 0) AS watch_seconds,
                       COALESCE(SUM(play_count), 0) AS play_count
                FROM playback_watch_days
@@ -2457,7 +2457,7 @@ async fn playback_stats_top_users(
     start_day: &str,
 ) -> anyhow::Result<Vec<JsonValue>> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             r#"SELECT pwd.user_id,
                       COALESCE(NULLIF(users.display_name, ''), NULLIF(users.username, ''), pwd.user_id) AS user_name,
                       COALESCE(SUM(pwd.watch_seconds), 0) AS watch_seconds,
@@ -2490,7 +2490,7 @@ async fn playback_stats_top_items(
     start_day: &str,
 ) -> anyhow::Result<Vec<JsonValue>> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &format!(
                 r#"SELECT pwd.item_id, mi.title, mi.item_type,
                           {series_id_sql} AS series_id,
@@ -2533,7 +2533,7 @@ async fn playback_stats_top_series(
     start_day: &str,
 ) -> anyhow::Result<Vec<JsonValue>> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &format!(
                 r#"SELECT series_id, series_name,
                           COALESCE(SUM(watch_seconds), 0) AS watch_seconds,
@@ -2614,7 +2614,7 @@ async fn run_user_usage_custom_query(
         "SELECT row_to_json(custom_query)::text AS value FROM ({sql}) AS custom_query LIMIT 500"
     );
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             &wrapped,
             Vec::<sea_orm::Value>::new(),
@@ -3998,9 +3998,9 @@ async fn notification_items(
     let models = ActivityLog::find()
         .filter(activity_log::Column::LogType.eq("Notification"))
         .filter(
-            activity_log::Column::UserId
-                .is_null()
-                .or(activity_log::Column::UserId.eq(user_id)),
+            Condition::any()
+                .add(activity_log::Column::UserId.is_null())
+                .add(activity_log::Column::UserId.eq(user_id)),
         )
         .order_by_desc(activity_log::Column::CreatedAt)
         .all(db)
@@ -4383,7 +4383,7 @@ async fn reports_activity_result(
         format!(" WHERE {}", where_parts.join(" AND "))
     };
     let count_rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &format!(
                 "SELECT COUNT(*) AS cnt FROM activity_log al LEFT JOIN media_items mi ON mi.id = al.item_id{where_sql}"
             ),
@@ -4400,7 +4400,7 @@ async fn reports_activity_result(
     row_values.push((limit as i64).into());
     row_values.push((start_index as i64).into());
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &format!(
                 r#"SELECT al.id, al.name, al.log_type, al.user_id, al.item_id, al.severity, al.created_at, users.username, mi.title AS item_name
                    FROM activity_log al
@@ -4455,7 +4455,7 @@ async fn reports_items_result(
     let (where_sql, values) = report_item_where(query);
     let order_sql = report_item_order(query);
     let count_rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &format!("SELECT COUNT(*) AS cnt FROM media_items mi{where_sql}"),
             values.clone(),
         ))
@@ -4470,7 +4470,7 @@ async fn reports_items_result(
     row_values.push((limit as i64).into());
     row_values.push((start_index as i64).into());
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &format!(
                 r#"SELECT mi.id, mi.title, mi.path, mi.item_type, mi.overview, mi.official_rating, mi.production_year, mi.premiere_date,
                           mi.runtime_ticks, mi.size_bytes, mi.season_number, mi.episode_number,

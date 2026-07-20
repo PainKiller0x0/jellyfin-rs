@@ -56,7 +56,7 @@ async fn similar_items_inner(
     }
 
     let similar_ids = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             r#"SELECT mg_rel.item_id
                FROM media_genres mg_src
                JOIN media_genres mg_rel ON mg_src.genre_id = mg_rel.genre_id AND mg_src.item_id <> mg_rel.item_id
@@ -93,7 +93,7 @@ async fn similar_items_inner(
         values.push(id.as_str().into());
     }
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
         .await
         .context("failed to fetch similar items")?;
     item_queries::decode_media_items(&rows)
@@ -197,7 +197,7 @@ async fn search_hints_inner(
         }
     }
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
         .await
         .context("failed to fetch search hints")?;
 
@@ -325,7 +325,7 @@ async fn next_up_inner(
     let values = vec![user_id.into(), user_id.into()];
 
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
         .await
         .context("failed to list next up episodes")?;
 
@@ -349,7 +349,7 @@ async fn next_up_for_series(
         item_queries::media_item_select_sql("")
     );
     let resume_rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &resume_sql,
             vec![user_id.into(), series_id.into()],
         ))
@@ -380,7 +380,7 @@ async fn next_up_for_series(
            LIMIT 1"#
     );
     let last_played = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             &last_played_sql,
             vec![user_id.into(), series_id.into()],
         ))
@@ -408,7 +408,7 @@ async fn next_up_for_series(
         item_queries::media_item_select_sql("")
     );
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&next_sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(&next_sql, values))
         .await
         .context("failed to list series next up episodes")?;
     item_queries::decode_media_items(&rows)

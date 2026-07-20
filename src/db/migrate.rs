@@ -26,7 +26,7 @@ pub async fn ensure_database_exists(database_url: &str) -> anyhow::Result<()> {
     })?;
 
     let exists = db
-        .query_one(pg_statement(
+        .query_one_raw(pg_statement(
             "SELECT 1 FROM pg_database WHERE datname = ?",
             vec![database_name.clone().into()],
         ))
@@ -34,7 +34,7 @@ pub async fn ensure_database_exists(database_url: &str) -> anyhow::Result<()> {
         .context("failed to check PostgreSQL database existence")?
         .is_some();
     if !exists {
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             DbBackend::Postgres,
             format!("CREATE DATABASE {}", quote_ident(&database_name)),
         ))
@@ -95,7 +95,7 @@ async fn execute_migration(
     sql: &str,
     context: &'static str,
 ) -> anyhow::Result<()> {
-    db.execute(Statement::from_string(DbBackend::Postgres, sql.to_string()))
+    db.execute_raw(Statement::from_string(DbBackend::Postgres, sql.to_string()))
         .await
         .context(context)?;
     Ok(())
@@ -103,7 +103,7 @@ async fn execute_migration(
 
 async fn execute_optional_migration(db: &DatabaseConnection, sql: &str, context: &'static str) {
     if let Err(error) = db
-        .execute(Statement::from_string(DbBackend::Postgres, sql.to_string()))
+        .execute_raw(Statement::from_string(DbBackend::Postgres, sql.to_string()))
         .await
     {
         let message = error.to_string().to_ascii_lowercase();
@@ -151,7 +151,7 @@ pub async fn test_db() -> Option<DatabaseConnection> {
         format!("SET search_path TO {quoted_schema}"),
     ] {
         if let Err(error) = db
-            .execute(Statement::from_string(DbBackend::Postgres, sql))
+            .execute_raw(Statement::from_string(DbBackend::Postgres, sql))
             .await
         {
             eprintln!("skipping database test: failed to initialize schema: {error}");

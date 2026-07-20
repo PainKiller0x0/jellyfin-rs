@@ -194,7 +194,7 @@ async fn enrich_season_list(
             format!("SELECT id, title FROM media_items WHERE id IN ({placeholders}) AND {visible}");
         let values: Vec<sea_orm::Value> = series_ids.iter().map(|id| id.as_str().into()).collect();
         if let Ok(rows) = db
-            .query_all(crate::db::helpers::pg_statement(&sql, values))
+            .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
             .await
         {
             for row in &rows {
@@ -215,7 +215,7 @@ async fn enrich_season_list(
         );
         let values: Vec<sea_orm::Value> = season_ids.iter().map(|id| id.as_str().into()).collect();
         if let Ok(rows) = db
-            .query_all(crate::db::helpers::pg_statement(&sql, values))
+            .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
             .await
         {
             for row in &rows {
@@ -238,7 +238,7 @@ async fn enrich_season_list(
             season_ids.iter().map(|id| id.as_str().into()).collect();
         values.push(user_id.into());
         if let Ok(rows) = db
-            .query_all(crate::db::helpers::pg_statement(&sql, values))
+            .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
             .await
         {
             for row in &rows {
@@ -290,7 +290,7 @@ async fn child_items_by_type(
         "ORDER BY media_items.title ASC"
     };
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &crate::jellyfin::item_queries::media_item_select_sql(&format!(
                 "WHERE media_items.parent_id = ? AND media_items.item_type = ? AND {} {order}",
                 visible_media_item_sql("media_items")
@@ -327,7 +327,7 @@ async fn descendant_episodes(
     show_id: &str,
 ) -> anyhow::Result<Vec<MediaItem>> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &format!(
                 r#"WITH RECURSIVE tree(id) AS (SELECT media_items.id FROM media_items WHERE media_items.id = ? AND {} UNION ALL SELECT media_items.id FROM media_items JOIN tree ON media_items.parent_id = tree.id WHERE {}) {} WHERE media_items.id IN (SELECT id FROM tree WHERE id <> ?) AND media_items.item_type = 'Episode' AND {} ORDER BY media_items.title ASC"#,
                 visible_media_item_sql("media_items"),

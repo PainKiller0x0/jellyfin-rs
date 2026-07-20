@@ -152,7 +152,7 @@ async fn download_season_images(
     tmdb_base_url: Option<&str>,
 ) {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             r#"SELECT s.id as season_id,
                       s.title,
                       s.season_number,
@@ -364,7 +364,7 @@ pub async fn fetch_and_apply_season_tmdb_metadata(
     tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<bool> {
     let Some(row) = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             r#"SELECT s.id AS season_id,
                       s.title,
                       s.path,
@@ -509,7 +509,7 @@ pub async fn fetch_and_apply_episode_tmdb_metadata(
     tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<bool> {
     let Some(row) = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             r#"SELECT e.id AS episode_id,
                       e.title AS episode_title,
                       e.path AS episode_path,
@@ -677,7 +677,7 @@ pub async fn batch_fetch_episode_tmdb(
     // First: download season images for all seasons
     download_season_images(db, api_key, client, tmdb_base_url).await;
 
-    let rows = db.query_all(crate::db::helpers::pg_statement(
+    let rows = db.query_all_raw(crate::db::helpers::pg_statement(
         r#"SELECT e.id as episode_id,
                   e.title as episode_title,
                   e.path as episode_path,
@@ -1089,7 +1089,7 @@ pub async fn fill_missing_tmdb(
     client: &reqwest::Client,
     tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<usize> {
-    let rows = db.query_all(crate::db::helpers::pg_statement(
+    let rows = db.query_all_raw(crate::db::helpers::pg_statement(
         r#"SELECT mi.id, mi.title, mi.path, mi.item_type FROM media_items mi WHERE mi.is_folder = 1 AND mi.item_type IN ('Movie', 'Series') AND NOT EXISTS (SELECT 1 FROM provider_ids p WHERE p.item_id = mi.id AND p.provider = 'Tmdb')"#,
         vec![],
     )).await?;
@@ -1166,7 +1166,7 @@ pub async fn refresh_existing_tmdb_titles(
     }
 
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             r#"SELECT mi.id, mi.title, mi.item_type, p.provider_item_id AS tmdb_id
                FROM media_items mi
                JOIN provider_ids p ON p.item_id = mi.id AND p.provider = 'Tmdb'

@@ -119,7 +119,7 @@ async fn list_extended_video_types_inner(
         "SELECT mi.extended_video_type FROM media_items mi WHERE {visible} AND mi.extended_video_type IS NOT NULL AND mi.extended_video_type <> ''"
     );
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, vec![]))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, vec![]))
         .await
         .context("failed to list extended video types")?;
 
@@ -191,7 +191,7 @@ async fn list_prefixes(
         column, table, column, column
     );
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, vec![]))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, vec![]))
         .await
         .context("failed to list prefixes")?;
     Ok(rows
@@ -217,7 +217,7 @@ async fn list_years_inner(
         "SELECT DISTINCT mi.production_year FROM media_items mi WHERE {visible} AND mi.production_year IS NOT NULL AND mi.production_year > 0 ORDER BY mi.production_year DESC"
     );
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, vec![]))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, vec![]))
         .await
         .context("failed to list years")?;
 
@@ -244,7 +244,7 @@ async fn year_exists(db: &DatabaseConnection, year: i64) -> anyhow::Result<bool>
         "SELECT COUNT(*) AS cnt FROM media_items mi WHERE {visible} AND mi.production_year = ?"
     );
     let row = db
-        .query_one(crate::db::helpers::pg_statement(&sql, vec![year.into()]))
+        .query_one_raw(crate::db::helpers::pg_statement(&sql, vec![year.into()]))
         .await
         .context("failed to check year")?;
     Ok(row
@@ -299,7 +299,7 @@ async fn list_distinct_values_inner(
         "SELECT DISTINCT mi.{column} FROM {table} mi WHERE {visible} AND mi.{column} IS NOT NULL AND mi.{column} <> '' ORDER BY mi.{column} ASC"
     );
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, vec![]))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, vec![]))
         .await
         .with_context(|| format!("failed to list distinct {column} from {table}"))?;
 
@@ -340,7 +340,7 @@ async fn list_media_stream_values_inner(
         "SELECT DISTINCT media_streams.{column} FROM media_streams JOIN media_items mi ON mi.id = media_streams.item_id WHERE {visible} AND media_streams.{column} IS NOT NULL AND media_streams.{column} <> '' ORDER BY media_streams.{column} ASC"
     );
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(&sql, vec![]))
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, vec![]))
         .await
         .with_context(|| format!("failed to list distinct {column} from media_streams"))?;
 
@@ -466,7 +466,7 @@ async fn list_filter_items_inner(
                         "SELECT DISTINCT p.id, p.name, ia.etag AS primary_image_tag FROM people p JOIN user_data ud ON ud.item_id = p.id JOIN media_people mp ON mp.person_id = p.id JOIN media_items mi ON mi.id = mp.item_id LEFT JOIN image_assets ia ON ia.item_id = p.id AND ia.image_type = 'Primary' WHERE {visible} AND ud.user_id = ? AND ud.is_favorite = 1 ORDER BY p.name ASC"
                     );
                     let models = db
-                        .query_all(crate::db::helpers::pg_statement(
+                        .query_all_raw(crate::db::helpers::pg_statement(
                             &sql,
                             vec![uid.as_str().into()],
                         ))
@@ -561,7 +561,7 @@ async fn list_public_related_items(
         "SELECT DISTINCT named.id, named.name FROM {table} named JOIN {relation_table} rel ON rel.{relation_column} = named.id JOIN media_items mi ON mi.id = rel.item_id WHERE {visible} ORDER BY named.name ASC"
     );
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             &sql,
             Vec::<DbValue>::new(),
         ))
@@ -600,7 +600,7 @@ async fn list_prefixes_sql(
     values: Vec<DbValue>,
 ) -> anyhow::Result<Vec<Value>> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(sql, values))
         .await
         .context("failed to list prefixes")?;
     Ok(rows

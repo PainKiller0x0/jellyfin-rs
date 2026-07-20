@@ -5,7 +5,7 @@ use std::{
 
 use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
-    password_hash::{SaltString, rand_core::OsRng},
+    password_hash::{Salt, SaltString},
 };
 use uuid::Uuid;
 
@@ -56,7 +56,11 @@ pub fn yyyy_mm_dd_to_jellyfin_date(value: &str) -> Option<String> {
 }
 
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
+    let mut salt_bytes = [0u8; Salt::RECOMMENDED_LENGTH];
+    getrandom::fill(&mut salt_bytes)
+        .map_err(|err| anyhow::anyhow!("failed to generate password salt: {err}"))?;
+    let salt = SaltString::encode_b64(&salt_bytes)
+        .map_err(|err| anyhow::anyhow!("failed to encode password salt: {err}"))?;
     Ok(Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map_err(|err| anyhow::anyhow!("failed to hash password: {err}"))?

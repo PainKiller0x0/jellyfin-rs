@@ -644,7 +644,7 @@ async fn collage_source_images(
     };
 
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             r#"SELECT ia.path
                FROM media_items mi
                JOIN image_assets ia ON ia.item_id = mi.id

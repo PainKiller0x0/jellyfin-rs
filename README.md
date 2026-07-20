@@ -39,10 +39,10 @@
 
 ### 依赖
 
-- Rust 1.85 或更新版本
+- Rust 1.97.1 或更新版本
 - PostgreSQL
 - `ffmpeg`/`ffprobe`，用于媒体探测和未来增强能力
-- Node.js、pnpm 11.3，用于构建管理后台
+- Node.js、pnpm 11.15.1，用于构建管理后台
 
 ### 本地运行
 

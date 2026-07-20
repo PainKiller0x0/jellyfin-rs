@@ -14,9 +14,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_VERSION: "1.85"
+  RUST_VERSION: "1.97.1"
   NODE_VERSION: "24"
-  PNPM_VERSION: "11.3.0"
+  PNPM_VERSION: "11.15.1"
 
 jobs:
   backend:
@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.85
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt
 

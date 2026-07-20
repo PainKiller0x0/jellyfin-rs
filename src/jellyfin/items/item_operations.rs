@@ -174,7 +174,7 @@ async fn descendant_item_rows(
     item_id: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let rows = db
-        .query_all(crate::db::helpers::pg_statement(
+        .query_all_raw(crate::db::helpers::pg_statement(
             r#"WITH RECURSIVE tree(id, path) AS (SELECT id, path FROM media_items WHERE id = ? UNION ALL SELECT media_items.id, media_items.path FROM media_items JOIN tree ON media_items.parent_id = tree.id) SELECT id, path FROM tree"#,
             vec![item_id.into()],
         ))

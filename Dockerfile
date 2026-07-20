@@ -1,12 +1,12 @@
 FROM node:24-bookworm-slim AS admin-builder
 WORKDIR /app/admin
-RUN npm install -g pnpm@11.3.0
+RUN npm install -g pnpm@11.15.1
 COPY admin/package.json admin/pnpm-lock.yaml admin/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY admin/ ./
 RUN pnpm build
 
-FROM rust:1.85 AS builder
+FROM rust:1.97.1 AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs

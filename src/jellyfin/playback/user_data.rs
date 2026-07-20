@@ -482,7 +482,7 @@ pub(crate) async fn playback_user_data_item_ids(
     item_id: &str,
 ) -> anyhow::Result<Vec<String>> {
     let Some(row) = db
-        .query_one(crate::db::helpers::pg_statement(
+        .query_one_raw(crate::db::helpers::pg_statement(
             "SELECT mi.id, mi.parent_id, mi.item_type, mi.is_folder, mi.season_number, mi.episode_number, parent.item_type AS parent_item_type, parent.is_folder AS parent_is_folder FROM media_items mi LEFT JOIN media_items parent ON parent.id = mi.parent_id WHERE mi.id = ?",
             vec![item_id.into()],
         ))
@@ -555,7 +555,7 @@ async fn item_ids_from_query(
     fallback_item_id: &str,
 ) -> anyhow::Result<Vec<String>> {
     let mut item_ids = db
-        .query_all(crate::db::helpers::pg_statement(sql, values))
+        .query_all_raw(crate::db::helpers::pg_statement(sql, values))
         .await?
         .iter()
         .filter_map(|row| row.get_opt_str("id").ok().flatten())

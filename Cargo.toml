@@ -11,6 +11,7 @@ argon2 = "0.5"
 axum = { version = "0.8", features = ["macros", "ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+cpu = "0.2.0"
 fastrand = "2.3"
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli"] }

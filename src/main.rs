@@ -9,7 +9,6 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use sea_orm::{ConnectOptions, Database};
 use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
 use tokio::{net::TcpListener, signal};
@@ -55,17 +54,10 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("invalid listen address")?;
 
-    let database_url = std::env::var("JELLYFIN_RS_DATABASE_URL")
-        .ok()
-        .filter(|url| !url.trim().is_empty())
-        .unwrap_or_else(|| db::DEFAULT_DATABASE_URL.to_string());
+    let database_url = db::database_url_from_env();
     db::ensure_database_exists(&database_url).await?;
 
-    let mut opt = ConnectOptions::new(database_url.clone());
-    opt.max_connections(20).sqlx_logging(false);
-    let db = Database::connect(opt)
-        .await
-        .with_context(|| format!("failed to connect database: {database_url}"))?;
+    let db = db::connect_foreground_database(&database_url).await?;
     db::migrate(&db).await?;
 
     let default_username =
@@ -129,12 +121,20 @@ async fn main() -> anyhow::Result<()> {
         .filter(|k| !k.is_empty())
     {
         let ep_state = state.clone();
+        let metadata_database_url = database_url.clone();
         tokio::spawn(async move {
+            let metadata_db = match crate::db::background_connection(&metadata_database_url).await {
+                Ok(db) => db,
+                Err(error) => {
+                    tracing::warn!("background TMDb metadata task skipped: {error:#}");
+                    return;
+                }
+            };
             // First: fill in missing TMDb IDs for movies/series without tags
             let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
             let tmdb_client = ep_state.tmdb_http_client().await;
             match library::tmdb_metadata::fill_missing_tmdb(
-                &ep_state.db,
+                &metadata_db,
                 &api_key,
                 &tmdb_client,
                 tmdb_base_url.as_deref(),
@@ -153,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             match library::tmdb_metadata::refresh_existing_tmdb_titles(
-                &ep_state.db,
+                &metadata_db,
                 &api_key,
                 &tmdb_client,
                 tmdb_base_url.as_deref(),
@@ -173,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
             let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
             let tmdb_client = ep_state.tmdb_http_client().await;
             match library::tmdb_metadata::batch_fetch_person_tmdb(
-                &ep_state.db,
+                &metadata_db,
                 &api_key,
                 &tmdb_client,
                 tmdb_base_url.as_deref(),
@@ -195,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
             let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
             let tmdb_client = ep_state.tmdb_http_client().await;
             match library::tmdb_metadata::batch_fetch_episode_tmdb(
-                &ep_state.db,
+                &metadata_db,
                 &api_key,
                 &tmdb_client,
                 tmdb_base_url.as_deref(),
@@ -215,11 +215,18 @@ async fn main() -> anyhow::Result<()> {
 
     {
         let douban_state = state.clone();
+        let douban_database_url = database_url.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let douban_db = match crate::db::background_connection(&douban_database_url).await {
+                Ok(db) => db,
+                Err(error) => {
+                    tracing::warn!("background Douban metadata task skipped: {error:#}");
+                    return;
+                }
+            };
             let cookie = douban_state.douban_cookie.read().await.clone();
-            match library::douban_metadata::fill_missing_douban(&douban_state.db, cookie.as_deref())
-                .await
+            match library::douban_metadata::fill_missing_douban(&douban_db, cookie.as_deref()).await
             {
                 Ok(0) => tracing::info!("No missing Douban metadata to fill"),
                 Ok(n) => tracing::info!("Filled Douban metadata for {n} items via name search"),

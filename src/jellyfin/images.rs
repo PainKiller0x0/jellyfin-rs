@@ -10,7 +10,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose};
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
     sea_query::OnConflict,
 };
 use serde::Deserialize;
@@ -18,10 +18,11 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::{
     app::state::AppState,
+    db::row_ext::QueryResultExt,
     entities::{
         image_assets::{self, Entity as ImageAssets},
         libraries::Entity as Libraries,
-        media_items::{self, Entity as MediaItems},
+        media_items::Entity as MediaItems,
     },
     jellyfin::common::{
         image as placeholder_image, internal_error, ok_response, wants_json_response,
@@ -44,6 +45,7 @@ const MAX_BASE64_IMAGE_BODY_BYTES: usize = 14 * 1024 * 1024;
 const MAX_REMOTE_IMAGE_URL_BODY_BYTES: usize = 4096;
 const MAX_IMAGE_INDEX: i64 = 255;
 const MAX_IMAGE_ID_BYTES: usize = 128;
+const COLLAGE_SOURCE_IMAGE_LIMIT: i64 = 12;
 
 type LegacyItemImagePath = (
     String,
@@ -640,65 +642,45 @@ async fn collage_source_images(
     } else {
         "Primary"
     };
-    let children = MediaItems::find()
-        .filter(media_items::Column::ParentId.eq(item_id))
-        .order_by_asc(media_items::Column::Title)
-        .all(db)
+
+    let rows = db
+        .query_all(crate::db::helpers::pg_statement(
+            r#"SELECT ia.path
+               FROM media_items mi
+               JOIN image_assets ia ON ia.item_id = mi.id
+               WHERE mi.parent_id = ?
+                 AND mi.is_public = 1
+                 AND ia.image_type = ?
+                 AND ia.path IS NOT NULL
+                 AND (mi.parent_id = ''
+                      OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = mi.parent_id)
+                      OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = mi.parent_id AND parent.is_public = 1))
+               ORDER BY mi.title ASC, ia.image_index ASC
+               LIMIT ?"#,
+            vec![
+                item_id.into(),
+                preferred_type.into(),
+                COLLAGE_SOURCE_IMAGE_LIMIT.into(),
+            ],
+        ))
         .await
-        .context("failed to find child images for collage")?;
+        .context("failed to find child image assets for collage")?;
 
     let mut images = Vec::new();
-    for child in children {
-        if !visible_media_item(db, &child).await? {
+    for row in rows {
+        let Some(path) = row.get_opt_str("path")? else {
             continue;
+        };
+        if image_storage_path_allowed(&path) {
+            if let Ok(bytes) = tokio::fs::read(&path).await {
+                images.push(bytes);
+            }
         }
-        let assets = ImageAssets::find()
-            .filter(image_assets::Column::ItemId.eq(&child.id))
-            .filter(image_assets::Column::ImageType.eq(preferred_type))
-            .order_by_asc(image_assets::Column::ImageIndex)
-            .all(db)
-            .await
-            .context("failed to find child image assets for collage")?;
-        for asset in assets {
-            let Some(path) = asset.path else {
-                continue;
-            };
-            if image_storage_path_allowed(&path) {
-                if let Ok(bytes) = tokio::fs::read(&path).await {
-                    images.push(bytes);
-                }
-            }
-            if images.len() >= 4 {
-                return Ok(images);
-            }
+        if images.len() >= 4 {
+            return Ok(images);
         }
     }
     Ok(images)
-}
-
-async fn visible_media_item(
-    db: &DatabaseConnection,
-    item: &media_items::Model,
-) -> anyhow::Result<bool> {
-    if item.is_public == 0 {
-        return Ok(false);
-    }
-    if item.parent_id.is_empty() {
-        return Ok(true);
-    }
-    if Libraries::find_by_id(item.parent_id.clone())
-        .one(db)
-        .await
-        .context("failed to check parent library visibility")?
-        .is_some()
-    {
-        return Ok(true);
-    }
-    Ok(MediaItems::find_by_id(item.parent_id.clone())
-        .one(db)
-        .await
-        .context("failed to check parent item visibility")?
-        .is_some_and(|parent| parent.is_public != 0))
 }
 
 fn image_response(bytes: Vec<u8>, content_type: &'static str, etag: String) -> Response {

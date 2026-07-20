@@ -112,9 +112,6 @@ docker compose up --build
 | `JELLYFIN_RS_FFPROBE_PATH` | `ffprobe` | 媒体流探测工具路径 |
 | `JELLYFIN_RS_FFPROBE_ANALYZE_DURATION` | `30000000` | ffprobe `-analyzeduration` 参数，设为 `0` 可不传 |
 | `JELLYFIN_RS_FFPROBE_PROBE_SIZE` | `100000000` | ffprobe `-probesize` 参数，设为 `0` 可不传 |
-| `JELLYFIN_RS_MEDIA_PROBE_CONCURRENCY` | `4` | 媒体探测并发数 |
-| `JELLYFIN_RS_METADATA_FETCH_CONCURRENCY` | `2` | 元数据补全并发数 |
-| `JELLYFIN_RS_MEDIA_PROBE_QUEUE_CAPACITY` | `1024` | 媒体探测队列容量 |
 | `JELLYFIN_RS_WATCH_DEBOUNCE_SECONDS` | `10` | 文件变化触发扫描前的防抖秒数 |
 | `JELLYFIN_RS_WATCH_POLL_SECONDS` | `60` | 文件监听轮询兜底间隔，设为 `0` 可关闭轮询 |
 | `JELLYFIN_RS_SESSION_TIMEOUT_SECONDS` | `120` | 播放会话超时秒数 |
@@ -123,6 +120,8 @@ docker compose up --build
 | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` | 无 | 标准代理变量，包括 TMDb 官方与 TMDb 反代请求 |
 | `NO_PROXY` | `localhost,127.0.0.1,::1` | 标准代理绕过列表 |
 | `JELLYFIN_RS_NO_PROXY` | 无 | 禁用通用代理 |
+
+媒体入库的数据库连接池、媒体探测并发、元数据补全并发和队列容量会根据 CPU 核心数自动计算，不提供环境变量覆盖，以优先保证用户播放和查询响应。
 | `JELLYFIN_RS_TMDB_API_KEY` | 无 | 启动时读取的 TMDb API Key，也可在后台设置 |
 | `JELLYFIN_RS_IP2REGION_V4_XDB` | 内置数据库 | 自定义 IPv4 离线归属地库路径 |
 

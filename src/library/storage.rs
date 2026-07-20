@@ -1,9 +1,9 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use anyhow::{Context, bail};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, Set, sea_query::OnConflict,
+    QueryOrder, QuerySelect, Set, sea_query::OnConflict,
 };
 
 use crate::{
@@ -51,6 +51,9 @@ pub struct CachedMediaProbe {
     pub runtime_ticks: Option<i64>,
     pub size_bytes: Option<i64>,
 }
+
+const MISSING_CLEANUP_BATCH_SIZE: u64 = 500;
+const MISSING_CLEANUP_PAUSE: Duration = Duration::from_millis(2);
 
 impl ScannedMediaItem {
     #[allow(clippy::too_many_arguments)]
@@ -991,27 +994,72 @@ async fn delete_stale_generated_stream_id(
 
 pub async fn remove_missing_media_items(
     db: &DatabaseConnection,
+    library_ids: &[String],
     seen_paths: &[String],
 ) -> anyhow::Result<()> {
+    if library_ids.is_empty() {
+        return Ok(());
+    }
+
     let seen_paths = seen_paths
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let items = MediaItems::find()
-        .all(db)
-        .await
-        .context("failed to list media items for cleanup")?;
-    for item in &items {
-        let id = item.id.clone();
-        let path = item.path.clone();
-        if !seen_paths.contains(path.as_str()) && !std::path::Path::new(&path).exists() {
+    let library_ids = library_ids
+        .iter()
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if library_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut last_id = None::<String>;
+    loop {
+        let mut query = MediaItems::find()
+            .filter(media_items::Column::LibraryId.is_in(library_ids.clone()))
+            .order_by_asc(media_items::Column::Id)
+            .limit(MISSING_CLEANUP_BATCH_SIZE);
+        if let Some(last_id) = last_id.as_deref() {
+            query = query.filter(media_items::Column::Id.gt(last_id));
+        }
+
+        let items = query
+            .all(db)
+            .await
+            .context("failed to list media items for cleanup")?;
+        if items.is_empty() {
+            break;
+        }
+
+        last_id = items.last().map(|item| item.id.clone());
+        for item in items {
+            let id = item.id.clone();
+            let path = item.path.clone();
+            if seen_paths.contains(path.as_str()) || cleanup_path_exists(&path).await {
+                continue;
+            }
             MediaItems::delete_by_id(id)
                 .exec(db)
                 .await
                 .with_context(|| format!("failed to delete missing media item: {path}"))?;
         }
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(MISSING_CLEANUP_PAUSE).await;
     }
     Ok(())
+}
+
+async fn cleanup_path_exists(path: &str) -> bool {
+    match tokio::fs::metadata(path).await {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            tracing::debug!("skipping missing-media cleanup for unreadable path {path}: {error}");
+            true
+        }
+    }
 }
 
 #[cfg(test)]

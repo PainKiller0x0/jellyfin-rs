@@ -37,11 +37,10 @@ use crate::{
 
 const MEDIA_PROBE_CACHE_VERSION_KEY: &str = "media_probe_cache_version";
 const MEDIA_PROBE_CACHE_VERSION: &str = "3";
-const DEFAULT_MEDIA_PROBE_CONCURRENCY: usize = 4;
-const DEFAULT_MEDIA_PROBE_QUEUE_CAPACITY: usize = 1024;
-const DEFAULT_INGEST_CONCURRENCY: usize = 1;
-const DEFAULT_INGEST_QUEUE_CAPACITY: usize = 4096;
-const DEFAULT_METADATA_FETCH_CONCURRENCY: usize = 2;
+const MIN_INGEST_QUEUE_CAPACITY: usize = 512;
+const MAX_INGEST_QUEUE_CAPACITY: usize = 4096;
+const MIN_MEDIA_PROBE_QUEUE_CAPACITY: usize = 128;
+const MAX_MEDIA_PROBE_QUEUE_CAPACITY: usize = 1024;
 const METADATA_FETCH_MAX_ATTEMPTS: usize = 30;
 const METADATA_FETCH_RETRY_DELAY_SECS: u64 = 2;
 
@@ -128,34 +127,39 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
         }
     };
 
-    let force_probe = !media_probe_cache_is_current(&state.db).await?;
+    let scan_database_url = crate::db::database_url_from_env();
+    let scan_db = crate::db::background_connection(&scan_database_url).await?;
+
+    let force_probe = !media_probe_cache_is_current(&scan_db).await?;
     if force_probe {
         tracing::info!("media probe cache version changed; forcing one-time media stream reprobe");
     }
 
     let probe_tx =
-        start_media_probe_pipeline(state.db.clone(), force_probe.then(|| state.db.clone()));
+        start_media_probe_pipeline(scan_db.clone(), force_probe.then(|| scan_db.clone()));
     let mut tasks = tokio::task::JoinSet::new();
     let api_key = state.tmdb_api_key.read().await.clone().unwrap_or_default();
     let douban_cookie = state.douban_cookie.read().await.clone();
     let metadata_tx = start_metadata_fetch_pipeline(
-        state.db.clone(),
+        scan_db.clone(),
         api_key.clone(),
         state.tmdb_proxy_url.clone(),
         state.tmdb_http_client.clone(),
         douban_cookie,
     );
     let ingest_pipeline = start_ingest_pipeline(
-        state.db.clone(),
+        scan_db.clone(),
         force_probe,
         probe_tx.clone(),
         metadata_tx.clone(),
     );
+    let mut scanned_library_ids = Vec::new();
     for (root, library_id, collection_type) in roots {
         if !root.exists() {
             tracing::warn!("media directory does not exist: {}", root.display());
             continue;
         }
+        scanned_library_ids.push(library_id.clone());
         let ingest_tx = ingest_pipeline.tx.clone();
         tasks.spawn(async move { scan_root(root, library_id, collection_type, ingest_tx).await });
     }
@@ -186,7 +190,9 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
     drop(probe_tx);
     drop(metadata_tx);
 
-    remove_missing_media_items(&state.db, &all_seen).await?;
+    scanned_library_ids.sort();
+    scanned_library_ids.dedup();
+    remove_missing_media_items(&scan_db, &scanned_library_ids, &all_seen).await?;
     tracing::info!(
         "media scan discovered {total} file item(s) across all libraries; queued {ingest_queued} ingest job(s)"
     );
@@ -1069,43 +1075,28 @@ async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String, S
 }
 
 fn media_probe_concurrency() -> usize {
-    std::env::var("JELLYFIN_RS_MEDIA_PROBE_CONCURRENCY")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_MEDIA_PROBE_CONCURRENCY)
+    (crate::db::cpu_parallelism() / 4).clamp(1, 3)
 }
 
 fn ingest_concurrency() -> usize {
-    std::env::var("JELLYFIN_RS_INGEST_CONCURRENCY")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_INGEST_CONCURRENCY)
+    (crate::db::cpu_parallelism() / 4).clamp(1, 2)
 }
 
 fn metadata_fetch_concurrency() -> usize {
-    std::env::var("JELLYFIN_RS_METADATA_FETCH_CONCURRENCY")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_METADATA_FETCH_CONCURRENCY)
+    (crate::db::cpu_parallelism() / 4).clamp(1, 2)
 }
 
 fn ingest_queue_capacity() -> usize {
-    std::env::var("JELLYFIN_RS_INGEST_QUEUE_CAPACITY")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_INGEST_QUEUE_CAPACITY)
+    crate::db::cpu_parallelism()
+        .saturating_mul(512)
+        .clamp(MIN_INGEST_QUEUE_CAPACITY, MAX_INGEST_QUEUE_CAPACITY)
 }
 
 fn media_probe_queue_capacity() -> usize {
-    std::env::var("JELLYFIN_RS_MEDIA_PROBE_QUEUE_CAPACITY")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_MEDIA_PROBE_QUEUE_CAPACITY)
+    crate::db::cpu_parallelism().saturating_mul(128).clamp(
+        MIN_MEDIA_PROBE_QUEUE_CAPACITY,
+        MAX_MEDIA_PROBE_QUEUE_CAPACITY,
+    )
 }
 
 async fn media_probe_cache_is_current(db: &sea_orm::DatabaseConnection) -> anyhow::Result<bool> {

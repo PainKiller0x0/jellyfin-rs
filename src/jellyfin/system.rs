@@ -2271,7 +2271,7 @@ fn current_process_usage() -> JsonValue {
         "Name": env!("CARGO_PKG_NAME"),
         "Path": exe.as_ref().and_then(|path| path.to_str()).unwrap_or_default(),
         "WorkingSetBytes": metadata.as_ref().map(|meta| meta.len()).unwrap_or_default(),
-        "ThreadCount": std::thread::available_parallelism().map(|value| value.get()).unwrap_or(1),
+        "ThreadCount": crate::db::online_cpu_count(),
         "Date": unix_to_jellyfin_date(now_unix()),
     })
 }

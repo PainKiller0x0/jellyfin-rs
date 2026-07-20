@@ -443,8 +443,16 @@ pub fn optional_migrations() -> Vec<Migration> {
             "add media_items.library_id+item_type+is_folder index",
         ),
         (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_library_id_id ON media_items(library_id, id)",
+            "add media_items.library_id+id cleanup index",
+        ),
+        (
             "CREATE INDEX IF NOT EXISTS idx_media_items_parent_type ON media_items(parent_id, item_type)",
             "add media_items.parent_id+item_type index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_public_parent_title_id ON media_items(parent_id, title, id) WHERE is_public = 1",
+            "add media_items public parent title index",
         ),
         (
             "CREATE INDEX IF NOT EXISTS idx_user_data_user_id ON user_data(user_id)",

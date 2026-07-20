@@ -1,250 +1,230 @@
 # jellyfin-rs
 
-轻量级 Jellyfin 兼容媒体服务器，使用 Rust 编写。专注直播放流，资源占用极低。
+`jellyfin-rs` 是一个使用 Rust 编写的轻量级 Jellyfin/Emby 兼容媒体服务器。它优先服务于直播放流、低资源占用、中文媒体库体验和常用客户端兼容，适合在 NAS、家庭服务器或开发环境里作为 Jellyfin API 兼容服务使用。
 
-A lightweight Jellyfin-compatible media server written in Rust. Designed for direct-play streaming with minimal resource usage.
+项目仍在快速迭代中。当前重点是媒体库管理、直播放流、播放进度、封面/元数据、管理后台和常用客户端 API 覆盖；转码、HLS、直播电视等完整 Jellyfin 能力尚未实现。
 
-## 致谢 / Acknowledgments
+## 功能亮点
 
-本项目深受以下开源项目启发，在此表示感谢：
+- Jellyfin/Emby API 兼容：支持登录、用户、媒体库视图、媒体列表、详情、搜索、过滤、收藏、播放状态、会话、图片和元数据管理等常用接口。
+- 直播放流：视频、音频、外挂字幕直出，支持 HTTP Range 和 `206 Partial Content`，适配常见 Jellyfin/Emby 客户端的直接播放路径。
+- 媒体库扫描：支持电影、剧集、季、集、混合内容识别，读取 `.nfo`，识别同目录海报/背景图/字幕，并通过 `ffprobe` 提取媒体流信息。
+- 元数据增强：支持 TMDb API Key、TMDb 代理、豆瓣 Cookie 配置，可补全影片、剧集、剧集分集、人物和远程图片信息。
+- STRM 与远程媒体：支持 `.strm` 文件，能解析本地路径、相对路径、`file://`、HTTP/HTTPS 目标并用于分类和直播放流。
+- 中文体验：包含简繁转换、中文搜索增强、可选拼音排序等面向中文媒体库的能力。
+- 管理后台：内置 Vue 3 管理界面，可管理媒体库、用户、计划任务、服务器设置、API Key、播放统计、活动日志和请求日志。
+- 离线播放地图：内置 `ip2region` IPv4 数据库，用于管理后台播放地域统计，默认不需要把 IP 发给外部地理位置服务。
 
-This project is deeply inspired by and grateful to:
+## 当前边界
 
-- **[Jellyfin](https://github.com/jellyfin/jellyfin)** — The Free Software Media System. 提供了完整的 API 规范和参考实现。
-- **[Tsukimi](https://github.com/tsukinaha/tsukimi)** — 优秀的 GTK Jellyfin 客户端。本项目优先适配 Tsukimi 的 API 调用，感谢其清晰简洁的代码作为集成参考。
+已支持的主要场景：
 
-## 功能 / Features
+- 使用管理员账号登录兼容客户端。
+- 创建媒体库并扫描本地媒体目录。
+- 浏览电影、剧集、合集、播放列表、最近添加、续播和搜索结果。
+- 直接播放本地文件或 STRM 指向的远程文件。
+- 同步播放进度、收藏、已播放状态和活跃会话。
+- 上传、删除、下载本地或远程封面图片。
+- 通过管理后台维护服务器名称、TMDb、豆瓣、API Key 和用户。
 
-- **Jellyfin API 兼容** — 可连接 Jellyfin 客户端（包括 Tsukimi）
-- **直播放流** — 视频/音频/字幕直出，支持 HTTP Range 断点续传
-- **媒体库扫描** — 自动扫描目录，解析 `.nfo` 元数据，识别同目录封面/字幕
-- **ffprobe 探测** — 可选媒体流分析（编码/分辨率/时长）
-- **TMDb 集成** — 影片元数据搜索、详情与海报（需 API Key）
-- **用户管理** — 多用户、Token 认证、播放进度追踪
-- **图片管理** — 上传/获取/删除封面海报，ETag/304 缓存
-- **播放会话** — 活跃会话追踪，可配超时清理
-- **活动日志** — 登录/扫描/编辑操作审计
-- **PostgreSQL 存储** — 使用 `JELLYFIN_RS_DATABASE_URL` 配置数据库连接
+暂未实现或仅提供占位响应的能力：
 
-## 快速开始 / Quick Start
+- 转码、HLS 和复杂码率自适应。
+- 直播电视、DVR、SyncPlay、完整插件系统。
+- Quick Connect 的完整生产级流程。
+- TVDb、IMDb、MusicBrainz 等完整外部提供者。
+- 完整缺失剧集检测。
+
+## 快速开始
+
+### 依赖
+
+- Rust 1.85 或更新版本
+- PostgreSQL
+- `ffmpeg`/`ffprobe`，用于媒体探测和未来增强能力
+- Node.js、pnpm 11.3，用于构建管理后台
+
+### 本地运行
+
+先准备 PostgreSQL。应用会尝试自动创建 `JELLYFIN_RS_DATABASE_URL` 指向的数据库，但连接账号需要有连接维护库和创建数据库的权限。
 
 ```bash
-# 设置环境变量
-export JELLYFIN_RS_MEDIA_DIRS="/data/movies;/data/tvshows"
+export JELLYFIN_RS_DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:5432/jellyfin_rs"
 export JELLYFIN_RS_USER="admin"
-export JELLYFIN_RS_PASSWORD="your-password"
+export JELLYFIN_RS_PASSWORD="change-me"
+export RUST_LOG="info"
 
-# 可选：TMDb API Key 通过管理接口配置
+pnpm --dir admin install
+pnpm --dir admin build
 
 cargo run --release
 ```
 
-服务默认监听 `http://127.0.0.1:8096`。使用管理员账号连接任意 Jellyfin 客户端。
+服务默认监听：
 
-### 管理后台 / Admin Console
+- API: `http://127.0.0.1:8096`
+- 管理后台: `http://127.0.0.1:8096/admin`
 
-管理后台位于 `admin/`，基于 Vue 3、Vite、TypeScript、Pinia、Element Plus 和 UnoCSS 构建。
+首次启动后，用 `JELLYFIN_RS_USER` 和 `JELLYFIN_RS_PASSWORD` 登录管理后台，在“媒体库”里创建媒体库并添加路径，然后触发扫描。
+
+### 管理后台开发模式
 
 ```bash
 pnpm --dir admin install
-pnpm --dir admin build
-cargo run --release
+pnpm --dir admin dev
 ```
 
-构建后访问 `http://127.0.0.1:8096/admin`。开发模式可运行 `pnpm --dir admin dev`，默认代理到 `VITE_JELLYFIN_API_BASE`。
+开发环境默认通过 `admin/.env.development` 中的 `VITE_JELLYFIN_API_BASE=http://127.0.0.1:8096` 访问后端。
 
-## 配置 / Configuration
+## Docker
 
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `JELLYFIN_RS_HOST` | `127.0.0.1` | 监听地址 |
+仓库提供 `Dockerfile` 和 `docker-compose.yml`。镜像构建会同时构建 Rust 后端和管理后台。
+
+```bash
+docker compose up --build
+```
+
+默认 compose 使用 host 网络，并假设 PostgreSQL 在宿主机 `127.0.0.1:5432` 可访问。常用覆盖项：
+
+```bash
+JELLYFIN_RS_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/jellyfin_rs \
+JELLYFIN_RS_USER=admin \
+JELLYFIN_RS_PASSWORD=change-me \
+JELLYFIN_RS_MEDIA_ROOT=/path/to/media \
+docker compose up --build
+```
+
+容器内默认把媒体目录挂载到 `/media`，仍需在管理后台里把 `/media` 添加为媒体库路径。
+
+## 配置
+
+常用环境变量：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `JELLYFIN_RS_HOST` | `127.0.0.1` | 监听地址，Docker 中默认设为 `0.0.0.0` |
 | `JELLYFIN_RS_PORT` | `8096` | 监听端口 |
-| `JELLYFIN_RS_PUBLIC_URL` | (按请求 Host 推断) | Docker/反代下返回给 Emby/Infuse 客户端的对外访问地址，例如 `http://192.168.1.10:8096` |
-| `JELLYFIN_RS_DATABASE_URL` | `postgresql://postgres:postgres@127.0.0.1:5432/jellyfin_rs` | PostgreSQL 数据库连接 |
-| `JELLYFIN_RS_MEDIA_DIRS` | (无) | 媒体目录，分号分隔 |
-| `JELLYFIN_RS_SCAN_ON_STARTUP` | `true` | 启动时扫描媒体库 |
-| `JELLYFIN_RS_USER` | `tsukimi` | 默认管理员用户名 |
-| `JELLYFIN_RS_PASSWORD` | `tsukimi` | 默认管理员密码 |
-| `JELLYFIN_RS_FFPROBE_PATH` | (系统 PATH) | ffprobe 路径 |
-| `JELLYFIN_RS_SESSION_TIMEOUT_SECONDS` | `120` | 会话超时秒数 |
-| `JELLYFIN_RS_IP2REGION_V4_XDB` | 内置 `ip2region_v4.xdb` | 自定义 IPv4 离线 IP 属地库路径 |
+| `JELLYFIN_RS_PUBLIC_URL` | 按请求 Host 推断 | 反向代理或 Docker 场景下返回给客户端的外部访问地址 |
+| `JELLYFIN_RS_DATABASE_URL` | `postgresql://postgres:postgres@127.0.0.1:5432/jellyfin_rs` | PostgreSQL 连接地址 |
+| `JELLYFIN_RS_USER` | `tsukimi` | 启动时创建的默认管理员用户名 |
+| `JELLYFIN_RS_PASSWORD` | 同用户名 | 启动时创建的默认管理员密码 |
+| `JELLYFIN_RS_SCAN_ON_STARTUP` | `true` | 启动后是否自动扫描已配置的媒体库路径 |
+| `JELLYFIN_RS_FFPROBE_PATH` | `ffprobe` | 媒体流探测工具路径 |
+| `JELLYFIN_RS_FFPROBE_ANALYZE_DURATION` | `30000000` | ffprobe `-analyzeduration` 参数，设为 `0` 可不传 |
+| `JELLYFIN_RS_FFPROBE_PROBE_SIZE` | `100000000` | ffprobe `-probesize` 参数，设为 `0` 可不传 |
+| `JELLYFIN_RS_MEDIA_PROBE_CONCURRENCY` | `4` | 媒体探测并发数 |
+| `JELLYFIN_RS_METADATA_FETCH_CONCURRENCY` | `2` | 元数据补全并发数 |
+| `JELLYFIN_RS_MEDIA_PROBE_QUEUE_CAPACITY` | `1024` | 媒体探测队列容量 |
+| `JELLYFIN_RS_WATCH_DEBOUNCE_SECONDS` | `10` | 文件变化触发扫描前的防抖秒数 |
+| `JELLYFIN_RS_WATCH_POLL_SECONDS` | `60` | 文件监听轮询兜底间隔，设为 `0` 可关闭轮询 |
+| `JELLYFIN_RS_SESSION_TIMEOUT_SECONDS` | `120` | 播放会话超时秒数 |
+| `JELLYFIN_RS_MAX_WATCH_DELTA_SECONDS` | `43200` | 播放进度上报允许的最大时间跳变，单位秒 |
+| `JELLYFIN_RS_PROXY` | 无 | 通用外部 HTTP 请求代理 |
+| `JELLYFIN_RS_NO_PROXY` | 无 | 禁用通用代理 |
+| `JELLYFIN_RS_TMDB_API_KEY` | 无 | 启动时读取的 TMDb API Key，也可在后台设置 |
+| `JELLYFIN_RS_IP2REGION_V4_XDB` | 内置数据库 | 自定义 IPv4 离线归属地库路径 |
 
-## API 覆盖 / API Coverage (80+ endpoints)
+STRM Assistant 相关配置既可通过数据库中的 `sa.*` 设置保存，也可用环境变量覆盖。常用变量包括：
 
-### 系统 / System
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `JELLYFIN_RS_SA_ENABLED` | `true` | 总开关 |
+| `JELLYFIN_RS_SA_STRM_ENABLED` | `true` | STRM 相关能力开关 |
+| `JELLYFIN_RS_SA_FFMPEG_PATH` | `ffmpeg` | ffmpeg 路径 |
+| `JELLYFIN_RS_SA_FFPROBE_PATH` | `ffprobe` | ffprobe 路径 |
+| `JELLYFIN_RS_SA_FPCALC_PATH` | `fpcalc` | 音频指纹工具路径 |
+| `JELLYFIN_RS_SA_INTRO_SKIP_ENABLED` | `true` | 片头/片尾检测能力开关 |
+| `JELLYFIN_RS_SA_FINGERPRINT_ENABLED` | `false` | 指纹检测开关 |
+| `JELLYFIN_RS_SA_THUMBNAIL_ENABLED` | `false` | 视频缩略图生成开关 |
+| `JELLYFIN_RS_SA_MEDIAINFO_ENABLED` | `false` | MediaInfo JSON 提取开关 |
+| `JELLYFIN_RS_SA_CHINESE_CONVERT` | `true` | 简繁转换 |
+| `JELLYFIN_RS_SA_CHINESE_SEARCH` | `true` | 中文搜索增强 |
+| `JELLYFIN_RS_SA_PINYIN_SORTING` | `false` | 拼音排序 |
+| `JELLYFIN_RS_SA_MERGE_ENABLED` | `false` | 多版本合并 |
+| `JELLYFIN_RS_SA_ENHANCED_SUBTITLE_SCAN` | `true` | 增强字幕扫描 |
 
-| Method | Endpoint | 说明 |
-|--------|----------|------|
-| GET | `/System/Info` | 服务器信息（名称/版本/OS） |
-| GET | `/System/Info/Public` | 公开服务器信息 |
-| GET | `/System/ActivityLog/Entries` | 活动日志（支持 hasUserId、分页） |
-| POST | `/System/Shutdown` | 关闭服务器 |
-| POST | `/System/Restart` | 重启服务器 |
-| GET | `/ScheduledTasks` | 计划任务列表（含上次执行结果） |
-| POST | `/ScheduledTasks/Running/{id}` | 触发计划任务 |
+## 媒体库约定
 
-### 媒体库管理 / Library Management
+推荐目录结构：
 
-| Method | Endpoint | 说明 |
-|--------|----------|------|
-| GET | `/Library/VirtualFolders` | 列出虚拟文件夹 |
-| POST | `/Library/VirtualFolders` | 创建虚拟文件夹 |
-| POST | `/Library/VirtualFolders/Paths` | 添加媒体路径 |
-| DELETE | `/Library/VirtualFolders/Paths` | 删除媒体路径 |
-| GET | `/Library/MediaFolders` | 获取媒体文件夹 |
-| POST | `/Library/Refresh` | 全量扫描媒体库 |
+```text
+/media
+  /Movies
+    /Inception (2010)
+      Inception (2010).mkv
+      poster.jpg
+      fanart.jpg
+      Inception (2010).zh-CN.srt
+  /TV
+    /Show Name (2024)
+      /Season 01
+        Show Name - S01E01.mkv
+```
 
-### 用户 / Users
+支持的常见旁路文件：
 
-| Method | Endpoint | 说明 |
-|--------|----------|------|
-| POST | `/Users/AuthenticateByName` | 用户名+密码登录 |
-| GET | `/Users` | 列出所有用户 |
-| GET | `/Users/Me` | 获取当前用户信息 |
-| POST | `/Users/New` | 创建新用户 |
-| GET | `/Users/{userId}` | 获取指定用户 |
-| DELETE | `/Users/{userId}` | 删除用户 |
-| POST | `/Users/{userId}/Password` | 修改密码 |
-| GET | `/Users/{userId}/Images/Primary` | 用户头像 |
+- 元数据：`.nfo`
+- 图片：`poster`、`fanart`、`backdrop`、`thumb` 等同目录图片
+- 字幕：`srt`、`ass`、`ssa`、`vtt`、`sub`
+- STRM：文件内容第一条非空、非注释行作为目标地址
 
-### 媒体浏览 / Media Browsing
+## 常用 API 范围
 
-| Method | Endpoint | 说明 |
-|--------|----------|------|
-| GET | `/Users/{userId}/Views` | 获取用户媒体库视图 |
-| GET | `/Users/{userId}/Items` | 媒体列表（支持 20+ 过滤参数） |
-| GET | `/Users/{userId}/Items/Latest` | 最近添加 |
-| GET | `/Users/{userId}/Items/Resume` | 续播列表 |
-| GET | `/Users/{userId}/Items/{itemId}` | 媒体详情（含 ProviderIds/People/ImageTags） |
-| GET | `/Items/{itemId}/Similar` | 相似媒体（共享类型匹配） |
-| GET | `/Items/Counts` | 各库媒体数量统计 |
+项目覆盖的 API 数量较多，完整路由以 `src/jellyfin/routes.rs` 为准。常用范围包括：
 
-### 搜索与过滤 / Search & Filters
+- System: `/System/Info`、`/System/Info/Public`、`/System/ActivityLog/Entries`、`/ScheduledTasks`
+- Auth/Users: `/Users/AuthenticateByName`、`/Users`、`/Users/Me`、`/Auth/Keys`
+- Library: `/Library/VirtualFolders`、`/Library/VirtualFolders/Paths`、`/Library/Refresh`
+- Browsing: `/Users/{userId}/Views`、`/Users/{userId}/Items`、`/Items/Counts`、`/Search/Hints`
+- Playback: `/Items/{itemId}/PlaybackInfo`、`/Videos/{itemId}/stream.{container}`、`/Audio/{itemId}/universal`
+- Sessions: `/Sessions`、`/Sessions/Playing`、`/Sessions/Playing/Progress`、`/Sessions/Playing/Stopped`
+- Images: `/Items/{itemId}/Images`、`/Items/{itemId}/RemoteImages`
+- Metadata: `/Items/{itemId}`、`/Items/RemoteSearch/{type}`、`/Items/RemoteSearch/Apply/{itemId}`
+- Collections/Playlists: `/Collections`、`/Playlists`
 
-| Method | Endpoint | 说明 |
-|--------|----------|------|
-| GET | `/Search/Hints` | 搜索建议 |
-| GET | `/Genres` | 类型列表 |
-| GET | `/Tags` | 标签列表 |
-| GET | `/Persons` | 人物列表 |
-| GET | `/Studios` | 工作室列表 |
-| GET | `/Years` | 年代列表 |
-| GET | `/Containers` | 容器格式列表 |
-| GET | `/VideoCodecs` | 视频编码列表 |
-| GET | `/OfficialRatings` | 分级列表（暂无数据） |
-| GET | `/ExtendedVideoTypes` | 扩展视频类型（暂无数据） |
+同时支持 `/emby/...` 前缀，便于 Emby 兼容客户端访问。
 
-支持的 Items 过滤参数：`SearchTerm` `IncludeItemTypes` `ExcludeItemTypes` `Filters`(IsPlayed/IsUnplayed/IsResumable/IsFavorite) `SortBy`(SortName/ProductionYear/Runtime/DatePlayed/DateCreated/Random/PlayCount) `SortOrder` `Years` `GenreIds` `TagIds` `PersonIds` `StudioIds` `Containers` `VideoCodecs` `MinWidth` `MaxWidth` `MediaTypes` `Recursive`
+## 开发与验证
 
-### 剧集 / TV Shows
-
-| Method | Endpoint | 说明 |
-|--------|----------|------|
-| GET | `/Shows/{showId}/Seasons` | 获取季列表 |
-| GET | `/Shows/{showId}/Episodes` | 获取集列表（支持 SeasonId） |
-| GET | `/Shows/NextUp` | 待看下一集（未播放剧集） |
-| GET | `/Shows/Missing` | 缺失剧集（暂无外部数据） |
-
-### 播放 / Playback
-
-| Method | Endpoint | 说明 |
-|--------|----------|------|
-| POST | `/Items/{itemId}/PlaybackInfo` | 获取播放信息（MediaSources/Streams） |
-| GET/HEAD | `/Videos/{itemId}/stream.{container}` | 视频直出串流（HTTP Range/206） |
-| GET/HEAD | `/Audio/{itemId}/universal` | 音频直出串流 |
-| GET/HEAD | `/Videos/{itemId}/Subtitles/{idx}/Stream.{fmt}` | 外挂字幕串流 |
-| GET | `/Items/{itemId}/Subtitles` | 字幕流列表 |
-| POST | `/Users/{userId}/FavoriteItems/{itemId}` | 收藏 |
-| POST | `/Users/{userId}/FavoriteItems/{itemId}/Delete` | 取消收藏 |
-| POST | `/Users/{userId}/PlayedItems/{itemId}` | 标记已播放（递增 play_count） |
-| POST | `/Users/{userId}/PlayedItems/{itemId}/Delete` | 标记未播放 |
-| POST | `/Users/{userId}/Items/{itemId}/HideFromResume` | 从续播列表隐藏 |
-
-### 播放会话 / Sessions
-
-| Method | Endpoint | 说明 |
-|--------|----------|------|
-| GET | `/Sessions` | 活跃会话列表（自动清理超时） |
-| POST | `/Sessions/Playing` | 上报播放开始 |
-| POST | `/Sessions/Playing/Progress` | 上报播放进度 |
-| POST | `/Sessions/Playing/Stopped` | 上报播放停止 |
-| POST | `/Sessions/Capabilities` | 上报客户端能力 |
-| POST | `/Sessions/Capabilities/Full` | 上报完整客户端能力 |
-
-### 图片 / Images
-
-| Method | Endpoint | 说明 |
-|--------|----------|------|
-| GET | `/Items/{itemId}/Images` | 图片列表 |
-| GET | `/Items/{itemId}/Images/{type}` | 获取图片（支持 ETag/304） |
-| POST | `/Items/{itemId}/Images/{type}` | 上传图片（支持 URL JSON） |
-| POST | `/Items/{itemId}/Images/{type}/Delete` | 删除图片 |
-| GET | `/Items/{itemId}/RemoteImages` | 远程图片搜索（TMDb） |
-| POST | `/Items/{itemId}/RemoteImages/Download` | 下载远程图片 |
-
-### 元数据 / Metadata
-
-| Method | Endpoint | 说明 |
-|--------|----------|------|
-| POST | `/Items/{itemId}` | 编辑元数据（标题/概述/年份/类型/标签等） |
-| GET | `/Items/{itemId}/ExternalIdInfos` | 外部 ID 信息 |
-| POST | `/Items/RemoteSearch/{type}` | 远程元数据搜索（TMDb） |
-| POST | `/Items/RemoteSearch/Apply/{itemId}` | 应用远程搜索结果 |
-| POST | `/items/metadata/reset` | 重置元数据（清除标识） |
-| POST | `/Items/{itemId}/Refresh` | 刷新媒体项 |
-| GET | `/Items/{itemId}/DeleteInfo` | 删除预览（显示将删除的文件） |
-| POST | `/Items/Delete` | 删除媒体项 |
-
-### 其他 / Miscellaneous
-
-| Method | Endpoint | 说明 |
-|--------|----------|------|
-| GET/POST | `/DisplayPreferences/{id}` | 视图偏好存取 |
-| POST | `/Users/{userId}/Items/{itemId}/Rating` | 评分（喜欢/不喜欢/数值） |
-| DELETE | `/Users/{userId}/Items/{itemId}/Rating` | 删除评分 |
-| GET | `/Videos/{itemId}/AdditionalParts` | 视频附加部件 |
-| GET | `/LiveTv/Channels` | 直播电视频道 |
-
-### 合集与播放列表 / Collections & Playlists
-
-| Method | Endpoint | 说明 |
-|--------|----------|------|
-| POST | `/Collections` | 创建合集（name + ids） |
-| POST | `/Collections/{id}/Items` | 添加项目到合集 |
-| DELETE | `/Collections/{id}/Items` | 从合集移除项目 |
-| POST | `/Playlists` | 创建播放列表 |
-| GET | `/Playlists/{id}` | 获取播放列表信息 |
-| POST | `/Playlists/{id}` | 更新播放列表（名称/项目顺序） |
-| GET | `/Playlists/{id}/Items` | 获取播放列表项目（分页） |
-| POST | `/Playlists/{id}/Items` | 添加项目到播放列表 |
-| DELETE | `/Playlists/{id}/Items` | 从播放列表移除项目 |
-
-合集/播放列表通过 `linked_children` 表关联项目，支持 `ListItemIds` 反查包含指定项目的所有合集/播放列表。
-
-### 媒体扫描 / Library Scanning
-
-- 目录遍历与媒体分类（Movie/Series/Season/Episode）
-- `.nfo` 元数据解析（标题/概述/年份/类型/标签/演员/工作室）
-- 同目录封面图识别（poster/fanart/backdrop/thumb）
-- 外挂字幕识别（srt/ass/ssa/vtt/sub）
-- ffprobe 媒体探测（编码/分辨率/码率/时长/声道）
-
-### 尚未实现 / Not Yet
-
-- 转码 / HLS 串流
-- 直播电视 / DVR
-- 完整缺失集检测（需 TVDb/TMDb 集数据）
-- TVDb / IMDb / MusicBrainz 提供者
-- 插件系统 / SyncPlay / Quick Connect
-
-## 构建 / Building
-
-需要 Rust 1.85+ (edition 2024)。
+构建后端：
 
 ```bash
 cargo build --release
 ```
 
+运行 Rust 测试：
+
+```bash
+cargo test
+```
+
+构建管理后台：
+
+```bash
+pnpm --dir admin build
+```
+
+OpenAPI 兼容性测试位于 `tests/openapi_contract`。先启动本服务，再运行：
+
+```bash
+uv run --project tests/openapi_contract pytest tests/openapi_contract
+```
+
+默认测试连接：
+
+- `EMBY_BASE_URL=http://127.0.0.1:8096`
+- `EMBY_USERNAME=admin`
+- `EMBY_PASSWORD=123456`
+- `EMBY_OPENAPI=docs/emby-openapi.json`
+
+## 致谢
+
+本项目深受以下项目启发：
+
+- [Jellyfin](https://github.com/jellyfin/jellyfin)：自由开源媒体系统，提供 API 规范与参考实现。
+- [Tsukimi](https://github.com/tsukinaha/tsukimi)：GTK Jellyfin 客户端，本项目优先参考并适配其常用调用路径。
+- [ip2region](https://github.com/lionsoul2014/ip2region)：离线 IP 归属地数据库，用于管理后台播放地域统计。
+
 ## License
 
-GPL-2.0-only, matching Jellyfin's open source license.
+GPL-2.0-only

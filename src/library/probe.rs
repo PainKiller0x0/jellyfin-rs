@@ -82,41 +82,89 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
         command.arg("-probesize").arg(probe_size);
     }
 
-    let output = command
+    let mut child = match command
         .arg(path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .ok()
-        .and_then(|mut child| {
-            // Wait with timeout (30 seconds)
-            let timeout = Duration::from_secs(30);
-            let start = std::time::Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let stdout = child.wait_with_output().ok()?.stdout;
-                        if !status.success() {
-                            return None;
-                        }
-                        return Some(stdout);
+    {
+        Ok(child) => child,
+        Err(error) => {
+            tracing::warn!(
+                "failed to start ffprobe for {}: {error}",
+                redacted_probe_path(path)
+            );
+            return None;
+        }
+    };
+
+    let output = {
+        let timeout = Duration::from_secs(30);
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break child.wait_with_output().ok()?,
+                Ok(None) => {
+                    if start.elapsed() > timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        tracing::warn!("ffprobe timed out for: {}", redacted_probe_path(path));
+                        return None;
                     }
-                    Ok(None) => {
-                        if start.elapsed() > timeout {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            tracing::warn!("ffprobe timed out for: {}", path.display());
-                            return None;
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(_) => return None,
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to wait for ffprobe on {}: {error}",
+                        redacted_probe_path(path)
+                    );
+                    return None;
                 }
             }
-        })?;
+        }
+    };
+    if !output.status.success() {
+        tracing::warn!(
+            "ffprobe failed for {}: {}",
+            redacted_probe_path(path),
+            truncated_probe_stderr(&output.stderr)
+        );
+        return None;
+    }
+    let output = output.stdout;
 
     let response = serde_json::from_slice::<FfprobeResponse>(&output).ok()?;
     Some(media_probe_from_ffprobe_response(response))
+}
+
+fn redacted_probe_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    if let Ok(mut url) = reqwest::Url::parse(&value) {
+        if matches!(url.scheme(), "http" | "https") {
+            url.set_query(None);
+            url.set_fragment(None);
+            return url.to_string();
+        }
+    }
+    value.to_string()
+}
+
+fn truncated_probe_stderr(stderr: &[u8]) -> String {
+    const MAX_LEN: usize = 500;
+    let message = String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if message.is_empty() {
+        return "no stderr output".to_string();
+    }
+    if message.chars().count() <= MAX_LEN {
+        return message;
+    }
+    let truncated = message.chars().take(MAX_LEN).collect::<String>();
+    format!("{truncated}...")
 }
 
 fn media_probe_from_ffprobe_response(response: FfprobeResponse) -> MediaProbe {
@@ -657,5 +705,22 @@ mod tests {
 
             assert_eq!(probe.size_bytes, None);
         }
+    }
+
+    #[test]
+    fn probe_logging_redacts_remote_url_query() {
+        assert_eq!(
+            redacted_probe_path(Path::new(
+                "https://example.test/movie.mkv?token=secret#frag"
+            )),
+            "https://example.test/movie.mkv"
+        );
+    }
+
+    #[test]
+    fn probe_stderr_is_limited() {
+        let message = truncated_probe_stderr("错误".repeat(600).as_bytes());
+        assert!(message.ends_with("..."));
+        assert!(message.chars().count() <= 503);
     }
 }

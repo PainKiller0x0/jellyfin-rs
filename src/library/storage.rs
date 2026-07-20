@@ -121,14 +121,19 @@ pub async fn cached_media_probe_if_current(
         .filter(media_streams::Column::IsExternal.eq(0))
         .filter(
             Condition::any()
+                .add(media_streams::Column::Codec.is_not_null())
                 .add(media_streams::Column::Profile.is_not_null())
+                .add(media_streams::Column::BitRate.is_not_null())
+                .add(media_streams::Column::Width.is_not_null())
+                .add(media_streams::Column::Height.is_not_null())
                 .add(media_streams::Column::PixelFormat.is_not_null())
                 .add(media_streams::Column::AverageFrameRate.is_not_null())
                 .add(media_streams::Column::AspectRatio.is_not_null())
+                .add(media_streams::Column::Channels.is_not_null())
+                .add(media_streams::Column::SampleRate.is_not_null())
                 .add(media_streams::Column::ChannelLayout.is_not_null())
                 .add(media_streams::Column::ColorTransfer.is_not_null())
-                .add(media_streams::Column::BitDepth.is_not_null())
-                .add(media_streams::Column::IsDefault.ne(0)),
+                .add(media_streams::Column::BitDepth.is_not_null()),
         )
         .one(db)
         .await
@@ -1064,7 +1069,10 @@ async fn cleanup_path_exists(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScannedMediaItem, upsert_media_item, upsert_probed_media_streams};
+    use super::{
+        ScannedMediaItem, cached_media_probe_if_current, upsert_default_media_stream,
+        upsert_media_item, upsert_probed_media_streams,
+    };
     use crate::entities::{
         media_items::{self, Entity as MediaItems},
         media_streams::{self, Entity as MediaStreams},
@@ -1138,6 +1146,49 @@ mod tests {
         );
         let row = media_stream_row(&db, &item.id).await;
         assert_eq!(row.codec.as_deref(), Some("hevc"));
+    }
+
+    #[tokio::test]
+    async fn default_stream_does_not_satisfy_probe_cache() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        let item = scanned_movie("movie-default-cache", "Default Cache Movie");
+        upsert_media_item(&db, &item).await.unwrap();
+        upsert_default_media_stream(&db, &item).await.unwrap();
+
+        assert!(
+            cached_media_probe_if_current(
+                &db,
+                &item.path,
+                item.modified_at,
+                item.size_bytes,
+                false
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let probe = media_probe("h264");
+        assert!(
+            upsert_probed_media_streams(&db, &item, &probe)
+                .await
+                .unwrap()
+        );
+
+        let cached = cached_media_probe_if_current(
+            &db,
+            &item.path,
+            item.modified_at,
+            item.size_bytes,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(cached.runtime_ticks, item.runtime_ticks);
+        assert_eq!(cached.size_bytes, item.size_bytes);
     }
 
     fn scanned_movie(id: &str, title: &str) -> ScannedMediaItem {

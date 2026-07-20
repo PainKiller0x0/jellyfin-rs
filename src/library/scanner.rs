@@ -30,6 +30,7 @@ const MEDIA_PROBE_CACHE_VERSION_KEY: &str = "media_probe_cache_version";
 const MEDIA_PROBE_CACHE_VERSION: &str = "3";
 const DEFAULT_MEDIA_PROBE_CONCURRENCY: usize = 4;
 const DEFAULT_MEDIA_PROBE_QUEUE_CAPACITY: usize = 1024;
+const DEFAULT_METADATA_FETCH_CONCURRENCY: usize = 2;
 
 struct ScanRootResult {
     scanned: usize,
@@ -46,6 +47,12 @@ struct MediaProbeJob {
 
 struct MediaProbeJobResult {
     stream_probe_succeeded: bool,
+}
+
+struct MetadataFetchJob {
+    item_id: String,
+    item_type: String,
+    path: PathBuf,
 }
 
 #[derive(Default)]
@@ -83,23 +90,26 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
         start_media_probe_pipeline(state.db.clone(), force_probe.then(|| state.db.clone()));
     let mut tasks = tokio::task::JoinSet::new();
     let api_key = state.tmdb_api_key.read().await.clone().unwrap_or_default();
+    let douban_cookie = state.douban_cookie.read().await.clone();
+    let metadata_tx =
+        start_metadata_fetch_pipeline(state.db.clone(), api_key.clone(), douban_cookie);
     for (root, library_id, collection_type) in roots {
         if !root.exists() {
             tracing::warn!("media directory does not exist: {}", root.display());
             continue;
         }
         let db = state.db.clone();
-        let api_key = api_key.clone();
         let probe_tx = probe_tx.clone();
+        let metadata_tx = metadata_tx.clone();
         tasks.spawn(async move {
             scan_root(
                 db,
                 root,
                 library_id,
                 collection_type,
-                &api_key,
                 force_probe,
                 probe_tx,
+                metadata_tx,
             )
             .await
         });
@@ -122,6 +132,7 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
         }
     }
     drop(probe_tx);
+    drop(metadata_tx);
 
     remove_missing_media_items(&state.db, &all_seen).await?;
     tracing::info!(
@@ -133,29 +144,6 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
         );
     }
 
-    // Post-scan: fetch TMDb episode metadata (series provider_ids are ready now)
-    if let Some(api_key) = state
-        .tmdb_api_key
-        .read()
-        .await
-        .as_deref()
-        .filter(|k| !k.is_empty())
-    {
-        if let Err(e) =
-            crate::library::tmdb_metadata::batch_fetch_episode_tmdb(&state.db, api_key).await
-        {
-            tracing::warn!("episode TMDb fetch failed: {e:#}");
-        }
-    }
-
-    let douban_cookie = state.douban_cookie.read().await.clone();
-    if let Err(e) =
-        crate::library::douban_metadata::fill_missing_douban(&state.db, douban_cookie.as_deref())
-            .await
-    {
-        tracing::warn!("Douban metadata fetch failed: {e:#}");
-    }
-
     Ok(Some(total))
 }
 
@@ -164,9 +152,9 @@ async fn scan_root(
     root: PathBuf,
     library_id: String,
     collection_type: String,
-    api_key: &str,
     force_probe: bool,
     probe_tx: mpsc::Sender<MediaProbeJob>,
+    metadata_tx: mpsc::UnboundedSender<MetadataFetchJob>,
 ) -> anyhow::Result<ScanRootResult> {
     let mut scanned = 0usize;
     let mut probe_skipped = 0usize;
@@ -224,8 +212,11 @@ async fn scan_root(
                 }
             };
             item.id = stored_item_id;
+            if folder_type == "Folder" {
+                clear_scraped_folder_metadata(&db, &item.id).await;
+            }
             upsert_sidecar_images(&db, path, &item.id).await?;
-            try_fetch_tmdb(&db, &item, path, api_key).await;
+            queue_metadata_fetch(&metadata_tx, &item, path);
             continue;
         }
 
@@ -446,6 +437,110 @@ fn start_media_probe_pipeline(
     tx
 }
 
+fn start_metadata_fetch_pipeline(
+    db: sea_orm::DatabaseConnection,
+    api_key: String,
+    douban_cookie: Option<String>,
+) -> mpsc::UnboundedSender<MetadataFetchJob> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<MetadataFetchJob>();
+    tokio::spawn(async move {
+        let concurrency = metadata_fetch_concurrency();
+        let mut pending = tokio::task::JoinSet::new();
+        let mut queued = 0usize;
+        let mut completed = 0usize;
+        let mut failed = 0usize;
+        tracing::info!("metadata fetch pipeline started concurrency={concurrency}");
+
+        while let Some(job) = rx.recv().await {
+            queued += 1;
+            while pending.len() >= concurrency {
+                if metadata_job_finished(pending.join_next().await) {
+                    completed += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+            let db = db.clone();
+            let api_key = api_key.clone();
+            pending.spawn(async move { run_metadata_fetch_job(db, job, &api_key).await });
+        }
+
+        while let Some(result) = pending.join_next().await {
+            if metadata_job_finished(Some(result)) {
+                completed += 1;
+            } else {
+                failed += 1;
+            }
+        }
+
+        run_post_scan_metadata_tasks(&db, &api_key, douban_cookie.as_deref()).await;
+        tracing::info!(
+            "metadata fetch pipeline completed {completed}/{queued} item(s); failed={failed}"
+        );
+    });
+    tx
+}
+
+fn metadata_job_finished(
+    result: Option<Result<anyhow::Result<()>, tokio::task::JoinError>>,
+) -> bool {
+    match result {
+        Some(Ok(Ok(()))) => true,
+        Some(Ok(Err(error))) => {
+            tracing::warn!("metadata fetch job failed: {error:#}");
+            false
+        }
+        Some(Err(error)) => {
+            tracing::warn!("metadata fetch worker task panicked: {error}");
+            false
+        }
+        None => false,
+    }
+}
+
+async fn run_metadata_fetch_job(
+    db: sea_orm::DatabaseConnection,
+    job: MetadataFetchJob,
+    api_key: &str,
+) -> anyhow::Result<()> {
+    if api_key.is_empty() {
+        return Ok(());
+    }
+    if job.item_type != "Movie" && job.item_type != "Series" {
+        return Ok(());
+    }
+    if tmdb_metadata_is_current(&db, &job.item_id).await {
+        return Ok(());
+    }
+    crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(
+        &db,
+        &job.item_id,
+        &job.item_type,
+        &job.path,
+        api_key,
+    )
+    .await
+}
+
+async fn run_post_scan_metadata_tasks(
+    db: &sea_orm::DatabaseConnection,
+    api_key: &str,
+    douban_cookie: Option<&str>,
+) {
+    if !api_key.is_empty() {
+        if let Err(error) =
+            crate::library::tmdb_metadata::batch_fetch_episode_tmdb(db, api_key).await
+        {
+            tracing::warn!("episode TMDb fetch failed: {error:#}");
+        }
+    }
+    if let Err(error) =
+        crate::library::douban_metadata::fill_missing_douban(db, douban_cookie).await
+    {
+        tracing::warn!("Douban metadata fetch failed: {error:#}");
+    }
+}
+
 async fn run_media_probe_job(
     db: sea_orm::DatabaseConnection,
     mut job: MediaProbeJob,
@@ -512,36 +607,60 @@ fn normalize_scanned_file_type(
     }
 }
 
-async fn try_fetch_tmdb(
-    db: &sea_orm::DatabaseConnection,
+fn queue_metadata_fetch(
+    metadata_tx: &mpsc::UnboundedSender<MetadataFetchJob>,
     item: &ScannedMediaItem,
     path: &std::path::Path,
-    api_key: &str,
 ) {
-    if api_key.is_empty() {
-        return;
-    }
     if item.item_type != "Movie" && item.item_type != "Series" {
         return;
     }
-    if tmdb_metadata_is_current(db, &item.id).await {
-        return;
+    if let Err(error) = metadata_tx.send(MetadataFetchJob {
+        item_id: item.id.clone(),
+        item_type: item.item_type.clone(),
+        path: path.to_path_buf(),
+    }) {
+        tracing::warn!(
+            "metadata fetch queue closed before job could be scheduled for {}",
+            error.0.path.display()
+        );
     }
-    let check_path = if item.is_folder {
-        path.to_path_buf()
-    } else {
-        path.parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| path.to_path_buf())
-    };
-    let _ = crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(
-        db,
-        &item.id,
-        &item.item_type,
-        &check_path,
-        api_key,
-    )
-    .await;
+}
+
+async fn clear_scraped_folder_metadata(db: &sea_orm::DatabaseConnection, item_id: &str) {
+    for table in [
+        "provider_ids",
+        "media_genres",
+        "media_studios",
+        "media_people",
+    ] {
+        if let Err(error) = db
+            .execute(crate::db::helpers::pg_statement(
+                &format!("DELETE FROM {table} WHERE item_id = ?"),
+                vec![item_id.into()],
+            ))
+            .await
+        {
+            tracing::debug!("failed to clear {table} for folder {item_id}: {error:#}");
+        }
+    }
+    if let Err(error) = db
+        .execute(crate::db::helpers::pg_statement(
+            r#"UPDATE media_items
+               SET overview = NULL,
+                   official_rating = NULL,
+                   production_year = NULL,
+                   premiere_date = NULL,
+                   community_rating = NULL,
+                   critic_rating = NULL,
+                   runtime_ticks = NULL
+               WHERE id = ? AND item_type = 'Folder'"#,
+            vec![item_id.into()],
+        ))
+        .await
+    {
+        tracing::debug!("failed to clear scraped scalar metadata for folder {item_id}: {error:#}");
+    }
 }
 
 async fn tmdb_metadata_is_current(db: &sea_orm::DatabaseConnection, item_id: &str) -> bool {
@@ -613,6 +732,14 @@ fn media_probe_concurrency() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_MEDIA_PROBE_CONCURRENCY)
+}
+
+fn metadata_fetch_concurrency() -> usize {
+    std::env::var("JELLYFIN_RS_METADATA_FETCH_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_METADATA_FETCH_CONCURRENCY)
 }
 
 fn media_probe_queue_capacity() -> usize {

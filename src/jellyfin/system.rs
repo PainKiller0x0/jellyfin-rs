@@ -1551,7 +1551,7 @@ pub(super) async fn first_admin_user(
 }
 
 pub async fn scheduled_tasks(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(vec![scan_library_task(&state.db).await])
+    Json(vec![scan_library_task_for_state(&state).await])
 }
 
 pub async fn scheduled_task(
@@ -1562,7 +1562,7 @@ pub async fn scheduled_task(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    Json(scan_library_task(&state.db).await).into_response()
+    Json(scan_library_task_for_state(&state).await).into_response()
 }
 
 pub async fn scheduled_task_triggers(
@@ -1734,10 +1734,19 @@ pub async fn plugin_not_found() -> Response {
 }
 
 pub async fn scan_library_task(db: &DatabaseConnection) -> JsonValue {
+    scan_library_task_value(db, false).await
+}
+
+async fn scan_library_task_for_state(state: &AppState) -> JsonValue {
+    let is_running = state.scan_lock.try_lock().is_err();
+    scan_library_task_value(&state.db, is_running).await
+}
+
+async fn scan_library_task_value(db: &DatabaseConnection, is_running: bool) -> JsonValue {
     let scan_result = last_task_result(db, "scan-library").await;
     json!({
         "Name": "Scan media library",
-        "State": "Idle",
+        "State": if is_running { "Running" } else { "Idle" },
         "Id": "scan-library",
         "Key": "scan-library",
         "Description": "Scans configured media library paths for new and updated media files.",

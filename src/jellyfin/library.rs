@@ -35,7 +35,7 @@ use crate::{
     },
     jellyfin::common::internal_error,
     jellyfin::system,
-    library::{path_utils, scanner::scan_media_library},
+    library::{path_utils, scanner::scan_media_library_if_idle},
     util::{now_unix, stable_text_id},
 };
 
@@ -401,12 +401,31 @@ pub async fn delete_virtual_folder_path(
 }
 
 pub async fn refresh_library(State(state): State<Arc<AppState>>) -> Response {
+    if state.scan_lock.try_lock().is_err() {
+        return Json(json!({ "Scanning": true, "AlreadyRunning": true })).into_response();
+    }
+
     tokio::spawn(async move {
         let start = now_unix();
-        let result = scan_media_library(&state).await;
+        system::upsert_task_result(
+            &state,
+            "scan-library",
+            "Running",
+            start,
+            start,
+            Some("Media library scan is running"),
+        )
+        .await;
+        let result = scan_media_library_if_idle(&state).await;
         let end = now_unix();
         let (status, message) = match &result {
-            Ok(count) => ("Completed", Some(format!("Scanned {count} items"))),
+            Ok(Some(count)) => ("Completed", Some(format!("Scanned {count} items"))),
+            Ok(None) => {
+                tracing::info!(
+                    "media scan request ignored because another scan is already running"
+                );
+                return;
+            }
             Err(error) => ("Failed", Some(format!("{error:#}"))),
         };
         system::upsert_task_result(
@@ -881,7 +900,7 @@ pub async fn library_notify(State(state): State<Arc<AppState>>) -> Response {
     // These endpoints notify the server that media has changed externally
     // We trigger a background scan in response
     tokio::spawn(async move {
-        let _ = scan_media_library(&state).await;
+        let _ = scan_media_library_if_idle(&state).await;
     });
     StatusCode::NO_CONTENT.into_response()
 }

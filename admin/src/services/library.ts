@@ -52,7 +52,7 @@ export function deleteLibraryPath(token: string, payload: LibraryPathPayload) {
 }
 
 export function refreshLibrary(token: string) {
-  return request<{ Scanning: boolean }>('/Library/Refresh', {
+  return request<{ Scanning: boolean; AlreadyRunning?: boolean }>('/Library/Refresh', {
     method: 'POST',
     token
   });

@@ -202,10 +202,18 @@ impl MediaItem {
             "DateLastMediaAdded".into(),
             JsonValue::String(unix_to_jellyfin_date(self.modified_at)),
         );
-        map.insert(
-            "ImageTags".into(),
-            self.image_tags.clone().unwrap_or_else(|| json!({})),
-        );
+        let image_tags = self.image_tags.clone().unwrap_or_else(|| json!({}));
+        if let Some(primary_image_tag) = image_tags
+            .get("Primary")
+            .and_then(JsonValue::as_str)
+            .filter(|tag| !tag.is_empty())
+        {
+            map.insert(
+                "PrimaryImageTag".into(),
+                JsonValue::String(primary_image_tag.to_string()),
+            );
+        }
+        map.insert("ImageTags".into(), image_tags);
 
         // Build BackdropImageTags from image_tags
         let backdrop_tags: Vec<JsonValue> = self

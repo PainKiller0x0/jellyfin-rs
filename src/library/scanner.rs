@@ -138,6 +138,7 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
     let probe_tx =
         start_media_probe_pipeline(scan_db.clone(), force_probe.then(|| scan_db.clone()));
     let mut tasks = tokio::task::JoinSet::new();
+    let root_concurrency = scan_root_concurrency();
     let api_key = state.tmdb_api_key.read().await.clone().unwrap_or_default();
     let douban_cookie = state.douban_cookie.read().await.clone();
     let metadata_tx = start_metadata_fetch_pipeline(
@@ -154,20 +155,29 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
         metadata_tx.clone(),
     );
     let mut scanned_library_ids = Vec::new();
-    for (root, library_id, collection_type) in roots {
-        if !root.exists() {
-            tracing::warn!("media directory does not exist: {}", root.display());
-            continue;
-        }
-        scanned_library_ids.push(library_id.clone());
-        let ingest_tx = ingest_pipeline.tx.clone();
-        tasks.spawn(async move { scan_root(root, library_id, collection_type, ingest_tx).await });
-    }
-
     let mut total = 0usize;
     let mut all_seen = Vec::new();
     let mut ingest_queued = 0usize;
-    while let Some(result) = tasks.join_next().await {
+    let mut pending_roots = roots.into_iter();
+    loop {
+        while tasks.len() < root_concurrency {
+            let Some((root, library_id, collection_type)) = pending_roots.next() else {
+                break;
+            };
+            if !root.exists() {
+                tracing::warn!("media directory does not exist: {}", root.display());
+                continue;
+            }
+            scanned_library_ids.push(library_id.clone());
+            let ingest_tx = ingest_pipeline.tx.clone();
+            tasks.spawn(
+                async move { scan_root(root, library_id, collection_type, ingest_tx).await },
+            );
+        }
+
+        let Some(result) = tasks.join_next().await else {
+            break;
+        };
         match result {
             Ok(Ok(result)) => {
                 total += result.scanned;
@@ -1078,6 +1088,10 @@ fn media_probe_concurrency() -> usize {
     (crate::db::cpu_parallelism() / 4).clamp(1, 3)
 }
 
+fn scan_root_concurrency() -> usize {
+    (crate::db::cpu_parallelism() / 4).clamp(1, 2)
+}
+
 fn ingest_concurrency() -> usize {
     (crate::db::cpu_parallelism() / 4).clamp(1, 2)
 }
@@ -1136,6 +1150,11 @@ mod tests {
     #[test]
     fn media_probe_concurrency_defaults_to_positive_value() {
         assert!(media_probe_concurrency() > 0);
+    }
+
+    #[test]
+    fn scan_root_concurrency_defaults_to_positive_value() {
+        assert!(scan_root_concurrency() > 0);
     }
 
     #[test]

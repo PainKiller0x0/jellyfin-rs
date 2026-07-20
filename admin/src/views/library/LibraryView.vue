@@ -243,8 +243,12 @@ async function scanLibrary() {
   }
 
   try {
-    await libraryApi.refreshLibrary(authStore.token);
-    ElMessage.success('已触发媒体库扫描');
+    const result = await libraryApi.refreshLibrary(authStore.token);
+    if (result.AlreadyRunning) {
+      ElMessage.info('媒体库扫描已在运行');
+    } else {
+      ElMessage.success('已触发媒体库扫描');
+    }
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '触发扫描失败');
   }

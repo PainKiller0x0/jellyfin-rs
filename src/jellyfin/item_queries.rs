@@ -378,6 +378,21 @@ pub async fn list_media_items(
         let needs_global_query =
             original_parent_id.is_none() && (recursive || has_search || has_filters);
 
+        if needs_global_query {
+            if let Some(result) = list_global_media_items_page(
+                db,
+                user_id,
+                query,
+                search_term.as_deref(),
+                limit,
+                offset,
+            )
+            .await?
+            {
+                return Ok(result);
+            }
+        }
+
         let rows = if parent_is_collection {
             let (sql, vals) = if let Some(like) = like_clause {
                 let base = linked_children_select_sql();
@@ -485,6 +500,304 @@ pub async fn list_media_items(
     };
 
     Ok(items)
+}
+
+async fn list_global_media_items_page(
+    db: &DatabaseConnection,
+    user_id: &str,
+    query: &HashMap<String, String>,
+    search_term: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> anyhow::Result<Option<(Vec<MediaItem>, usize)>> {
+    if query_contains_any(
+        query,
+        &[
+            "GenreIds",
+            "genreIds",
+            "TagIds",
+            "tagIds",
+            "PersonIds",
+            "personIds",
+            "StudioIds",
+            "studioIds",
+            "ListItemIds",
+            "listItemIds",
+            "VideoCodecs",
+            "videoCodecs",
+            "MinWidth",
+            "minWidth",
+            "MaxWidth",
+            "maxWidth",
+        ],
+    ) {
+        return Ok(None);
+    }
+    if primary_sort_value(query).eq_ignore_ascii_case("Random") {
+        return Ok(None);
+    }
+
+    let mut conditions = vec![visible_media_item_sql("media_items")];
+    let mut filter_values = Vec::<sea_orm::Value>::new();
+
+    if let Some(search_term) = search_term {
+        conditions.push("LOWER(media_items.title) LIKE LOWER(?)".to_string());
+        filter_values.push(search_term.into());
+    }
+
+    if let Some(include_types) = query_ids_any(
+        query,
+        &[
+            "IncludeItemTypes",
+            "includeItemTypes",
+            "IncludeSearchTypes",
+            "includeSearchTypes",
+        ],
+    ) {
+        push_in_condition(
+            &mut conditions,
+            &mut filter_values,
+            "media_items.item_type",
+            &include_types,
+            false,
+        );
+        conditions.push("media_items.item_type <> 'Video'".to_string());
+    }
+
+    if let Some(exclude_types) = query_ids_any(query, &["ExcludeItemTypes", "excludeItemTypes"]) {
+        push_in_condition(
+            &mut conditions,
+            &mut filter_values,
+            "media_items.item_type",
+            &exclude_types,
+            true,
+        );
+    }
+
+    if let Some(media_types) = query_ids_any(query, &["MediaTypes", "mediaTypes"]) {
+        let has_video = media_types
+            .iter()
+            .any(|media_type| media_type.eq_ignore_ascii_case("Video"));
+        let has_audio = media_types
+            .iter()
+            .any(|media_type| media_type.eq_ignore_ascii_case("Audio"));
+        let has_photo = media_types
+            .iter()
+            .any(|media_type| media_type.eq_ignore_ascii_case("Photo"));
+        match (has_video, has_audio, has_photo) {
+            (true, false, false) => push_static_in_condition(
+                &mut conditions,
+                "media_items.item_type",
+                &["Movie", "Series", "Season", "Episode"],
+            ),
+            (false, true, false) => push_static_in_condition(
+                &mut conditions,
+                "media_items.item_type",
+                &["Audio", "MusicAlbum"],
+            ),
+            (false, false, true) => {
+                conditions.push("media_items.item_type = 'Photo'".to_string());
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    if let Some(filters) = query_value_any(query, &["Filters", "filters"]) {
+        let filters = filters.to_ascii_lowercase();
+        if filters.contains("isfavorite") {
+            conditions.push("COALESCE(user_data.is_favorite, CAST(0 AS bigint)) <> 0".to_string());
+        }
+        if filters.contains("isplayed") {
+            conditions.push("COALESCE(user_data.played, CAST(0 AS bigint)) <> 0".to_string());
+        }
+        if filters.contains("isunplayed") {
+            conditions.push("COALESCE(user_data.played, CAST(0 AS bigint)) = 0".to_string());
+        }
+        if filters.contains("isresumable") {
+            conditions.push(
+                "COALESCE(user_data.playback_position_ticks, CAST(0 AS bigint)) > 0".to_string(),
+            );
+        }
+    }
+
+    if let Some(years) = query_i64s_any(query, &["Years", "years"]) {
+        push_i64_in_condition(
+            &mut conditions,
+            &mut filter_values,
+            "media_items.production_year",
+            &years,
+            false,
+        );
+    }
+
+    if let Some(containers) = query_ids_any(query, &["Containers", "containers"]) {
+        push_in_condition(
+            &mut conditions,
+            &mut filter_values,
+            "media_items.container",
+            &containers,
+            false,
+        );
+    }
+
+    let where_clause = format!("WHERE {}", conditions.join(" AND "));
+    let count_sql = format!(
+        r#"SELECT COUNT(*) AS cnt
+           FROM media_items
+           LEFT JOIN user_data ON user_data.item_id = media_items.id AND user_data.user_id = ?
+           LEFT JOIN libraries ON libraries.id = media_items.library_id
+           {where_clause}"#
+    );
+    let mut count_values = vec![user_id.into()];
+    count_values.extend(filter_values.clone());
+    let total = db
+        .query_one_raw(crate::db::helpers::pg_statement(&count_sql, count_values))
+        .await
+        .context("failed to count global media items")?
+        .and_then(|row| row.get_i64("cnt").ok())
+        .unwrap_or_default()
+        .max(0) as usize;
+
+    let order_clause = global_order_clause(query);
+    let select_clause = format!("{where_clause} {order_clause} LIMIT ? OFFSET ?");
+    let mut select_values = vec![user_id.into()];
+    select_values.extend(filter_values);
+    select_values.push((limit as i64).into());
+    select_values.push((offset as i64).into());
+    let rows = db
+        .query_all_raw(crate::db::helpers::pg_statement(
+            &media_item_select_sql(&select_clause),
+            select_values,
+        ))
+        .await
+        .context("failed to list global media items")?;
+    let mut items = decode_media_items(&rows)?;
+    deduplicate_episode_versions(db, &mut items).await;
+    let _ = attach_item_image_tags(db, &mut items).await;
+    Ok(Some((items, total)))
+}
+
+fn primary_sort_value(query: &HashMap<String, String>) -> &str {
+    query
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("SortBy"))
+        .map(|(_, value)| value.split(',').next().unwrap_or(value.as_str()).trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("")
+}
+
+fn global_order_clause(query: &HashMap<String, String>) -> String {
+    let descending = query
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("SortOrder"))
+        .is_some_and(|(_, value)| value.eq_ignore_ascii_case("Descending"));
+    let direction = if descending { "DESC" } else { "ASC" };
+    let sort = primary_sort_value(query);
+    let sort = if sort.is_empty() {
+        if query_ids_any(
+            query,
+            &[
+                "IncludeItemTypes",
+                "includeItemTypes",
+                "IncludeSearchTypes",
+                "includeSearchTypes",
+            ],
+        )
+        .is_some_and(|types| {
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|item_type| item_type.eq_ignore_ascii_case("Episode"))
+        }) {
+            "IndexNumber"
+        } else {
+            "SortName"
+        }
+    } else {
+        sort
+    };
+
+    match sort {
+        "IndexNumber" | "AiredEpisodeOrder" => format!(
+            "ORDER BY COALESCE(media_items.season_number, 0) {direction}, COALESCE(media_items.episode_number, 0) {direction}, media_items.title {direction}"
+        ),
+        "DateCreated" => format!("ORDER BY media_items.created_at {direction}"),
+        "DateLastMediaAdded" | "DateLastContentAdded" => {
+            format!("ORDER BY media_items.modified_at {direction}")
+        }
+        "IsFolder" => format!(
+            "ORDER BY media_items.is_folder {} , LOWER(media_items.title) {direction}",
+            if descending { "ASC" } else { "DESC" }
+        ),
+        "ProductionYear" => format!(
+            "ORDER BY COALESCE(media_items.production_year, {}) {direction}, LOWER(media_items.title) {direction}",
+            if descending { i64::MIN } else { i64::MAX }
+        ),
+        "PremiereDate" => format!(
+            "ORDER BY COALESCE(media_items.premiere_date, '{}') {direction}, COALESCE(media_items.production_year, {}) {direction}, LOWER(media_items.title) {direction}",
+            if descending {
+                "0000-01-01"
+            } else {
+                "9999-12-31"
+            },
+            if descending { i64::MIN } else { i64::MAX }
+        ),
+        "Runtime" => format!(
+            "ORDER BY COALESCE(media_items.runtime_ticks, {}) {direction}, LOWER(media_items.title) {direction}",
+            if descending { i64::MIN } else { i64::MAX }
+        ),
+        "DatePlayed" => format!(
+            "ORDER BY COALESCE(user_data.last_played_at, 0) {direction}, LOWER(media_items.title) {direction}"
+        ),
+        "IsFavoriteOrLiked" => format!(
+            "ORDER BY COALESCE(user_data.is_favorite, CAST(0 AS bigint)) {direction}, LOWER(media_items.title) {direction}"
+        ),
+        "PlayCount" => format!(
+            "ORDER BY COALESCE(user_data.play_count, CAST(0 AS bigint)) {direction}, LOWER(media_items.title) {direction}"
+        ),
+        _ => format!("ORDER BY LOWER(media_items.title) {direction}"),
+    }
+}
+
+fn push_in_condition(
+    conditions: &mut Vec<String>,
+    values: &mut Vec<sea_orm::Value>,
+    column: &str,
+    items: &[String],
+    negated: bool,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let placeholders = items.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let operator = if negated { "NOT IN" } else { "IN" };
+    conditions.push(format!("{column} {operator} ({placeholders})"));
+    values.extend(items.iter().map(|item| item.as_str().into()));
+}
+
+fn push_i64_in_condition(
+    conditions: &mut Vec<String>,
+    values: &mut Vec<sea_orm::Value>,
+    column: &str,
+    items: &[i64],
+    negated: bool,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let placeholders = items.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let operator = if negated { "NOT IN" } else { "IN" };
+    conditions.push(format!("{column} {operator} ({placeholders})"));
+    values.extend(items.iter().map(|item| (*item).into()));
+}
+
+fn push_static_in_condition(conditions: &mut Vec<String>, column: &str, items: &[&str]) {
+    let quoted = items
+        .iter()
+        .map(|item| format!("'{item}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    conditions.push(format!("{column} IN ({quoted})"));
 }
 
 pub async fn list_trailers(
@@ -1159,9 +1472,13 @@ async fn relation_item_ids(
 }
 
 fn query_ids(query: &HashMap<String, String>, key: &str) -> Option<Vec<String>> {
+    query_ids_any(query, &[key])
+}
+
+fn query_ids_any(query: &HashMap<String, String>, keys: &[&str]) -> Option<Vec<String>> {
     query
         .iter()
-        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+        .find(|(candidate, _)| keys.iter().any(|key| candidate.eq_ignore_ascii_case(key)))
         .map(|(_, value)| {
             value
                 .split(',')
@@ -1171,6 +1488,17 @@ fn query_ids(query: &HashMap<String, String>, key: &str) -> Option<Vec<String>> 
                 .collect::<Vec<_>>()
         })
         .filter(|ids| !ids.is_empty())
+}
+
+fn query_i64s_any(query: &HashMap<String, String>, keys: &[&str]) -> Option<Vec<i64>> {
+    query_ids_any(query, keys)
+        .map(|values| {
+            values
+                .into_iter()
+                .filter_map(|value| value.parse::<i64>().ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
 }
 
 fn sort_media_items(items: &mut [MediaItem], query: &HashMap<String, String>) {

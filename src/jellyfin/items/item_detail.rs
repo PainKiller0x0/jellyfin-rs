@@ -210,6 +210,14 @@ async fn item_json_with_provider_ids(
         .unwrap_or_default();
     value["BackdropImageTags"] = Value::Array(backdrop_tags);
     value["ImageTags"] = image_tags;
+    if let Some(primary_image_tag) = value
+        .get("ImageTags")
+        .and_then(|tags| tags.get("Primary"))
+        .and_then(Value::as_str)
+        .filter(|tag| !tag.is_empty())
+    {
+        value["PrimaryImageTag"] = json!(primary_image_tag);
+    }
 
     // Combine genres, tags, studios into one UNION ALL query
     let rel_rows = db
@@ -612,15 +620,15 @@ async fn batch_episode_parent_info(
         .map(|_| "?")
         .collect::<Vec<_>>()
         .join(",");
-    let root_visible = visible_media_item_sql("mi");
-    let ancestor_visible = visible_media_item_sql("ancestor_parent");
+    let root_visible = "mi.is_public = 1";
+    let ancestor_visible = "ancestor_parent.is_public = 1";
     let sql = format!(
         r#"WITH RECURSIVE ancestors(root_id, id, title, item_type, parent_id, depth) AS (
-               SELECT mi.id, mi.id, mi.title, mi.item_type, mi.parent_id, 0
+               SELECT mi.id, mi.id, mi.title, mi.item_type, mi.parent_id, CAST(0 AS bigint)
                FROM media_items mi
                WHERE mi.id IN ({placeholders}) AND {root_visible}
                UNION ALL
-               SELECT ancestors.root_id, ancestor_parent.id, ancestor_parent.title, ancestor_parent.item_type, ancestor_parent.parent_id, ancestors.depth + 1
+               SELECT ancestors.root_id, ancestor_parent.id, ancestor_parent.title, ancestor_parent.item_type, ancestor_parent.parent_id, ancestors.depth + CAST(1 AS bigint)
                FROM media_items ancestor_parent
                JOIN ancestors ON ancestor_parent.id = ancestors.parent_id
                WHERE ancestors.depth < 8 AND {ancestor_visible}
@@ -1218,6 +1226,7 @@ mod tests {
         item_json_with_provider_ids,
     };
     use crate::entities::{
+        image_assets::{self, Entity as ImageAssets},
         libraries::{self, Entity as Libraries},
         media_items::{self, Entity as MediaItems},
         media_streams::{self, Entity as MediaStreams},
@@ -1395,6 +1404,14 @@ mod tests {
             None,
         )
         .await;
+        insert_image(
+            &db,
+            "direct-series-primary",
+            "direct-series",
+            "Primary",
+            "series-primary-tag",
+        )
+        .await;
         insert_item(
             &db,
             "direct-episode",
@@ -1419,12 +1436,27 @@ mod tests {
         assert_eq!(direct_json["SeriesName"], "Direct Series");
         assert_eq!(direct_json["SeasonId"], "direct-series");
         assert_eq!(direct_json["SeasonName"], "Season 1");
+        assert_eq!(direct_json["SeriesPrimaryImageTag"], "series-primary-tag");
+        assert_eq!(direct_json["ParentPrimaryImageItemId"], "direct-series");
+        assert_eq!(direct_json["ParentPrimaryImageTag"], "series-primary-tag");
 
         let direct_enriched = enrich_episode_list(&db, "u1", vec![direct_episode]).await;
         assert_eq!(direct_enriched[0]["SeriesId"], "direct-series");
         assert_eq!(direct_enriched[0]["SeriesName"], "Direct Series");
         assert_eq!(direct_enriched[0]["SeasonId"], "direct-series");
         assert_eq!(direct_enriched[0]["SeasonName"], "Season 1");
+        assert_eq!(
+            direct_enriched[0]["SeriesPrimaryImageTag"],
+            "series-primary-tag"
+        );
+        assert_eq!(
+            direct_enriched[0]["ParentPrimaryImageItemId"],
+            "direct-series"
+        );
+        assert_eq!(
+            direct_enriched[0]["ParentPrimaryImageTag"],
+            "series-primary-tag"
+        );
 
         let hidden_episode = crate::jellyfin::item_queries::find_media_item_for_admin(
             &db,
@@ -1641,6 +1673,31 @@ mod tests {
             created_at: Set(1),
             updated_at: Set(1),
             ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_image(
+        db: &DatabaseConnection,
+        id: &str,
+        item_id: &str,
+        image_type: &str,
+        etag: &str,
+    ) {
+        ImageAssets::insert(image_assets::ActiveModel {
+            id: Set(id.to_string()),
+            item_id: Set(item_id.to_string()),
+            image_type: Set(image_type.to_string()),
+            image_index: Set(0),
+            path: Set(Some(format!("/tmp/{id}.jpg"))),
+            etag: Set(Some(etag.to_string())),
+            width: Set(Some(1000)),
+            height: Set(Some(1500)),
+            size_bytes: Set(Some(1)),
+            created_at: Set(1),
+            updated_at: Set(1),
         })
         .exec_without_returning(db)
         .await

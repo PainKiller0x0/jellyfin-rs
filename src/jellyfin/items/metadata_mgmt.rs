@@ -37,7 +37,7 @@ use crate::{
         common::{internal_error, strip_nulls},
         item_queries,
     },
-    library::{models::media_source_json_with_streams, scanner::scan_media_library},
+    library::{models::media_source_json_with_streams, scanner::scan_media_library_if_idle},
     playback::streaming::readable_media_path,
     util::{now_unix, stable_text_id},
 };
@@ -809,12 +809,31 @@ async fn item_counts_response(
 }
 
 pub async fn scan_handler(State(state): State<Arc<AppState>>) -> Response {
+    if state.scan_lock.try_lock().is_err() {
+        return Json(json!({ "Scanning": true, "AlreadyRunning": true })).into_response();
+    }
+
     tokio::spawn(async move {
         let start = now_unix();
-        let result = scan_media_library(&state).await;
+        crate::jellyfin::system::upsert_task_result(
+            &state,
+            "scan-library",
+            "Running",
+            start,
+            start,
+            Some("Media library scan is running"),
+        )
+        .await;
+        let result = scan_media_library_if_idle(&state).await;
         let end = now_unix();
         let (status, message) = match &result {
-            Ok(count) => ("Completed", Some(format!("Scanned {count} items"))),
+            Ok(Some(count)) => ("Completed", Some(format!("Scanned {count} items"))),
+            Ok(None) => {
+                tracing::info!(
+                    "media scan request ignored because another scan is already running"
+                );
+                return;
+            }
             Err(error) => ("Failed", Some(format!("{error:#}"))),
         };
         crate::jellyfin::system::upsert_task_result(

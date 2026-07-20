@@ -104,6 +104,9 @@ export type PlaybackRegion = {
   RegionCode: string;
   ProvinceCode?: string;
   ProvinceName?: string;
+  CityName?: string;
+  CountryName?: string;
+  Isp?: string;
   IsPrivate: boolean;
   PlayCount: number;
   UserCount: number;

@@ -74,16 +74,31 @@ pub use localization::{
     localization_countries, localization_cultures, localization_options, parental_ratings,
 };
 
-pub async fn system_info(State(state): State<Arc<AppState>>) -> Response {
+pub async fn system_info(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let server_name = app_setting(&state.db, "ServerName", SERVER_NAME).await;
     let startup_completed = app_setting_bool(&state.db, "StartupWizardCompleted", false).await;
-    Json(system_info_value(server_name, startup_completed, true)).into_response()
+    Json(system_info_value(
+        server_name,
+        startup_completed,
+        true,
+        Some(request_base_url(&headers)),
+    ))
+    .into_response()
 }
 
-pub async fn public_system_info(State(state): State<Arc<AppState>>) -> Response {
+pub async fn public_system_info(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
     let server_name = app_setting(&state.db, "ServerName", SERVER_NAME).await;
     let startup_completed = app_setting_bool(&state.db, "StartupWizardCompleted", false).await;
-    Json(system_info_value(server_name, startup_completed, false)).into_response()
+    Json(system_info_value(
+        server_name,
+        startup_completed,
+        false,
+        Some(request_base_url(&headers)),
+    ))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -172,21 +187,102 @@ fn system_info_value(
     server_name: String,
     startup_completed: bool,
     include_private: bool,
+    local_address: Option<String>,
 ) -> JsonValue {
+    let local_address = local_address.filter(|value| !value.trim().is_empty());
     let mut value = json!({
         "ServerName": server_name,
         "Version": VERSION,
+        "ProductName": "Emby Server",
+        "OperatingSystem": std::env::consts::OS,
         "Id": "jellyfin-rs",
         "ServerId": "jellyfin-rs",
         "StartupWizardCompleted": startup_completed,
     });
+    if let Some(local_address) = local_address.as_ref() {
+        value["LocalAddress"] = json!(local_address);
+    }
     if include_private {
-        value["LocalAddress"] = json!("http://127.0.0.1:8096");
-        value["WanAddress"] = json!("http://127.0.0.1:8096");
-        value["OperatingSystem"] = json!(std::env::consts::OS);
+        let local_address = local_address.unwrap_or_else(|| "http://127.0.0.1:8096".to_string());
+        let http_port = base_url_port(&local_address).unwrap_or(8096);
+        let supports_https = local_address.starts_with("https://");
+        value["LocalAddress"] = json!(local_address.clone());
+        value["WanAddress"] = json!(local_address);
+        value["OperatingSystemDisplayName"] = json!(format!(
+            "{}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ));
+        value["HasPendingRestart"] = json!(false);
+        value["IsShuttingDown"] = json!(false);
         value["HasUpdateAvailable"] = json!(false);
+        value["WebSocketPortNumber"] = json!(http_port);
+        value["HttpServerPortNumber"] = json!(http_port);
+        value["SupportsHttps"] = json!(supports_https);
+        value["HttpsPortNumber"] = json!(if supports_https { http_port } else { 0 });
+        value["CanSelfRestart"] = json!(false);
+        value["CanSelfUpdate"] = json!(false);
+        value["CanLaunchWebBrowser"] = json!(false);
+        value["SupportsLibraryMonitor"] = json!(true);
+        value["ProgramDataPath"] = json!("");
+        value["ItemsByNamePath"] = json!("");
+        value["CachePath"] = json!("");
+        value["LogPath"] = json!("");
+        value["InternalMetadataPath"] = json!("");
+        value["TranscodingTempPath"] = json!("");
+        value["EncoderLocation"] = json!("System");
+        value["SystemArchitecture"] = json!(std::env::consts::ARCH);
+        value["CompletedInstallations"] = json!([]);
     }
     value
+}
+
+fn base_url_port(value: &str) -> Option<u16> {
+    let authority = value
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(value)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    if authority.starts_with('[') {
+        return authority
+            .rsplit_once("]:")
+            .and_then(|(_, port)| port.parse::<u16>().ok());
+    }
+    authority
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+}
+
+fn request_base_url(headers: &HeaderMap) -> String {
+    if let Some(public_url) = configured_public_url() {
+        return public_url;
+    }
+    let scheme = header_text(headers, "x-forwarded-proto")
+        .and_then(|value| value.split(',').next().map(str::trim).map(str::to_string))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "http".to_string());
+    let host = header_text(headers, "x-forwarded-host")
+        .or_else(|| header_text(headers, "host"))
+        .unwrap_or_else(|| "127.0.0.1:8096".to_string());
+    format!("{scheme}://{host}")
+}
+
+fn configured_public_url() -> Option<String> {
+    std::env::var("JELLYFIN_RS_PUBLIC_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+}
+
+fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 pub async fn web_strings() -> Response {
@@ -762,7 +858,7 @@ pub async fn system_endpoint() -> impl IntoResponse {
 }
 
 pub async fn system_ping() -> impl IntoResponse {
-    "Jellyfin Server is running"
+    "Emby Server"
 }
 
 pub async fn utc_time() -> impl IntoResponse {
@@ -910,6 +1006,18 @@ pub async fn bitrate_test(Query(query): Query<HashMap<String, String>>) -> impl 
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
     (headers, Body::from(bytes))
+}
+
+pub async fn web_manifest() -> impl IntoResponse {
+    Json(json!({
+        "name": "Emby Server",
+        "short_name": "Emby",
+        "start_url": "/web/index.html",
+        "display": "standalone",
+        "background_color": "#101010",
+        "theme_color": "#52b54b",
+        "icons": []
+    }))
 }
 
 pub async fn activity_log(
@@ -5017,16 +5125,34 @@ mod tests {
 
     #[test]
     fn system_info_reports_server_ids() {
-        let full = system_info_value("Home".to_string(), true, true);
+        let full = system_info_value(
+            "Home".to_string(),
+            true,
+            true,
+            Some("http://media.local:8096".to_string()),
+        );
         assert_eq!(full["Id"], "jellyfin-rs");
         assert_eq!(full["ServerId"], "jellyfin-rs");
         assert_eq!(full["ServerName"], "Home");
-        assert!(full["LocalAddress"].as_str().is_some());
+        assert_eq!(full["ProductName"], "Emby Server");
+        assert_eq!(full["LocalAddress"], "http://media.local:8096");
+        assert_eq!(full["HttpServerPortNumber"], 8096);
+        assert_eq!(full["WebSocketPortNumber"], 8096);
+        assert_eq!(full["SupportsHttps"], false);
+        assert_eq!(full["HasPendingRestart"], false);
+        assert_eq!(full["IsShuttingDown"], false);
+        assert_eq!(full["EncoderLocation"], "System");
 
-        let public = system_info_value("Home".to_string(), false, false);
+        let public = system_info_value(
+            "Home".to_string(),
+            false,
+            false,
+            Some("https://media.example".to_string()),
+        );
         assert_eq!(public["Id"], "jellyfin-rs");
         assert_eq!(public["ServerId"], "jellyfin-rs");
-        assert!(public.get("LocalAddress").is_none());
+        assert_eq!(public["ProductName"], "Emby Server");
+        assert_eq!(public["LocalAddress"], "https://media.example");
     }
 
     #[tokio::test]

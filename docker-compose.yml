@@ -1,9 +1,17 @@
 services:
   app:
-    build: .
+    build:
+      context: .
+      network: host
+      args:
+        HTTP_PROXY: ${JELLYFIN_RS_BUILD_PROXY:-http://127.0.0.1:7890}
+        HTTPS_PROXY: ${JELLYFIN_RS_BUILD_PROXY:-http://127.0.0.1:7890}
+        ALL_PROXY: ${JELLYFIN_RS_BUILD_PROXY:-http://127.0.0.1:7890}
+        NO_PROXY: ${JELLYFIN_RS_NO_PROXY:-localhost,127.0.0.1,::1}
     network_mode: host
     environment:
       JELLYFIN_RS_HOST: ${JELLYFIN_RS_HOST:-0.0.0.0}
+      JELLYFIN_RS_PUBLIC_URL: ${JELLYFIN_RS_PUBLIC_URL:-}
       JELLYFIN_RS_DATABASE_URL: ${JELLYFIN_RS_DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/jellyfin_rs}
       JELLYFIN_RS_USER: ${JELLYFIN_RS_USER:-admin}
       JELLYFIN_RS_PASSWORD: ${JELLYFIN_RS_PASSWORD:-123456}

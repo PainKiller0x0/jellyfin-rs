@@ -32,24 +32,33 @@ use crate::{
 const PUBLIC_PATHS: &[&str] = &[
     "/GetUtcTime",
     "/System/Info/Public",
+    "/system/info/public",
     "/System/Endpoint",
+    "/system/endpoint",
     "/System/Ping",
+    "/system/ping",
     "/Users/AuthenticateByName",
     "/Users/authenticatebyname",
+    "/users/authenticatebyname",
     "/Users/Public",
+    "/users/public",
     "/Users/ForgotPassword",
     "/Users/ForgotPassword/Pin",
     "/QuickConnect/Enabled",
+    "/quickconnect/enabled",
     "/QuickConnect/Authorize",
     "/QuickConnect/Connect",
     "/QuickConnect/Initiate",
     "/Branding/Configuration",
+    "/branding/configuration",
     "/Branding/Css",
     "/Branding/Css.css",
     "/Branding/Splashscreen",
     "/description.xml",
     "/web/ConfigurationPages",
     "/web/ConfigurationPage",
+    "/web/manifest.json",
+    "/Web/manifest.json",
     "/web/strings",
     "/web/stringset",
     "/openapi",
@@ -516,14 +525,14 @@ pub async fn forgot_password() -> impl IntoResponse {
 pub async fn auth_providers() -> impl IntoResponse {
     Json(name_id_pairs(&[(
         "Default",
-        "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider",
+        "Emby.Server.Implementations.Library.DefaultAuthenticationProvider",
     )]))
 }
 
 pub async fn password_reset_providers() -> impl IntoResponse {
     Json(name_id_pairs(&[(
         "Default",
-        "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider",
+        "Emby.Server.Implementations.Library.DefaultPasswordResetProvider",
     )]))
 }
 
@@ -1259,6 +1268,8 @@ async fn public_users_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<JsonV
                 "Id": m.id,
                 "ServerId": "jellyfin-rs",
                 "HasPassword": m.password_hash.is_some(),
+                "HasConfiguredPassword": m.password_hash.is_some(),
+                "HasConfiguredEasyPassword": false,
             })
         })
         .collect())
@@ -1711,6 +1722,7 @@ fn is_public_request(method: &Method, path: &str) -> bool {
         path,
         "/Users/AuthenticateByName"
             | "/Users/authenticatebyname"
+            | "/users/authenticatebyname"
             | "/Users/AuthenticateWithQuickConnect"
             | "/Users/ForgotPassword"
             | "/Users/ForgotPassword/Pin"
@@ -1805,14 +1817,14 @@ fn unauthenticated_media_stream_path(path: &str) -> bool {
 }
 
 fn item_original_file_path(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/Items/") else {
+    let Some(rest) = strip_path_prefix_ascii_case(path, "/Items/") else {
         return false;
     };
     matches!(rest.split('/').collect::<Vec<_>>().as_slice(), [_, "File"])
 }
 
 fn video_stream_path(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/Videos/") else {
+    let Some(rest) = strip_path_prefix_ascii_case(path, "/Videos/") else {
         return false;
     };
     let parts = rest.split('/').collect::<Vec<_>>();
@@ -1829,7 +1841,7 @@ fn video_stream_path(path: &str) -> bool {
 }
 
 fn audio_stream_path(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/Audio/") else {
+    let Some(rest) = strip_path_prefix_ascii_case(path, "/Audio/") else {
         return false;
     };
     let parts = rest.split('/').collect::<Vec<_>>();
@@ -1838,6 +1850,12 @@ fn audio_stream_path(path: &str) -> bool {
         [_, "hls1", _, _] => true,
         _ => false,
     }
+}
+
+fn strip_path_prefix_ascii_case<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    path.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        .then(|| &path[prefix.len()..])
 }
 
 fn stream_file_name(file: &str) -> bool {
@@ -2392,6 +2410,7 @@ fn user_json(
         "HasPassword": has_password,
         "HasConfiguredPassword": has_password,
         "HasConfiguredEasyPassword": false,
+        "EnableAutoLogin": false,
         "Configuration": default_user_configuration(),
         "Policy": default_user_policy(is_admin, is_disabled)
     })
@@ -2420,6 +2439,8 @@ fn default_user_configuration() -> JsonValue {
         "RememberSubtitleSelections": true,
         "EnableNextEpisodeAutoPlay": true,
         "DisplayMissingEpisodes": false,
+        "DisplayCollectionsView": false,
+        "EnableLocalPassword": false,
         "GroupedFolders": [],
         "LatestItemsExcludes": [],
         "MyMediaExcludes": [],
@@ -2479,8 +2500,6 @@ fn default_user_policy(is_admin: bool, is_disabled: bool) -> JsonValue {
         "EnableSharedDeviceControl",
         "EnableLiveTvManagement",
         "EnableLiveTvAccess",
-        "EnableAudioPlaybackTranscoding",
-        "EnableVideoPlaybackTranscoding",
         "ForceRemoteSourceTranscoding",
         "EnableContentDeletion",
         "EnableSyncTranscoding",
@@ -2511,8 +2530,11 @@ fn default_user_policy(is_admin: bool, is_disabled: bool) -> JsonValue {
         ("EnableUserPreferenceAccess", json!(true)),
         ("EnableRemoteAccess", json!(true)),
         ("EnableMediaPlayback", json!(true)),
+        ("EnableAudioPlaybackTranscoding", json!(true)),
+        ("EnableVideoPlaybackTranscoding", json!(true)),
         ("EnablePlaybackRemuxing", json!(true)),
         ("EnableContentDownloading", json!(true)),
+        ("EnableSubtitleDownloading", json!(true)),
         ("EnableAllDevices", json!(true)),
         ("EnableAllChannels", json!(true)),
         ("EnableAllFolders", json!(true)),
@@ -2520,8 +2542,14 @@ fn default_user_policy(is_admin: bool, is_disabled: bool) -> JsonValue {
         ("LoginAttemptsBeforeLockout", json!(-1)),
         ("MaxActiveSessions", json!(0)),
         ("RemoteClientBitrateLimit", json!(0)),
-        ("AuthenticationProviderId", json!("Default")),
-        ("PasswordResetProviderId", json!("Default")),
+        (
+            "AuthenticationProviderId",
+            json!("Emby.Server.Implementations.Library.DefaultAuthenticationProvider"),
+        ),
+        (
+            "PasswordResetProviderId",
+            json!("Emby.Server.Implementations.Library.DefaultPasswordResetProvider"),
+        ),
         ("SyncPlayAccess", json!("None")),
     ] {
         policy.insert(key.to_string(), value);
@@ -2817,7 +2845,9 @@ mod tests {
     #[test]
     fn auth_rules_leave_discovery_public() {
         assert!(is_public_request(&Method::GET, "/System/Info/Public"));
+        assert!(is_public_request(&Method::GET, "/system/info/public"));
         assert!(is_public_request(&Method::GET, "/Branding/Css"));
+        assert!(is_public_request(&Method::GET, "/web/manifest.json"));
         assert!(is_public_request(&Method::GET, "/Branding/Splashscreen"));
         assert!(is_public_request(&Method::GET, "/web/ConfigurationPages"));
         assert!(!is_public_request(&Method::GET, "/web/private"));
@@ -2856,6 +2886,10 @@ mod tests {
             &Method::POST,
             "/emby/Users/authenticatebyname"
         ));
+        assert!(is_public_request(
+            &Method::POST,
+            "/emby/users/authenticatebyname"
+        ));
     }
 
     #[test]
@@ -2873,6 +2907,7 @@ mod tests {
             "/emby/Videos/17c24581-7ecf-5adf-a2a6-c85fe4d1fbf8/stream.mkv"
         ));
         assert!(is_public_request(&Method::GET, "/Videos/item/stream"));
+        assert!(is_public_request(&Method::GET, "/videos/item/stream"));
         assert!(is_public_request(
             &Method::GET,
             "/Videos/item/source/original.mkv"
@@ -3529,6 +3564,20 @@ mod tests {
         assert_eq!(user["HasPassword"], false);
         assert_eq!(user["HasConfiguredPassword"], false);
         assert_eq!(user["HasConfiguredEasyPassword"], false);
+        assert_eq!(user["EnableAutoLogin"], false);
+        assert_eq!(user["Configuration"]["DisplayCollectionsView"], false);
+        assert_eq!(user["Configuration"]["EnableLocalPassword"], false);
+        assert_eq!(
+            user["Policy"]["AuthenticationProviderId"],
+            "Emby.Server.Implementations.Library.DefaultAuthenticationProvider"
+        );
+        assert_eq!(
+            user["Policy"]["PasswordResetProviderId"],
+            "Emby.Server.Implementations.Library.DefaultPasswordResetProvider"
+        );
+        assert_eq!(user["Policy"]["EnableAudioPlaybackTranscoding"], true);
+        assert_eq!(user["Policy"]["EnableVideoPlaybackTranscoding"], true);
+        assert_eq!(user["Policy"]["EnableSubtitleDownloading"], true);
     }
 
     #[test]

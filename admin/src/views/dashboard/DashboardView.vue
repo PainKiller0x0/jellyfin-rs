@@ -426,6 +426,13 @@ function regionHeatStyle(region: PlaybackRegion) {
   };
 }
 
+function regionMeta(region: PlaybackRegion) {
+  const location = [region.ProvinceName, region.CityName, region.Isp].filter(Boolean).join(' · ');
+  return [`${region.UserCount} 用户`, `${region.IpCount} IP`, location, region.SampleIps.join(', ')]
+    .filter(Boolean)
+    .join(' · ');
+}
+
 function logLine(entry: AdminHttpLogEntry) {
   const query = entry.Query ? `?${entry.Query}` : '';
   return `${entry.Method} ${entry.Path}${query}`;
@@ -532,7 +539,7 @@ onBeforeUnmount(stopPolling);
               <i class="dashboard-page__region-swatch" :style="regionHeatStyle(region)"></i>
               <div>
                 <strong>{{ region.Region }}</strong>
-                <span>{{ region.UserCount }} 用户 · {{ region.IpCount }} IP · {{ region.SampleIps.join(', ') || '-' }}</span>
+                <span>{{ regionMeta(region) }}</span>
                 <b :style="regionBarStyle(region)"></b>
               </div>
               <ElTag class="dashboard-page__region-count" type="success" effect="plain">
@@ -780,7 +787,14 @@ onBeforeUnmount(stopPolling);
   overflow: hidden;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #f6f8fa;
+  background:
+    linear-gradient(rgba(31, 35, 40, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(31, 35, 40, 0.08) 1px, transparent 1px),
+    #ffffff;
+  background-size:
+    100% 74px,
+    150px 100%,
+    auto;
   isolation: isolate;
 }
 
@@ -792,17 +806,12 @@ onBeforeUnmount(stopPolling);
 }
 
 .dashboard-page__map-ocean {
-  fill: #ffffff;
-  stroke: rgba(31, 35, 40, 0.08);
-  stroke-width: 1;
+  fill: transparent;
+  stroke: none;
 }
 
-.dashboard-page__map-grid path {
-  fill: none;
-  stroke: rgba(31, 35, 40, 0.1);
-  stroke-dasharray: 4 10;
-  stroke-linecap: round;
-  vector-effect: non-scaling-stroke;
+.dashboard-page__map-grid {
+  display: none;
 }
 
 .dashboard-page__china-province {

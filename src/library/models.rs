@@ -99,8 +99,14 @@ impl MediaItem {
         map.insert("Name".into(), JsonValue::String(self.title.clone()));
         map.insert("Id".into(), JsonValue::String(self.id.clone()));
         map.insert("Type".into(), JsonValue::String(self.item_type.clone()));
-        map.insert("ServerId".into(), JsonValue::Null);
-        map.insert("Etag".into(), JsonValue::Null);
+        map.insert(
+            "ServerId".into(),
+            JsonValue::String("jellyfin-rs".to_string()),
+        );
+        map.insert(
+            "Etag".into(),
+            JsonValue::String(format!("{}-{}", self.id, self.modified_at)),
+        );
         map.insert("Path".into(), JsonValue::String(self.path.clone()));
         map.insert(
             "LibraryId".into(),
@@ -220,19 +226,25 @@ impl MediaItem {
         map.insert("ParentPrimaryImageTag".into(), JsonValue::Null);
         map.insert("MediaSources".into(), media_sources);
         map.insert("MediaStreams".into(), JsonValue::Null);
-        map.insert("MediaSourceCount".into(), JsonValue::Null);
+        map.insert(
+            "MediaSourceCount".into(),
+            JsonValue::Number(serde_json::Number::from(if self.is_folder { 0 } else { 1 })),
+        );
         map.insert("Chapters".into(), json!([]));
         map.insert("Trickplay".into(), json!({}));
-        map.insert("LocalTrailerCount".into(), JsonValue::Null);
+        map.insert("LocalTrailerCount".into(), JsonValue::Number(0.into()));
         map.insert("RemoteTrailers".into(), json!([]));
-        map.insert("SpecialFeatureCount".into(), JsonValue::Null);
+        map.insert("SpecialFeatureCount".into(), JsonValue::Number(0.into()));
         map.insert("ExtraType".into(), JsonValue::Null);
         map.insert("IsPlaceHolder".into(), JsonValue::Null);
-        map.insert("ChildCount".into(), JsonValue::Null);
-        map.insert("RecursiveItemCount".into(), JsonValue::Null);
+        map.insert("ChildCount".into(), JsonValue::Number(0.into()));
+        map.insert("RecursiveItemCount".into(), JsonValue::Number(0.into()));
         map.insert("CumulativeRunTimeTicks".into(), JsonValue::Null);
-        map.insert("PartCount".into(), JsonValue::Null);
-        map.insert("EnableMediaSourceDisplay".into(), JsonValue::Null);
+        map.insert(
+            "PartCount".into(),
+            JsonValue::Number(serde_json::Number::from(if self.is_folder { 0 } else { 1 })),
+        );
+        map.insert("EnableMediaSourceDisplay".into(), JsonValue::Bool(false));
         map.insert("IsMovie".into(), JsonValue::Null);
         map.insert("IsSeries".into(), JsonValue::Null);
         map.insert("IsSports".into(), JsonValue::Null);
@@ -352,12 +364,11 @@ pub fn media_source_json_with_streams(
     let (media_streams, media_attachments) =
         split_media_streams_and_attachments(&item.id, &item.id, media_streams);
     let bitrate = media_source_bitrate(item.size_bytes, item.runtime_ticks, &media_streams);
-    let container = item.container.as_deref().unwrap_or("bin");
     let direct_stream_url = match remote_strm_target(&item.path) {
         Some(target) => target,
         None => match item.item_type.as_str() {
             "Audio" => format!("/Audio/{}/universal", item.id),
-            _ => format!("/Videos/{}/stream.{container}", item.id),
+            _ => format!("/Videos/{}/stream", item.id),
         },
     };
     let (protocol, path, is_remote) = media_source_protocol_path(&item.path);
@@ -902,7 +913,7 @@ pub fn child_video_source_json_for_item(
         split_media_streams_and_attachments(item_id, media_source_id, media_streams);
     let bitrate = media_source_bitrate(size, runtime_ticks, &media_streams);
     let direct_stream_url = remote_strm_target(path)
-        .unwrap_or_else(|| format!("/Videos/{item_id}/{media_source_id}/stream.{container}"));
+        .unwrap_or_else(|| format!("/Videos/{item_id}/{media_source_id}/stream"));
     let (protocol, path, is_remote) = media_source_protocol_path(path);
     let mut map = Map::new();
     map.insert("Id".into(), JsonValue::String(media_source_id.to_string()));
@@ -1095,6 +1106,24 @@ mod tests {
         assert_eq!(source["DirectStreamUrl"], "https://example.test/part.mkv");
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn media_item_json_uses_emby_base_item_defaults() {
+        let value = video_item().to_jellyfin_json();
+
+        assert_eq!(value["ServerId"], "jellyfin-rs");
+        assert_eq!(value["Etag"], "movie-1");
+        assert_eq!(value["MediaSourceCount"], 1);
+        assert_eq!(value["PartCount"], 1);
+        assert_eq!(value["ChildCount"], 0);
+        assert_eq!(value["RecursiveItemCount"], 0);
+        assert_eq!(value["LocalTrailerCount"], 0);
+        assert_eq!(value["EnableMediaSourceDisplay"], false);
+        assert_eq!(
+            value["MediaSources"][0]["DirectStreamUrl"],
+            "/Videos/movie/stream"
+        );
     }
 
     #[test]

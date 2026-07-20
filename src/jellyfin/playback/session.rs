@@ -51,7 +51,9 @@ pub async fn playback_info(
     };
     match item_result {
         Ok(Some(item)) => {
-            let profile = dlna::request_device_profile(body.as_ref().map(|Json(value)| value));
+            let body_value = body.as_ref().map(|Json(value)| value);
+            let profile = dlna::request_device_profile(body_value);
+            let max_streaming_bitrate = playback_max_streaming_bitrate(&query, body_value);
 
             // For Movie/Episode folders with child Video files (multi-version), return their media sources
             let mut media_sources = if item.is_folder && (item.item_type == "Movie" || item.item_type == "Episode") {
@@ -111,6 +113,9 @@ pub async fn playback_info(
                     Err(error) => return internal_error(error),
                 }
             };
+            if let Some(max_streaming_bitrate) = max_streaming_bitrate {
+                apply_max_streaming_bitrate_to_sources(&mut media_sources, max_streaming_bitrate);
+            }
             if let Some(token) = request_token(&headers, &query) {
                 append_access_token_to_media_sources(&mut media_sources, &token);
             }
@@ -122,6 +127,23 @@ pub async fn playback_info(
         )
         .into_response(),
         Err(error) => internal_error(error),
+    }
+}
+
+fn playback_max_streaming_bitrate(
+    query: &HashMap<String, String>,
+    body: Option<&JsonValue>,
+) -> Option<i64> {
+    body.and_then(|value| query_json_i64(value, "MaxStreamingBitrate"))
+        .or_else(|| query_i64(query, "MaxStreamingBitrate"))
+        .filter(|value| *value > 0)
+}
+
+fn apply_max_streaming_bitrate_to_sources(media_sources: &mut [JsonValue], bitrate: i64) {
+    for source in media_sources {
+        if let Some(object) = source.as_object_mut() {
+            object.insert("FallbackMaxStreamingBitrate".to_string(), json!(bitrate));
+        }
     }
 }
 
@@ -179,6 +201,27 @@ fn append_access_token_to_value(value: &mut JsonValue, token: &str) {
         }
         _ => {}
     }
+}
+
+fn query_i64(query: &HashMap<String, String>, key: &str) -> Option<i64> {
+    query
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .and_then(|(_, value)| value.trim().parse::<i64>().ok())
+}
+
+fn query_json_i64(value: &JsonValue, key: &str) -> Option<i64> {
+    value.as_object().and_then(|object| {
+        object
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .and_then(|(_, value)| {
+                value
+                    .as_i64()
+                    .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+                    .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
+            })
+    })
 }
 
 fn stream_url_with_token(url: &str, token: &str) -> Option<String> {
@@ -1241,7 +1284,8 @@ pub async fn current_user_playing_item_progress(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_access_token_to_media_sources, current_user_playing_item_start, watch_delta_seconds,
+        append_access_token_to_media_sources, apply_max_streaming_bitrate_to_sources,
+        current_user_playing_item_start, playback_max_streaming_bitrate, watch_delta_seconds,
         watch_segment_day_slices,
     };
     use crate::app::state::{AppState, PlaybackSession};
@@ -1260,7 +1304,7 @@ mod tests {
     #[test]
     fn playback_info_urls_include_access_token_for_clients_that_drop_auth_headers() {
         let mut sources = vec![serde_json::json!({
-            "DirectStreamUrl": "/Videos/video/stream.mkv",
+            "DirectStreamUrl": "/Videos/video/stream",
             "TranscodingUrl": null,
             "MediaAttachments": [
                 { "DeliveryUrl": "/Videos/video/video/Attachments/5" }
@@ -1271,12 +1315,29 @@ mod tests {
 
         assert_eq!(
             sources[0]["DirectStreamUrl"],
-            "/Videos/video/stream.mkv?api_key=token%201"
+            "/Videos/video/stream?api_key=token%201"
         );
         assert_eq!(
             sources[0]["MediaAttachments"][0]["DeliveryUrl"],
             "/Videos/video/video/Attachments/5?api_key=token%201"
         );
+    }
+
+    #[test]
+    fn playback_info_accepts_emby_max_streaming_bitrate_shapes() {
+        let mut query = HashMap::new();
+        query.insert("maxStreamingBitrate".to_string(), "12000000".to_string());
+        assert_eq!(playback_max_streaming_bitrate(&query, None), Some(12000000));
+
+        let body = serde_json::json!({ "MaxStreamingBitrate": "24000000" });
+        assert_eq!(
+            playback_max_streaming_bitrate(&query, Some(&body)),
+            Some(24000000)
+        );
+
+        let mut sources = vec![serde_json::json!({ "Id": "source" })];
+        apply_max_streaming_bitrate_to_sources(&mut sources, 36000000);
+        assert_eq!(sources[0]["FallbackMaxStreamingBitrate"], 36000000);
     }
 
     #[test]

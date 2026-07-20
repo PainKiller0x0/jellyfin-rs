@@ -4,7 +4,11 @@
 /.venv
 /.venv-*
 /cd2/
-/data/
+/data/*
+!/data/
+!/data/ip2region_v4.xdb
+!/data/README.md
+!/data/IP2REGION_LICENSE.md
 /jellyfin/
 /loadtest/
 /loadtest-results/

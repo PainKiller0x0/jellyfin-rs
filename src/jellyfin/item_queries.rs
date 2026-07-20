@@ -22,7 +22,12 @@ struct LibraryItemCounts {
 pub async fn library_views(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>> {
     let rows = db
         .query_all(crate::db::helpers::pg_statement(
-            "SELECT id, name, collection_type FROM libraries ORDER BY name ASC",
+            r#"SELECT l.id, l.name, l.collection_type, l.created_at, l.updated_at,
+                      COALESCE(MIN(lp.path), '') AS path
+               FROM libraries l
+               LEFT JOIN library_paths lp ON lp.library_id = l.id
+               GROUP BY l.id, l.name, l.collection_type, l.created_at, l.updated_at
+               ORDER BY l.name ASC"#,
             vec![],
         ))
         .await
@@ -38,7 +43,11 @@ pub async fn library_views(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>
     rows.iter()
         .map(|row| -> anyhow::Result<Value> {
             let id = row.get_str("id")?;
+            let name = row.get_str("name")?;
             let collection_type = row.get_str("collection_type")?;
+            let path = row.get_str("path").unwrap_or_default();
+            let created_at = row.get_i64("created_at").unwrap_or(0);
+            let updated_at = row.get_i64("updated_at").unwrap_or(0);
             let item_counts = counts.get(&id).copied().unwrap_or_default();
             let child_count = library_child_count(&collection_type, item_counts);
             let recursive_count = library_recursive_count(&collection_type, item_counts);
@@ -46,20 +55,47 @@ pub async fn library_views(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>
             let primary_image_tag = image_tag(&image_tags, "Primary").unwrap_or_default();
             let backdrop_tags = backdrop_image_tags(&image_tags);
             Ok(json!({
-                "Name": row.get_str("name")?,
-                "Id": id,
+                "Name": name.clone(),
+                "Id": id.clone(),
+                "ServerId": "jellyfin-rs",
+                "Etag": stable_text_id(&format!("library:{id}:{updated_at}")),
                 "CollectionType": collection_type.clone(),
                 "Type": "CollectionFolder",
                 "MediaType": "Unknown",
                 "IsFolder": true,
+                "Path": path.clone(),
+                "ParentId": "",
+                "LibraryId": id.clone(),
+                "SortName": name,
+                "LocationType": if path.is_empty() { "Virtual" } else { "FileSystem" },
+                "CanDelete": false,
+                "CanDownload": false,
+                "PlayAccess": "Full",
                 "ChildCount": child_count,
                 "RecursiveItemCount": recursive_count,
                 "MovieCount": item_counts.movie_count,
                 "SeriesCount": item_counts.series_count,
                 "EpisodeCount": item_counts.episode_count,
+                "MediaSources": [],
+                "MediaSourceCount": 0,
+                "PartCount": 0,
+                "LocalTrailerCount": 0,
+                "ProviderIds": {},
                 "ImageTags": image_tags,
                 "PrimaryImageTag": primary_image_tag,
                 "BackdropImageTags": backdrop_tags,
+                "Genres": [],
+                "GenreItems": [],
+                "Tags": [],
+                "TagItems": [],
+                "Studios": [],
+                "People": [],
+                "DateCreated": crate::util::unix_to_jellyfin_date(created_at),
+                "DateLastMediaAdded": crate::util::unix_to_jellyfin_date(updated_at),
+                "LockData": false,
+                "LockedFields": [],
+                "ExternalUrls": [],
+                "UserData": library_user_data(&id),
             }))
         })
         .collect()
@@ -73,7 +109,10 @@ pub async fn find_library_as_item(
 ) -> anyhow::Result<Option<Value>> {
     let row = db
         .query_one(crate::db::helpers::pg_statement(
-            "SELECT id, name, collection_type, created_at, updated_at FROM libraries WHERE id = ?",
+            r#"SELECT l.id, l.name, l.collection_type, l.created_at, l.updated_at,
+                      COALESCE((SELECT MIN(path) FROM library_paths WHERE library_id = l.id), '') AS path
+               FROM libraries l
+               WHERE l.id = ?"#,
             vec![library_id.into()],
         ))
         .await
@@ -85,6 +124,7 @@ pub async fn find_library_as_item(
             let collection_type: String = row.get_str("collection_type")?;
             let created_at: i64 = row.get_i64("created_at")?;
             let updated_at: i64 = row.get_i64("updated_at")?;
+            let path: String = row.get_str("path").unwrap_or_default();
             let counts = library_item_counts(db, std::slice::from_ref(&id)).await?;
             let item_counts = counts.get(&id).copied().unwrap_or_default();
             let child_count = library_child_count(&collection_type, item_counts);
@@ -96,8 +136,10 @@ pub async fn find_library_as_item(
             let primary_image_tag = image_tag(&image_tags, "Primary").unwrap_or_default();
             let backdrop_tags = backdrop_image_tags(&image_tags);
             let mut value = json!({
-                "Name": name,
-                "Id": id,
+                "Name": name.clone(),
+                "Id": id.clone(),
+                "ServerId": "jellyfin-rs",
+                "Etag": stable_text_id(&format!("library:{id}:{updated_at}")),
                 "CollectionType": collection_type.clone(),
                 "Type": "CollectionFolder",
                 "MediaType": "Unknown",
@@ -105,12 +147,19 @@ pub async fn find_library_as_item(
                 "ProviderIds": {},
                 "PlayAccess": "Full",
                 "IsFolder": true,
+                "Path": path.clone(),
+                "ParentId": "",
+                "LibraryId": id.clone(),
+                "LocationType": if path.is_empty() { "Virtual" } else { "FileSystem" },
                 "ChildCount": child_count,
                 "RecursiveItemCount": recursive_count,
                 "MovieCount": item_counts.movie_count,
                 "SeriesCount": item_counts.series_count,
                 "EpisodeCount": item_counts.episode_count,
                 "MediaSources": [],
+                "MediaSourceCount": 0,
+                "PartCount": 0,
+                "LocalTrailerCount": 0,
                 "ImageTags": image_tags,
                 "BackdropImageTags": backdrop_tags,
                 "Genres": [],
@@ -124,37 +173,35 @@ pub async fn find_library_as_item(
                 "LockData": false,
                 "LockedFields": [],
                 "ExternalUrls": [],
+                "UserData": library_user_data(&id),
+                "CanDelete": false,
+                "CanDownload": false,
             });
-            value["ServerId"] = Value::Null;
-            value["Etag"] = Value::Null;
-            value["Path"] = Value::Null;
-            value["ParentId"] = Value::Null;
-            value["LibraryId"] = Value::Null;
             value["Overview"] = Value::Null;
             value["ProductionYear"] = Value::Null;
             value["PremiereDate"] = Value::Null;
-            value["CanDelete"] = json!(false);
-            value["CanDownload"] = json!(false);
             value["HasSubtitles"] = Value::Null;
-            value["LocationType"] = Value::Null;
-            value["UserData"] = json!({
-                "ItemId": id,
-                "Key": id,
-                "Played": false,
-                "IsFavorite": false,
-                "PlayCount": 0,
-                "PlaybackPositionTicks": 0,
-                "PlayedPercentage": null,
-                "Rating": null,
-                "LastPlayedDate": null,
-                "Likes": null,
-                "UnplayedItemCount": null,
-            });
             value["PrimaryImageTag"] = json!(primary_image_tag);
             Ok(Some(value))
         }
         None => Ok(None),
     }
+}
+
+fn library_user_data(library_id: &str) -> Value {
+    json!({
+        "ItemId": library_id,
+        "Key": library_id,
+        "Played": false,
+        "IsFavorite": false,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "PlayedPercentage": null,
+        "Rating": null,
+        "LastPlayedDate": null,
+        "Likes": null,
+        "UnplayedItemCount": null,
+    })
 }
 
 fn library_image_tag(library_id: &str, image_type: &str) -> String {
@@ -1399,6 +1446,12 @@ mod tests {
         .await
         .unwrap();
         db.execute(crate::db::helpers::pg_statement(
+            "INSERT INTO library_paths (id, library_id, path, created_at) VALUES (?, ?, ?, 1)",
+            vec!["path-1".into(), "movies".into(), "/media/movies".into()],
+        ))
+        .await
+        .unwrap();
+        db.execute(crate::db::helpers::pg_statement(
             "INSERT INTO image_assets (id, item_id, image_type, image_index, path, etag, created_at, updated_at) VALUES (?, ?, 'Primary', 0, 'data/images/movies_primary.png', 'uploaded-tag', 1, 1)",
             vec!["image-1".into(), "movies".into()],
         ))
@@ -1406,10 +1459,20 @@ mod tests {
         .unwrap();
 
         let views = library_views(&db).await.unwrap();
+        assert_eq!(views[0]["ServerId"], "jellyfin-rs");
+        assert_eq!(views[0]["Type"], "CollectionFolder");
+        assert_eq!(views[0]["Path"], "/media/movies");
+        assert_eq!(views[0]["LocationType"], "FileSystem");
+        assert_eq!(views[0]["MediaSourceCount"], 0);
+        assert_eq!(views[0]["UserData"]["Key"], "movies");
         assert_eq!(views[0]["ImageTags"]["Primary"], "uploaded-tag");
         assert_eq!(views[0]["PrimaryImageTag"], "uploaded-tag");
 
         let item = find_library_as_item(&db, "movies").await.unwrap().unwrap();
+        assert_eq!(item["ServerId"], "jellyfin-rs");
+        assert_eq!(item["Path"], "/media/movies");
+        assert_eq!(item["LocationType"], "FileSystem");
+        assert_eq!(item["MediaSourceCount"], 0);
         assert_eq!(item["ImageTags"]["Primary"], "uploaded-tag");
         assert_eq!(item["PrimaryImageTag"], "uploaded-tag");
     }

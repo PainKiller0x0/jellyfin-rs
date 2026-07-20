@@ -35,7 +35,12 @@ pub fn api_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/GetUtcTime", get(system::utc_time))
         .route("/System/Info", get(system::system_info))
+        .route("/system/info", get(system::system_info))
         .route("/System/Info/Public", get(system::public_system_info))
+        .route(
+            "/system/info/public",
+            get(system::public_system_info),
+        )
         .route(
             "/Admin/ServerName",
             get(system::admin_server_name).post(system::update_admin_server_name),
@@ -44,8 +49,13 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/Admin/PlaybackMap", get(system::admin_playback_map))
         .route("/Admin/PlaybackStats", get(system::admin_playback_stats))
         .route("/System/Endpoint", get(system::system_endpoint))
+        .route("/system/endpoint", get(system::system_endpoint))
         .route(
             "/System/Ping",
+            get(system::system_ping).post(system::system_ping),
+        )
+        .route(
+            "/system/ping",
             get(system::system_ping).post(system::system_ping),
         )
         .route("/System/Logs", get(system::system_logs))
@@ -103,6 +113,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/System/WakeOnLanInfo",
             get(system::system_wake_on_lan_info),
         )
+        .route(
+            "/system/wakeonlaninfo",
+            get(system::system_wake_on_lan_info),
+        )
         .route("/System/Logs/{name}", get(system::system_log_download))
         .route("/System/Logs/{name}/Lines", get(system::system_log_lines))
         .route(
@@ -110,6 +124,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(system::update_server_configuration_partial),
         )
         .route("/QuickConnect/Enabled", get(system::quick_connect_enabled))
+        .route("/quickconnect/enabled", get(system::quick_connect_enabled))
         .route(
             "/QuickConnect/Authorize",
             post(auth::quick_connect_authorize),
@@ -124,6 +139,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(system::branding_configuration),
         )
         .route(
+            "/branding/configuration",
+            get(system::branding_configuration),
+        )
+        .route(
             "/System/Configuration/Branding",
             get(system::branding_configuration).post(system::update_branding_configuration),
         )
@@ -134,6 +153,9 @@ pub fn api_routes() -> Router<Arc<AppState>> {
                 .delete(system::delete_branding_splashscreen),
         )
         .route("/Playback/BitrateTest", get(system::bitrate_test))
+        .route("/playback/bitratetest", get(system::bitrate_test))
+        .route("/web/manifest.json", get(system::web_manifest))
+        .route("/Web/manifest.json", get(system::web_manifest))
         .route(
             "/Encoding/CodecConfiguration/Defaults",
             get(system::encoding_codec_configuration_defaults),
@@ -406,6 +428,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/Users/authenticatebyname",
             post(auth::authenticate_by_name),
         )
+        .route(
+            "/users/authenticatebyname",
+            post(auth::authenticate_by_name),
+        )
         .route("/Users", get(auth::list_users).post(auth::update_user_legacy))
         .route("/Users/Query", get(auth::users_query))
         .route("/Users/Prefixes", get(filters::users_prefixes))
@@ -421,7 +447,9 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(auth::authenticate_with_quick_connect),
         )
         .route("/Users/Public", get(auth::public_users))
+        .route("/users/public", get(auth::public_users))
         .route("/Users/Me", get(auth::current_user))
+        .route("/users/me", get(auth::current_user))
         .route("/Users/New", post(auth::create_user))
         .route(
             "/Users/{user_id}",
@@ -611,6 +639,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/Items/{item_id}/PlaybackInfo",
+            get(playback::playback_info).post(playback::playback_info),
+        )
+        .route(
+            "/items/{item_id}/playbackinfo",
             get(playback::playback_info).post(playback::playback_info),
         )
         .route("/Items/{item_id}/Refresh", post(items::scan_handler))
@@ -807,7 +839,15 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(stream_video).head(stream_video_head),
         )
         .route(
+            "/videos/{item_id}/stream.{container}",
+            get(stream_video).head(stream_video_head),
+        )
+        .route(
             "/Videos/{item_id}/stream",
+            get(stream_video_simple).head(stream_video_simple_head),
+        )
+        .route(
+            "/videos/{item_id}/stream",
             get(stream_video_simple).head(stream_video_simple_head),
         )
         .route(
@@ -815,7 +855,15 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(stream_video_with_source).head(stream_video_with_source_head),
         )
         .route(
+            "/videos/{item_id}/{media_source_id}/stream.{container}",
+            get(stream_video_with_source).head(stream_video_with_source_head),
+        )
+        .route(
             "/Videos/{item_id}/{media_source_id}/stream",
+            get(stream_video_with_source_simple).head(stream_video_with_source_simple_head),
+        )
+        .route(
+            "/videos/{item_id}/{media_source_id}/stream",
             get(stream_video_with_source_simple).head(stream_video_with_source_simple_head),
         )
         .route(
@@ -823,7 +871,15 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(stream_video_original_container).head(stream_video_original_container_head),
         )
         .route(
+            "/videos/{item_id}/original.{container}",
+            get(stream_video_original_container).head(stream_video_original_container_head),
+        )
+        .route(
             "/Videos/{item_id}/original",
+            get(stream_video_original).head(stream_video_original_head),
+        )
+        .route(
+            "/videos/{item_id}/original",
             get(stream_video_original).head(stream_video_original_head),
         )
         .route(
@@ -832,7 +888,16 @@ pub fn api_routes() -> Router<Arc<AppState>> {
                 .head(stream_video_original_with_source_container_head),
         )
         .route(
+            "/videos/{item_id}/{media_source_id}/original.{container}",
+            get(stream_video_original_with_source_container)
+                .head(stream_video_original_with_source_container_head),
+        )
+        .route(
             "/Videos/{item_id}/{media_source_id}/original",
+            get(stream_video_original_with_source).head(stream_video_original_with_source_head),
+        )
+        .route(
+            "/videos/{item_id}/{media_source_id}/original",
             get(stream_video_original_with_source).head(stream_video_original_with_source_head),
         )
         .route(
@@ -1487,6 +1552,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/websocket", get(ws::ws_handler))
         .route("/WebSocket", get(ws::ws_handler))
+        .route("/embywebsocket", get(ws::ws_handler))
+        .route("/socket", get(ws::ws_handler))
 }
 
 #[cfg(test)]
@@ -1504,9 +1571,20 @@ mod tests {
         let routes = include_str!("routes.rs");
 
         assert!(routes.contains("/Videos/{item_id}/{media_source_id}/stream.{container}"));
+        assert!(routes.contains("/videos/{item_id}/{media_source_id}/stream.{container}"));
         assert!(routes.contains("/Videos/{item_id}/{media_source_id}/stream"));
         assert!(routes.contains("/Videos/{item_id}/original"));
         assert!(routes.contains("/Videos/{item_id}/{media_source_id}/original"));
+    }
+
+    #[test]
+    fn emby_client_probe_routes_include_aliases() {
+        let routes = include_str!("routes.rs");
+
+        assert!(routes.contains("/system/info/public"));
+        assert!(routes.contains("/web/manifest.json"));
+        assert!(routes.contains("/embywebsocket"));
+        assert!(routes.contains("/socket"));
     }
 
     #[test]

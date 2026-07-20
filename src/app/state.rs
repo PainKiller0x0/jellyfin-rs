@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -22,6 +22,9 @@ pub const VERSION: &str = "0.1.0";
 pub const DEFAULT_USER_NAME: &str = "tsukimi";
 const MAX_ADMIN_HTTP_LOGS: usize = 1_000;
 const MAX_PLAYBACK_RECENT_EVENTS: usize = 200;
+const IP2REGION_V4_XDB_ENV: &str = "JELLYFIN_RS_IP2REGION_V4_XDB";
+const EMBEDDED_IP2REGION_V4_XDB: &[u8] = include_bytes!("../../data/ip2region_v4.xdb");
+static IP_GEO_DATABASE: OnceLock<Option<IpGeoDatabase>> = OnceLock::new();
 
 pub struct AppState {
     pub user_id: Uuid,
@@ -89,6 +92,11 @@ pub struct PlaybackDistribution {
 struct PlaybackRegionStats {
     region: String,
     region_code: String,
+    province_code: Option<String>,
+    province_name: Option<String>,
+    city_name: Option<String>,
+    country_name: Option<String>,
+    isp: Option<String>,
     is_private: bool,
     x: u8,
     y: u8,
@@ -387,6 +395,11 @@ impl AppState {
             .or_insert_with(|| PlaybackRegionStats {
                 region: region.region,
                 region_code: region.region_code,
+                province_code: region.province_code,
+                province_name: region.province_name,
+                city_name: region.city_name,
+                country_name: region.country_name,
+                isp: region.isp,
                 is_private: region.is_private,
                 x: region.x,
                 y: region.y,
@@ -414,6 +427,11 @@ impl AppState {
                 json!({
                     "Region": stats.region,
                     "RegionCode": stats.region_code,
+                    "ProvinceCode": stats.province_code.as_deref(),
+                    "ProvinceName": stats.province_name.as_deref(),
+                    "CityName": stats.city_name.as_deref(),
+                    "CountryName": stats.country_name.as_deref(),
+                    "Isp": stats.isp.as_deref(),
                     "IsPrivate": stats.is_private,
                     "PlayCount": stats.play_count,
                     "UserCount": stats.users.len() as i64,
@@ -447,9 +465,233 @@ impl AppState {
 struct PlaybackRegion {
     region: String,
     region_code: String,
+    province_code: Option<String>,
+    province_name: Option<String>,
+    city_name: Option<String>,
+    country_name: Option<String>,
+    isp: Option<String>,
     is_private: bool,
     x: u8,
     y: u8,
+}
+
+impl PlaybackRegion {
+    fn basic(
+        region: impl Into<String>,
+        region_code: impl Into<String>,
+        is_private: bool,
+        x: u8,
+        y: u8,
+    ) -> Self {
+        Self {
+            region: region.into(),
+            region_code: region_code.into(),
+            province_code: None,
+            province_name: None,
+            city_name: None,
+            country_name: None,
+            isp: None,
+            is_private,
+            x,
+            y,
+        }
+    }
+
+    fn from_geo(location: IpGeoLocation, fallback_ip: &str) -> Self {
+        let (x, y) = deterministic_map_point(fallback_ip);
+        let province_name = location.province.clone();
+        let province_code = province_name
+            .as_deref()
+            .and_then(china_province_code)
+            .map(str::to_string);
+        let country_name = location.country.clone();
+        let city_name = location.city.clone();
+        let region = public_geo_region_name(&location);
+        let region_code = province_code
+            .as_deref()
+            .map(|code| format!("cn-{code}"))
+            .unwrap_or_else(|| format!("geo-{}", stable_hash(&location.raw)));
+
+        Self {
+            region,
+            region_code,
+            province_code,
+            province_name,
+            city_name,
+            country_name,
+            isp: location.isp,
+            is_private: false,
+            x,
+            y,
+        }
+    }
+}
+
+enum IpGeoDatabase {
+    Embedded(&'static [u8]),
+    Loaded(Vec<u8>),
+}
+
+impl IpGeoDatabase {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Embedded(data) => data,
+            Self::Loaded(data) => data.as_slice(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IpGeoLocation {
+    raw: String,
+    country: Option<String>,
+    province: Option<String>,
+    city: Option<String>,
+    isp: Option<String>,
+}
+
+fn ip_geo_database() -> Option<&'static IpGeoDatabase> {
+    IP_GEO_DATABASE.get_or_init(load_ip_geo_database).as_ref()
+}
+
+fn load_ip_geo_database() -> Option<IpGeoDatabase> {
+    if let Ok(path) = std::env::var(IP2REGION_V4_XDB_ENV) {
+        let path = path.trim();
+        if !path.is_empty() {
+            match xdb_parse::load_file(PathBuf::from(path)) {
+                Ok(data) => return Some(IpGeoDatabase::Loaded(data)),
+                Err(error) => {
+                    tracing::warn!(
+                        path,
+                        %error,
+                        "failed to load configured ip2region database, falling back to embedded database"
+                    );
+                }
+            }
+        }
+    }
+
+    Some(IpGeoDatabase::Embedded(EMBEDDED_IP2REGION_V4_XDB))
+}
+
+fn ip_geo_lookup(ip: IpAddr) -> Option<IpGeoLocation> {
+    let database = ip_geo_database()?;
+    let raw = xdb_parse::search_by_ipaddr(ip, database.as_slice()).ok()?;
+    Some(parse_ip2region_location(raw))
+}
+
+fn parse_ip2region_location(raw: &str) -> IpGeoLocation {
+    let fields = raw.split('|').collect::<Vec<_>>();
+    let field1 = clean_ip2region_field(fields.get(1).copied());
+    let field2 = clean_ip2region_field(fields.get(2).copied());
+    let field3 = clean_ip2region_field(fields.get(3).copied());
+    let field4 = clean_ip2region_field(fields.get(4).copied());
+    let uses_new_layout = field4
+        .as_deref()
+        .is_some_and(|value| value.len() == 2 && value.chars().all(|ch| ch.is_ascii_uppercase()))
+        || field1.as_deref().and_then(china_province_code).is_some();
+
+    let (province, city, isp) = if uses_new_layout {
+        (field1, field2, field3)
+    } else {
+        (field2, field3, field4)
+    };
+
+    IpGeoLocation {
+        raw: raw.to_string(),
+        country: clean_ip2region_field(fields.first().copied()),
+        province,
+        city,
+        isp,
+    }
+}
+
+fn clean_ip2region_field(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "0")
+        .map(str::to_string)
+}
+
+fn public_geo_region_name(location: &IpGeoLocation) -> String {
+    if let Some(province) = location
+        .province
+        .as_deref()
+        .filter(|name| china_province_code(name).is_some())
+    {
+        return china_province_display_name(province);
+    }
+
+    let region = [
+        location.country.as_deref(),
+        location.province.as_deref(),
+        location.city.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .trim()
+    .to_string();
+    if region.is_empty() {
+        "公网".to_string()
+    } else {
+        region
+    }
+}
+
+fn china_province_code(name: &str) -> Option<&'static str> {
+    match normalize_china_province_name(name).as_str() {
+        "北京" => Some("11"),
+        "天津" => Some("12"),
+        "河北" => Some("13"),
+        "山西" => Some("14"),
+        "内蒙古" => Some("15"),
+        "辽宁" => Some("21"),
+        "吉林" => Some("22"),
+        "黑龙江" => Some("23"),
+        "上海" => Some("31"),
+        "江苏" => Some("32"),
+        "浙江" => Some("33"),
+        "安徽" => Some("34"),
+        "福建" => Some("35"),
+        "江西" => Some("36"),
+        "山东" => Some("37"),
+        "河南" => Some("41"),
+        "湖北" => Some("42"),
+        "湖南" => Some("43"),
+        "广东" => Some("44"),
+        "广西" => Some("45"),
+        "海南" => Some("46"),
+        "重庆" => Some("50"),
+        "四川" => Some("51"),
+        "贵州" => Some("52"),
+        "云南" => Some("53"),
+        "西藏" => Some("54"),
+        "陕西" => Some("61"),
+        "甘肃" => Some("62"),
+        "青海" => Some("63"),
+        "宁夏" => Some("64"),
+        "新疆" => Some("65"),
+        "台湾" => Some("71"),
+        "香港" => Some("香港"),
+        "澳门" => Some("澳门"),
+        _ => None,
+    }
+}
+
+fn china_province_display_name(name: &str) -> String {
+    normalize_china_province_name(name)
+}
+
+fn normalize_china_province_name(name: &str) -> String {
+    name.trim()
+        .replace("特别行政区", "")
+        .replace("壮族自治区", "")
+        .replace("回族自治区", "")
+        .replace("维吾尔自治区", "")
+        .replace("自治区", "")
+        .replace(['省', '市', ' '], "")
 }
 
 fn normalize_remote_ip(value: &str) -> Option<String> {
@@ -480,95 +722,56 @@ fn normalize_remote_ip(value: &str) -> Option<String> {
 
 fn playback_region_for_ip(ip: &str) -> PlaybackRegion {
     if ip == "unknown" {
-        return PlaybackRegion {
-            region: "未知来源".to_string(),
-            region_code: "unknown".to_string(),
-            is_private: false,
-            x: 50,
-            y: 50,
-        };
+        return PlaybackRegion::basic("未知来源", "unknown", false, 50, 50);
     }
 
     match ip.parse::<IpAddr>() {
-        Ok(IpAddr::V4(addr)) if addr.is_loopback() => PlaybackRegion {
-            region: "本机".to_string(),
-            region_code: "loopback".to_string(),
-            is_private: true,
-            x: 50,
-            y: 58,
-        },
+        Ok(IpAddr::V4(addr)) if addr.is_loopback() => {
+            PlaybackRegion::basic("本机", "loopback", true, 50, 58)
+        }
         Ok(IpAddr::V4(addr)) if addr.is_private() => {
             let octets = addr.octets();
             if octets[0] == 192 && octets[1] == 168 {
-                PlaybackRegion {
-                    region: format!("局域网 {}.{}.{}.0/24", octets[0], octets[1], octets[2]),
-                    region_code: format!("lan-{}-{}-{}", octets[0], octets[1], octets[2]),
-                    is_private: true,
-                    x: 64,
-                    y: 58,
-                }
+                PlaybackRegion::basic(
+                    format!("局域网 {}.{}.{}.0/24", octets[0], octets[1], octets[2]),
+                    format!("lan-{}-{}-{}", octets[0], octets[1], octets[2]),
+                    true,
+                    64,
+                    58,
+                )
             } else if octets[0] == 10 {
-                PlaybackRegion {
-                    region: "局域网 10.0.0.0/8".to_string(),
-                    region_code: "lan-10".to_string(),
-                    is_private: true,
-                    x: 46,
-                    y: 56,
-                }
+                PlaybackRegion::basic("局域网 10.0.0.0/8", "lan-10", true, 46, 56)
             } else {
-                PlaybackRegion {
-                    region: "局域网 172.16.0.0/12".to_string(),
-                    region_code: "lan-172".to_string(),
-                    is_private: true,
-                    x: 56,
-                    y: 66,
-                }
+                PlaybackRegion::basic("局域网 172.16.0.0/12", "lan-172", true, 56, 66)
             }
         }
         Ok(IpAddr::V4(addr)) => {
-            let octets = addr.octets();
+            if let Some(location) = ip_geo_lookup(IpAddr::V4(addr)) {
+                return PlaybackRegion::from_geo(location, ip);
+            }
             let (x, y) = deterministic_map_point(ip);
-            PlaybackRegion {
-                region: format!("公网 {}.{}.0.0/16", octets[0], octets[1]),
-                region_code: format!("public-{}-{}", octets[0], octets[1]),
-                is_private: false,
+            let octets = addr.octets();
+            PlaybackRegion::basic(
+                format!("公网 {}.{}.0.0/16", octets[0], octets[1]),
+                format!("public-{}-{}", octets[0], octets[1]),
+                false,
                 x,
                 y,
-            }
+            )
         }
-        Ok(IpAddr::V6(addr)) if addr.is_loopback() => PlaybackRegion {
-            region: "本机".to_string(),
-            region_code: "loopback".to_string(),
-            is_private: true,
-            x: 50,
-            y: 58,
-        },
-        Ok(IpAddr::V6(addr)) if addr.is_unique_local() => PlaybackRegion {
-            region: "局域网 IPv6".to_string(),
-            region_code: "lan-ipv6".to_string(),
-            is_private: true,
-            x: 58,
-            y: 52,
-        },
+        Ok(IpAddr::V6(addr)) if addr.is_loopback() => {
+            PlaybackRegion::basic("本机", "loopback", true, 50, 58)
+        }
+        Ok(IpAddr::V6(addr)) if addr.is_unique_local() => {
+            PlaybackRegion::basic("局域网 IPv6", "lan-ipv6", true, 58, 52)
+        }
         Ok(IpAddr::V6(_)) => {
             let (x, y) = deterministic_map_point(ip);
-            PlaybackRegion {
-                region: "公网 IPv6".to_string(),
-                region_code: "public-ipv6".to_string(),
-                is_private: false,
-                x,
-                y,
-            }
+            PlaybackRegion::basic("公网 IPv6", "public-ipv6", false, x, y)
         }
         Err(_) => {
             let (x, y) = deterministic_map_point(ip);
-            PlaybackRegion {
-                region: ip.to_string(),
-                region_code: format!("raw-{}", stable_hash(ip)),
-                is_private: false,
-                x,
-                y,
-            }
+            PlaybackRegion::basic(ip, format!("raw-{}", stable_hash(ip)), false, x, y)
         }
     }
 }
@@ -588,7 +791,10 @@ fn stable_hash(value: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_douban_cookie_value, normalize_remote_ip, playback_region_for_ip};
+    use super::{
+        china_province_code, normalize_douban_cookie_value, normalize_remote_ip,
+        parse_ip2region_location, playback_region_for_ip,
+    };
 
     #[test]
     fn remote_ip_normalization_accepts_socket_addresses_and_forwarded_for() {
@@ -607,6 +813,42 @@ mod tests {
         let region = playback_region_for_ip("192.168.1.16");
         assert_eq!(region.region, "局域网 192.168.1.0/24");
         assert!(region.is_private);
+    }
+
+    #[test]
+    fn ip2region_location_parser_cleans_empty_fields() {
+        let location = parse_ip2region_location("中国|0|广东省|深圳市|阿里云");
+        assert_eq!(location.country.as_deref(), Some("中国"));
+        assert_eq!(location.province.as_deref(), Some("广东省"));
+        assert_eq!(location.city.as_deref(), Some("深圳市"));
+        assert_eq!(location.isp.as_deref(), Some("阿里云"));
+
+        let new_layout = parse_ip2region_location("中国|广东省|深圳市|阿里|CN");
+        assert_eq!(new_layout.province.as_deref(), Some("广东省"));
+        assert_eq!(new_layout.city.as_deref(), Some("深圳市"));
+        assert_eq!(new_layout.isp.as_deref(), Some("阿里"));
+
+        let empty = parse_ip2region_location("美国|0|0|0|0");
+        assert_eq!(empty.country.as_deref(), Some("美国"));
+        assert_eq!(empty.province, None);
+        assert_eq!(empty.city, None);
+        assert_eq!(empty.isp, None);
+    }
+
+    #[test]
+    fn playback_region_maps_public_ipv4_to_real_province() {
+        let region = playback_region_for_ip("120.24.78.129");
+        assert_eq!(region.province_code.as_deref(), Some("44"));
+        assert_eq!(region.region_code, "cn-44");
+        assert_eq!(region.region, "广东");
+        assert!(!region.is_private);
+    }
+
+    #[test]
+    fn china_province_code_normalizes_suffixes() {
+        assert_eq!(china_province_code("广东省"), Some("44"));
+        assert_eq!(china_province_code("内蒙古自治区"), Some("15"));
+        assert_eq!(china_province_code("香港特别行政区"), Some("香港"));
     }
 
     #[test]

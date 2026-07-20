@@ -1045,24 +1045,7 @@ pub async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>)
                 let stream_jsons = crate::jellyfin::playback::media_streams_for_item(db, &item.id)
                     .await
                     .unwrap_or_default();
-                let container = item.container.as_deref().unwrap_or("bin");
-                let source = json!({
-                    "Id": item.id,
-                    "Name": item.title,
-                    "Path": item.path,
-                    "Type": "Default",
-                    "Container": container,
-                    "Size": item.size_bytes,
-                    "RunTimeTicks": item.runtime_ticks,
-                    "SupportsDirectPlay": true,
-                    "SupportsDirectStream": true,
-                    "SupportsTranscoding": false,
-                    "IsInfiniteStream": false,
-                    "MediaStreams": stream_jsons,
-                    "Formats": [],
-                    "RequiredHttpHeaders": {},
-                    "DirectStreamUrl": format!("/Videos/{}/stream.{}", item.id, container),
-                });
+                let source = media_source_json_with_streams(item, stream_jsons);
                 source_map.insert(item.id.clone(), vec![source]);
             }
         }

@@ -4,7 +4,8 @@
 .venv/
 .venv-*/
 target/
-data/
+data/*
+!data/ip2region_v4.xdb
 logs/
 media/
 cd2/

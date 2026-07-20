@@ -29,6 +29,7 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 dashmap = "6"
+xdb-parse = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

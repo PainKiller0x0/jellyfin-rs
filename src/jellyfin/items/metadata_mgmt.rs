@@ -1962,7 +1962,7 @@ mod tests {
         let sources = alternate_sources_inner(&db, "v1").await.unwrap().unwrap();
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0]["Id"], "v2");
-        assert_eq!(sources[0]["DirectStreamUrl"], "/Videos/v2/stream.mkv");
+        assert_eq!(sources[0]["DirectStreamUrl"], "/Videos/v2/stream");
         assert_eq!(alternate_sources_inner(&db, "private").await.unwrap(), None);
         assert_eq!(
             alternate_sources_inner(&db, "hidden-child").await.unwrap(),

@@ -59,6 +59,7 @@ cargo run --release
 |----------|--------|------|
 | `JELLYFIN_RS_HOST` | `127.0.0.1` | 监听地址 |
 | `JELLYFIN_RS_PORT` | `8096` | 监听端口 |
+| `JELLYFIN_RS_PUBLIC_URL` | (按请求 Host 推断) | Docker/反代下返回给 Emby/Infuse 客户端的对外访问地址，例如 `http://192.168.1.10:8096` |
 | `JELLYFIN_RS_DATABASE_URL` | `postgresql://postgres:postgres@127.0.0.1:5432/jellyfin_rs` | PostgreSQL 数据库连接 |
 | `JELLYFIN_RS_MEDIA_DIRS` | (无) | 媒体目录，分号分隔 |
 | `JELLYFIN_RS_SCAN_ON_STARTUP` | `true` | 启动时扫描媒体库 |
@@ -66,6 +67,7 @@ cargo run --release
 | `JELLYFIN_RS_PASSWORD` | `tsukimi` | 默认管理员密码 |
 | `JELLYFIN_RS_FFPROBE_PATH` | (系统 PATH) | ffprobe 路径 |
 | `JELLYFIN_RS_SESSION_TIMEOUT_SECONDS` | `120` | 会话超时秒数 |
+| `JELLYFIN_RS_IP2REGION_V4_XDB` | 内置 `ip2region_v4.xdb` | 自定义 IPv4 离线 IP 属地库路径 |
 
 ## API 覆盖 / API Coverage (80+ endpoints)
 

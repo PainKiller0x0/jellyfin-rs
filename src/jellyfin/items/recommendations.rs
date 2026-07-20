@@ -71,7 +71,7 @@ async fn movie_recommendations_inner(
     let recent_movies = db
         .query_all(crate::db::helpers::pg_statement(
             &format!(
-                "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' AND {media_visible} AND COALESCE(user_data.played, 0) = 1 AND COALESCE(user_data.play_count, 0) > 0 {} ORDER BY user_data.last_played_at DESC LIMIT 12",
+                "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' AND {media_visible} AND user_data.played = 1 AND user_data.play_count > 0 {} ORDER BY user_data.last_played_at DESC LIMIT 12",
                 crate::jellyfin::item_queries::media_item_select_sql(""),
                 parent_id.map(|_p| "AND media_items.library_id = ?").unwrap_or(""),
             ),

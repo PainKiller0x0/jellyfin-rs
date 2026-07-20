@@ -487,6 +487,95 @@ pub fn optional_migrations() -> Vec<Migration> {
             "add linked_children.item_id index",
         ),
         (
+            r#"DO $$
+DECLARE
+    trgm_schema text;
+BEGIN
+    BEGIN
+        CREATE EXTENSION IF NOT EXISTS pg_trgm;
+    EXCEPTION
+        WHEN insufficient_privilege THEN
+            RAISE NOTICE 'pg_trgm extension unavailable; skipping media title trigram index';
+            RETURN;
+    END;
+
+    SELECT n.nspname
+      INTO trgm_schema
+      FROM pg_extension e
+      JOIN pg_namespace n ON n.oid = e.extnamespace
+     WHERE e.extname = 'pg_trgm';
+
+    IF trgm_schema IS NULL THEN
+        RETURN;
+    END IF;
+
+    EXECUTE format(
+        'CREATE INDEX IF NOT EXISTS idx_media_items_title_trgm ON media_items USING GIN (LOWER(title) %I.gin_trgm_ops)',
+        trgm_schema
+    );
+EXCEPTION
+    WHEN undefined_object OR insufficient_privilege THEN
+        RAISE NOTICE 'pg_trgm operator class unavailable; skipping media title trigram index';
+END $$"#,
+            "add media_items title trigram search index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_parent_type_title ON media_items(parent_id, item_type, title, id)",
+            "add media_items parent/type/title index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_public_library_type_modified ON media_items(library_id, item_type, modified_at DESC) WHERE is_public = 1",
+            "add media_items public latest index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_public_folder_type_created ON media_items(item_type, created_at DESC) WHERE is_public = 1 AND is_folder = 1",
+            "add media_items public folder created index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_public_movie_rating ON media_items(community_rating DESC) WHERE is_public = 1 AND is_folder = 1 AND item_type = 'Movie' AND community_rating IS NOT NULL",
+            "add media_items public movie rating index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_episode_versions ON media_items(parent_id, season_number, episode_number, size_bytes DESC, path) WHERE item_type = 'Episode'",
+            "add media_items episode version lookup index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_public_year ON media_items(production_year DESC) WHERE is_public = 1 AND production_year IS NOT NULL AND production_year > 0",
+            "add media_items public production year index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_public_official_rating ON media_items(official_rating) WHERE is_public = 1 AND official_rating IS NOT NULL AND official_rating <> ''",
+            "add media_items public official rating index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_public_container ON media_items(container) WHERE is_public = 1 AND container IS NOT NULL AND container <> ''",
+            "add media_items public container index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_public_extended_video_type ON media_items(extended_video_type) WHERE is_public = 1 AND extended_video_type IS NOT NULL AND extended_video_type <> ''",
+            "add media_items public extended video type index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_people_person_sort_item ON media_people(person_id, sort_order, item_id)",
+            "add media_people person sort index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_people_item_sort_person ON media_people(item_id, sort_order, person_id)",
+            "add media_people item sort index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_people_lower_person_type_person ON media_people(LOWER(person_type), person_id, item_id)",
+            "add media_people lower person type index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_user_data_user_favorite_item ON user_data(user_id, is_favorite, item_id)",
+            "add user_data favorite item index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_user_data_user_played_recent ON user_data(user_id, last_played_at DESC, item_id) WHERE played = 1 AND play_count > 0",
+            "add user_data recent played index",
+        ),
+        (
             r#"CREATE TABLE IF NOT EXISTS playback_watch_sessions (play_session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, item_id TEXT NOT NULL, media_source_id TEXT, client TEXT, device_name TEXT, position_ticks BIGINT NOT NULL DEFAULT 0, runtime_ticks BIGINT, is_paused BIGINT NOT NULL DEFAULT 0, started_at BIGINT NOT NULL, last_event_at BIGINT NOT NULL, ended_at BIGINT, watch_seconds BIGINT NOT NULL DEFAULT 0, updated_at BIGINT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"#,
             "create playback_watch_sessions table",
         ),

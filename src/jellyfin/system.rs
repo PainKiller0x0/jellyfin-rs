@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
-    app::state::{AppState, PlaybackSession, SERVER_NAME, SessionCapabilities, VERSION},
+    app::state::{AppState, PlaybackSession, SERVER_NAME, SessionCapabilities},
     db::row_ext::QueryResultExt,
     entities::{
         access_tokens, access_tokens::Entity as AccessTokens, activity_log,
@@ -56,6 +56,7 @@ const MAX_NOTIFICATION_DESCRIPTION_LEN: usize = 4096;
 const MAX_NOTIFICATION_IDS: usize = 512;
 const MAX_NOTIFICATION_ID_LEN: usize = 128;
 const MAX_ADMIN_SERVER_NAME_LEN: usize = 128;
+const EMBY_COMPAT_VERSION: &str = "4.8.0.0";
 const CAMERA_UPLOADS_PATH: &str = "data/camera_uploads";
 const USER_USAGE_BACKUP_PATH: &str = "data/user_usage_stats";
 const FALLBACK_FONTS_PATH: &str = "data/fonts";
@@ -192,7 +193,7 @@ fn system_info_value(
     let local_address = local_address.filter(|value| !value.trim().is_empty());
     let mut value = json!({
         "ServerName": server_name,
-        "Version": VERSION,
+        "Version": EMBY_COMPAT_VERSION,
         "ProductName": "Emby Server",
         "OperatingSystem": std::env::consts::OS,
         "Id": "jellyfin-rs",
@@ -297,8 +298,8 @@ pub async fn web_string_set() -> Response {
     .into_response()
 }
 
-pub async fn quick_connect_enabled() -> impl IntoResponse {
-    Json(true)
+pub async fn quick_connect_enabled(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(app_setting_bool(&state.db, "QuickConnectEnabled", false).await)
 }
 
 pub async fn branding_configuration(State(state): State<Arc<AppState>>) -> Response {
@@ -1482,7 +1483,7 @@ pub(crate) async fn server_config_json(db: &DatabaseConnection) -> JsonValue {
         .unwrap_or_else(|_| json!({}))
 }
 
-pub(super) async fn app_setting_bool(db: &DatabaseConnection, key: &str, default: bool) -> bool {
+pub(crate) async fn app_setting_bool(db: &DatabaseConnection, key: &str, default: bool) -> bool {
     match app_setting(db, key, if default { "true" } else { "false" })
         .await
         .to_ascii_lowercase()
@@ -5125,6 +5126,7 @@ mod tests {
         assert_eq!(full["ServerId"], "jellyfin-rs");
         assert_eq!(full["ServerName"], "Home");
         assert_eq!(full["ProductName"], "Emby Server");
+        assert_eq!(full["Version"], "4.8.0.0");
         assert_eq!(full["LocalAddress"], "http://media.local:8096");
         assert_eq!(full["HttpServerPortNumber"], 8096);
         assert_eq!(full["WebSocketPortNumber"], 8096);

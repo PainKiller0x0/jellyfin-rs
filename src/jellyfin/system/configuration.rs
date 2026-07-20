@@ -201,6 +201,8 @@ pub async fn server_configuration(
         super::app_setting(&state.db, "PreferredMetadataLanguage", "zh-CN").await,
         super::app_setting_bool(&state.db, "EnableRemoteAccess", false).await,
         super::app_setting_bool(&state.db, "StartupWizardCompleted", true).await,
+        super::app_setting_bool(&state.db, "QuickConnectEnabled", false).await,
+        super::app_setting_bool(&state.db, "PublicUserListEnabled", false).await,
     ))
     .into_response()
 }
@@ -333,14 +335,21 @@ pub(super) fn runtime_server_settings(
         }
     }
 
-    if let Some(value) = request.get("EnableRemoteAccess").and_then(Value::as_bool) {
-        settings.push((
-            "EnableRemoteAccess",
-            (if value { "true" } else { "false" }).to_string(),
-        ));
+    for key in [
+        "EnableRemoteAccess",
+        "QuickConnectEnabled",
+        "PublicUserListEnabled",
+    ] {
+        if let Some(value) = request.get(key).and_then(Value::as_bool) {
+            settings.push((key, bool_setting_value(value)));
+        }
     }
 
     Ok(settings)
+}
+
+fn bool_setting_value(value: bool) -> String {
+    (if value { "true" } else { "false" }).to_string()
 }
 
 pub(super) async fn sync_runtime_server_settings(
@@ -404,6 +413,8 @@ fn server_configuration_value(
     preferred_metadata_language: String,
     enable_remote_access: bool,
     startup_completed: bool,
+    quick_connect_enabled: bool,
+    public_user_list_enabled: bool,
 ) -> Value {
     let mut config = default_server_configuration();
     if let (Some(config), Some(saved)) = (config.as_object_mut(), saved_config.as_object()) {
@@ -431,6 +442,14 @@ fn server_configuration_value(
         "IsStartupWizardCompleted".to_string(),
         json!(startup_completed),
     );
+    object.insert(
+        "QuickConnectEnabled".to_string(),
+        json!(quick_connect_enabled),
+    );
+    object.insert(
+        "PublicUserListEnabled".to_string(),
+        json!(public_user_list_enabled),
+    );
     if !object
         .get("ContentTypes")
         .is_some_and(|value| value.is_array())
@@ -453,6 +472,8 @@ fn default_server_configuration() -> Value {
     json!({
         "EnableCaseSensitiveItemIds": true,
         "EnableMetrics": false,
+        "QuickConnectEnabled": false,
+        "PublicUserListEnabled": false,
         "IsStartupWizardCompleted": true,
         "MetadataPath": "",
         "MetadataNetworkPath": "",
@@ -703,11 +724,15 @@ mod tests {
             "en".to_string(),
             false,
             true,
+            false,
+            false,
         );
 
         assert_eq!(value["ServerName"], "Home Server");
         assert_eq!(value["EnableRemoteAccess"], false);
         assert_eq!(value["IsStartupWizardCompleted"], true);
+        assert_eq!(value["QuickConnectEnabled"], false);
+        assert_eq!(value["PublicUserListEnabled"], false);
         assert_eq!(value["MinResumePct"], 5);
         assert_eq!(value["MaxResumePct"], 90);
         assert_eq!(value["MetadataCountryCode"], "US");

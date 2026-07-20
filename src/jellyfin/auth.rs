@@ -261,7 +261,9 @@ pub async fn list_users(
 }
 
 pub async fn public_users(State(state): State<Arc<AppState>>) -> Response {
-    match public_users_inner(&state.db).await {
+    let enabled =
+        crate::jellyfin::system::app_setting_bool(&state.db, "PublicUserListEnabled", false).await;
+    match public_users_inner(&state.db, enabled).await {
         Ok(users) => Json(users).into_response(),
         Err(error) => internal_error(error),
     }
@@ -1264,7 +1266,14 @@ async fn list_users_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<JsonVal
     Ok(users)
 }
 
-async fn public_users_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<JsonValue>> {
+async fn public_users_inner(
+    db: &DatabaseConnection,
+    public_user_list_enabled: bool,
+) -> anyhow::Result<Vec<JsonValue>> {
+    if !public_user_list_enabled {
+        return Ok(Vec::new());
+    }
+
     let models = Users::find()
         .filter(users::Column::IsDisabled.eq(0))
         .order_by_asc(users::Column::Username)
@@ -3986,6 +3995,23 @@ mod tests {
 
         let users = list_users_inner(&db).await.unwrap();
         assert_eq!(users[0]["Policy"]["EnableAllFolders"], false);
+    }
+
+    #[tokio::test]
+    async fn public_users_default_to_hidden_but_can_be_enabled() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        insert_test_user(&db, "u1", false, false).await;
+        insert_test_user(&db, "u2", false, true).await;
+
+        assert!(public_users_inner(&db, false).await.unwrap().is_empty());
+
+        let users = public_users_inner(&db, true).await.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0]["Id"], "u1");
+        assert_eq!(users[0]["HasConfiguredPassword"], false);
+        assert!(users[0].get("Policy").is_none());
     }
 
     #[tokio::test]

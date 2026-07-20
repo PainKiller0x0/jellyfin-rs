@@ -397,6 +397,7 @@ pub fn media_source_json_with_streams(
     map.insert("SupportsDirectPlay".into(), JsonValue::Bool(true));
     map.insert("SupportsDirectStream".into(), JsonValue::Bool(true));
     map.insert("SupportsTranscoding".into(), JsonValue::Bool(false));
+    map.insert("AddApiKeyToDirectStreamUrl".into(), JsonValue::Bool(false));
     map.insert("SupportsProbing".into(), JsonValue::Bool(true));
     map.insert("IsInfiniteStream".into(), JsonValue::Bool(false));
     map.insert("IsRemote".into(), JsonValue::Bool(is_remote));
@@ -936,6 +937,7 @@ pub fn child_video_source_json_for_item(
     map.insert("SupportsDirectPlay".into(), JsonValue::Bool(true));
     map.insert("SupportsDirectStream".into(), JsonValue::Bool(true));
     map.insert("SupportsTranscoding".into(), JsonValue::Bool(false));
+    map.insert("AddApiKeyToDirectStreamUrl".into(), JsonValue::Bool(false));
     map.insert("SupportsProbing".into(), JsonValue::Bool(true));
     map.insert("IsInfiniteStream".into(), JsonValue::Bool(false));
     map.insert("IsRemote".into(), JsonValue::Bool(is_remote));
@@ -1074,6 +1076,7 @@ mod tests {
         assert_eq!(source["Protocol"], "Http");
         assert_eq!(source["Path"], "https://example.test/movie.mp4?token=1");
         assert_eq!(source["IsRemote"], true);
+        assert_eq!(source["AddApiKeyToDirectStreamUrl"], false);
         assert_eq!(
             source["DirectStreamUrl"],
             "https://example.test/movie.mp4?token=1"
@@ -1103,6 +1106,7 @@ mod tests {
         assert_eq!(source["Protocol"], "Http");
         assert_eq!(source["Path"], "https://example.test/part.mkv");
         assert_eq!(source["IsRemote"], true);
+        assert_eq!(source["AddApiKeyToDirectStreamUrl"], false);
         assert_eq!(source["DirectStreamUrl"], "https://example.test/part.mkv");
 
         let _ = std::fs::remove_dir_all(root);

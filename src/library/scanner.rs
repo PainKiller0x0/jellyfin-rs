@@ -16,7 +16,7 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrde
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 use crate::{
     app::state::AppState,
@@ -668,15 +668,23 @@ async fn scan_root(
     let mut seen_paths = Vec::new();
     let mut refresh_queued = 0usize;
     let mut sidecar_fingerprints = SidecarFingerprintCache::default();
+    let inventory = scan_path_inventory(&scan_path, &cancellation, &progress).await?;
     let stack_part_owners = scan_path
         .is_dir()
-        .then(|| movie_stack_part_owners(&scan_path, &collection_type, &cancellation))
+        .then(|| {
+            movie_stack_part_owners(
+                inventory.iter().filter_map(inventory_file_path),
+                &scan_path,
+                &collection_type,
+                &cancellation,
+            )
+        })
         .unwrap_or_default();
     let episode_version_owners = scan_path
         .is_dir()
         .then(|| {
             episode_version_owners(
-                &scan_path,
+                inventory.iter().filter_map(inventory_file_path),
                 &root,
                 &library_id,
                 &collection_type,
@@ -685,16 +693,8 @@ async fn scan_root(
         })
         .unwrap_or_default();
 
-    for entry in WalkDir::new(&scan_path).follow_links(false).into_iter() {
+    for entry in inventory {
         ensure_scan_active(&cancellation)?;
-        progress.discovered_entry();
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracing::warn!("failed to read media path: {error}");
-                continue;
-            }
-        };
         visited_entries += 1;
         if visited_entries.is_multiple_of(64) {
             crate::library::resource_governor::cooperative_scan_yield().await;
@@ -1129,7 +1129,32 @@ async fn scan_root(
     })
 }
 
-fn movie_stack_part_owners(
+async fn scan_path_inventory(
+    scan_path: &std::path::Path,
+    cancellation: &CancellationToken,
+    progress: &ScanProgressTracker,
+) -> anyhow::Result<Vec<DirEntry>> {
+    let mut inventory = Vec::new();
+    for entry in WalkDir::new(scan_path).follow_links(false).into_iter() {
+        ensure_scan_active(cancellation)?;
+        progress.discovered_entry();
+        match entry {
+            Ok(entry) => inventory.push(entry),
+            Err(error) => tracing::warn!("failed to read media path: {error}"),
+        }
+        if inventory.len().is_multiple_of(64) {
+            crate::library::resource_governor::cooperative_scan_yield().await;
+        }
+    }
+    Ok(inventory)
+}
+
+fn inventory_file_path(entry: &DirEntry) -> Option<&std::path::Path> {
+    entry.file_type().is_file().then(|| entry.path())
+}
+
+fn movie_stack_part_owners<'a>(
+    paths: impl IntoIterator<Item = &'a std::path::Path>,
     root: &std::path::Path,
     collection_type: &str,
     cancellation: &CancellationToken,
@@ -1139,16 +1164,10 @@ fn movie_stack_part_owners(
     }
 
     let mut groups = HashMap::<(PathBuf, String), Vec<(i64, PathBuf)>>::new();
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-    {
+    for path in paths {
         if cancellation.is_cancelled() {
             break;
         }
-        let path = entry.path();
         if should_skip_disc_structure_entry(path, root)
             || classify_media_path(path, collection_type).as_deref() != Some("Video")
             || video_extra_type(path, false).is_some()
@@ -1185,8 +1204,8 @@ fn movie_stack_part_owners(
     owners
 }
 
-fn episode_version_owners(
-    scan_path: &std::path::Path,
+fn episode_version_owners<'a>(
+    paths: impl IntoIterator<Item = &'a std::path::Path>,
     library_root: &std::path::Path,
     library_id: &str,
     collection_type: &str,
@@ -1199,16 +1218,10 @@ fn episode_version_owners(
     let mut groups =
         HashMap::<(String, Option<i64>, String), Vec<(PathBuf, Option<String>, Option<i64>)>>::new(
         );
-    for entry in WalkDir::new(scan_path)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-    {
+    for path in paths {
         if cancellation.is_cancelled() {
             break;
         }
-        let path = entry.path();
         if classify_media_path(path, collection_type).as_deref() != Some("Episode")
             || video_extra_type(path, false).is_some()
         {
@@ -2909,7 +2922,12 @@ mod tests {
         fs::write(&cd1, []).unwrap();
         fs::write(&cd2, []).unwrap();
 
-        let owners = movie_stack_part_owners(&root, "movies", &CancellationToken::new());
+        let owners = movie_stack_part_owners(
+            [cd1.as_path(), cd2.as_path()],
+            &root,
+            "movies",
+            &CancellationToken::new(),
+        );
         assert_eq!(owners.get(&cd2), Some(&cd1));
         assert!(!owners.contains_key(&cd1));
 

@@ -9,7 +9,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
+    QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -633,99 +634,183 @@ async fn delete_virtual_folder_inner(db: &DatabaseConnection, name: &str) -> any
         return Ok(false);
     };
     let library_id = library.id;
+    let transaction = db.begin().await?;
 
     let item_ids: Vec<String> = MediaItems::find()
         .filter(media_items::Column::LibraryId.eq(&library_id))
-        .all(db)
+        .all(&transaction)
         .await
         .context("failed to list library media items")?
         .into_iter()
         .map(|item| item.id)
         .collect();
 
-    if !item_ids.is_empty() {
+    delete_media_items(&transaction, &item_ids, &format!("library: {name}")).await?;
+
+    LibraryPaths::delete_many()
+        .filter(library_paths::Column::LibraryId.eq(&library_id))
+        .exec(&transaction)
+        .await
+        .context("failed to delete library paths")?;
+    Libraries::delete_by_id(library_id)
+        .exec(&transaction)
+        .await
+        .context("failed to delete library")?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+async fn delete_media_items<C: ConnectionTrait>(
+    db: &C,
+    item_ids: &[String],
+    context: &str,
+) -> anyhow::Result<()> {
+    if item_ids.is_empty() {
+        return Ok(());
+    }
+
+    for item_ids in item_ids.chunks(5_000) {
+        let item_ids = item_ids.to_vec();
         MediaGenres::delete_many()
             .filter(media_genres::Column::ItemId.is_in(item_ids.clone()))
             .exec(db)
             .await
-            .with_context(|| format!("failed to delete media_genres for library: {name}"))?;
+            .with_context(|| format!("failed to delete media_genres for {context}"))?;
         MediaTags::delete_many()
             .filter(media_tags::Column::ItemId.is_in(item_ids.clone()))
             .exec(db)
             .await
-            .with_context(|| format!("failed to delete media_tags for library: {name}"))?;
+            .with_context(|| format!("failed to delete media_tags for {context}"))?;
         MediaStudios::delete_many()
             .filter(media_studios::Column::ItemId.is_in(item_ids.clone()))
             .exec(db)
             .await
-            .with_context(|| format!("failed to delete media_studios for library: {name}"))?;
+            .with_context(|| format!("failed to delete media_studios for {context}"))?;
         MediaPeople::delete_many()
             .filter(media_people::Column::ItemId.is_in(item_ids.clone()))
             .exec(db)
             .await
-            .with_context(|| format!("failed to delete media_people for library: {name}"))?;
+            .with_context(|| format!("failed to delete media_people for {context}"))?;
         MediaGameGenres::delete_many()
             .filter(media_game_genres::Column::ItemId.is_in(item_ids.clone()))
             .exec(db)
             .await
-            .with_context(|| format!("failed to delete media_game_genres for library: {name}"))?;
+            .with_context(|| format!("failed to delete media_game_genres for {context}"))?;
         MediaStreams::delete_many()
             .filter(media_streams::Column::ItemId.is_in(item_ids.clone()))
             .exec(db)
             .await
-            .with_context(|| format!("failed to delete media_streams for library: {name}"))?;
+            .with_context(|| format!("failed to delete media_streams for {context}"))?;
         UserData::delete_many()
             .filter(user_data::Column::ItemId.is_in(item_ids.clone()))
             .exec(db)
             .await
-            .with_context(|| format!("failed to delete user_data for library: {name}"))?;
+            .with_context(|| format!("failed to delete user_data for {context}"))?;
         ImageAssets::delete_many()
             .filter(image_assets::Column::ItemId.is_in(item_ids.clone()))
             .exec(db)
             .await
-            .with_context(|| format!("failed to delete image_assets for library: {name}"))?;
+            .with_context(|| format!("failed to delete image_assets for {context}"))?;
         ProviderIds::delete_many()
             .filter(provider_ids::Column::ItemId.is_in(item_ids.clone()))
             .exec(db)
             .await
-            .with_context(|| format!("failed to delete provider_ids for library: {name}"))?;
+            .with_context(|| format!("failed to delete provider_ids for {context}"))?;
         Chapters::delete_many()
             .filter(chapters::Column::ItemId.is_in(item_ids.clone()))
             .exec(db)
             .await
-            .with_context(|| format!("failed to delete chapters for library: {name}"))?;
+            .with_context(|| format!("failed to delete chapters for {context}"))?;
         TrickplayImages::delete_many()
             .filter(trickplay_images::Column::ItemId.is_in(item_ids.clone()))
             .exec(db)
             .await
-            .with_context(|| format!("failed to delete trickplay_images for library: {name}"))?;
+            .with_context(|| format!("failed to delete trickplay_images for {context}"))?;
         LinkedChildren::delete_many()
             .filter(linked_children::Column::ItemId.is_in(item_ids.clone()))
             .exec(db)
             .await
-            .context("failed to delete linked children for library")?;
+            .with_context(|| format!("failed to delete linked children for {context}"))?;
         LinkedChildren::delete_many()
             .filter(linked_children::Column::ParentId.is_in(item_ids.clone()))
             .exec(db)
             .await
-            .context("failed to delete linked children for library")?;
+            .with_context(|| format!("failed to delete linked children for {context}"))?;
         MediaItems::delete_many()
             .filter(media_items::Column::Id.is_in(item_ids))
             .exec(db)
             .await
-            .context("failed to delete library media items")?;
+            .with_context(|| format!("failed to delete media items for {context}"))?;
     }
+    Ok(())
+}
 
-    LibraryPaths::delete_many()
-        .filter(library_paths::Column::LibraryId.eq(&library_id))
-        .exec(db)
+fn path_descendant_prefix(path: &str) -> String {
+    let mut prefix = path_utils::normalize_path(path);
+    if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
+        prefix.push(std::path::MAIN_SEPARATOR);
+    }
+    prefix
+}
+
+async fn find_stored_library_path<C: ConnectionTrait>(
+    db: &C,
+    library_id: &str,
+    requested_path: &str,
+) -> anyhow::Result<Option<library_paths::Model>> {
+    let normalized = path_utils::normalize_path(requested_path);
+    let canonical = path_utils::canonicalize_path(&normalized).ok();
+    let mut candidates = vec![normalized];
+    if let Some(canonical) = canonical.filter(|path| !candidates.contains(path)) {
+        candidates.push(canonical);
+    }
+    Ok(LibraryPaths::find()
+        .filter(library_paths::Column::LibraryId.eq(library_id))
+        .filter(library_paths::Column::Path.is_in(candidates))
+        .one(db)
+        .await?)
+}
+
+async fn delete_items_under_library_path<C: ConnectionTrait>(
+    db: &C,
+    library_id: &str,
+    root_path: &str,
+) -> anyhow::Result<()> {
+    let prefix = path_descendant_prefix(root_path);
+    let item_ids = MediaItems::find()
+        .filter(media_items::Column::LibraryId.eq(library_id))
+        .filter(
+            Condition::any()
+                .add(media_items::Column::Path.eq(root_path))
+                .add(media_items::Column::Path.starts_with(&prefix)),
+        )
+        .all(db)
         .await
-        .context("failed to delete library paths")?;
-    Libraries::delete_by_id(library_id)
-        .exec(db)
-        .await
-        .context("failed to delete library")?;
-    Ok(true)
+        .with_context(|| format!("failed to list media items under path: {root_path}"))?
+        .into_iter()
+        .map(|item| item.id)
+        .collect::<Vec<_>>();
+    delete_media_items(db, &item_ids, &format!("library path: {root_path}")).await
+}
+
+async fn delete_refresh_jobs_under_library_path<C: ConnectionTrait>(
+    db: &C,
+    library_id: &str,
+    root_path: &str,
+) -> anyhow::Result<()> {
+    let prefix = path_descendant_prefix(root_path);
+    db.execute_raw(crate::db::helpers::pg_statement(
+        "DELETE FROM library_refresh_jobs WHERE library_id = ? AND (path = ? OR LEFT(path, CHAR_LENGTH(?)) = ?)",
+        vec![
+            library_id.to_string().into(),
+            root_path.to_string().into(),
+            prefix.clone().into(),
+            prefix.into(),
+        ],
+    ))
+    .await
+    .with_context(|| format!("failed to delete refresh jobs under path: {root_path}"))?;
+    Ok(())
 }
 
 async fn delete_virtual_folder_path_inner(
@@ -734,7 +819,7 @@ async fn delete_virtual_folder_path_inner(
     path: &str,
 ) -> anyhow::Result<bool> {
     let name = normalize_library_name(name)?;
-    let path = path_utils::canonicalize_path(&normalize_library_path_text(path)?)?;
+    let path = normalize_library_path_text(path)?;
     let Some(library) = Libraries::find()
         .filter(libraries::Column::Name.eq(&name))
         .one(db)
@@ -742,12 +827,17 @@ async fn delete_virtual_folder_path_inner(
     else {
         return Ok(false);
     };
-    let result = LibraryPaths::delete_many()
-        .filter(library_paths::Column::LibraryId.eq(library.id))
-        .filter(library_paths::Column::Path.eq(path))
-        .exec(db)
+    let Some(stored_path) = find_stored_library_path(db, &library.id, &path).await? else {
+        return Ok(false);
+    };
+    let transaction = db.begin().await?;
+    delete_refresh_jobs_under_library_path(&transaction, &library.id, &stored_path.path).await?;
+    delete_items_under_library_path(&transaction, &library.id, &stored_path.path).await?;
+    LibraryPaths::delete_by_id(stored_path.id)
+        .exec(&transaction)
         .await?;
-    Ok(result.rows_affected > 0)
+    transaction.commit().await?;
+    Ok(true)
 }
 
 async fn rename_virtual_folder_inner(
@@ -778,7 +868,7 @@ async fn update_virtual_folder_path_inner(
     target_path: &str,
 ) -> anyhow::Result<bool> {
     let name = normalize_library_name(name)?;
-    let path = path_utils::canonicalize_path(&normalize_library_path_text(path)?)?;
+    let path = normalize_library_path_text(path)?;
     let target_path =
         path_utils::validate_library_path(&normalize_library_path_text(target_path)?)?;
     let Some(library) = Libraries::find()
@@ -789,18 +879,21 @@ async fn update_virtual_folder_path_inner(
         return Ok(false);
     };
     let library_id = library.id;
-    let Some(model) = LibraryPaths::find()
-        .filter(library_paths::Column::LibraryId.eq(&library_id))
-        .filter(library_paths::Column::Path.eq(path))
-        .one(db)
-        .await?
-    else {
+    let Some(model) = find_stored_library_path(db, &library_id, &path).await? else {
         return Ok(false);
     };
+    if model.path == target_path {
+        return Ok(true);
+    }
+    let old_path = model.path.clone();
+    let transaction = db.begin().await?;
+    delete_refresh_jobs_under_library_path(&transaction, &library_id, &old_path).await?;
+    delete_items_under_library_path(&transaction, &library_id, &old_path).await?;
     let mut active: library_paths::ActiveModel = model.into();
     active.path = Set(target_path);
     active.library_id = Set(library_id);
-    active.update(db).await?;
+    active.update(&transaction).await?;
+    transaction.commit().await?;
     Ok(true)
 }
 
@@ -1252,8 +1345,25 @@ mod tests {
         let new_dir = temp_media_dir("new");
         std::fs::create_dir_all(&old_dir).unwrap();
         std::fs::create_dir_all(&new_dir).unwrap();
+        let sibling_dir = old_dir.with_file_name(format!(
+            "{}-archive",
+            old_dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&sibling_dir).unwrap();
         insert_library(&db, "movies", "Movies").await;
         insert_library_path(&db, "movies", &old_dir.to_string_lossy()).await;
+        insert_media_item(
+            &db,
+            "old-item",
+            &old_dir.join("movie.mkv").to_string_lossy(),
+        )
+        .await;
+        insert_media_item(
+            &db,
+            "sibling-item",
+            &sibling_dir.join("movie.mkv").to_string_lossy(),
+        )
+        .await;
 
         assert!(
             update_virtual_folder_path_inner(
@@ -1275,9 +1385,55 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(
+            MediaItems::find_by_id("old-item".to_string())
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            MediaItems::find_by_id("sibling-item".to_string())
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         std::fs::remove_dir_all(&old_dir).unwrap();
         std::fs::remove_dir_all(&new_dir).unwrap();
+        std::fs::remove_dir_all(&sibling_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_offline_library_path_removes_its_items() {
+        let Some(db) = test_db().await else {
+            return;
+        };
+        let dir = temp_media_dir("offline-delete");
+        std::fs::create_dir_all(&dir).unwrap();
+        insert_library(&db, "movies", "Movies").await;
+        insert_library_path(&db, "movies", &dir.to_string_lossy()).await;
+        insert_media_item(
+            &db,
+            "offline-item",
+            &dir.join("movie.mkv").to_string_lossy(),
+        )
+        .await;
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(
+            delete_virtual_folder_path_inner(&db, "Movies", &dir.to_string_lossy())
+                .await
+                .unwrap()
+        );
+        assert!(
+            MediaItems::find_by_id("offline-item".to_string())
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

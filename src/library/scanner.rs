@@ -41,8 +41,8 @@ const MEDIA_PROBE_CACHE_VERSION_KEY: &str = "media_probe_cache_version";
 const MEDIA_PROBE_CACHE_VERSION: &str = "3";
 const MIN_INGEST_QUEUE_CAPACITY: usize = 512;
 const MAX_INGEST_QUEUE_CAPACITY: usize = 4096;
-const MIN_MEDIA_PROBE_QUEUE_CAPACITY: usize = 128;
-const MAX_MEDIA_PROBE_QUEUE_CAPACITY: usize = 1024;
+const MIN_MEDIA_PROBE_QUEUE_CAPACITY: usize = 32;
+const MAX_MEDIA_PROBE_QUEUE_CAPACITY: usize = 256;
 const METADATA_FETCH_MAX_ATTEMPTS: usize = 30;
 const METADATA_FETCH_RETRY_DELAY_SECS: u64 = 2;
 
@@ -546,13 +546,23 @@ async fn run_ingest_job(
         media_path: pending_probe.media_path,
         probe_path: pending_probe.probe_path,
     };
-    if let Err(error) = probe_tx.send(probe_job).await {
-        tracing::warn!(
-            "media probe queue closed before job could be scheduled for {}",
-            error.0.item.path
-        );
-    } else {
-        result.probe_queued = true;
+    match probe_tx.try_send(probe_job) {
+        Ok(()) => {
+            result.probe_queued = true;
+        }
+        Err(mpsc::error::TrySendError::Full(job)) => {
+            result.probe_skipped = true;
+            tracing::debug!(
+                "media probe queue is full; skipping probe for {}",
+                job.item.path
+            );
+        }
+        Err(mpsc::error::TrySendError::Closed(job)) => {
+            tracing::warn!(
+                "media probe queue closed before job could be scheduled for {}",
+                job.item.path
+            );
+        }
     }
 
     Ok(result)
@@ -1157,7 +1167,7 @@ fn ingest_queue_capacity() -> usize {
 }
 
 fn media_probe_queue_capacity() -> usize {
-    crate::db::cpu_parallelism().saturating_mul(128).clamp(
+    crate::db::cpu_parallelism().saturating_mul(32).clamp(
         MIN_MEDIA_PROBE_QUEUE_CAPACITY,
         MAX_MEDIA_PROBE_QUEUE_CAPACITY,
     )

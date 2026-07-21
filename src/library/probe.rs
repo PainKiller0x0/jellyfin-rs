@@ -133,10 +133,17 @@ fn probe_media_once(
     let response = match serde_json::from_slice::<FfprobeResponse>(&output) {
         Ok(response) => response,
         Err(error) => {
-            tracing::warn!(
-                "failed to parse ffprobe output for {}: {error}",
-                redacted_probe_path(path)
-            );
+            if remote_url.is_some() {
+                tracing::debug!(
+                    "failed to parse remote ffprobe output for {}: {error}",
+                    redacted_probe_path(path)
+                );
+            } else {
+                tracing::warn!(
+                    "failed to parse ffprobe output for {}: {error}",
+                    redacted_probe_path(path)
+                );
+            }
             return Err(ProbeFailure::Failed);
         }
     };
@@ -189,10 +196,17 @@ fn run_ffprobe(path: &Path, is_remote: bool, http_proxy: Option<&str>) -> Option
     {
         Ok(child) => child,
         Err(error) => {
-            tracing::warn!(
-                "failed to start ffprobe for {}: {error}",
-                redacted_probe_path(path)
-            );
+            if is_remote {
+                tracing::debug!(
+                    "failed to start remote ffprobe for {}: {error}",
+                    redacted_probe_path(path)
+                );
+            } else {
+                tracing::warn!(
+                    "failed to start ffprobe for {}: {error}",
+                    redacted_probe_path(path)
+                );
+            }
             return None;
         }
     };
@@ -207,7 +221,14 @@ fn run_ffprobe(path: &Path, is_remote: bool, http_proxy: Option<&str>) -> Option
                     if start.elapsed() > timeout {
                         let _ = child.kill();
                         let _ = child.wait();
-                        tracing::warn!("ffprobe timed out for: {}", redacted_probe_path(path));
+                        if is_remote {
+                            tracing::debug!(
+                                "remote ffprobe timed out for: {}",
+                                redacted_probe_path(path)
+                            );
+                        } else {
+                            tracing::warn!("ffprobe timed out for: {}", redacted_probe_path(path));
+                        }
                         return None;
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -223,11 +244,19 @@ fn run_ffprobe(path: &Path, is_remote: bool, http_proxy: Option<&str>) -> Option
         }
     };
     if !output.status.success() {
-        tracing::warn!(
-            "ffprobe failed for {}: {}",
-            redacted_probe_path(path),
-            truncated_probe_stderr(&output.stderr)
-        );
+        if is_remote {
+            tracing::debug!(
+                "remote ffprobe failed for {}: {}",
+                redacted_probe_path(path),
+                truncated_probe_stderr(&output.stderr)
+            );
+        } else {
+            tracing::warn!(
+                "ffprobe failed for {}: {}",
+                redacted_probe_path(path),
+                truncated_probe_stderr(&output.stderr)
+            );
+        }
         return None;
     }
     let output = output.stdout;

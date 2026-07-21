@@ -195,6 +195,16 @@ pub async fn delete_completed(db: &DatabaseConnection, scan_id: &str) -> anyhow:
     Ok(())
 }
 
+pub async fn delete_scan(db: &DatabaseConnection, scan_id: &str) -> anyhow::Result<()> {
+    db.execute_raw(crate::db::helpers::pg_statement(
+        "DELETE FROM library_refresh_jobs WHERE scan_id = ?",
+        vec![scan_id.to_string().into()],
+    ))
+    .await
+    .context("failed to cancel refresh jobs")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1630,9 +1630,12 @@ pub async fn stop_scheduled_task(
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    let now = now_unix();
-    upsert_task_result(&state, &task_id, "Cancelled", now, now, None).await;
-    StatusCode::NO_CONTENT.into_response()
+    if task_id == "scan-library" {
+        state.scan_task.cancel();
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    StatusCode::NOT_FOUND.into_response()
 }
 
 fn is_known_scheduled_task(task_id: &str) -> bool {
@@ -6149,18 +6152,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_scheduled_task_records_cancelled_result() {
+    async fn stop_scheduled_task_cancels_running_scan() {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
         let state = Arc::new(test_state(db));
+        let cancellation = state.scan_task.start();
 
         let response =
             stop_scheduled_task(State(state.clone()), Path("scan-library".to_string())).await;
 
         assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
-        let result = last_task_result(&state.db, "scan-library").await.unwrap();
-        assert_eq!(result["Status"], "Cancelled");
+        assert!(cancellation.is_cancelled());
     }
 
     #[tokio::test]
@@ -7138,6 +7141,7 @@ mod tests {
             tmdb_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             douban_cookie: RwLock::new(None),
             scan_lock: tokio::sync::Mutex::new(()),
+            scan_task: Default::default(),
             chapter_image_task_cancel: tokio::sync::Mutex::new(None),
             playback_sessions: RwLock::new(HashMap::new()),
             session_capabilities: RwLock::new(HashMap::new()),

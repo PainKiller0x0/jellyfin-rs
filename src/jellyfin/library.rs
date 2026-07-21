@@ -442,6 +442,10 @@ pub async fn refresh_library(
                 );
                 return;
             }
+            Err(error) if crate::library::scanner::is_scan_cancelled(error) => (
+                "Cancelled",
+                Some("Media library scan was cancelled".to_string()),
+            ),
             Err(error) => ("Failed", Some(format!("{error:#}"))),
         };
         system::upsert_task_result(

@@ -13,6 +13,7 @@ use sea_orm::DatabaseConnection;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::util::{now_unix, unix_to_jellyfin_date};
@@ -38,6 +39,7 @@ pub struct AppState {
     pub tmdb_http_client: Arc<RwLock<reqwest::Client>>,
     pub douban_cookie: RwLock<Option<String>>,
     pub scan_lock: Mutex<()>,
+    pub scan_task: ScanTaskControl,
     pub chapter_image_task_cancel: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     pub playback_sessions: RwLock<HashMap<String, PlaybackSession>>,
     pub session_capabilities: RwLock<HashMap<String, SessionCapabilities>>,
@@ -50,6 +52,35 @@ pub struct AppState {
     pub intro_detector: Arc<crate::intro_skip::detector::IntroDetector>,
     #[allow(dead_code)]
     pub queue_manager: Arc<crate::queue::QueueManager>,
+}
+
+#[derive(Default)]
+pub struct ScanTaskControl {
+    cancellation: std::sync::Mutex<Option<CancellationToken>>,
+}
+
+impl ScanTaskControl {
+    pub fn start(&self) -> CancellationToken {
+        let token = CancellationToken::new();
+        *self.cancellation.lock().unwrap_or_else(|e| e.into_inner()) = Some(token.clone());
+        token
+    }
+
+    pub fn cancel(&self) -> bool {
+        let current = self.cancellation.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(token) = current.as_ref() else {
+            return false;
+        };
+        token.cancel();
+        true
+    }
+
+    pub fn finish(&self) {
+        self.cancellation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
 }
 
 #[derive(Clone, Serialize)]

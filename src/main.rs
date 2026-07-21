@@ -92,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         tmdb_http_client: Arc::new(RwLock::new(tmdb_http_client)),
         douban_cookie: RwLock::new(douban_cookie),
         scan_lock: tokio::sync::Mutex::new(()),
+        scan_task: Default::default(),
         chapter_image_task_cancel: tokio::sync::Mutex::new(None),
         playback_sessions: RwLock::new(HashMap::new()),
         session_capabilities: RwLock::new(HashMap::new()),

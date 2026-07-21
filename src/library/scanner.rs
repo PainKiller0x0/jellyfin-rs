@@ -12,6 +12,7 @@ use sea_orm::sea_query::OnConflict;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, mpsc};
+use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 use crate::{
@@ -62,6 +63,36 @@ const MAX_ITEM_REFRESH_QUEUE_CAPACITY: usize = 4096;
 const METADATA_DEPENDENCY_MAX_ATTEMPTS: usize = 30;
 const METADATA_DEPENDENCY_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SCAN_FINGERPRINT_VERSION: u64 = 2;
+
+#[derive(Debug)]
+pub struct ScanCancelled;
+
+impl std::fmt::Display for ScanCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("media library scan was cancelled")
+    }
+}
+
+impl std::error::Error for ScanCancelled {}
+
+pub fn is_scan_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ScanCancelled>().is_some()
+}
+
+struct ScanTaskGuard<'a>(&'a crate::app::state::ScanTaskControl);
+
+impl Drop for ScanTaskGuard<'_> {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+fn ensure_scan_active(cancellation: &CancellationToken) -> anyhow::Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(ScanCancelled.into());
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 struct SidecarFingerprintCache {
@@ -331,6 +362,8 @@ pub async fn scan_media_libraries_if_idle(
             return Ok(None);
         }
     };
+    let cancellation = state.scan_task.start();
+    let _scan_task_guard = ScanTaskGuard(&state.scan_task);
 
     let scan_database_url = crate::db::database_url_from_env();
     let scan_db = crate::db::background_connection(&scan_database_url).await?;
@@ -362,7 +395,7 @@ pub async fn scan_media_libraries_if_idle(
     let mut refresh_queued = 0usize;
     let mut pending_roots = roots.into_iter();
     loop {
-        while tasks.len() < root_concurrency {
+        while !cancellation.is_cancelled() && tasks.len() < root_concurrency {
             let Some((root, library_id, collection_type, enable_photos)) = pending_roots.next()
             else {
                 break;
@@ -374,6 +407,7 @@ pub async fn scan_media_libraries_if_idle(
             completed_library_ids.push(library_id.clone());
             let refresh_tx = refresh_stager.tx.clone();
             let scan_states = scan_states.clone();
+            let cancellation = cancellation.clone();
             let scan_context = scan_contexts.get(&library_id).copied().unwrap_or_default();
             tasks.spawn(async move {
                 scan_root(
@@ -384,6 +418,7 @@ pub async fn scan_media_libraries_if_idle(
                     scan_context,
                     scan_states,
                     refresh_tx,
+                    cancellation,
                 )
                 .await
             });
@@ -410,10 +445,21 @@ pub async fn scan_media_libraries_if_idle(
         .await
         .context("refresh job stager task panicked")??;
     tracing::info!("staged {staged_jobs} item refresh job(s) in PostgreSQL");
+    if cancellation.is_cancelled() {
+        crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
+        return Err(ScanCancelled.into());
+    }
 
     completed_library_ids.sort();
     completed_library_ids.dedup();
-    remove_missing_media_items(&scan_db, &completed_library_ids, &all_seen).await?;
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
+            return Err(ScanCancelled.into());
+        }
+        result = remove_missing_media_items(&scan_db, &completed_library_ids, &all_seen) => result?,
+    }
 
     let refresh_stats = run_item_refresh_workers(
         scan_db.clone(),
@@ -424,21 +470,33 @@ pub async fn scan_media_libraries_if_idle(
         state.tmdb_proxy_url.clone(),
         state.tmdb_http_client.clone(),
         tmdb_library_options,
+        cancellation.clone(),
     )
     .await;
+    if cancellation.is_cancelled() {
+        crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
+        return Err(ScanCancelled.into());
+    }
     if force_probe && refresh_stats.probe_failed == 0 {
         if let Err(error) = set_media_probe_cache_current(&scan_db).await {
             tracing::warn!("failed to mark media probe cache current: {error:#}");
         }
     }
-    run_post_scan_metadata_tasks(
+    let post_scan_metadata = run_post_scan_metadata_tasks(
         &scan_db,
         &api_key,
         state.tmdb_proxy_url.clone(),
         state.tmdb_http_client.clone(),
         douban_cookie.as_deref(),
-    )
-    .await;
+    );
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
+            return Err(ScanCancelled.into());
+        }
+        _ = post_scan_metadata => {}
+    }
 
     let queue_stats = crate::library::refresh_queue::stats(&scan_db, &scan_id).await?;
     tracing::info!(
@@ -483,6 +541,7 @@ async fn scan_root(
     scan_context: i64,
     scan_states: Arc<HashMap<String, i64>>,
     refresh_tx: mpsc::Sender<ItemRefreshJob>,
+    cancellation: CancellationToken,
 ) -> anyhow::Result<ScanRootResult> {
     let mut scanned = 0usize;
     let mut unchanged = 0usize;
@@ -490,10 +549,12 @@ async fn scan_root(
     let mut seen_paths = Vec::new();
     let mut refresh_queued = 0usize;
     let mut sidecar_fingerprints = SidecarFingerprintCache::default();
-    let stack_part_owners = movie_stack_part_owners(&root, &collection_type);
-    let episode_version_owners = episode_version_owners(&root, &library_id, &collection_type);
+    let stack_part_owners = movie_stack_part_owners(&root, &collection_type, &cancellation);
+    let episode_version_owners =
+        episode_version_owners(&root, &library_id, &collection_type, &cancellation);
 
     for entry in WalkDir::new(&root).follow_links(false).into_iter() {
+        ensure_scan_active(&cancellation)?;
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -650,7 +711,7 @@ async fn scan_root(
                 media_probe,
                 scan_fingerprint,
             };
-            if queue_item_refresh(&refresh_tx, job).await {
+            if queue_item_refresh(&refresh_tx, job, &cancellation).await {
                 refresh_queued += 1;
             }
             continue;
@@ -922,7 +983,7 @@ async fn scan_root(
             media_probe,
             scan_fingerprint,
         };
-        if queue_item_refresh(&refresh_tx, job).await {
+        if queue_item_refresh(&refresh_tx, job, &cancellation).await {
             refresh_queued += 1;
         }
     }
@@ -938,6 +999,7 @@ async fn scan_root(
 fn movie_stack_part_owners(
     root: &std::path::Path,
     collection_type: &str,
+    cancellation: &CancellationToken,
 ) -> HashMap<PathBuf, PathBuf> {
     if collection_type != "movies" {
         return HashMap::new();
@@ -950,6 +1012,9 @@ fn movie_stack_part_owners(
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
     {
+        if cancellation.is_cancelled() {
+            break;
+        }
         let path = entry.path();
         if should_skip_disc_structure_entry(path, root)
             || classify_media_path(path, collection_type).as_deref() != Some("Video")
@@ -991,6 +1056,7 @@ fn episode_version_owners(
     root: &std::path::Path,
     library_id: &str,
     collection_type: &str,
+    cancellation: &CancellationToken,
 ) -> HashMap<PathBuf, PathBuf> {
     if !matches!(collection_type, "tvshows" | "tv") {
         return HashMap::new();
@@ -1005,6 +1071,9 @@ fn episode_version_owners(
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
     {
+        if cancellation.is_cancelled() {
+            break;
+        }
         let path = entry.path();
         if classify_media_path(path, collection_type).as_deref() != Some("Episode")
             || video_extra_type(path, false).is_some()
@@ -1096,8 +1165,14 @@ fn video_version_rank(version: Option<&str>) -> i64 {
 async fn queue_item_refresh(
     refresh_tx: &mpsc::Sender<ItemRefreshJob>,
     job: ItemRefreshJob,
+    cancellation: &CancellationToken,
 ) -> bool {
-    match refresh_tx.send(job).await {
+    let sent = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return false,
+        result = refresh_tx.send(job) => result,
+    };
+    match sent {
         Ok(()) => true,
         Err(error) => {
             tracing::warn!(
@@ -1157,6 +1232,7 @@ async fn run_item_refresh_workers(
     tmdb_proxy_url: Arc<RwLock<Option<String>>>,
     tmdb_http_client: Arc<RwLock<reqwest::Client>>,
     library_options: HashMap<String, crate::library::tmdb_metadata::TmdbLibraryProviderOptions>,
+    cancellation: CancellationToken,
 ) -> ItemRefreshWorkerStats {
     let concurrency = item_refresh_concurrency();
     let chapter_image_settings = Arc::new(crate::chapters::chapter_image_scan_settings(&db).await);
@@ -1177,16 +1253,20 @@ async fn run_item_refresh_workers(
         let library_options = library_options.clone();
         let chapter_image_settings = chapter_image_settings.clone();
         let preferred_scan_id = preferred_scan_id.clone();
+        let cancellation = cancellation.clone();
         workers.spawn(async move {
             let mut stats = ItemRefreshWorkerStats::default();
             let mut idle_rounds = 0usize;
             loop {
-                let claimed = match crate::library::refresh_queue::claim_next(
-                    &db,
-                    &preferred_scan_id,
-                )
-                .await
-                {
+                if cancellation.is_cancelled() {
+                    break;
+                }
+                let claim = crate::library::refresh_queue::claim_next(&db, &preferred_scan_id);
+                let claimed = match tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    claimed = claim => claimed,
+                } {
                     Ok(claimed) => claimed,
                     Err(error) => {
                         stats.failed += 1;
@@ -1199,7 +1279,11 @@ async fn run_item_refresh_workers(
                     if idle_rounds >= 3 {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
                     continue;
                 };
                 idle_rounds = 0;
@@ -1216,9 +1300,12 @@ async fn run_item_refresh_workers(
                         continue;
                     }
                 };
-                crate::library::resource_governor::wait_for_background_worker(worker_index, 1)
-                    .await;
-                match run_item_refresh_job(
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    _ = crate::library::resource_governor::wait_for_background_worker(worker_index, 1) => {}
+                }
+                let refresh = run_item_refresh_job(
                     db.clone(),
                     job,
                     force_probe,
@@ -1229,9 +1316,13 @@ async fn run_item_refresh_workers(
                     tmdb_proxy_url.clone(),
                     tmdb_http_client.clone(),
                     &library_options,
-                )
-                .await
-                {
+                );
+                let refresh_result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    result = refresh => result,
+                };
+                match refresh_result {
                     Ok(result) => {
                         stats.completed += 1;
                         if result.metadata_completed {
@@ -2580,7 +2671,7 @@ mod tests {
         fs::write(&cd1, []).unwrap();
         fs::write(&cd2, []).unwrap();
 
-        let owners = movie_stack_part_owners(&root, "movies");
+        let owners = movie_stack_part_owners(&root, "movies", &CancellationToken::new());
         assert_eq!(owners.get(&cd2), Some(&cd1));
         assert!(!owners.contains_key(&cd1));
 
@@ -2834,12 +2925,40 @@ mod tests {
             42,
             states,
             tx,
+            CancellationToken::new(),
         )
         .await
         .unwrap();
 
         assert_eq!(result.scanned, 1);
         assert_eq!(result.unchanged, 1);
+        assert!(rx.recv().await.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn scan_root_stops_before_traversal_when_cancelled() {
+        let root = test_dir("scan_root_stops_before_traversal_when_cancelled");
+        fs::write(root.join("Movie.mkv"), b"video").unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = scan_root(
+            root.clone(),
+            "movies".to_string(),
+            "movies".to_string(),
+            true,
+            0,
+            Arc::new(HashMap::new()),
+            tx,
+            cancellation,
+        )
+        .await
+        .err()
+        .expect("cancelled scan should return an error");
+
+        assert!(is_scan_cancelled(&error));
         assert!(rx.recv().await.is_none());
         let _ = fs::remove_dir_all(root);
     }
@@ -2941,6 +3060,7 @@ mod tests {
             0,
             Arc::new(HashMap::new()),
             tx,
+            CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -2977,6 +3097,7 @@ mod tests {
             0,
             Arc::new(HashMap::new()),
             tx,
+            CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -3035,6 +3156,7 @@ mod tests {
             0,
             Arc::new(HashMap::new()),
             tx,
+            CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -3102,6 +3224,7 @@ mod tests {
             0,
             Arc::new(HashMap::new()),
             tx,
+            CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -3369,6 +3492,7 @@ mod tests {
             0,
             Arc::new(HashMap::new()),
             tx,
+            CancellationToken::new(),
         )
         .await
         .unwrap();

@@ -830,6 +830,10 @@ pub async fn scan_handler(State(state): State<Arc<AppState>>) -> Response {
                 );
                 return;
             }
+            Err(error) if crate::library::scanner::is_scan_cancelled(error) => (
+                "Cancelled",
+                Some("Media library scan was cancelled".to_string()),
+            ),
             Err(error) => ("Failed", Some(format!("{error:#}"))),
         };
         crate::jellyfin::system::upsert_task_result(
@@ -2546,6 +2550,7 @@ mod tests {
             tmdb_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             douban_cookie: RwLock::new(None),
             scan_lock: tokio::sync::Mutex::new(()),
+            scan_task: Default::default(),
             chapter_image_task_cancel: tokio::sync::Mutex::new(None),
             playback_sessions: RwLock::new(HashMap::new()),
             session_capabilities: RwLock::new(HashMap::new()),

@@ -10,9 +10,11 @@ FROM rust:1.97.1-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs
-RUN cargo fetch
+RUN cargo build --release
+RUN rm -rf src
 COPY src src
 COPY data data
+RUN touch src/main.rs
 RUN cargo build --release
 
 FROM debian:bookworm-slim

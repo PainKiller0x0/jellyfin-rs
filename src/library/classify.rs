@@ -68,22 +68,20 @@ pub fn parent_id_for_scanned_file(
     item_type: &str,
 ) -> String {
     if matches!(collection_type, "tvshows" | "tv") && item_type == "Episode" {
-        if let Some(parent) = parent_path_for_path(path, root) {
+        let mut current = parent_path_for_path(path, root);
+        while let Some(parent) = current {
             let parent_name = parent
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default();
-            if is_quality_or_range_folder_name(parent_name) {
-                if let Some(grandparent) = parent_path_for_path(&parent, root) {
-                    let grandparent_name = grandparent
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default();
-                    if is_season_folder_name(grandparent_name) {
-                        return stable_item_id(&grandparent);
-                    }
-                }
+            let parent_type = tv_folder_type(&parent, root, collection_type);
+            if matches!(parent_type, "Season" | "Series") {
+                return stable_item_id(&parent);
             }
+            if !is_quality_or_range_folder_name(parent_name) {
+                break;
+            }
+            current = parent_path_for_path(&parent, root);
         }
     }
 
@@ -361,7 +359,15 @@ fn is_quality_or_range_folder_name(name: &str) -> bool {
         r#"(?i)^[0-9]{1,4}\s*-\s*[0-9]{1,4}\s*集?(?:[ ._\-]*(?:4k|2160p|1080p|720p))?$"#,
     )
     .expect("range folder regex must compile");
-    range.is_match(&trimmed)
+    if range.is_match(&trimmed) {
+        return true;
+    }
+    let chinese_number = r#"(?:[0-9]{1,4}|[零〇一二两三四五六七八九十百千]+)"#;
+    let chinese_range = regex::Regex::new(&format!(
+        r#"(?i)^第\s*{chinese_number}\s*(?:集\s*)?(?:到|至|[-~－—])\s*第?\s*{chinese_number}\s*集?(?:[ ._\-]*(?:4k|2160p|1080p|720p))?$"#
+    ))
+    .expect("Chinese range folder regex must compile");
+    chinese_range.is_match(&trimmed)
 }
 
 fn is_extra_folder_name(name: &str) -> bool {
@@ -517,14 +523,18 @@ mod tests {
         let series = root.join("剧名 (2025){tmdb-123}");
         let quality = series.join("4K DV 高码");
         let range = series.join("001-020集.4K");
+        let chinese_range = series.join("第1集到第20集.4K");
         fs::create_dir_all(&quality).unwrap();
         fs::create_dir_all(&range).unwrap();
+        fs::create_dir_all(&chinese_range).unwrap();
         fs::write(quality.join("剧名 S01E01.mkv"), []).unwrap();
         fs::write(range.join("01.mkv"), []).unwrap();
+        fs::write(chinese_range.join("第1集.mkv"), []).unwrap();
 
         assert_eq!(tv_folder_type(&series, &root, "tvshows"), "Series");
         assert_eq!(tv_folder_type(&quality, &root, "tvshows"), "Folder");
         assert_eq!(tv_folder_type(&range, &root, "tvshows"), "Folder");
+        assert_eq!(tv_folder_type(&chinese_range, &root, "tvshows"), "Folder");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -559,6 +569,18 @@ mod tests {
         assert_eq!(
             super::parent_id_for_scanned_file(&episode, root, "library", "tvshows", "Episode"),
             crate::util::stable_item_id(&season)
+        );
+    }
+
+    #[test]
+    fn tv_episode_parent_skips_range_folder_inside_series() {
+        let root = Path::new("/media/动漫/国漫");
+        let episode = root.join("S/双生武魂 (2025){tmdb-290681}/第1集到第20集.4K/第1集.strm");
+        let series = root.join("S/双生武魂 (2025){tmdb-290681}");
+
+        assert_eq!(
+            super::parent_id_for_scanned_file(&episode, root, "library", "tvshows", "Episode"),
+            crate::util::stable_item_id(&series)
         );
     }
 

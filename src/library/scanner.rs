@@ -730,7 +730,14 @@ fn start_metadata_fetch_pipeline(
             }
         }
 
-        run_post_scan_metadata_tasks(&db, douban_cookie.as_deref()).await;
+        run_post_scan_metadata_tasks(
+            &db,
+            &api_key,
+            tmdb_proxy_url,
+            tmdb_http_client,
+            douban_cookie.as_deref(),
+        )
+        .await;
         tracing::info!(
             "metadata fetch pipeline completed {completed}/{queued} item(s); failed={failed}"
         );
@@ -821,8 +828,8 @@ fn schedule_metadata_fetch_retry(
     retry_tx: mpsc::WeakUnboundedSender<MetadataFetchJob>,
 ) {
     if job.attempts >= METADATA_FETCH_MAX_ATTEMPTS {
-        tracing::warn!(
-            "TMDb metadata dependency was not ready after {} attempt(s) for {} {} ({})",
+        tracing::debug!(
+            "TMDb metadata dependency was not ready after {} attempt(s) for {} {} ({}); post-scan TMDb batch will retry it",
             METADATA_FETCH_MAX_ATTEMPTS,
             job.item_type,
             job.item_id,
@@ -865,8 +872,31 @@ fn schedule_metadata_fetch_retry(
 
 async fn run_post_scan_metadata_tasks(
     db: &sea_orm::DatabaseConnection,
+    api_key: &str,
+    tmdb_proxy_url: Arc<RwLock<Option<String>>>,
+    tmdb_http_client: Arc<RwLock<reqwest::Client>>,
     douban_cookie: Option<&str>,
 ) {
+    if !api_key.is_empty() {
+        let tmdb_base_url = tmdb_proxy_url.read().await.clone();
+        let tmdb_client = tmdb_http_client.read().await.clone();
+        match crate::library::tmdb_metadata::batch_fetch_episode_tmdb(
+            db,
+            api_key,
+            &tmdb_client,
+            tmdb_base_url.as_deref(),
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("post-scan episode TMDb batch fetched {n} title(s)"),
+            Err(error) => tracing::warn!(
+                "post-scan episode TMDb batch failed: {}",
+                crate::library::tmdb_metadata::redact_tmdb_error(&error)
+            ),
+        }
+    }
+
     if let Err(error) =
         crate::library::douban_metadata::fill_missing_douban(db, douban_cookie).await
     {

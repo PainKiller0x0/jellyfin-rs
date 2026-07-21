@@ -69,8 +69,9 @@ fn parse_episode_name(stem: &str, folder: &str) -> ParsedName {
         }
     }
 
-    if let Some(episode) = parse_chinese_episode_number(stem) {
+    if let Some((episode, ending)) = parse_chinese_episode_number(stem) {
         parsed.episode_number = Some(episode);
+        parsed.ending_episode_number = ending;
         parsed.title = clean_title(stem);
         parsed.version = parse_version(stem);
         parsed.extended_video_types = parse_extended_video_types(stem);
@@ -92,12 +93,18 @@ fn parse_episode_name(stem: &str, folder: &str) -> ParsedName {
     parsed
 }
 
-fn parse_chinese_episode_number(value: &str) -> Option<i64> {
-    let regex =
-        Regex::new(r#"第\s*(?P<number>[0-9]{1,4}|[零〇一二两三四五六七八九十百]+)\s*[集话話回]"#)
-            .expect("Chinese episode regex must compile");
+fn parse_chinese_episode_number(value: &str) -> Option<(i64, Option<i64>)> {
+    let number = r#"(?:[0-9]{1,4}|[零〇一二两三四五六七八九十百千]+)"#;
+    let regex = Regex::new(&format!(
+        r#"第\s*(?P<number>{number})\s*(?:(?:[集话話回]\s*)?(?:到|至|[-~－—])\s*第?\s*(?P<ending>{number})\s*)?[集话話回]"#
+    ))
+    .expect("Chinese episode regex must compile");
     let captures = regex.captures(value)?;
-    crate::util::parse_chinese_number(captures.name("number")?.as_str())
+    let episode = crate::util::parse_chinese_number(captures.name("number")?.as_str())?;
+    let ending = captures
+        .name("ending")
+        .and_then(|value| crate::util::parse_chinese_number(value.as_str()));
+    Some((episode, ending))
 }
 
 fn parse_video_name(stem: &str) -> ParsedName {
@@ -499,6 +506,14 @@ mod tests {
         let parsed = parse_media_name(Path::new("第十二集.strm"), "tvshows");
         assert_eq!(parsed.episode_number, Some(12));
         assert_eq!(parsed.title, "第十二集");
+
+        let parsed = parse_media_name(Path::new("第1集到第3集.strm"), "tvshows");
+        assert_eq!(parsed.episode_number, Some(1));
+        assert_eq!(parsed.ending_episode_number, Some(3));
+
+        let parsed = parse_media_name(Path::new("第十二集至第十五集.strm"), "tvshows");
+        assert_eq!(parsed.episode_number, Some(12));
+        assert_eq!(parsed.ending_episode_number, Some(15));
     }
 
     #[test]

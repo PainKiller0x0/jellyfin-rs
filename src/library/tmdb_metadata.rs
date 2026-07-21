@@ -513,18 +513,24 @@ pub async fn fetch_and_apply_episode_tmdb_metadata(
             r#"SELECT e.id AS episode_id,
                       e.title AS episode_title,
                       e.path AS episode_path,
-                      COALESCE(e.season_number, se.season_number) AS season_number,
+                      COALESCE(
+                          e.season_number,
+                          CASE WHEN parent.item_type = 'Season' THEN parent.season_number ELSE NULL END
+                      ) AS season_number,
                       e.episode_number,
                       e.production_year,
                       e.premiere_date,
-                      s.title AS series_title,
-                      s.production_year AS series_year,
+                      series.title AS series_title,
+                      series.production_year AS series_year,
                       p.provider_item_id AS tmdb_id,
                       ep.provider_item_id AS episode_tmdb_id
                FROM media_items e
-               LEFT JOIN media_items se ON se.id = e.parent_id
-               LEFT JOIN media_items s ON s.id = se.parent_id
-               LEFT JOIN provider_ids p ON p.item_id = s.id AND p.provider = 'Tmdb'
+               LEFT JOIN media_items parent ON parent.id = e.parent_id
+               LEFT JOIN media_items series ON (
+                   (parent.item_type = 'Season' AND series.id = parent.parent_id)
+                   OR (parent.item_type = 'Series' AND series.id = parent.id)
+               )
+               LEFT JOIN provider_ids p ON p.item_id = series.id AND p.provider = 'Tmdb'
                LEFT JOIN provider_ids ep ON ep.item_id = e.id AND ep.provider = 'Tmdb'
                WHERE e.id = ? AND e.item_type = 'Episode'"#,
             vec![item_id.into()],
@@ -681,18 +687,27 @@ pub async fn batch_fetch_episode_tmdb(
         r#"SELECT e.id as episode_id,
                   e.title as episode_title,
                   e.path as episode_path,
-                  e.season_number,
+                  COALESCE(
+                      e.season_number,
+                      CASE WHEN parent.item_type = 'Season' THEN parent.season_number ELSE NULL END
+                  ) AS season_number,
                   e.episode_number,
-                  s.title as series_title,
-                  s.production_year as series_year,
+                  series.title as series_title,
+                  series.production_year as series_year,
                   p.provider_item_id as tmdb_id
            FROM media_items e
-           JOIN media_items se ON se.id = e.parent_id
-           JOIN media_items s ON s.id = se.parent_id
-           JOIN provider_ids p ON p.item_id = s.id AND p.provider = 'Tmdb'
+           JOIN media_items parent ON parent.id = e.parent_id
+           JOIN media_items series ON (
+               (parent.item_type = 'Season' AND series.id = parent.parent_id)
+               OR (parent.item_type = 'Series' AND series.id = parent.id)
+           )
+           JOIN provider_ids p ON p.item_id = series.id AND p.provider = 'Tmdb'
            LEFT JOIN provider_ids ep ON ep.item_id = e.id AND ep.provider = 'Tmdb'
            WHERE e.item_type = 'Episode'
-             AND e.season_number IS NOT NULL
+             AND COALESCE(
+                 e.season_number,
+                 CASE WHEN parent.item_type = 'Season' THEN parent.season_number ELSE NULL END
+             ) IS NOT NULL
              AND e.episode_number IS NOT NULL
              AND (
                  ep.provider_item_id IS NULL

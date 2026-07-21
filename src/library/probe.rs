@@ -88,17 +88,36 @@ pub struct ProbedStream {
 
 pub fn probe_media(path: &Path) -> Option<MediaProbe> {
     let remote_url = remote_probe_url(path);
+    let mut redirected_url = remote_url
+        .as_ref()
+        .and_then(remote_probe_preferred_redirect);
+    let mut tried_redirected_url = false;
+    if let Some(url) = redirected_url.as_ref() {
+        tracing::debug!(
+            "probing remote media after redirect resolution: {} -> {}",
+            remote_url
+                .as_ref()
+                .map(redacted_probe_url)
+                .unwrap_or_else(|| path.to_string_lossy().to_string()),
+            redacted_probe_url(url)
+        );
+        let redirected_path = Path::new(url.as_str());
+        tried_redirected_url = true;
+        if let Ok(probe) = probe_media_once(redirected_path, Some(url)) {
+            return Some(probe);
+        }
+    }
+
     match probe_media_once(path, remote_url.as_ref()) {
         Ok(probe) => Some(probe),
         Err(ProbeFailure::EndpointUnavailable) => None,
         Err(ProbeFailure::Failed) => {
-            let redirected_url = remote_url
-                .as_ref()
-                .and_then(resolve_remote_probe_redirect)?;
-            if remote_url
-                .as_ref()
-                .is_some_and(|url| url.as_str() == redirected_url.as_str())
-            {
+            let redirected_url = redirected_url.take().or_else(|| {
+                remote_url
+                    .as_ref()
+                    .and_then(remote_probe_preferred_redirect)
+            })?;
+            if tried_redirected_url {
                 return None;
             }
             tracing::debug!(
@@ -113,6 +132,11 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
             probe_media_once(redirected_path, Some(&redirected_url)).ok()
         }
     }
+}
+
+fn remote_probe_preferred_redirect(url: &reqwest::Url) -> Option<reqwest::Url> {
+    let redirected_url = resolve_remote_probe_redirect(url)?;
+    (redirected_url.as_str() != url.as_str()).then_some(redirected_url)
 }
 
 fn probe_media_once(
@@ -522,12 +546,15 @@ fn proxy_bidirectional(client: TcpStream, upstream: TcpStream) -> io::Result<()>
 }
 
 fn resolve_remote_probe_redirect(url: &reqwest::Url) -> Option<reqwest::Url> {
-    let client = reqwest::blocking::Client::builder()
+    let ipv4_proxy = Ipv4ProbeProxy::start();
+    let mut builder = reqwest::blocking::Client::builder()
         .timeout(REMOTE_REDIRECT_RESOLVE_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(REMOTE_FFPROBE_USER_AGENT)
-        .build()
-        .ok()?;
+        .user_agent(REMOTE_FFPROBE_USER_AGENT);
+    if let Some(proxy) = ipv4_proxy.as_ref() {
+        builder = builder.proxy(reqwest::Proxy::all(&proxy.url).ok()?);
+    }
+    let client = builder.build().ok()?;
 
     match resolve_remote_probe_redirect_with_method(&client, url) {
         Ok(url) => url,

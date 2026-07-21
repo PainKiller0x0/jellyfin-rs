@@ -1973,6 +1973,72 @@ pub async fn remove_missing_media_items(
     Ok(())
 }
 
+pub async fn remove_missing_media_items_in_scopes(
+    db: &DatabaseConnection,
+    scopes: &[(String, String)],
+    seen_paths: &[String],
+) -> anyhow::Result<()> {
+    if scopes.is_empty() {
+        return Ok(());
+    }
+    let seen_paths = seen_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut last_id = None::<String>;
+    loop {
+        let mut scope_filter = Condition::any();
+        for (library_id, path) in scopes {
+            let normalized = crate::library::path_utils::normalize_path(path);
+            let mut prefix = normalized.clone();
+            if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
+                prefix.push(std::path::MAIN_SEPARATOR);
+            }
+            scope_filter = scope_filter.add(
+                Condition::all()
+                    .add(media_items::Column::LibraryId.eq(library_id))
+                    .add(
+                        Condition::any()
+                            .add(media_items::Column::Path.eq(&normalized))
+                            .add(media_items::Column::Path.starts_with(prefix)),
+                    ),
+            );
+        }
+
+        let mut query = MediaItems::find()
+            .filter(scope_filter)
+            .order_by_asc(media_items::Column::Id)
+            .limit(MISSING_CLEANUP_BATCH_SIZE);
+        if let Some(last_id) = last_id.as_deref() {
+            query = query.filter(media_items::Column::Id.gt(last_id));
+        }
+        let items = query
+            .all(db)
+            .await
+            .context("failed to list targeted media items for cleanup")?;
+        if items.is_empty() {
+            break;
+        }
+
+        last_id = items.last().map(|item| item.id.clone());
+        for item in items {
+            let id = item.id.clone();
+            let path = item.path.clone();
+            if seen_paths.contains(path.as_str()) || cleanup_path_exists(&path).await {
+                continue;
+            }
+            MediaItems::delete_by_id(id)
+                .exec(db)
+                .await
+                .with_context(|| format!("failed to delete missing media item: {path}"))?;
+        }
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(MISSING_CLEANUP_PAUSE).await;
+    }
+    Ok(())
+}
+
 async fn cleanup_path_exists(path: &str) -> bool {
     match tokio::fs::metadata(path).await {
         Ok(_) => true,

@@ -113,7 +113,7 @@ docker compose up --build
 | `JELLYFIN_RS_FFPROBE_ANALYZE_DURATION` | `30000000` | ffprobe `-analyzeduration` 参数，设为 `0` 可不传 |
 | `JELLYFIN_RS_FFPROBE_PROBE_SIZE` | `100000000` | ffprobe `-probesize` 参数，设为 `0` 可不传 |
 | `JELLYFIN_RS_WATCH_DEBOUNCE_SECONDS` | `10` | 文件变化触发扫描前的防抖秒数 |
-| `JELLYFIN_RS_WATCH_POLL_SECONDS` | `60` | 文件监听轮询兜底间隔，设为 `0` 可关闭轮询 |
+| `JELLYFIN_RS_WATCH_POLL_SECONDS` | `0` | 文件监听轮询兜底间隔，默认关闭；设为正数可启用轮询 |
 | `JELLYFIN_RS_SESSION_TIMEOUT_SECONDS` | `120` | 播放会话超时秒数 |
 | `JELLYFIN_RS_MAX_WATCH_DELTA_SECONDS` | `43200` | 播放进度上报允许的最大时间跳变，单位秒 |
 | `JELLYFIN_RS_PROXY` | 无 | 通用外部 HTTP 请求代理，优先级高于标准代理变量 |

@@ -47,7 +47,8 @@ use crate::{
         probe::{ProbedAudioMetadata, probe_video_media},
         storage::{
             CachedMediaProbe, ScannedMediaItem, cached_media_probe_if_current,
-            refresh_external_lyric_stream, remove_missing_media_items, upsert_default_media_stream,
+            refresh_external_lyric_stream, remove_missing_media_items,
+            remove_missing_media_items_in_scopes, upsert_default_media_stream,
             upsert_failed_media_probe, upsert_media_item, upsert_media_metadata,
             upsert_probed_audio_metadata, upsert_probed_media_streams,
         },
@@ -391,9 +392,40 @@ pub async fn scan_media_libraries_if_idle(
     state: &AppState,
     library_ids: &[String],
 ) -> anyhow::Result<Option<usize>> {
+    scan_media_libraries_internal(state, library_ids, None).await
+}
+
+pub async fn scan_media_paths_if_idle(
+    state: &AppState,
+    changed_paths: &[PathBuf],
+) -> anyhow::Result<Option<usize>> {
+    scan_media_libraries_internal(state, &[], Some(changed_paths)).await
+}
+
+async fn scan_media_libraries_internal(
+    state: &AppState,
+    library_ids: &[String],
+    changed_paths: Option<&[PathBuf]>,
+) -> anyhow::Result<Option<usize>> {
     let selected_library_ids =
         (!library_ids.is_empty()).then(|| library_ids.iter().cloned().collect::<HashSet<_>>());
     let roots = media_roots(state, selected_library_ids.as_ref()).await?;
+    let targeted = changed_paths.is_some();
+    let roots = match changed_paths {
+        Some(changed_paths) => targeted_scan_roots(roots, changed_paths),
+        None => roots
+            .into_iter()
+            .map(|(root, library_id, collection_type, enable_photos)| {
+                (
+                    root.clone(),
+                    root,
+                    library_id,
+                    collection_type,
+                    enable_photos,
+                )
+            })
+            .collect(),
+    };
     if roots.is_empty() {
         tracing::info!("media scan skipped because no media library paths are configured");
         return Ok(Some(0));
@@ -415,7 +447,7 @@ pub async fn scan_media_libraries_if_idle(
     let scan_db = crate::db::background_connection(&scan_database_url).await?;
     let scanned_library_ids = roots
         .iter()
-        .map(|(_, library_id, _, _)| library_id.clone())
+        .map(|(_, _, library_id, _, _)| library_id.clone())
         .collect::<HashSet<_>>();
     let scan_states = Arc::new(load_scan_states(&scan_db, &scanned_library_ids).await?);
     let api_key = state.tmdb_api_key.read().await.clone().unwrap_or_default();
@@ -435,6 +467,7 @@ pub async fn scan_media_libraries_if_idle(
     let scan_id = uuid::Uuid::new_v4().to_string();
     let refresh_stager = start_refresh_job_stager(scan_db.clone(), scan_id.clone());
     let mut completed_library_ids = Vec::new();
+    let mut completed_scan_scopes = Vec::new();
     let mut total = 0usize;
     let mut unchanged = 0usize;
     let mut all_seen = Vec::new();
@@ -444,7 +477,8 @@ pub async fn scan_media_libraries_if_idle(
     let mut pending_roots = roots.into_iter();
     loop {
         while !cancellation.is_cancelled() && tasks.len() < root_concurrency {
-            let Some((root, library_id, collection_type, enable_photos)) = pending_roots.next()
+            let Some((root, scan_path, library_id, collection_type, enable_photos)) =
+                pending_roots.next()
             else {
                 break;
             };
@@ -453,6 +487,7 @@ pub async fn scan_media_libraries_if_idle(
                 continue;
             }
             completed_library_ids.push(library_id.clone());
+            completed_scan_scopes.push((library_id.clone(), scan_path.to_string_lossy().into()));
             let refresh_tx = refresh_stager.tx.clone();
             let scan_states = scan_states.clone();
             let cancellation = cancellation.clone();
@@ -461,6 +496,7 @@ pub async fn scan_media_libraries_if_idle(
             tasks.spawn(async move {
                 scan_root(
                     root,
+                    scan_path,
                     library_id,
                     collection_type,
                     enable_photos,
@@ -505,13 +541,28 @@ pub async fn scan_media_libraries_if_idle(
 
     completed_library_ids.sort();
     completed_library_ids.dedup();
-    tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
-            return Err(ScanCancelled.into());
+    if targeted {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
+                return Err(ScanCancelled.into());
+            }
+            result = remove_missing_media_items_in_scopes(
+                &scan_db,
+                &completed_scan_scopes,
+                &all_seen,
+            ) => result?,
         }
-        result = remove_missing_media_items(&scan_db, &completed_library_ids, &all_seen) => result?,
+    } else {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
+                return Err(ScanCancelled.into());
+            }
+            result = remove_missing_media_items(&scan_db, &completed_library_ids, &all_seen) => result?,
+        }
     }
     progress.set(45.0);
     if staged_jobs == 0 {
@@ -542,21 +593,23 @@ pub async fn scan_media_libraries_if_idle(
             tracing::warn!("failed to mark media probe cache current: {error:#}");
         }
     }
-    let post_scan_metadata = run_post_scan_metadata_tasks(
-        &scan_db,
-        &api_key,
-        state.tmdb_proxy_url.clone(),
-        state.tmdb_http_client.clone(),
-        douban_cookie.as_deref(),
-    );
-    progress.set(95.0);
-    tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
-            return Err(ScanCancelled.into());
+    if !targeted {
+        let post_scan_metadata = run_post_scan_metadata_tasks(
+            &scan_db,
+            &api_key,
+            state.tmdb_proxy_url.clone(),
+            state.tmdb_http_client.clone(),
+            douban_cookie.as_deref(),
+        );
+        progress.set(95.0);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
+                return Err(ScanCancelled.into());
+            }
+            _ = post_scan_metadata => {}
         }
-        _ = post_scan_metadata => {}
     }
     progress.set(99.0);
 
@@ -599,6 +652,7 @@ pub async fn scan_media_libraries_if_idle(
 
 async fn scan_root(
     root: PathBuf,
+    scan_path: PathBuf,
     library_id: String,
     collection_type: String,
     enable_photos: bool,
@@ -614,11 +668,24 @@ async fn scan_root(
     let mut seen_paths = Vec::new();
     let mut refresh_queued = 0usize;
     let mut sidecar_fingerprints = SidecarFingerprintCache::default();
-    let stack_part_owners = movie_stack_part_owners(&root, &collection_type, &cancellation);
-    let episode_version_owners =
-        episode_version_owners(&root, &library_id, &collection_type, &cancellation);
+    let stack_part_owners = scan_path
+        .is_dir()
+        .then(|| movie_stack_part_owners(&scan_path, &collection_type, &cancellation))
+        .unwrap_or_default();
+    let episode_version_owners = scan_path
+        .is_dir()
+        .then(|| {
+            episode_version_owners(
+                &scan_path,
+                &root,
+                &library_id,
+                &collection_type,
+                &cancellation,
+            )
+        })
+        .unwrap_or_default();
 
-    for entry in WalkDir::new(&root).follow_links(false).into_iter() {
+    for entry in WalkDir::new(&scan_path).follow_links(false).into_iter() {
         ensure_scan_active(&cancellation)?;
         progress.discovered_entry();
         let entry = match entry {
@@ -1119,7 +1186,8 @@ fn movie_stack_part_owners(
 }
 
 fn episode_version_owners(
-    root: &std::path::Path,
+    scan_path: &std::path::Path,
+    library_root: &std::path::Path,
     library_id: &str,
     collection_type: &str,
     cancellation: &CancellationToken,
@@ -1131,7 +1199,7 @@ fn episode_version_owners(
     let mut groups =
         HashMap::<(String, Option<i64>, String), Vec<(PathBuf, Option<String>, Option<i64>)>>::new(
         );
-    for entry in WalkDir::new(root)
+    for entry in WalkDir::new(scan_path)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
@@ -1149,7 +1217,7 @@ fn episode_version_owners(
         let parsed = parse_media_name(path, collection_type);
         let season = parsed
             .season_number
-            .or_else(|| episode_season_number_from_path(path, root, collection_type))
+            .or_else(|| episode_season_number_from_path(path, library_root, collection_type))
             .or_else(|| {
                 (parsed.episode_number.is_some() || parsed.premiere_date.is_some()).then_some(1)
             });
@@ -1163,8 +1231,14 @@ fn episode_version_owners(
         } else {
             continue;
         };
-        let parent_id =
-            parent_id_for_scanned_file(path, root, library_id, collection_type, "Episode", false);
+        let parent_id = parent_id_for_scanned_file(
+            path,
+            library_root,
+            library_id,
+            collection_type,
+            "Episode",
+            false,
+        );
         groups
             .entry((parent_id, season, episode_key))
             .or_default()
@@ -2540,6 +2614,99 @@ async fn media_roots(
         .collect())
 }
 
+type MediaRoot = (PathBuf, String, String, bool);
+type MediaScanRoot = (PathBuf, PathBuf, String, String, bool);
+
+fn targeted_scan_roots(roots: Vec<MediaRoot>, changed_paths: &[PathBuf]) -> Vec<MediaScanRoot> {
+    let mut targets = Vec::<MediaScanRoot>::new();
+    for changed_path in changed_paths {
+        let changed_path =
+            PathBuf::from(path_utils::normalize_path(&changed_path.to_string_lossy()));
+        let Some((root, library_id, collection_type, enable_photos)) = roots
+            .iter()
+            .filter(|(root, _, _, _)| changed_path.starts_with(root))
+            .max_by_key(|(root, _, _, _)| root.components().count())
+        else {
+            continue;
+        };
+        let Some(scan_path) = targeted_scan_path(&changed_path, root, collection_type) else {
+            continue;
+        };
+
+        if targets
+            .iter()
+            .any(|(existing_root, existing_path, existing_library, _, _)| {
+                existing_root == root
+                    && existing_library == library_id
+                    && scan_path.starts_with(existing_path)
+            })
+        {
+            continue;
+        }
+        targets.retain(|(existing_root, existing_path, existing_library, _, _)| {
+            existing_root != root
+                || existing_library != library_id
+                || !existing_path.starts_with(&scan_path)
+        });
+        targets.push((
+            root.clone(),
+            scan_path,
+            library_id.clone(),
+            collection_type.clone(),
+            *enable_photos,
+        ));
+    }
+    targets.sort_by(|left, right| left.1.cmp(&right.1));
+    targets
+}
+
+fn targeted_scan_path(
+    changed_path: &std::path::Path,
+    library_root: &std::path::Path,
+    collection_type: &str,
+) -> Option<PathBuf> {
+    if changed_path.is_dir()
+        || classify_media_path(changed_path, collection_type).is_some()
+        || strm::is_strm_path(changed_path)
+    {
+        return Some(changed_path.to_path_buf());
+    }
+    if is_metadata_sidecar_path(changed_path) {
+        return changed_path
+            .parent()
+            .filter(|parent| parent.starts_with(library_root))
+            .map(std::path::Path::to_path_buf);
+    }
+    if !changed_path.exists() {
+        return Some(changed_path.to_path_buf());
+    }
+    None
+}
+
+fn is_metadata_sidecar_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "nfo"
+                    | "xml"
+                    | "jpg"
+                    | "jpeg"
+                    | "png"
+                    | "webp"
+                    | "srt"
+                    | "ass"
+                    | "ssa"
+                    | "sub"
+                    | "vtt"
+                    | "lrc"
+                    | "cue"
+            )
+        })
+        .unwrap_or(false)
+}
+
 async fn load_scan_states(
     db: &sea_orm::DatabaseConnection,
     library_ids: &HashSet<String>,
@@ -2990,6 +3157,7 @@ mod tests {
 
         let result = scan_root(
             root.clone(),
+            root.clone(),
             "movies".to_string(),
             "movies".to_string(),
             true,
@@ -3018,6 +3186,7 @@ mod tests {
 
         let error = scan_root(
             root.clone(),
+            root.clone(),
             "movies".to_string(),
             "movies".to_string(),
             true,
@@ -3034,6 +3203,67 @@ mod tests {
         assert!(is_scan_cancelled(&error));
         assert!(rx.recv().await.is_none());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn targeted_file_scan_does_not_queue_sibling_media() {
+        let root = test_dir("targeted_file_scan_does_not_queue_sibling_media");
+        let changed = root.join("Changed.mkv");
+        let sibling = root.join("Sibling.mkv");
+        fs::write(&changed, b"changed").unwrap();
+        fs::write(&sibling, b"sibling").unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        scan_root(
+            root.clone(),
+            changed.clone(),
+            "movies".to_string(),
+            "movies".to_string(),
+            true,
+            0,
+            Arc::new(HashMap::new()),
+            tx,
+            CancellationToken::new(),
+            test_progress(),
+        )
+        .await
+        .unwrap();
+
+        let mut paths = Vec::new();
+        while let Some(job) = rx.recv().await {
+            paths.push(job.item.path);
+        }
+        assert_eq!(
+            paths,
+            vec![path_utils::normalize_path(&changed.to_string_lossy())]
+        );
+        assert!(!paths.contains(&path_utils::normalize_path(&sibling.to_string_lossy())));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn targeted_roots_keep_media_files_narrow_and_expand_sidecars() {
+        let root = test_dir("targeted_roots_keep_media_files_narrow_and_expand_sidecars");
+        let media = root.join("Movie.mkv");
+        let sidecar = root.join("Movie.nfo");
+        let unrelated = root.join("notes.txt");
+        fs::write(&media, b"video").unwrap();
+        fs::write(&sidecar, b"<movie />").unwrap();
+        fs::write(&unrelated, b"notes").unwrap();
+        let roots = vec![(
+            root.clone(),
+            "movies".to_string(),
+            "movies".to_string(),
+            true,
+        )];
+
+        let media_target = targeted_scan_roots(roots.clone(), std::slice::from_ref(&media));
+        assert_eq!(media_target[0].1, media);
+        let sidecar_target = targeted_scan_roots(roots.clone(), std::slice::from_ref(&sidecar));
+        assert_eq!(sidecar_target[0].1, root);
+        assert!(targeted_scan_roots(roots, &[unrelated]).is_empty());
+
+        let _ = fs::remove_dir_all(sidecar_target[0].0.clone());
     }
 
     #[test]
@@ -3127,6 +3357,7 @@ mod tests {
 
         let result = scan_root(
             root.clone(),
+            root.clone(),
             "tv".to_string(),
             "tvshows".to_string(),
             true,
@@ -3164,6 +3395,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
 
         scan_root(
+            root.clone(),
             root.clone(),
             "tv".to_string(),
             "tvshows".to_string(),
@@ -3224,6 +3456,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
 
         let result = scan_root(
+            root.clone(),
             root.clone(),
             "movies".to_string(),
             "movies".to_string(),
@@ -3293,6 +3526,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
 
         scan_root(
+            root.clone(),
             root.clone(),
             "movies".to_string(),
             "movies".to_string(),
@@ -3566,6 +3800,7 @@ mod tests {
     ) -> Vec<ItemRefreshJob> {
         let (tx, mut rx) = mpsc::channel(64);
         scan_root(
+            root.to_path_buf(),
             root.to_path_buf(),
             library_id.to_string(),
             collection.to_string(),

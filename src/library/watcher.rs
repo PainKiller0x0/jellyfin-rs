@@ -1,5 +1,5 @@
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -62,14 +62,9 @@ async fn watch_loop(state: Arc<AppState>) -> anyhow::Result<()> {
         loop {
             match tokio::time::timeout(watcher_reload_interval(), rx.recv()).await {
                 Ok(Some(Ok(event))) if is_relevant(&event) => {
-                    let changed_library_ids = changed_library_ids(&event, &targets);
-                    if !changed_library_ids.is_empty() {
-                        schedule_watch_scan(
-                            state.clone(),
-                            pending_scan.clone(),
-                            changed_library_ids,
-                        )
-                        .await;
+                    let paths = changed_paths(&event, &targets);
+                    if !paths.is_empty() {
+                        schedule_watch_scan(state.clone(), pending_scan.clone(), paths).await;
                     }
                 }
                 Ok(Some(Ok(_))) => {}
@@ -94,16 +89,16 @@ struct LibraryWatchTarget {
 #[derive(Default)]
 struct PendingWatchScan {
     scheduled: bool,
-    library_ids: HashSet<String>,
+    paths: HashSet<PathBuf>,
 }
 
 async fn schedule_watch_scan(
     state: Arc<AppState>,
     pending_scan: Arc<Mutex<PendingWatchScan>>,
-    library_ids: HashSet<String>,
+    paths: HashSet<PathBuf>,
 ) {
     let mut pending = pending_scan.lock().await;
-    pending.library_ids.extend(library_ids);
+    pending.paths.extend(paths);
     if pending.scheduled {
         return;
     }
@@ -113,23 +108,22 @@ async fn schedule_watch_scan(
     tokio::spawn(async move {
         tokio::time::sleep(debounce_duration()).await;
         loop {
-            let library_ids = {
+            let paths = {
                 let mut pending = pending_scan.lock().await;
-                std::mem::take(&mut pending.library_ids)
+                std::mem::take(&mut pending.paths)
             };
-            if !library_ids.is_empty() {
-                let mut library_ids = library_ids.into_iter().collect::<Vec<_>>();
-                library_ids.sort();
+            if !paths.is_empty() {
+                let mut paths = paths.into_iter().collect::<Vec<_>>();
+                paths.sort();
                 info!(
-                    "file change detected, scanning {} affected library(s)",
-                    library_ids.len()
+                    "file change detected, refreshing {} changed path(s)",
+                    paths.len()
                 );
-                run_scheduled_scan_when_idle(&state, &library_ids, "targeted file watcher trigger")
-                    .await;
+                run_scheduled_scan_when_idle(&state, &paths, "targeted file watcher trigger").await;
             }
 
             let mut pending = pending_scan.lock().await;
-            if pending.library_ids.is_empty() {
+            if pending.paths.is_empty() {
                 pending.scheduled = false;
                 break;
             }
@@ -139,14 +133,16 @@ async fn schedule_watch_scan(
     });
 }
 
-fn changed_library_ids(event: &Event, targets: &[LibraryWatchTarget]) -> HashSet<String> {
-    targets
+fn changed_paths(event: &Event, targets: &[LibraryWatchTarget]) -> HashSet<PathBuf> {
+    event
+        .paths
         .iter()
-        .filter(|target| {
-            let root = Path::new(&target.path);
-            event.paths.iter().any(|changed| changed.starts_with(root))
+        .filter(|changed| {
+            targets
+                .iter()
+                .any(|target| changed.starts_with(Path::new(&target.path)))
         })
-        .map(|target| target.library_id.clone())
+        .cloned()
         .collect()
 }
 
@@ -195,9 +191,10 @@ async fn poll_loop(state: Arc<AppState>) {
                 match media_tree_snapshot(paths).await {
                     Ok(settled_snapshot) => {
                         if settled_snapshot == current_snapshot {
+                            let changed_paths = media_tree_changes(previous, &settled_snapshot);
                             if run_scheduled_scan_when_idle(
                                 &state,
-                                &[],
+                                &changed_paths,
                                 "file watcher polling fallback",
                             )
                             .await
@@ -225,11 +222,11 @@ async fn poll_loop(state: Arc<AppState>) {
 
 async fn run_scheduled_scan_when_idle(
     state: &AppState,
-    library_ids: &[String],
+    changed_paths: &[PathBuf],
     reason: &str,
 ) -> bool {
     loop {
-        match crate::library::scanner::scan_media_libraries_if_idle(state, library_ids).await {
+        match crate::library::scanner::scan_media_paths_if_idle(state, changed_paths).await {
             Ok(Some(_)) => {
                 info!("scheduled scan completed ({reason})");
                 return true;
@@ -287,7 +284,7 @@ fn watcher_reload_interval() -> Duration {
 }
 
 fn poll_interval() -> Option<Duration> {
-    let seconds = env_duration_secs("JELLYFIN_RS_WATCH_POLL_SECONDS", 60);
+    let seconds = env_duration_secs("JELLYFIN_RS_WATCH_POLL_SECONDS", 0);
     (seconds > 0).then(|| Duration::from_secs(seconds))
 }
 
@@ -308,6 +305,33 @@ struct FileSnapshot {
     path: String,
     len: u64,
     modified_at_nanos: u128,
+}
+
+fn media_tree_changes(previous: &MediaTreeSnapshot, current: &MediaTreeSnapshot) -> Vec<PathBuf> {
+    let previous = previous
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), (file.len, file.modified_at_nanos)))
+        .collect::<HashMap<_, _>>();
+    let current = current
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), (file.len, file.modified_at_nanos)))
+        .collect::<HashMap<_, _>>();
+    let mut changed = previous
+        .iter()
+        .filter(|(path, fingerprint)| current.get(*path) != Some(*fingerprint))
+        .map(|(path, _)| PathBuf::from(path))
+        .chain(
+            current
+                .iter()
+                .filter(|(path, fingerprint)| previous.get(*path) != Some(*fingerprint))
+                .map(|(path, _)| PathBuf::from(path)),
+        )
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed.dedup();
+    changed
 }
 
 async fn media_tree_snapshot(paths: Vec<String>) -> anyhow::Result<MediaTreeSnapshot> {
@@ -450,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn file_event_selects_only_affected_library() {
+    fn file_event_preserves_only_paths_inside_watched_roots() {
         let event = Event {
             kind: EventKind::Create(CreateKind::File),
             paths: vec![Path::new("/media/tv/Show/episode.mkv").to_path_buf()],
@@ -467,7 +491,51 @@ mod tests {
             },
         ];
 
-        let selected = changed_library_ids(&event, &targets);
-        assert_eq!(selected, HashSet::from(["tv".to_string()]));
+        let selected = changed_paths(&event, &targets);
+        assert_eq!(
+            selected,
+            HashSet::from([PathBuf::from("/media/tv/Show/episode.mkv")])
+        );
+    }
+
+    #[test]
+    fn snapshot_diff_returns_added_modified_and_removed_paths() {
+        let previous = MediaTreeSnapshot {
+            files: vec![
+                FileSnapshot {
+                    path: "/media/removed.mkv".to_string(),
+                    len: 1,
+                    modified_at_nanos: 1,
+                },
+                FileSnapshot {
+                    path: "/media/modified.mkv".to_string(),
+                    len: 1,
+                    modified_at_nanos: 1,
+                },
+            ],
+        };
+        let current = MediaTreeSnapshot {
+            files: vec![
+                FileSnapshot {
+                    path: "/media/added.mkv".to_string(),
+                    len: 1,
+                    modified_at_nanos: 1,
+                },
+                FileSnapshot {
+                    path: "/media/modified.mkv".to_string(),
+                    len: 2,
+                    modified_at_nanos: 2,
+                },
+            ],
+        };
+
+        assert_eq!(
+            media_tree_changes(&previous, &current),
+            vec![
+                PathBuf::from("/media/added.mkv"),
+                PathBuf::from("/media/modified.mkv"),
+                PathBuf::from("/media/removed.mkv"),
+            ]
+        );
     }
 }

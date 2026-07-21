@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -84,6 +87,47 @@ struct ScanTaskGuard<'a>(&'a crate::app::state::ScanTaskControl);
 impl Drop for ScanTaskGuard<'_> {
     fn drop(&mut self) {
         self.0.finish();
+    }
+}
+
+#[derive(Clone)]
+struct ScanProgressTracker {
+    reporter: crate::app::state::ScanProgressReporter,
+    discovered_entries: Arc<AtomicU64>,
+    refreshed_items: Arc<AtomicU64>,
+}
+
+impl ScanProgressTracker {
+    fn new(reporter: crate::app::state::ScanProgressReporter) -> Self {
+        Self {
+            reporter,
+            discovered_entries: Arc::new(AtomicU64::new(0)),
+            refreshed_items: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn set(&self, percentage: f64) {
+        self.reporter.set(percentage);
+    }
+
+    fn discovered_entry(&self) {
+        let discovered = self.discovered_entries.fetch_add(1, Ordering::Relaxed) + 1;
+        if discovered.is_multiple_of(64) {
+            let fraction = discovered as f64 / (discovered as f64 + 2_048.0);
+            self.set(2.0 + 28.0 * fraction);
+        }
+    }
+
+    fn root_completed(&self, completed: usize, total: usize) {
+        if total > 0 {
+            self.set(2.0 + 38.0 * completed as f64 / total as f64);
+        }
+    }
+
+    fn refresh_completed(&self, total: usize) {
+        let completed = self.refreshed_items.fetch_add(1, Ordering::Relaxed) + 1;
+        let fraction = completed.min(total.max(1) as u64) as f64 / total.max(1) as f64;
+        self.set(45.0 + 45.0 * fraction);
     }
 }
 
@@ -364,6 +408,8 @@ pub async fn scan_media_libraries_if_idle(
     };
     let cancellation = state.scan_task.start();
     let _scan_task_guard = ScanTaskGuard(&state.scan_task);
+    let progress = ScanProgressTracker::new(state.scan_task.progress());
+    progress.set(1.0);
 
     let scan_database_url = crate::db::database_url_from_env();
     let scan_db = crate::db::background_connection(&scan_database_url).await?;
@@ -393,6 +439,8 @@ pub async fn scan_media_libraries_if_idle(
     let mut unchanged = 0usize;
     let mut all_seen = Vec::new();
     let mut refresh_queued = 0usize;
+    let root_count = roots.len();
+    let mut completed_roots = 0usize;
     let mut pending_roots = roots.into_iter();
     loop {
         while !cancellation.is_cancelled() && tasks.len() < root_concurrency {
@@ -408,6 +456,7 @@ pub async fn scan_media_libraries_if_idle(
             let refresh_tx = refresh_stager.tx.clone();
             let scan_states = scan_states.clone();
             let cancellation = cancellation.clone();
+            let progress = progress.clone();
             let scan_context = scan_contexts.get(&library_id).copied().unwrap_or_default();
             tasks.spawn(async move {
                 scan_root(
@@ -419,6 +468,7 @@ pub async fn scan_media_libraries_if_idle(
                     scan_states,
                     refresh_tx,
                     cancellation,
+                    progress,
                 )
                 .await
             });
@@ -427,6 +477,8 @@ pub async fn scan_media_libraries_if_idle(
         let Some(result) = tasks.join_next().await else {
             break;
         };
+        completed_roots += 1;
+        progress.root_completed(completed_roots, root_count);
         match result {
             Ok(Ok(result)) => {
                 total += result.scanned;
@@ -449,6 +501,7 @@ pub async fn scan_media_libraries_if_idle(
         crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
         return Err(ScanCancelled.into());
     }
+    progress.set(40.0);
 
     completed_library_ids.sort();
     completed_library_ids.dedup();
@@ -459,6 +512,10 @@ pub async fn scan_media_libraries_if_idle(
             return Err(ScanCancelled.into());
         }
         result = remove_missing_media_items(&scan_db, &completed_library_ids, &all_seen) => result?,
+    }
+    progress.set(45.0);
+    if staged_jobs == 0 {
+        progress.set(90.0);
     }
 
     let refresh_stats = run_item_refresh_workers(
@@ -471,12 +528,15 @@ pub async fn scan_media_libraries_if_idle(
         state.tmdb_http_client.clone(),
         tmdb_library_options,
         cancellation.clone(),
+        progress.clone(),
+        staged_jobs,
     )
     .await;
     if cancellation.is_cancelled() {
         crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
         return Err(ScanCancelled.into());
     }
+    progress.set(90.0);
     if force_probe && refresh_stats.probe_failed == 0 {
         if let Err(error) = set_media_probe_cache_current(&scan_db).await {
             tracing::warn!("failed to mark media probe cache current: {error:#}");
@@ -489,6 +549,7 @@ pub async fn scan_media_libraries_if_idle(
         state.tmdb_http_client.clone(),
         douban_cookie.as_deref(),
     );
+    progress.set(95.0);
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => {
@@ -497,6 +558,7 @@ pub async fn scan_media_libraries_if_idle(
         }
         _ = post_scan_metadata => {}
     }
+    progress.set(99.0);
 
     let queue_stats = crate::library::refresh_queue::stats(&scan_db, &scan_id).await?;
     tracing::info!(
@@ -530,6 +592,8 @@ pub async fn scan_media_libraries_if_idle(
         );
     }
 
+    progress.set(100.0);
+
     Ok(Some(total))
 }
 
@@ -542,6 +606,7 @@ async fn scan_root(
     scan_states: Arc<HashMap<String, i64>>,
     refresh_tx: mpsc::Sender<ItemRefreshJob>,
     cancellation: CancellationToken,
+    progress: ScanProgressTracker,
 ) -> anyhow::Result<ScanRootResult> {
     let mut scanned = 0usize;
     let mut unchanged = 0usize;
@@ -555,6 +620,7 @@ async fn scan_root(
 
     for entry in WalkDir::new(&root).follow_links(false).into_iter() {
         ensure_scan_active(&cancellation)?;
+        progress.discovered_entry();
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -1233,6 +1299,8 @@ async fn run_item_refresh_workers(
     tmdb_http_client: Arc<RwLock<reqwest::Client>>,
     library_options: HashMap<String, crate::library::tmdb_metadata::TmdbLibraryProviderOptions>,
     cancellation: CancellationToken,
+    progress: ScanProgressTracker,
+    refresh_total: usize,
 ) -> ItemRefreshWorkerStats {
     let concurrency = item_refresh_concurrency();
     let chapter_image_settings = Arc::new(crate::chapters::chapter_image_scan_settings(&db).await);
@@ -1254,6 +1322,7 @@ async fn run_item_refresh_workers(
         let chapter_image_settings = chapter_image_settings.clone();
         let preferred_scan_id = preferred_scan_id.clone();
         let cancellation = cancellation.clone();
+        let progress = progress.clone();
         workers.spawn(async move {
             let mut stats = ItemRefreshWorkerStats::default();
             let mut idle_rounds = 0usize;
@@ -1297,6 +1366,7 @@ async fn run_item_refresh_workers(
                             &format!("invalid refresh payload: {error}"),
                         )
                         .await;
+                        progress.refresh_completed(refresh_total);
                         continue;
                     }
                 };
@@ -1366,6 +1436,7 @@ async fn run_item_refresh_workers(
                         tracing::warn!("item refresh failed: {error:#}");
                     }
                 }
+                progress.refresh_completed(refresh_total);
             }
             stats
         });
@@ -2926,6 +2997,7 @@ mod tests {
             states,
             tx,
             CancellationToken::new(),
+            test_progress(),
         )
         .await
         .unwrap();
@@ -2953,6 +3025,7 @@ mod tests {
             Arc::new(HashMap::new()),
             tx,
             cancellation,
+            test_progress(),
         )
         .await
         .err()
@@ -3061,6 +3134,7 @@ mod tests {
             Arc::new(HashMap::new()),
             tx,
             CancellationToken::new(),
+            test_progress(),
         )
         .await
         .unwrap();
@@ -3098,6 +3172,7 @@ mod tests {
             Arc::new(HashMap::new()),
             tx,
             CancellationToken::new(),
+            test_progress(),
         )
         .await
         .unwrap();
@@ -3157,6 +3232,7 @@ mod tests {
             Arc::new(HashMap::new()),
             tx,
             CancellationToken::new(),
+            test_progress(),
         )
         .await
         .unwrap();
@@ -3225,6 +3301,7 @@ mod tests {
             Arc::new(HashMap::new()),
             tx,
             CancellationToken::new(),
+            test_progress(),
         )
         .await
         .unwrap();
@@ -3459,6 +3536,10 @@ mod tests {
         );
     }
 
+    fn test_progress() -> ScanProgressTracker {
+        ScanProgressTracker::new(crate::app::state::ScanTaskControl::default().progress())
+    }
+
     fn test_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3493,6 +3574,7 @@ mod tests {
             Arc::new(HashMap::new()),
             tx,
             CancellationToken::new(),
+            test_progress(),
         )
         .await
         .unwrap();

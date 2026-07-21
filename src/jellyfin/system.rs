@@ -1851,12 +1851,13 @@ pub async fn plugin_not_found() -> Response {
 }
 
 pub async fn scan_library_task(db: &DatabaseConnection) -> JsonValue {
-    scan_library_task_value(db, false).await
+    scan_library_task_value(db, false, None).await
 }
 
 async fn scan_library_task_for_state(state: &AppState) -> JsonValue {
     let is_running = state.scan_lock.try_lock().is_err();
-    scan_library_task_value(&state.db, is_running).await
+    let progress = is_running.then(|| state.scan_task.progress_percentage());
+    scan_library_task_value(&state.db, is_running, progress).await
 }
 
 async fn chapter_images_task_for_state(state: &AppState) -> JsonValue {
@@ -1875,7 +1876,11 @@ async fn chapter_images_task_for_state(state: &AppState) -> JsonValue {
     })
 }
 
-async fn scan_library_task_value(db: &DatabaseConnection, is_running: bool) -> JsonValue {
+async fn scan_library_task_value(
+    db: &DatabaseConnection,
+    is_running: bool,
+    progress: Option<f64>,
+) -> JsonValue {
     let scan_result = last_task_result(db, "scan-library").await;
     json!({
         "Name": "Scan media library",
@@ -1885,6 +1890,7 @@ async fn scan_library_task_value(db: &DatabaseConnection, is_running: bool) -> J
         "Description": "Scans configured media library paths for new and updated media files.",
         "Category": "Library",
         "IsHidden": false,
+        "CurrentProgressPercentage": progress,
         "LastExecutionResult": scan_result,
         "Triggers": scan_library_triggers(db).await,
     })
@@ -5363,10 +5369,10 @@ mod tests {
         report_activity_headers_for_query, report_csv, report_item_headers_for_query,
         reports_activity_result, reports_items_result, required_upload_part,
         run_user_usage_custom_query, safe_log_path, safe_user_usage_backup_file,
-        sanitize_file_part, save_camera_upload_to, scan_library_task, smtp_notification_test,
-        stop_scheduled_task, sync_data, sync_data_result, sync_empty_query_result,
-        sync_empty_response, sync_options_result, sync_play_unavailable, sync_unavailable,
-        system_info_value, system_log_file, system_log_lines, system_logs_query,
+        sanitize_file_part, save_camera_upload_to, scan_library_task, scan_library_task_value,
+        smtp_notification_test, stop_scheduled_task, sync_data, sync_data_result,
+        sync_empty_query_result, sync_empty_response, sync_options_result, sync_play_unavailable,
+        sync_unavailable, system_info_value, system_log_file, system_log_lines, system_logs_query,
         tmdb_client_configuration_value, ui_command, update_notification_read_state,
         usage_stats_breakdown_items, usage_stats_duration_histogram_items,
         usage_stats_hourly_items, usage_stats_session_entry, usage_user_entry,
@@ -6018,8 +6024,13 @@ mod tests {
         assert_eq!(task["Key"], "scan-library");
         assert_eq!(task["Name"], "Scan media library");
         assert_eq!(task["State"], "Idle");
+        assert!(task["CurrentProgressPercentage"].is_null());
         assert!(task["Triggers"].as_array().is_some());
         assert!(task["LastExecutionResult"].is_null());
+
+        let running = scan_library_task_value(&db, true, Some(42.75)).await;
+        assert_eq!(running["State"], "Running");
+        assert_eq!(running["CurrentProgressPercentage"], 42.75);
 
         let state = test_state(db);
         let chapter_task = chapter_images_task_for_state(&state).await;

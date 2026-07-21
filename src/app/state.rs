@@ -54,14 +54,24 @@ pub struct AppState {
     pub queue_manager: Arc<crate::queue::QueueManager>,
 }
 
-#[derive(Default)]
 pub struct ScanTaskControl {
     cancellation: std::sync::Mutex<Option<CancellationToken>>,
+    progress_basis_points: Arc<AtomicU64>,
+}
+
+impl Default for ScanTaskControl {
+    fn default() -> Self {
+        Self {
+            cancellation: std::sync::Mutex::new(None),
+            progress_basis_points: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 impl ScanTaskControl {
     pub fn start(&self) -> CancellationToken {
         let token = CancellationToken::new();
+        self.progress_basis_points.store(0, Ordering::Relaxed);
         *self.cancellation.lock().unwrap_or_else(|e| e.into_inner()) = Some(token.clone());
         token
     }
@@ -80,6 +90,28 @@ impl ScanTaskControl {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+    }
+
+    pub fn progress(&self) -> ScanProgressReporter {
+        ScanProgressReporter {
+            basis_points: self.progress_basis_points.clone(),
+        }
+    }
+
+    pub fn progress_percentage(&self) -> f64 {
+        self.progress_basis_points.load(Ordering::Relaxed) as f64 / 100.0
+    }
+}
+
+#[derive(Clone)]
+pub struct ScanProgressReporter {
+    basis_points: Arc<AtomicU64>,
+}
+
+impl ScanProgressReporter {
+    pub fn set(&self, percentage: f64) {
+        let basis_points = (percentage.clamp(0.0, 100.0) * 100.0).round() as u64;
+        self.basis_points.fetch_max(basis_points, Ordering::Relaxed);
     }
 }
 
@@ -834,9 +866,23 @@ fn stable_hash(value: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        china_province_code, normalize_douban_cookie_value, normalize_remote_ip,
+        ScanTaskControl, china_province_code, normalize_douban_cookie_value, normalize_remote_ip,
         normalize_tmdb_proxy_url, parse_ip2region_location, playback_region_for_ip,
     };
+
+    #[test]
+    fn scan_progress_is_precise_and_monotonic() {
+        let control = ScanTaskControl::default();
+        control.start();
+        let progress = control.progress();
+
+        progress.set(12.34);
+        progress.set(8.0);
+        assert_eq!(control.progress_percentage(), 12.34);
+
+        progress.set(100.0);
+        assert_eq!(control.progress_percentage(), 100.0);
+    }
 
     #[test]
     fn remote_ip_normalization_accepts_socket_addresses_and_forwarded_for() {

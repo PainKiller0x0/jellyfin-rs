@@ -63,6 +63,7 @@ export type ScheduledTask = {
   Description: string;
   Category: string;
   IsHidden: boolean;
+  CurrentProgressPercentage?: number | null;
   LastExecutionResult?: ScheduledTaskResult | null;
   Triggers?: ScheduledTaskTrigger[];
 };

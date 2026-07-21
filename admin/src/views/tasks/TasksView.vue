@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import dayjs from 'dayjs';
 import { ElMessage } from 'element-plus';
-import { computed, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
 import * as serverApi from '@/services/server';
 import { useAuthStore } from '@/stores/auth';
@@ -11,6 +11,7 @@ const authStore = useAuthStore();
 const loading = ref(false);
 const actionTaskId = ref('');
 const tasks = ref<ScheduledTask[]>([]);
+let pollTimer: ReturnType<typeof setInterval> | undefined;
 
 const runningCount = computed(() => tasks.value.filter(task => task.State !== 'Idle').length);
 const completedCount = computed(
@@ -42,18 +43,24 @@ const taskStats = computed(() => [
   }
 ]);
 
-async function loadTasks() {
+async function loadTasks(showLoading = true) {
   if (!authStore.token) {
     return;
   }
 
-  loading.value = true;
+  if (showLoading) {
+    loading.value = true;
+  }
   try {
     tasks.value = await serverApi.scheduledTasks(authStore.token);
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '加载计划任务失败');
+    if (showLoading) {
+      ElMessage.error(error instanceof Error ? error.message : '加载计划任务失败');
+    }
   } finally {
-    loading.value = false;
+    if (showLoading) {
+      loading.value = false;
+    }
   }
 }
 
@@ -141,7 +148,20 @@ function triggerText(task: ScheduledTask) {
   return triggers.map(trigger => trigger.Type).join(', ');
 }
 
-onMounted(loadTasks);
+function taskProgress(task: ScheduledTask) {
+  return Math.round(Math.min(100, Math.max(0, task.CurrentProgressPercentage ?? 0)) * 10) / 10;
+}
+
+onMounted(() => {
+  void loadTasks();
+  pollTimer = setInterval(() => void loadTasks(false), 1000);
+});
+
+onBeforeUnmount(() => {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+  }
+});
 </script>
 
 <template>
@@ -151,7 +171,7 @@ onMounted(loadTasks);
         <h1>计划任务</h1>
         <p>{{ tasks.length }} 个任务，{{ runningCount }} 个运行中。</p>
       </div>
-      <ElButton :loading="loading" type="primary" @click="loadTasks">
+      <ElButton :loading="loading" type="primary" @click="loadTasks()">
         <ElIcon>
           <Refresh />
         </ElIcon>
@@ -193,17 +213,30 @@ onMounted(loadTasks);
               <span>结束：{{ formatDate(task.LastExecutionResult?.EndTimeUtc) }}</span>
               <span>分类：{{ task.Category || task.Key || '-' }}</span>
             </div>
+            <div v-if="task.State === 'Running'" class="tasks-page__progress">
+              <ElProgress :percentage="taskProgress(task)" :stroke-width="8" />
+            </div>
           </div>
         </div>
 
         <div class="tasks-page__card-actions">
-          <ElButton :loading="actionTaskId === task.Id" type="primary" @click="runTask(task)">
+          <ElButton
+            :disabled="task.State !== 'Idle'"
+            :loading="actionTaskId === task.Id"
+            type="primary"
+            @click="runTask(task)"
+          >
             <ElIcon>
               <VideoPlay />
             </ElIcon>
             运行
           </ElButton>
-          <ElButton :loading="actionTaskId === task.Id" type="warning" @click="stopTask(task)">
+          <ElButton
+            :disabled="task.State === 'Idle'"
+            :loading="actionTaskId === task.Id"
+            type="warning"
+            @click="stopTask(task)"
+          >
             <ElIcon>
               <SwitchButton />
             </ElIcon>
@@ -385,6 +418,10 @@ onMounted(loadTasks);
     font-size: 13px;
     line-height: 1.15;
   }
+}
+
+.tasks-page__progress {
+  width: min(520px, 100%);
 }
 
 .tasks-page__card-actions {

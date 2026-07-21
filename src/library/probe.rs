@@ -1,6 +1,21 @@
-use std::{collections::HashMap, path::Path, process::Command, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{TcpStream, ToSocketAddrs},
+    path::Path,
+    process::Command,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Deserializer};
+
+const LOCAL_FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_FFPROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_FFPROBE_RW_TIMEOUT_MICROS: &str = "5000000";
+const REMOTE_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const REMOTE_PROBE_FAILURE_TTL: Duration = Duration::from_secs(300);
+
+static REMOTE_PROBE_FAILURES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 #[derive(Default)]
 pub struct MediaProbe {
@@ -53,6 +68,13 @@ pub struct ProbedStream {
 }
 
 pub fn probe_media(path: &Path) -> Option<MediaProbe> {
+    let remote_url = remote_probe_url(path);
+    if let Some(url) = remote_url.as_ref() {
+        if !remote_probe_endpoint_available(url) {
+            return None;
+        }
+    }
+
     let ffprobe =
         std::env::var("JELLYFIN_RS_FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string());
     let analyze_duration = std::env::var("JELLYFIN_RS_FFPROBE_ANALYZE_DURATION")
@@ -81,6 +103,11 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
     if probe_size != "0" {
         command.arg("-probesize").arg(probe_size);
     }
+    if remote_url.is_some() {
+        command
+            .arg("-rw_timeout")
+            .arg(REMOTE_FFPROBE_RW_TIMEOUT_MICROS);
+    }
 
     let mut child = match command
         .arg(path)
@@ -99,7 +126,7 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
     };
 
     let output = {
-        let timeout = Duration::from_secs(30);
+        let timeout = ffprobe_timeout(remote_url.is_some());
         let start = std::time::Instant::now();
         loop {
             match child.try_wait() {
@@ -137,16 +164,137 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
     Some(media_probe_from_ffprobe_response(response))
 }
 
-fn redacted_probe_path(path: &Path) -> String {
+fn ffprobe_timeout(is_remote: bool) -> Duration {
+    if is_remote {
+        REMOTE_FFPROBE_TIMEOUT
+    } else {
+        LOCAL_FFPROBE_TIMEOUT
+    }
+}
+
+fn remote_probe_url(path: &Path) -> Option<reqwest::Url> {
     let value = path.to_string_lossy();
-    if let Ok(mut url) = reqwest::Url::parse(&value) {
-        if matches!(url.scheme(), "http" | "https") {
-            url.set_query(None);
-            url.set_fragment(None);
-            return url.to_string();
+    let url = reqwest::Url::parse(&value).ok()?;
+    matches!(url.scheme(), "http" | "https").then_some(url)
+}
+
+fn remote_probe_endpoint_available(url: &reqwest::Url) -> bool {
+    let Some(key) = remote_probe_endpoint_key(url) else {
+        return true;
+    };
+    if remote_probe_failure_is_fresh(&key) {
+        tracing::debug!(
+            "remote media probe skipped because endpoint is recently unavailable: {}",
+            redacted_probe_url(url)
+        );
+        return false;
+    }
+
+    let Some((host, port)) = remote_probe_socket(url) else {
+        return true;
+    };
+    let addresses = match (host.as_str(), port).to_socket_addrs() {
+        Ok(addresses) => addresses.collect::<Vec<_>>(),
+        Err(error) => {
+            remember_remote_probe_failure(&key);
+            tracing::warn!(
+                "remote media probe skipped because endpoint could not be resolved: {} ({error})",
+                redacted_probe_url(url)
+            );
+            return false;
+        }
+    };
+    if addresses.is_empty() {
+        remember_remote_probe_failure(&key);
+        tracing::warn!(
+            "remote media probe skipped because endpoint resolved no addresses: {}",
+            redacted_probe_url(url)
+        );
+        return false;
+    }
+
+    let mut last_error = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, REMOTE_PROBE_CONNECT_TIMEOUT) {
+            Ok(_) => {
+                clear_remote_probe_failure(&key);
+                return true;
+            }
+            Err(error) => last_error = Some(error),
         }
     }
+
+    let should_warn = remember_remote_probe_failure(&key);
+    if should_warn {
+        let error = last_error
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "connection failed".to_string());
+        tracing::warn!(
+            "remote media probe skipped because endpoint is unreachable: {} ({error})",
+            redacted_probe_url(url)
+        );
+    }
+    false
+}
+
+fn remote_probe_socket(url: &reqwest::Url) -> Option<(String, u16)> {
+    Some((url.host_str()?.to_string(), url.port_or_known_default()?))
+}
+
+fn remote_probe_endpoint_key(url: &reqwest::Url) -> Option<String> {
+    let (host, port) = remote_probe_socket(url)?;
+    Some(format!(
+        "{}://{}:{port}",
+        url.scheme(),
+        host.to_ascii_lowercase()
+    ))
+}
+
+fn remote_probe_failures() -> &'static Mutex<HashMap<String, Instant>> {
+    REMOTE_PROBE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remote_probe_failure_is_fresh(key: &str) -> bool {
+    let now = Instant::now();
+    remote_probe_failures()
+        .lock()
+        .ok()
+        .and_then(|failures| failures.get(key).copied())
+        .is_some_and(|failed_at| now.duration_since(failed_at) < REMOTE_PROBE_FAILURE_TTL)
+}
+
+fn remember_remote_probe_failure(key: &str) -> bool {
+    let now = Instant::now();
+    let Ok(mut failures) = remote_probe_failures().lock() else {
+        return true;
+    };
+    let should_warn = failures
+        .get(key)
+        .is_none_or(|failed_at| now.duration_since(*failed_at) >= REMOTE_PROBE_FAILURE_TTL);
+    failures.insert(key.to_string(), now);
+    should_warn
+}
+
+fn clear_remote_probe_failure(key: &str) {
+    if let Ok(mut failures) = remote_probe_failures().lock() {
+        failures.remove(key);
+    }
+}
+
+fn redacted_probe_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    if let Some(url) = remote_probe_url(path) {
+        return redacted_probe_url(&url);
+    }
     value.to_string()
+}
+
+fn redacted_probe_url(url: &reqwest::Url) -> String {
+    let mut url = url.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
 }
 
 fn truncated_probe_stderr(stderr: &[u8]) -> String {
@@ -715,6 +863,29 @@ mod tests {
             )),
             "https://example.test/movie.mkv"
         );
+    }
+
+    #[test]
+    fn remote_probe_url_only_accepts_http_urls() {
+        assert!(remote_probe_url(Path::new("http://example.test/movie.mkv")).is_some());
+        assert!(remote_probe_url(Path::new("https://example.test/movie.mkv")).is_some());
+        assert!(remote_probe_url(Path::new("/media/movie.mkv")).is_none());
+        assert!(remote_probe_url(Path::new("file:///media/movie.mkv")).is_none());
+    }
+
+    #[test]
+    fn remote_probe_endpoint_key_uses_known_default_port() {
+        let url = reqwest::Url::parse("https://Example.test/movie.mkv?token=secret").unwrap();
+
+        assert_eq!(
+            remote_probe_endpoint_key(&url),
+            Some("https://example.test:443".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_probe_uses_shorter_ffprobe_timeout() {
+        assert!(ffprobe_timeout(true) < ffprobe_timeout(false));
     }
 
     #[test]

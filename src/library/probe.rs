@@ -1,9 +1,14 @@
 use std::{
     collections::HashMap,
-    net::{TcpStream, ToSocketAddrs},
+    io::{self, Read, Write},
+    net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::Path,
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -21,6 +26,12 @@ static REMOTE_PROBE_FAILURES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLo
 enum ProbeFailure {
     EndpointUnavailable,
     Failed,
+}
+
+struct Ipv4ProbeProxy {
+    url: String,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
 }
 
 #[derive(Default)]
@@ -106,12 +117,19 @@ fn probe_media_once(
     path: &Path,
     remote_url: Option<&reqwest::Url>,
 ) -> Result<MediaProbe, ProbeFailure> {
+    let mut proxy = None;
+    let mut http_proxy = None;
     if let Some(url) = remote_url {
         if !remote_probe_endpoint_available(url) {
             return Err(ProbeFailure::EndpointUnavailable);
         }
+        let ipv4_proxy = Ipv4ProbeProxy::start().ok_or(ProbeFailure::EndpointUnavailable)?;
+        http_proxy = Some(ipv4_proxy.url.clone());
+        proxy = Some(ipv4_proxy);
     }
-    let output = run_ffprobe(path, remote_url.is_some()).ok_or(ProbeFailure::Failed)?;
+    let output = run_ffprobe(path, remote_url.is_some(), http_proxy.as_deref())
+        .ok_or(ProbeFailure::Failed)?;
+    drop(proxy);
     let response = match serde_json::from_slice::<FfprobeResponse>(&output) {
         Ok(response) => response,
         Err(error) => {
@@ -125,7 +143,7 @@ fn probe_media_once(
     Ok(media_probe_from_ffprobe_response(response))
 }
 
-fn run_ffprobe(path: &Path, is_remote: bool) -> Option<Vec<u8>> {
+fn run_ffprobe(path: &Path, is_remote: bool, http_proxy: Option<&str>) -> Option<Vec<u8>> {
     let ffprobe =
         std::env::var("JELLYFIN_RS_FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string());
     let analyze_duration = std::env::var("JELLYFIN_RS_FFPROBE_ANALYZE_DURATION")
@@ -158,6 +176,9 @@ fn run_ffprobe(path: &Path, is_remote: bool) -> Option<Vec<u8>> {
         command
             .arg("-rw_timeout")
             .arg(REMOTE_FFPROBE_RW_TIMEOUT_MICROS);
+        if let Some(http_proxy) = http_proxy {
+            command.arg("-http_proxy").arg(http_proxy);
+        }
     }
 
     let mut child = match command
@@ -225,6 +246,246 @@ fn remote_probe_url(path: &Path) -> Option<reqwest::Url> {
     let value = path.to_string_lossy();
     let url = reqwest::Url::parse(&value).ok()?;
     matches!(url.scheme(), "http" | "https").then_some(url)
+}
+
+impl Ipv4ProbeProxy {
+    fn start() -> Option<Self> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
+        listener.set_nonblocking(true).ok()?;
+        let address = listener.local_addr().ok()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let proxy_stop = stop.clone();
+        let handle = std::thread::spawn(move || run_ipv4_probe_proxy(listener, proxy_stop));
+
+        Some(Self {
+            url: format!("http://{address}"),
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for Ipv4ProbeProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn run_ipv4_probe_proxy(listener: TcpListener, stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((client, _)) => {
+                std::thread::spawn(move || {
+                    if let Err(error) = handle_ipv4_proxy_connection(client) {
+                        tracing::debug!("IPv4 probe proxy connection failed: {error}");
+                    }
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                tracing::debug!("IPv4 probe proxy stopped accepting connections: {error}");
+                break;
+            }
+        }
+    }
+}
+
+fn handle_ipv4_proxy_connection(mut client: TcpStream) -> io::Result<()> {
+    client.set_read_timeout(Some(REMOTE_FFPROBE_TIMEOUT))?;
+    client.set_write_timeout(Some(REMOTE_FFPROBE_TIMEOUT))?;
+
+    let (header, extra) = read_proxy_header(&mut client)?;
+    let request = ProxyRequest::parse(&header)?;
+    let mut upstream = connect_ipv4_upstream(&request.host, request.port)?;
+    upstream.set_read_timeout(Some(REMOTE_FFPROBE_TIMEOUT))?;
+    upstream.set_write_timeout(Some(REMOTE_FFPROBE_TIMEOUT))?;
+
+    if request.is_connect {
+        client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+    } else {
+        upstream.write_all(&request.forward_header)?;
+        if !extra.is_empty() {
+            upstream.write_all(&extra)?;
+        }
+    }
+
+    proxy_bidirectional(client, upstream)
+}
+
+struct ProxyRequest {
+    host: String,
+    port: u16,
+    is_connect: bool,
+    forward_header: Vec<u8>,
+}
+
+impl ProxyRequest {
+    fn parse(header: &[u8]) -> io::Result<Self> {
+        let text = std::str::from_utf8(header)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "proxy header is not UTF-8"))?;
+        let request_line = text
+            .lines()
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing request line"))?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing method"))?;
+        let target = parts
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing target"))?;
+        let version = parts
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP version"))?;
+
+        if method.eq_ignore_ascii_case("CONNECT") {
+            let (host, port) = parse_proxy_authority(target, 443)?;
+            return Ok(Self {
+                host,
+                port,
+                is_connect: true,
+                forward_header: Vec::new(),
+            });
+        }
+
+        if let Ok(url) = reqwest::Url::parse(target) {
+            let host = url
+                .host_str()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing URL host"))?
+                .to_string();
+            let port = url.port_or_known_default().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing URL default port")
+            })?;
+            let path = match url.query() {
+                Some(query) => format!("{}?{query}", url.path()),
+                None => url.path().to_string(),
+            };
+            return Ok(Self {
+                host,
+                port,
+                is_connect: false,
+                forward_header: rewrite_proxy_request_line(method, &path, version, text),
+            });
+        }
+
+        let host_header = proxy_header_value(text, "host")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing Host header"))?;
+        let (host, port) = parse_proxy_authority(host_header, 80)?;
+        Ok(Self {
+            host,
+            port,
+            is_connect: false,
+            forward_header: header.to_vec(),
+        })
+    }
+}
+
+fn read_proxy_header(client: &mut TcpStream) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    const MAX_HEADER_BYTES: usize = 32 * 1024;
+
+    let mut buffer = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = client.read(&mut chunk)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before proxy header",
+            ));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(end) = header_end(&buffer) {
+            let extra = buffer.split_off(end);
+            return Ok((buffer, extra));
+        }
+        if buffer.len() > MAX_HEADER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "proxy header is too large",
+            ));
+        }
+    }
+}
+
+fn header_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+}
+
+fn parse_proxy_authority(value: &str, default_port: u16) -> io::Result<(String, u16)> {
+    let value = value.trim();
+    if value.starts_with('[') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPv6 proxy authority is not supported for media probe",
+        ));
+    }
+    let (host, port) = match value.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|ch| ch.is_ascii_digit()) => {
+            (host, port.parse().unwrap_or(default_port))
+        }
+        _ => (value, default_port),
+    };
+    if host.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing proxy host",
+        ));
+    }
+    Ok((host.trim().to_string(), port))
+}
+
+fn proxy_header_value<'a>(headers: &'a str, wanted: &str) -> Option<&'a str> {
+    headers.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case(wanted)
+            .then(|| value.trim())
+    })
+}
+
+fn rewrite_proxy_request_line(method: &str, path: &str, version: &str, header: &str) -> Vec<u8> {
+    let rest = header
+        .split_once("\r\n")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default();
+    format!("{method} {path} {version}\r\n{rest}").into_bytes()
+}
+
+fn connect_ipv4_upstream(host: &str, port: u16) -> io::Result<TcpStream> {
+    let ipv4 = remote_probe_ipv4(host, port).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("no IPv4 address for {host}:{port}"),
+        )
+    })?;
+    TcpStream::connect_timeout(
+        &SocketAddr::from((ipv4, port)),
+        REMOTE_PROBE_CONNECT_TIMEOUT,
+    )
+}
+
+fn proxy_bidirectional(client: TcpStream, upstream: TcpStream) -> io::Result<()> {
+    let mut client_read = client.try_clone()?;
+    let mut upstream_write = upstream.try_clone()?;
+    let client_to_upstream = std::thread::spawn(move || {
+        let _ = io::copy(&mut client_read, &mut upstream_write);
+        let _ = upstream_write.shutdown(Shutdown::Write);
+    });
+
+    let mut upstream_read = upstream;
+    let mut client_write = client;
+    let result = io::copy(&mut upstream_read, &mut client_write).map(|_| ());
+    let _ = client_write.shutdown(Shutdown::Write);
+    let _ = client_to_upstream.join();
+    result
 }
 
 fn resolve_remote_probe_redirect(url: &reqwest::Url) -> Option<reqwest::Url> {
@@ -312,53 +573,49 @@ fn remote_probe_endpoint_available(url: &reqwest::Url) -> bool {
     let Some((host, port)) = remote_probe_socket(url) else {
         return true;
     };
-    let addresses = match (host.as_str(), port).to_socket_addrs() {
-        Ok(addresses) => addresses.collect::<Vec<_>>(),
-        Err(error) => {
-            remember_remote_probe_failure(&key);
-            tracing::warn!(
-                "remote media probe skipped because endpoint could not be resolved: {} ({error})",
-                redacted_probe_url(url)
-            );
-            return false;
-        }
-    };
-    if addresses.is_empty() {
+    let Some(ipv4) = remote_probe_ipv4(&host, port) else {
         remember_remote_probe_failure(&key);
         tracing::warn!(
-            "remote media probe skipped because endpoint resolved no addresses: {}",
+            "remote media probe skipped because endpoint resolved no IPv4 address: {}",
             redacted_probe_url(url)
         );
         return false;
-    }
+    };
 
-    let mut last_error = None;
-    for address in addresses {
-        match TcpStream::connect_timeout(&address, REMOTE_PROBE_CONNECT_TIMEOUT) {
-            Ok(_) => {
-                clear_remote_probe_failure(&key);
-                return true;
-            }
-            Err(error) => last_error = Some(error),
+    let address = SocketAddr::from((ipv4, port));
+    match TcpStream::connect_timeout(&address, REMOTE_PROBE_CONNECT_TIMEOUT) {
+        Ok(_) => {
+            clear_remote_probe_failure(&key);
+            return true;
         }
-    }
-
-    let should_warn = remember_remote_probe_failure(&key);
-    if should_warn {
-        let error = last_error
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "connection failed".to_string());
-        tracing::warn!(
-            "remote media probe skipped because endpoint is unreachable: {} ({error})",
-            redacted_probe_url(url)
-        );
+        Err(error) => {
+            let should_warn = remember_remote_probe_failure(&key);
+            if should_warn {
+                tracing::warn!(
+                    "remote media probe skipped because IPv4 endpoint is unreachable: {} ({error})",
+                    redacted_probe_url(url)
+                );
+            }
+        }
     }
     false
 }
 
 fn remote_probe_socket(url: &reqwest::Url) -> Option<(String, u16)> {
     Some((url.host_str()?.to_string(), url.port_or_known_default()?))
+}
+
+fn remote_probe_ipv4(host: &str, port: u16) -> Option<Ipv4Addr> {
+    if let Ok(ipv4) = host.parse::<Ipv4Addr>() {
+        return Some(ipv4);
+    }
+    (host, port)
+        .to_socket_addrs()
+        .ok()?
+        .find_map(|address| match address {
+            SocketAddr::V4(address) => Some(*address.ip()),
+            SocketAddr::V6(_) => None,
+        })
 }
 
 fn remote_probe_endpoint_key(url: &reqwest::Url) -> Option<String> {
@@ -999,6 +1256,37 @@ mod tests {
         assert_eq!(
             remote_probe_endpoint_key(&url),
             Some("https://example.test:443".to_string())
+        );
+    }
+
+    #[test]
+    fn ipv4_proxy_parses_connect_without_rewriting_host() {
+        let request = ProxyRequest::parse(
+            b"CONNECT media.example.test:443 HTTP/1.1\r\nHost: media.example.test:443\r\n\r\n",
+        )
+        .unwrap();
+
+        assert!(request.is_connect);
+        assert_eq!(request.host, "media.example.test");
+        assert_eq!(request.port, 443);
+        assert!(request.forward_header.is_empty());
+    }
+
+    #[test]
+    fn ipv4_proxy_rewrites_absolute_http_request_to_origin_form() {
+        let request =
+            ProxyRequest::parse(b"GET http://media.example.test:8080/path/file.mkv?sign=secret HTTP/1.1\r\nHost: media.example.test:8080\r\n\r\n")
+                .unwrap();
+
+        assert!(!request.is_connect);
+        assert_eq!(request.host, "media.example.test");
+        assert_eq!(request.port, 8080);
+        assert!(
+            std::str::from_utf8(&request.forward_header)
+                .unwrap()
+                .starts_with(
+                    "GET /path/file.mkv?sign=secret HTTP/1.1\r\nHost: media.example.test:8080\r\n"
+                )
         );
     }
 

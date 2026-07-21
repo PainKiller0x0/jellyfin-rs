@@ -52,8 +52,10 @@ pub struct CachedMediaProbe {
     pub size_bytes: Option<i64>,
 }
 
+pub(crate) const MEDIA_PROBE_FAILURE_STREAM_TYPE: &str = "ProbeFailure";
 const MISSING_CLEANUP_BATCH_SIZE: u64 = 500;
 const MISSING_CLEANUP_PAUSE: Duration = Duration::from_millis(2);
+const MEDIA_PROBE_FAILURE_CACHE_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 impl ScannedMediaItem {
     #[allow(clippy::too_many_arguments)]
@@ -116,9 +118,25 @@ pub async fn cached_media_probe_if_current(
         return Ok(None);
     };
 
+    let has_failed_probe = MediaStreams::find()
+        .filter(media_streams::Column::ItemId.eq(&item.id))
+        .filter(media_streams::Column::StreamType.eq(MEDIA_PROBE_FAILURE_STREAM_TYPE))
+        .filter(media_streams::Column::CreatedAt.gt(now_unix() - MEDIA_PROBE_FAILURE_CACHE_SECONDS))
+        .one(db)
+        .await
+        .with_context(|| format!("failed to check cached media probe failure: {path}"))?
+        .is_some();
+    if has_failed_probe {
+        return Ok(Some(CachedMediaProbe {
+            runtime_ticks: item.runtime_ticks,
+            size_bytes: item.size_bytes,
+        }));
+    }
+
     let has_probe_stream = MediaStreams::find()
         .filter(media_streams::Column::ItemId.eq(&item.id))
         .filter(media_streams::Column::IsExternal.eq(0))
+        .filter(media_streams::Column::StreamType.ne(MEDIA_PROBE_FAILURE_STREAM_TYPE))
         .filter(
             Condition::any()
                 .add(media_streams::Column::Codec.is_not_null())
@@ -747,6 +765,43 @@ pub async fn upsert_default_media_stream(
     Ok(())
 }
 
+pub async fn upsert_failed_media_probe(
+    db: &DatabaseConnection,
+    item: &ScannedMediaItem,
+) -> anyhow::Result<()> {
+    if item.is_folder {
+        return Ok(());
+    }
+    let stream_id = stable_text_id(&format!("stream:{}:probe-failure", item.id));
+    delete_stale_generated_stream_id(db, &stream_id, &item.id).await?;
+    if let Some(existing) = MediaStreams::find()
+        .filter(media_streams::Column::ItemId.eq(&item.id))
+        .filter(media_streams::Column::StreamType.eq(MEDIA_PROBE_FAILURE_STREAM_TYPE))
+        .one(db)
+        .await
+        .with_context(|| format!("failed to read failed media probe marker: {}", item.path))?
+    {
+        let mut active: media_streams::ActiveModel = existing.into();
+        active.created_at = Set(now_unix());
+        active.update(db).await.with_context(|| {
+            format!("failed to update failed media probe marker: {}", item.path)
+        })?;
+    } else {
+        MediaStreams::insert(media_streams::ActiveModel {
+            id: Set(stream_id),
+            item_id: Set(item.id.clone()),
+            stream_index: Set(-1),
+            stream_type: Set(MEDIA_PROBE_FAILURE_STREAM_TYPE.to_string()),
+            created_at: Set(now_unix()),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .with_context(|| format!("failed to insert failed media probe marker: {}", item.path))?;
+    }
+    Ok(())
+}
+
 async fn default_media_stream_matches(
     db: &DatabaseConnection,
     item_id: &str,
@@ -1071,7 +1126,7 @@ async fn cleanup_path_exists(path: &str) -> bool {
 mod tests {
     use super::{
         ScannedMediaItem, cached_media_probe_if_current, upsert_default_media_stream,
-        upsert_media_item, upsert_probed_media_streams,
+        upsert_failed_media_probe, upsert_media_item, upsert_probed_media_streams,
     };
     use crate::entities::{
         media_items::{self, Entity as MediaItems},
@@ -1176,6 +1231,30 @@ mod tests {
                 .await
                 .unwrap()
         );
+
+        let cached = cached_media_probe_if_current(
+            &db,
+            &item.path,
+            item.modified_at,
+            item.size_bytes,
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(cached.runtime_ticks, item.runtime_ticks);
+        assert_eq!(cached.size_bytes, item.size_bytes);
+    }
+
+    #[tokio::test]
+    async fn failed_probe_marker_satisfies_probe_cache() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        let item = scanned_movie("movie-failed-cache", "Failed Cache Movie");
+        upsert_media_item(&db, &item).await.unwrap();
+        upsert_default_media_stream(&db, &item).await.unwrap();
+        upsert_failed_media_probe(&db, &item).await.unwrap();
 
         let cached = cached_media_probe_if_current(
             &db,

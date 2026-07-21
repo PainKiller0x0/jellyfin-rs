@@ -18,7 +18,9 @@ use crate::{
         provider_ids::{self, Entity as ProviderIds},
     },
     library::{
-        classify::{classify_media_path, parent_id_for_path, tv_folder_type},
+        classify::{
+            classify_media_path, parent_id_for_path, parent_id_for_scanned_file, tv_folder_type,
+        },
         images::upsert_sidecar_images,
         metadata::{ParsedMetadata, parse_sidecar_metadata, provider_ids_from_path},
         naming::parse_media_name,
@@ -26,8 +28,8 @@ use crate::{
         probe::probe_media,
         storage::{
             CachedMediaProbe, ScannedMediaItem, cached_media_probe_if_current,
-            remove_missing_media_items, upsert_default_media_stream, upsert_media_item,
-            upsert_media_metadata, upsert_probed_media_streams,
+            remove_missing_media_items, upsert_default_media_stream, upsert_failed_media_probe,
+            upsert_media_item, upsert_media_metadata, upsert_probed_media_streams,
         },
         subtitles::{clear_sidecar_subtitles, upsert_sidecar_subtitles},
     },
@@ -257,7 +259,7 @@ async fn scan_root(
         };
 
         let path_string = resolved.path.clone();
-        let parent_id = parent_id_for_path(path, &root, &library_id);
+        let mut parent_id = parent_id_for_path(path, &root, &library_id);
 
         if resolved.is_directory {
             seen_paths.push(path_string.clone());
@@ -323,6 +325,8 @@ async fn scan_root(
             path,
             &root,
         );
+        parent_id =
+            parent_id_for_scanned_file(path, &root, &library_id, &collection_type, &item_type);
         let container = if is_strm_file {
             probe_path
                 .as_ref()
@@ -337,6 +341,9 @@ async fn scan_root(
         seen_paths.push(path_string.clone());
         let parsed_metadata = parse_sidecar_metadata(path).await;
         let parsed_name = parse_media_name(path, &collection_type);
+        let season_number = parsed_name
+            .season_number
+            .or_else(|| episode_season_number_from_path(path, &root, &collection_type));
         let title = if has_sidecar_nfo(path) {
             parsed_metadata
                 .title
@@ -364,7 +371,7 @@ async fn scan_root(
             production_year: parsed_metadata.production_year,
             runtime_ticks: None,
             size_bytes: resolved.size_bytes,
-            season_number: parsed_name.season_number,
+            season_number,
             episode_number: parsed_name.episode_number,
             modified_at: resolved.modified_at,
             created_at: now_unix(),
@@ -883,19 +890,31 @@ async fn run_media_probe_job(
             upsert_default_media_stream(&db, &job.item).await?;
         }
     } else {
-        match crate::mediainfo::deserialize_mediainfo(&db, &job.item.id, &job.probe_path, None)
-            .await
+        let restored_mediainfo =
+            match crate::mediainfo::deserialize_mediainfo(&db, &job.item.id, &job.probe_path, None)
+                .await
+            {
+                Ok(true) => {
+                    tracing::debug!("restored mediainfo from sidecar for {}", job.item.path);
+                    true
+                }
+                Ok(false) => false,
+                Err(error) => {
+                    tracing::debug!(
+                        "failed to restore mediainfo sidecar for {}: {error:#}",
+                        job.item.path
+                    );
+                    false
+                }
+            };
+        if !restored_mediainfo
+            && crate::strm::is_remote_url(&job.probe_path.to_string_lossy())
+            && let Err(error) = upsert_failed_media_probe(&db, &job.item).await
         {
-            Ok(true) => {
-                tracing::debug!("restored mediainfo from sidecar for {}", job.item.path);
-            }
-            Ok(false) => {}
-            Err(error) => {
-                tracing::debug!(
-                    "failed to restore mediainfo sidecar for {}: {error:#}",
-                    job.item.path
-                );
-            }
+            tracing::debug!(
+                "failed to cache remote media probe failure for {}: {error:#}",
+                job.item.path
+            );
         }
     }
 
@@ -928,6 +947,37 @@ fn normalize_scanned_file_type(
     } else {
         item_type.to_string()
     }
+}
+
+fn episode_season_number_from_path(
+    path: &std::path::Path,
+    root: &std::path::Path,
+    collection_type: &str,
+) -> Option<i64> {
+    if !matches!(collection_type, "tvshows" | "tv") {
+        return None;
+    }
+
+    let mut current = path.parent();
+    while let Some(parent) = current {
+        if same_normalized_path(parent, root) {
+            break;
+        }
+        if let Some(number) = parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(crate::library::tmdb_metadata::parse_season_number)
+        {
+            return Some(number);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn same_normalized_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    path_utils::normalize_path(&left.to_string_lossy())
+        == path_utils::normalize_path(&right.to_string_lossy())
 }
 
 fn queue_metadata_fetch(
@@ -1217,6 +1267,17 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn episode_season_number_uses_decorated_chinese_season_ancestor() {
+        let root = PathBuf::from("/media/动漫/国漫");
+        let path = root.join("L/灵笼{tmdb-91097}/灵笼 第一季（2019）/4K 高码率/第1集.strm");
+
+        assert_eq!(
+            episode_season_number_from_path(&path, &root, "tvshows"),
+            Some(1)
+        );
     }
 
     fn test_dir(name: &str) -> PathBuf {

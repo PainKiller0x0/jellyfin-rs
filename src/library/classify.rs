@@ -54,14 +54,50 @@ pub fn classify_media_path(path: &Path, collection_type: &str) -> Option<String>
 }
 
 pub fn parent_id_for_path(path: &Path, root: &Path, library_id: &str) -> String {
+    parent_path_for_path(path, root)
+        .as_deref()
+        .map(stable_item_id)
+        .unwrap_or_else(|| library_id.to_string())
+}
+
+pub fn parent_id_for_scanned_file(
+    path: &Path,
+    root: &Path,
+    library_id: &str,
+    collection_type: &str,
+    item_type: &str,
+) -> String {
+    if matches!(collection_type, "tvshows" | "tv") && item_type == "Episode" {
+        if let Some(parent) = parent_path_for_path(path, root) {
+            let parent_name = parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if is_quality_or_range_folder_name(parent_name) {
+                if let Some(grandparent) = parent_path_for_path(&parent, root) {
+                    let grandparent_name = grandparent
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default();
+                    if is_season_folder_name(grandparent_name) {
+                        return stable_item_id(&grandparent);
+                    }
+                }
+            }
+        }
+    }
+
+    parent_id_for_path(path, root, library_id)
+}
+
+fn parent_path_for_path(path: &Path, root: &Path) -> Option<PathBuf> {
     let norm_path = super::path_utils::normalize_path(&path.to_string_lossy());
     let norm_root = super::path_utils::normalize_path(&root.to_string_lossy());
     let path = std::path::Path::new(&norm_path);
     let root = std::path::Path::new(&norm_root);
     path.parent()
         .filter(|parent| *parent != root)
-        .map(stable_item_id)
-        .unwrap_or_else(|| library_id.to_string())
+        .map(PathBuf::from)
 }
 
 pub fn tv_folder_type(path: &Path, root: &Path, collection_type: &str) -> &'static str {
@@ -282,7 +318,13 @@ fn is_season_folder_name(name: &str) -> bool {
         || first_token.starts_with('s')
             && first_token[1..].chars().all(|c| c.is_ascii_digit())
             && first_token.len() > 1
-        || name.starts_with('第') && name.ends_with('季')
+        || has_chinese_season_marker(&name)
+}
+
+fn has_chinese_season_marker(name: &str) -> bool {
+    name.split_once('第')
+        .and_then(|(_, rest)| rest.split_once('季').map(|(number, _)| number.trim()))
+        .is_some_and(|number| crate::util::parse_chinese_number(number).is_some())
 }
 
 fn is_quality_or_range_folder_name(name: &str) -> bool {
@@ -493,6 +535,30 @@ mod tests {
         assert_eq!(
             tv_folder_type(&root.join("国产/剧名/S01 高码率"), root, "tvshows"),
             "Season"
+        );
+        assert_eq!(
+            tv_folder_type(&root.join("动漫/灵笼/灵笼 第一季（2019）"), root, "tvshows"),
+            "Season"
+        );
+        assert_eq!(
+            tv_folder_type(&root.join("动漫/灵笼/灵笼 第二季（2025）"), root, "tvshows"),
+            "Season"
+        );
+        assert_eq!(
+            tv_folder_type(&root.join("动漫/剧名/第十二季"), root, "tvshows"),
+            "Season"
+        );
+    }
+
+    #[test]
+    fn tv_episode_parent_skips_quality_folder_inside_season() {
+        let root = Path::new("/media/动漫/国漫");
+        let episode = root.join("L/灵笼{tmdb-91097}/灵笼 第一季（2019）/4K 高码率/第1集.strm");
+        let season = root.join("L/灵笼{tmdb-91097}/灵笼 第一季（2019）");
+
+        assert_eq!(
+            super::parent_id_for_scanned_file(&episode, root, "library", "tvshows", "Episode"),
+            crate::util::stable_item_id(&season)
         );
     }
 

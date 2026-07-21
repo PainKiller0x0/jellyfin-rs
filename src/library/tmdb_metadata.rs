@@ -256,7 +256,7 @@ pub(crate) fn parse_season_number(title: &str) -> Option<i64> {
     }
     if let Some(rest) = title.split_once('第').map(|(_, rest)| rest) {
         if let Some((number, _)) = rest.split_once('季') {
-            if let Ok(number) = number.trim().parse::<i64>() {
+            if let Some(number) = crate::util::parse_chinese_number(number) {
                 return Some(number);
             }
         }
@@ -2036,6 +2036,9 @@ mod tests {
         assert_eq!(parse_season_number("Season 1"), Some(1));
         assert_eq!(parse_season_number("season_2"), Some(2));
         assert_eq!(parse_season_number("第3季"), Some(3));
+        assert_eq!(parse_season_number("灵笼 第一季（2019）"), Some(1));
+        assert_eq!(parse_season_number("灵笼 第二季（2025）"), Some(2));
+        assert_eq!(parse_season_number("第十二季"), Some(12));
         assert_eq!(parse_season_number("S04"), Some(4));
         assert_eq!(parse_season_number("Specials"), None);
     }

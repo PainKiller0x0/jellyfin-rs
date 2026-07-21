@@ -17,6 +17,51 @@ pub fn stable_text_id(value: &str) -> String {
     Uuid::new_v5(&Uuid::NAMESPACE_URL, value.as_bytes()).to_string()
 }
 
+pub fn parse_chinese_number(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(number) = value.parse::<i64>() {
+        return Some(number);
+    }
+
+    let mut total = 0_i64;
+    let mut current = 0_i64;
+    for ch in value.chars() {
+        if let Some(digit) = chinese_digit(ch) {
+            current = digit;
+            continue;
+        }
+        let unit = match ch {
+            '十' => 10,
+            '百' => 100,
+            _ => return None,
+        };
+        total += current.max(1) * unit;
+        current = 0;
+    }
+
+    let number = total + current;
+    (number > 0).then_some(number)
+}
+
+fn chinese_digit(value: char) -> Option<i64> {
+    Some(match value {
+        '零' | '〇' => 0,
+        '一' => 1,
+        '二' | '两' => 2,
+        '三' => 3,
+        '四' => 4,
+        '五' => 5,
+        '六' => 6,
+        '七' => 7,
+        '八' => 8,
+        '九' => 9,
+        _ => return None,
+    })
+}
+
 pub fn media_title(path: &Path) -> String {
     path.file_stem()
         .and_then(|name| name.to_str())

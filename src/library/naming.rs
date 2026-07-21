@@ -69,6 +69,14 @@ fn parse_episode_name(stem: &str, folder: &str) -> ParsedName {
         }
     }
 
+    if let Some(episode) = parse_chinese_episode_number(stem) {
+        parsed.episode_number = Some(episode);
+        parsed.title = clean_title(stem);
+        parsed.version = parse_version(stem);
+        parsed.extended_video_types = parse_extended_video_types(stem);
+        return parsed;
+    }
+
     if let Some((season, episode)) = parse_compact_episode(&normalized) {
         parsed.season_number = Some(season);
         parsed.episode_number = Some(episode);
@@ -82,6 +90,14 @@ fn parse_episode_name(stem: &str, folder: &str) -> ParsedName {
     parsed.version = parse_version(stem);
     parsed.extended_video_types = parse_extended_video_types(stem);
     parsed
+}
+
+fn parse_chinese_episode_number(value: &str) -> Option<i64> {
+    let regex =
+        Regex::new(r#"第\s*(?P<number>[0-9]{1,4}|[零〇一二两三四五六七八九十百]+)\s*[集话話回]"#)
+            .expect("Chinese episode regex must compile");
+    let captures = regex.captures(value)?;
+    crate::util::parse_chinese_number(captures.name("number")?.as_str())
 }
 
 fn parse_video_name(stem: &str) -> ParsedName {
@@ -475,6 +491,14 @@ mod tests {
         let parsed = parse_media_name(Path::new("01.strm"), "tvshows");
         assert_eq!(parsed.episode_number, Some(1));
         assert_eq!(parsed.title, "01");
+
+        let parsed = parse_media_name(Path::new("第10集.strm"), "tvshows");
+        assert_eq!(parsed.episode_number, Some(10));
+        assert_eq!(parsed.title, "第10集");
+
+        let parsed = parse_media_name(Path::new("第十二集.strm"), "tvshows");
+        assert_eq!(parsed.episode_number, Some(12));
+        assert_eq!(parsed.title, "第十二集");
     }
 
     #[test]

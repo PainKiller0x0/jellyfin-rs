@@ -73,6 +73,10 @@ pub(crate) async fn media_streams_for_item(
 ) -> anyhow::Result<Vec<JsonValue>> {
     let models = MediaStreams::find()
         .filter(crate::entities::media_streams::Column::ItemId.eq(item_id))
+        .filter(
+            crate::entities::media_streams::Column::StreamType
+                .ne(crate::library::storage::MEDIA_PROBE_FAILURE_STREAM_TYPE),
+        )
         .order_by_asc(crate::entities::media_streams::Column::StreamIndex)
         .all(db)
         .await
@@ -97,6 +101,10 @@ pub(crate) async fn media_streams_for_items(
             .filter(
                 crate::entities::media_streams::Column::ItemId
                     .is_in(chunk.iter().map(|id| id.as_str())),
+            )
+            .filter(
+                crate::entities::media_streams::Column::StreamType
+                    .ne(crate::library::storage::MEDIA_PROBE_FAILURE_STREAM_TYPE),
             )
             .order_by_asc(crate::entities::media_streams::Column::ItemId)
             .order_by_asc(crate::entities::media_streams::Column::StreamIndex)
@@ -493,8 +501,14 @@ pub async fn subtitle_stream_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_episode_version_sources, child_video_sources, episode_version_sources};
-    use crate::entities::media_items::{self, Entity as MediaItems};
+    use super::{
+        batch_episode_version_sources, child_video_sources, episode_version_sources,
+        media_streams_for_item,
+    };
+    use crate::entities::{
+        media_items::{self, Entity as MediaItems},
+        media_streams::{self, Entity as MediaStreams},
+    };
     use crate::library::models::MediaItem;
     use sea_orm::{DatabaseConnection, EntityTrait, Set};
 
@@ -552,6 +566,52 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn media_streams_hide_probe_failure_markers() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        insert_test_media_item(
+            &db,
+            "movie",
+            "Movie",
+            "/tmp/movie.mkv",
+            "movies",
+            "movies",
+            "Movie",
+            0,
+            1,
+            Some(100),
+            None,
+            None,
+        )
+        .await;
+        for (id, index, stream_type) in [
+            ("stream-video", 0_i64, "Video"),
+            (
+                "stream-failure",
+                -1_i64,
+                crate::library::storage::MEDIA_PROBE_FAILURE_STREAM_TYPE,
+            ),
+        ] {
+            MediaStreams::insert(media_streams::ActiveModel {
+                id: Set(id.to_string()),
+                item_id: Set("movie".to_string()),
+                stream_index: Set(index),
+                stream_type: Set(stream_type.to_string()),
+                created_at: Set(1),
+                ..Default::default()
+            })
+            .exec_without_returning(&db)
+            .await
+            .unwrap();
+        }
+
+        let streams = media_streams_for_item(&db, "movie").await.unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0]["Type"], "Video");
     }
 
     #[tokio::test]

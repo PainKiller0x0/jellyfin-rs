@@ -17,6 +17,8 @@ use serde::{Deserialize, Deserializer};
 const LOCAL_FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_FFPROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_FFPROBE_RW_TIMEOUT_MICROS: &str = "5000000";
+const REMOTE_FFPROBE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 const REMOTE_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_REDIRECT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(6);
 const REMOTE_PROBE_FAILURE_TTL: Duration = Duration::from_secs(300);
@@ -182,7 +184,9 @@ fn run_ffprobe(path: &Path, is_remote: bool, http_proxy: Option<&str>) -> Option
     if is_remote {
         command
             .arg("-rw_timeout")
-            .arg(REMOTE_FFPROBE_RW_TIMEOUT_MICROS);
+            .arg(REMOTE_FFPROBE_RW_TIMEOUT_MICROS)
+            .arg("-user_agent")
+            .arg(REMOTE_FFPROBE_USER_AGENT);
         if let Some(http_proxy) = http_proxy {
             command.arg("-http_proxy").arg(http_proxy);
         }
@@ -521,22 +525,11 @@ fn resolve_remote_probe_redirect(url: &reqwest::Url) -> Option<reqwest::Url> {
     let client = reqwest::blocking::Client::builder()
         .timeout(REMOTE_REDIRECT_RESOLVE_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent("jellyfin-rs")
+        .user_agent(REMOTE_FFPROBE_USER_AGENT)
         .build()
         .ok()?;
 
-    match resolve_remote_probe_redirect_with_method(&client, url, false) {
-        Ok(Some(url)) => return Some(url),
-        Ok(None) => {}
-        Err(error) => {
-            tracing::debug!(
-                "failed to resolve remote media probe redirect with HEAD for {}: {error}",
-                redacted_probe_url(url)
-            );
-        }
-    }
-
-    match resolve_remote_probe_redirect_with_method(&client, url, true) {
+    match resolve_remote_probe_redirect_with_method(&client, url) {
         Ok(url) => url,
         Err(error) => {
             tracing::debug!(
@@ -551,21 +544,16 @@ fn resolve_remote_probe_redirect(url: &reqwest::Url) -> Option<reqwest::Url> {
 fn resolve_remote_probe_redirect_with_method(
     client: &reqwest::blocking::Client,
     url: &reqwest::Url,
-    use_get: bool,
 ) -> Result<Option<reqwest::Url>, reqwest::Error> {
     const MAX_REDIRECTS: usize = 5;
 
     let original = url.clone();
     let mut current = url.clone();
     for _ in 0..MAX_REDIRECTS {
-        let response = if use_get {
-            client
-                .get(current.clone())
-                .header(reqwest::header::RANGE, "bytes=0-0")
-                .send()?
-        } else {
-            client.head(current.clone()).send()?
-        };
+        let response = client
+            .get(current.clone())
+            .header(reqwest::header::RANGE, "bytes=0-0")
+            .send()?;
         if let Some(next) = redirect_location(response.url(), &response) {
             current = next;
             continue;
@@ -1324,6 +1312,7 @@ mod tests {
         use std::{
             io::{Read, Write},
             net::TcpListener,
+            sync::{Arc, Mutex},
             thread,
         };
 
@@ -1332,6 +1321,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let media_url = format!("http://{address}/media.mp4?token=2");
         let media_url_for_server = media_url.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
         let handle = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(2);
             let mut served = 0usize;
@@ -1341,6 +1332,7 @@ mod tests {
                         let mut buffer = [0u8; 1024];
                         let read = stream.read(&mut buffer).unwrap_or_default();
                         let request = String::from_utf8_lossy(&buffer[..read]);
+                        server_requests.lock().unwrap().push(request.to_string());
                         if request.contains("/openlist") {
                             write!(
                                 stream,
@@ -1369,6 +1361,14 @@ mod tests {
 
         assert_eq!(redirected.as_str(), media_url);
         handle.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains("range: bytes=0-0\r\n"))
+        );
     }
 
     #[test]

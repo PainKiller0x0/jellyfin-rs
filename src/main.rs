@@ -5,7 +5,7 @@ use axum::{
     Router,
     body::{Body, to_bytes},
     extract::{ConnectInfo, Request, State},
-    http::{HeaderMap, HeaderValue, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::Next,
     response::Response,
 };
@@ -13,6 +13,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
 use tokio::{net::TcpListener, signal};
 use tower_http::{
+    compression::CompressionLayer,
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
@@ -249,11 +250,13 @@ async fn main() -> anyhow::Result<()> {
         .fallback(jellyfin::routes::not_found)
         .with_state(state.clone())
         .layer(axum::middleware::from_fn(openapi_contract_response))
+        .layer(axum::middleware::from_fn(tagged_image_cache_response))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             log_http_request,
         ))
         .layer(CorsLayer::permissive())
+        .layer(CompressionLayer::new().gzip(true).br(true))
         .layer(TraceLayer::new_for_http());
 
     let listener = TcpListener::bind(addr)
@@ -270,6 +273,58 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .context("server failed")
+}
+
+async fn tagged_image_cache_response(request: Request<Body>, next: Next) -> Response {
+    let tagged_image = is_tagged_image_request(request.uri());
+    let mut response = next.run(request).await;
+    let is_image = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("image/"));
+    if tagged_image && (is_image || response.status() == StatusCode::NOT_MODIFIED) {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=31536000, immutable"),
+        );
+    }
+    response
+}
+
+fn is_tagged_image_request(uri: &axum::http::Uri) -> bool {
+    let is_image_path = uri
+        .path()
+        .split('/')
+        .any(|segment| segment.eq_ignore_ascii_case("images"));
+    let has_tag = uri.query().is_some_and(|query| {
+        query.split('&').any(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            key.eq_ignore_ascii_case("tag") && !value.is_empty()
+        })
+    });
+    is_image_path && has_tag
+}
+
+#[cfg(test)]
+mod http_optimization_tests {
+    use super::*;
+
+    #[test]
+    fn tagged_image_detection_requires_an_image_path_and_nonempty_tag() {
+        assert!(is_tagged_image_request(
+            &"/Items/item/Images/Backdrop/0?tag=etag-1".parse().unwrap()
+        ));
+        assert!(is_tagged_image_request(
+            &"/Users/user/Images/Primary?Tag=etag-2".parse().unwrap()
+        ));
+        assert!(!is_tagged_image_request(
+            &"/Items/item/Images/Backdrop/0?tag=".parse().unwrap()
+        ));
+        assert!(!is_tagged_image_request(
+            &"/Items/item?tag=etag-1".parse().unwrap()
+        ));
+    }
 }
 
 async fn shutdown_signal() {

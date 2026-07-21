@@ -21,7 +21,7 @@ serde_json = "1.0"
 sea-orm = { version = "2.0", default-features = false, features = ["runtime-tokio", "sqlx-postgres", "macros"] }
 tokio = { version = "1.53", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
-tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.7", features = ["compression-br", "compression-gzip", "cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.24", features = ["v4", "v5", "serde"] }

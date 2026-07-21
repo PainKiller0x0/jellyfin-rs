@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Context;
 use axum::{
@@ -92,7 +96,8 @@ pub async fn get_item_image(
     {
         return response;
     }
-    serve_item_image(&state.db, &headers, &query, &item_id, &image_type, 0).await
+    let response = serve_item_image(&state.db, &headers, &query, &item_id, &image_type, 0).await;
+    with_tagged_image_cache(response, &query)
 }
 
 pub async fn get_item_image_with_index(
@@ -110,7 +115,7 @@ pub async fn get_item_image_with_index(
     } else {
         (second, first.parse::<i64>().unwrap_or_default())
     };
-    serve_item_image(
+    let response = serve_item_image(
         &state.db,
         &headers,
         &query,
@@ -118,7 +123,8 @@ pub async fn get_item_image_with_index(
         &image_type,
         image_index,
     )
-    .await
+    .await;
+    with_tagged_image_cache(response, &query)
 }
 
 pub async fn get_item_image_legacy_path(
@@ -129,7 +135,7 @@ pub async fn get_item_image_legacy_path(
         item_id,
         image_type,
         image_index,
-        _tag,
+        tag,
         format,
         max_width,
         max_height,
@@ -144,7 +150,8 @@ pub async fn get_item_image_legacy_path(
     query.entry("Format".to_string()).or_insert(format);
     query.entry("MaxWidth".to_string()).or_insert(max_width);
     query.entry("MaxHeight".to_string()).or_insert(max_height);
-    serve_item_image(
+    query.entry("Tag".to_string()).or_insert(tag);
+    let response = serve_item_image(
         &state.db,
         &headers,
         &query,
@@ -152,7 +159,21 @@ pub async fn get_item_image_legacy_path(
         &image_type,
         image_index.parse::<i64>().unwrap_or_default(),
     )
-    .await
+    .await;
+    with_tagged_image_cache(response, &query)
+}
+
+fn with_tagged_image_cache(mut response: Response, query: &HashMap<String, String>) -> Response {
+    let has_tag = query
+        .iter()
+        .any(|(key, value)| key.eq_ignore_ascii_case("tag") && !value.trim().is_empty());
+    if has_tag {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=31536000, immutable"),
+        );
+    }
+    response
 }
 
 pub async fn upload_item_image(
@@ -404,7 +425,7 @@ async fn serve_item_image(
     if wants_json_response(headers) {
         return ok_response();
     }
-    let options = image_options_from_query(query, image_type);
+    let mut options = image_options_from_query(query, image_type);
     let model = match find_item_image_asset(db, item_id, image_type, image_index)
         .await
         .with_context(|| {
@@ -429,6 +450,11 @@ async fn serve_item_image(
     let path = model.path.unwrap_or_default();
     if !image_storage_path_allowed(&path) {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    if image_format_from_query(query).is_none()
+        && let Some(format) = image_format_from_path(&path)
+    {
+        options.format = format;
     }
 
     // Check processed image cache before doing expensive re-processing
@@ -1030,7 +1056,7 @@ fn image_options_from_query(
         quality: query_u8(query, &["Quality", "quality"])
             .unwrap_or(90)
             .clamp(1, 100),
-        format: image_format_from_query(query).unwrap_or(EncodedImageFormat::Png),
+        format: image_format_from_query(query).unwrap_or(EncodedImageFormat::Jpeg),
     }
 }
 
@@ -1074,6 +1100,20 @@ fn image_format_from_query(query: &HashMap<String, String>) -> Option<EncodedIma
         .trim()
         .to_ascii_lowercase();
     match format.as_str() {
+        "jpg" | "jpeg" => Some(EncodedImageFormat::Jpeg),
+        "png" => Some(EncodedImageFormat::Png),
+        "webp" => Some(EncodedImageFormat::Webp),
+        _ => None,
+    }
+}
+
+fn image_format_from_path(path: &str) -> Option<EncodedImageFormat> {
+    match FsPath::new(path)
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "jpg" | "jpeg" => Some(EncodedImageFormat::Jpeg),
         "png" => Some(EncodedImageFormat::Png),
         "webp" => Some(EncodedImageFormat::Webp),
@@ -1247,8 +1287,8 @@ pub(crate) fn add_art_tag_fallback(tags: &mut serde_json::Map<String, JsonValue>
 mod tests {
     use super::{
         MAX_IMAGE_BYTES, add_art_tag_fallback, canonical_image_type, collage_source_images,
-        decode_image_body, image_storage_path_allowed, image_type_and_index, is_image_too_large,
-        item_images_inner,
+        decode_image_body, image_format_from_path, image_storage_path_allowed,
+        image_type_and_index, is_image_too_large, item_images_inner, with_tagged_image_cache,
     };
     use crate::entities::{
         image_assets::{self, Entity as ImageAssets},
@@ -1256,7 +1296,10 @@ mod tests {
     };
     use sea_orm::{DatabaseConnection, EntityTrait, Set};
     use serde_json::json;
-    use std::fs;
+    use std::{collections::HashMap, fs};
+
+    use crate::library::image_processing::EncodedImageFormat;
+    use axum::{http::header, response::IntoResponse};
 
     #[test]
     fn image_storage_path_allowed_rejects_sibling_directory() {
@@ -1312,6 +1355,36 @@ mod tests {
         tags.insert("Backdrop".to_string(), json!("backdrop-tag"));
         add_art_tag_fallback(&mut tags);
         assert_eq!(tags.get("Art"), Some(&json!("backdrop-tag")));
+    }
+
+    #[test]
+    fn inferred_image_format_preserves_supported_source_extensions() {
+        assert_eq!(
+            image_format_from_path("data/images/backdrop.jpeg"),
+            Some(EncodedImageFormat::Jpeg)
+        );
+        assert_eq!(
+            image_format_from_path("data/images/poster.WEBP"),
+            Some(EncodedImageFormat::Webp)
+        );
+        assert_eq!(
+            image_format_from_path("data/images/logo.png"),
+            Some(EncodedImageFormat::Png)
+        );
+        assert_eq!(image_format_from_path("data/images/unknown.bin"), None);
+    }
+
+    #[test]
+    fn tagged_images_get_long_lived_private_browser_cache() {
+        let response = with_tagged_image_cache(
+            axum::http::StatusCode::OK.into_response(),
+            &HashMap::from([("tag".to_string(), "etag-1".to_string())]),
+        );
+
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, max-age=31536000, immutable"
+        );
     }
 
     #[tokio::test]

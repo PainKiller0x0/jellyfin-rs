@@ -3,7 +3,7 @@ use std::io::Cursor;
 use anyhow::Context;
 use image::{
     DynamicImage, GenericImage, GenericImageView, ImageBuffer, ImageFormat, Rgba,
-    imageops::FilterType,
+    codecs::jpeg::JpegEncoder, imageops::FilterType,
 };
 
 pub struct ImageRequestOptions {
@@ -13,7 +13,7 @@ pub struct ImageRequestOptions {
     pub format: EncodedImageFormat,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodedImageFormat {
     Png,
     Jpeg,
@@ -44,7 +44,7 @@ impl Default for ImageRequestOptions {
             width: None,
             height: None,
             quality: 90,
-            format: EncodedImageFormat::Png,
+            format: EncodedImageFormat::Jpeg,
         }
     }
 }
@@ -142,24 +142,27 @@ pub fn create_placeholder(
 }
 
 fn resize_to_options(image: DynamicImage, options: &ImageRequestOptions) -> DynamicImage {
-    match (options.width, options.height) {
-        (Some(width), Some(height)) => {
-            // Fit within the bounding box while preserving aspect ratio
-            let (src_w, src_h) = image.dimensions();
-            if src_w == 0 || src_h == 0 {
-                return image;
-            }
-            let scale_w = width as f64 / src_w as f64;
-            let scale_h = height as f64 / src_h as f64;
-            let scale = scale_w.min(scale_h);
-            let new_w = ((src_w as f64 * scale) as u32).max(1);
-            let new_h = ((src_h as f64 * scale) as u32).max(1);
-            image.resize(new_w, new_h, FilterType::Lanczos3)
-        }
-        (Some(width), None) => image.resize(width.max(1), u32::MAX, FilterType::Lanczos3),
-        (None, Some(height)) => image.resize(u32::MAX, height.max(1), FilterType::Lanczos3),
-        (None, None) => image,
+    let (source_width, source_height) = image.dimensions();
+    if source_width == 0 || source_height == 0 {
+        return image;
     }
+
+    let width_scale = options
+        .width
+        .map(|width| width as f64 / source_width as f64)
+        .unwrap_or(1.0);
+    let height_scale = options
+        .height
+        .map(|height| height as f64 / source_height as f64)
+        .unwrap_or(1.0);
+    let scale = width_scale.min(height_scale).min(1.0);
+    if scale >= 1.0 {
+        return image;
+    }
+
+    let width = ((source_width as f64 * scale).round() as u32).max(1);
+    let height = ((source_height as f64 * scale).round() as u32).max(1);
+    image.resize_exact(width, height, FilterType::Lanczos3)
 }
 
 fn crop_resize(image: &DynamicImage, width: u32, height: u32) -> DynamicImage {
@@ -187,11 +190,17 @@ fn crop_resize(image: &DynamicImage, width: u32, height: u32) -> DynamicImage {
 }
 
 fn encode_image(image: DynamicImage, options: &ImageRequestOptions) -> anyhow::Result<Vec<u8>> {
-    let _quality = options.quality;
     let mut bytes = Vec::new();
-    image
-        .write_to(&mut Cursor::new(&mut bytes), options.format.image_format())
-        .context("failed to encode image")?;
+    match options.format {
+        EncodedImageFormat::Jpeg => {
+            JpegEncoder::new_with_quality(&mut bytes, options.quality.clamp(1, 100))
+                .encode_image(&image)
+                .context("failed to encode JPEG image")?
+        }
+        EncodedImageFormat::Png | EncodedImageFormat::Webp => image
+            .write_to(&mut Cursor::new(&mut bytes), options.format.image_format())
+            .context("failed to encode image")?,
+    }
     Ok(bytes)
 }
 
@@ -226,9 +235,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn creates_placeholder_png() {
+    fn creates_placeholder_jpeg() {
         let bytes = create_placeholder(64, 36, "test", &ImageRequestOptions::default()).unwrap();
-        assert!(bytes.starts_with(b"\x89PNG"));
+        assert!(bytes.starts_with(&[0xff, 0xd8, 0xff]));
     }
 
     #[test]
@@ -237,7 +246,46 @@ mod tests {
         let first = create_placeholder(32, 32, "first", &options).unwrap();
         let second = create_placeholder(32, 32, "second", &options).unwrap();
         let collage = create_collage(&[first, second], 80, 45, &options).unwrap();
-        assert!(collage.starts_with(b"\x89PNG"));
+        assert!(collage.starts_with(&[0xff, 0xd8, 0xff]));
+    }
+
+    #[test]
+    fn max_dimensions_never_upscale_source_images() {
+        let source = create_placeholder(64, 36, "source", &ImageRequestOptions::default()).unwrap();
+        let options = ImageRequestOptions {
+            width: Some(3840),
+            height: Some(2160),
+            ..ImageRequestOptions::default()
+        };
+
+        let processed = process_image(&source, &options).unwrap();
+        let image = image::load_from_memory(&processed).unwrap();
+        assert_eq!(image.dimensions(), (64, 36));
+    }
+
+    #[test]
+    fn jpeg_quality_changes_encoded_output() {
+        let source =
+            create_placeholder(320, 180, "quality", &ImageRequestOptions::default()).unwrap();
+        let low_quality = process_image(
+            &source,
+            &ImageRequestOptions {
+                quality: 20,
+                ..ImageRequestOptions::default()
+            },
+        )
+        .unwrap();
+        let high_quality = process_image(
+            &source,
+            &ImageRequestOptions {
+                quality: 95,
+                ..ImageRequestOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_ne!(low_quality, high_quality);
+        assert!(low_quality.len() < high_quality.len());
     }
 
     #[test]

@@ -55,13 +55,18 @@ pub async fn tmdb_movie_details(
     api_key: &str,
     tmdb_id: &str,
     base_url: Option<&str>,
+    language: &str,
+    country_code: &str,
 ) -> anyhow::Result<Value> {
     let response = client
         .get(tmdb::api_url(base_url, &format!("movie/{tmdb_id}")))
         .query(&[
             ("api_key", api_key),
-            ("language", "zh-CN"),
-            ("append_to_response", "credits,release_dates"),
+            ("language", language),
+            (
+                "append_to_response",
+                "credits,release_dates,keywords,videos",
+            ),
         ])
         .send()
         .await?
@@ -74,35 +79,76 @@ pub async fn tmdb_movie_details(
         .as_deref()
         .and_then(|date| date.get(0..4))
         .and_then(|year| year.parse::<i64>().ok());
-    let cast = response
-        .credits
-        .map(|credits| credits.cast)
-        .unwrap_or_default()
+    let credits = response.credits.unwrap_or_default();
+    let mut people = credits
+        .cast
         .into_iter()
-        .take(20)
+        .take(15)
         .map(|person| {
-            let mut entry =
-                json!({ "Name": person.name, "Role": person.character, "Type": "Actor" });
+            let mut entry = json!({
+                "Name": person.name,
+                "Role": person.character,
+                "Type": "Actor",
+                "SortOrder": person.order,
+                "ProviderIds": { "Tmdb": person.id.to_string() }
+            });
             if let Some(ref profile) = person.profile_path {
                 entry["ImageUrl"] = json!(tmdb::image_url(base_url, "w185", profile));
             }
             entry
         })
         .collect::<Vec<_>>();
+    people.extend(
+        credits
+            .crew
+            .into_iter()
+            .filter_map(|person| {
+                let person_type = tmdb_crew_person_type(
+                    person.department.as_deref().unwrap_or_default(),
+                    person.job.as_deref().unwrap_or_default(),
+                )?;
+                let mut entry = json!({
+                    "Name": person.name,
+                    "Role": person.job,
+                    "Type": person_type,
+                    "ProviderIds": { "Tmdb": person.id.to_string() }
+                });
+                if let Some(ref profile) = person.profile_path {
+                    entry["ImageUrl"] = json!(tmdb::image_url(base_url, "w185", profile));
+                }
+                Some(entry)
+            })
+            .take(15),
+    );
 
-    // Extract official rating (US certification preferred)
+    // Jellyfin prefers the item's metadata country, then US.
     let official_rating = response.release_dates.as_ref().and_then(|rd| {
-        rd.results
+        let releases = rd
+            .results
             .iter()
-            .filter(|r| r.iso_3166_1.as_deref() == Some("US"))
-            .flat_map(|r| &r.release_dates)
-            .find_map(|rd| rd.certification.as_ref().filter(|c| !c.is_empty()).cloned())
-            .or_else(|| {
-                // Fallback: any non-empty certification
-                rd.results
+            .filter_map(|result| {
+                result
+                    .release_dates
                     .iter()
-                    .flat_map(|r| &r.release_dates)
-                    .find_map(|rd| rd.certification.as_ref().filter(|c| !c.is_empty()).cloned())
+                    .find_map(|release| {
+                        release
+                            .certification
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|rating| !rating.is_empty())
+                    })
+                    .map(|rating| (result.iso_3166_1.as_deref().unwrap_or_default(), rating))
+            })
+            .collect::<Vec<_>>();
+        releases
+            .iter()
+            .find(|(country, _)| country.eq_ignore_ascii_case(country_code))
+            .map(|(_, rating)| build_parental_rating(country_code, rating))
+            .or_else(|| {
+                releases
+                    .iter()
+                    .find(|(country, _)| country.eq_ignore_ascii_case("US"))
+                    .map(|(_, rating)| (*rating).to_string())
             })
     });
 
@@ -117,9 +163,35 @@ pub async fn tmdb_movie_details(
         .iter()
         .filter_map(|l| l.name.clone())
         .collect();
+    let mut trailer_videos = response
+        .videos
+        .as_ref()
+        .map(|videos| videos.results.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    trailer_videos.sort_by_key(|video| !video.video_type.eq_ignore_ascii_case("trailer"));
+    let remote_trailers = trailer_videos
+        .into_iter()
+        .filter(|video| tmdb_video_is_trailer(video))
+        .map(|video| {
+            json!({
+                "Name": video.name,
+                "Url": format!("https://www.youtube.com/watch?v={}", video.key)
+            })
+        })
+        .collect::<Vec<_>>();
+    let tmdb_collection_id = response
+        .belongs_to_collection
+        .as_ref()
+        .map(|collection| collection.id.to_string())
+        .unwrap_or_default();
+    let collection_name = response
+        .belongs_to_collection
+        .as_ref()
+        .map(|collection| collection.name.clone());
 
     Ok(json!({
         "Name": response.title,
+        "OriginalTitle": response.original_title,
         "Type": "Movie",
         "Overview": response.overview,
         "ProductionYear": year,
@@ -127,18 +199,23 @@ pub async fn tmdb_movie_details(
         "CommunityRating": response.vote_average,
         "OfficialRating": official_rating,
         "Tagline": response.tagline,
+        "ProductionLocations": countries,
         "RuntimeTicks": response.runtime.map(|m| m * 60 * 10_000_000),
         "Status": response.status,
         "OriginalLanguage": response.original_language,
+        "CollectionName": collection_name,
+        "RemoteTrailers": remote_trailers,
         "Countries": countries,
         "Languages": languages,
         "ProviderIds": {
             "Tmdb": response.id.to_string(),
-            "IMDB": response.imdb_id.unwrap_or_default()
+            "IMDB": response.imdb_id.unwrap_or_default(),
+            "TmdbCollection": tmdb_collection_id
         },
         "Genres": response.genres.into_iter().map(|genre| genre.name).collect::<Vec<_>>(),
+        "Tags": response.keywords.map(|keywords| keywords.keywords.into_iter().map(|keyword| keyword.name).collect::<Vec<_>>()).unwrap_or_default(),
         "Studios": response.production_companies.into_iter().map(|company| company.name).collect::<Vec<_>>(),
-        "People": cast,
+        "People": people,
         "ImageUrl": response.poster_path.map(|p| tmdb::image_url(base_url, "w500", &p)),
         "BackdropUrl": response.backdrop_path.map(|p| tmdb::image_url(base_url, "w1280", &p)),
     }))
@@ -196,13 +273,18 @@ pub async fn tmdb_tv_details(
     api_key: &str,
     tmdb_id: &str,
     base_url: Option<&str>,
+    language: &str,
+    country_code: &str,
 ) -> anyhow::Result<Value> {
     let response = client
         .get(tmdb::api_url(base_url, &format!("tv/{tmdb_id}")))
         .query(&[
             ("api_key", api_key),
-            ("language", "zh-CN"),
-            ("append_to_response", "credits,external_ids,content_ratings"),
+            ("language", language),
+            (
+                "append_to_response",
+                "credits,external_ids,content_ratings,keywords,videos",
+            ),
         ])
         .send()
         .await?
@@ -215,20 +297,59 @@ pub async fn tmdb_tv_details(
         .as_deref()
         .and_then(|date| date.get(0..4))
         .and_then(|year| year.parse::<i64>().ok());
-    let cast = response
-        .credits
-        .map(|credits| credits.cast)
-        .unwrap_or_default()
+    let credits = response.credits.unwrap_or_default();
+    let mut people = credits
+        .cast
         .into_iter()
-        .take(20)
+        .take(15)
         .map(|person| {
-            let mut entry = json!({ "Name": person.name, "Role": person.character.or_else(|| person.roles.first().map(|r| r.character.clone())).unwrap_or_default(), "Type": "Actor" });
+            let mut entry = json!({
+                "Name": person.name,
+                "Role": person.character.or_else(|| person.roles.first().map(|r| r.character.clone())).unwrap_or_default(),
+                "Type": "Actor",
+                "SortOrder": person.order,
+                "ProviderIds": { "Tmdb": person.id.to_string() }
+            });
             if let Some(ref profile) = person.profile_path {
                 entry["ImageUrl"] = json!(tmdb::image_url(base_url, "w185", profile));
             }
             entry
         })
         .collect::<Vec<_>>();
+    people.extend(
+        credits
+            .crew
+            .into_iter()
+            .filter_map(|person| {
+                let person_type = tmdb_crew_person_type(
+                    person.department.as_deref().unwrap_or_default(),
+                    person.job.as_deref().unwrap_or_default(),
+                )?;
+                let mut entry = json!({
+                    "Name": person.name,
+                    "Role": person.job,
+                    "Type": person_type,
+                    "ProviderIds": { "Tmdb": person.id.to_string() }
+                });
+                if let Some(ref profile) = person.profile_path {
+                    entry["ImageUrl"] = json!(tmdb::image_url(base_url, "w185", profile));
+                }
+                Some(entry)
+            })
+            .take(15),
+    );
+    people.extend(response.created_by.iter().map(|person| {
+        let mut entry = json!({
+            "Name": person.name,
+            "Role": "",
+            "Type": "Creator",
+            "ProviderIds": { "Tmdb": person.id.to_string() }
+        });
+        if let Some(ref profile) = person.profile_path {
+            entry["ImageUrl"] = json!(tmdb::image_url(base_url, "w185", profile));
+        }
+        entry
+    }));
 
     let external_imdb = response
         .external_ids
@@ -239,17 +360,31 @@ pub async fn tmdb_tv_details(
         .as_ref()
         .and_then(|ids| ids.tvdb_id.map(|id| id.to_string()));
 
-    // Extract official rating (US content rating preferred)
+    // Jellyfin prefers the item's metadata country, then US, then first.
     let official_rating = response.content_ratings.as_ref().and_then(|cr| {
-        cr.results
+        let ratings = cr
+            .results
             .iter()
-            .filter(|r| r.iso_3166_1.as_deref() == Some("US"))
-            .find_map(|r| r.rating.as_ref().filter(|c| !c.is_empty()).cloned())
-            .or_else(|| {
-                cr.results
-                    .iter()
-                    .find_map(|r| r.rating.as_ref().filter(|c| !c.is_empty()).cloned())
+            .filter_map(|result| {
+                result
+                    .rating
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|rating| !rating.is_empty())
+                    .map(|rating| (result.iso_3166_1.as_deref().unwrap_or_default(), rating))
             })
+            .collect::<Vec<_>>();
+        ratings
+            .iter()
+            .find(|(country, _)| country.eq_ignore_ascii_case(country_code))
+            .map(|(_, rating)| build_parental_rating(country_code, rating))
+            .or_else(|| {
+                ratings
+                    .iter()
+                    .find(|(country, _)| country.eq_ignore_ascii_case("US"))
+                    .map(|(_, rating)| (*rating).to_string())
+            })
+            .or_else(|| ratings.first().map(|(_, rating)| (*rating).to_string()))
     });
 
     let runtime_minutes = response.episode_run_time.first().copied();
@@ -259,18 +394,41 @@ pub async fn tmdb_tv_details(
         .iter()
         .filter_map(|l| l.name.clone())
         .collect();
+    let studios = response
+        .networks
+        .iter()
+        .chain(response.production_companies.iter())
+        .map(|company| company.name.clone())
+        .collect::<Vec<_>>();
+    let remote_trailers = response
+        .videos
+        .as_ref()
+        .into_iter()
+        .flat_map(|videos| videos.results.iter())
+        .filter(|video| tmdb_video_is_trailer(video))
+        .map(|video| {
+            json!({
+                "Name": video.name,
+                "Url": format!("https://www.youtube.com/watch?v={}", video.key)
+            })
+        })
+        .collect::<Vec<_>>();
 
     Ok(json!({
         "Name": response.name,
+        "OriginalTitle": response.original_name,
         "Type": "Series",
         "Overview": response.overview,
         "ProductionYear": year,
         "PremiereDate": response.first_air_date.as_deref().and_then(normalize_yyyy_mm_dd),
+        "EndDate": response.last_air_date.as_deref().and_then(normalize_yyyy_mm_dd),
         "CommunityRating": response.vote_average,
         "OfficialRating": official_rating,
         "Tagline": response.tagline,
         "RuntimeTicks": runtime_minutes.map(|m| m * 60 * 10_000_000),
         "OriginalLanguage": response.original_language,
+        "HomePageUrl": response.homepage,
+        "RemoteTrailers": remote_trailers,
         "Countries": countries,
         "Languages": languages,
         "ProviderIds": {
@@ -279,12 +437,12 @@ pub async fn tmdb_tv_details(
             "Tvdb": external_tvdb.unwrap_or_default(),
         },
         "Genres": response.genres.into_iter().map(|genre| genre.name).collect::<Vec<_>>(),
-        "Studios": response.networks.into_iter().map(|network| network.name).collect::<Vec<_>>(),
-        "People": cast,
+        "Tags": response.keywords.map(|keywords| keywords.results.into_iter().map(|keyword| keyword.name).collect::<Vec<_>>()).unwrap_or_default(),
+        "Studios": studios,
+        "People": people,
         "ImageUrl": response.poster_path.map(|p| tmdb::image_url(base_url, "w500", &p)),
         "BackdropUrl": response.backdrop_path.map(|p| tmdb::image_url(base_url, "w1280", &p)),
-        "Status": response.status,
-        "AirDays": runtime_minutes,
+        "Status": response.status.as_deref().and_then(normalize_tmdb_series_status),
         "SeasonCount": response.number_of_seasons,
         "EpisodeCount": response.number_of_episodes,
     }))
@@ -467,6 +625,7 @@ struct TmdbSearchItem {
 struct TmdbMovieDetails {
     id: i64,
     title: String,
+    original_title: Option<String>,
     overview: Option<String>,
     release_date: Option<String>,
     poster_path: Option<String>,
@@ -477,6 +636,7 @@ struct TmdbMovieDetails {
     runtime: Option<i64>,
     status: Option<String>,
     original_language: Option<String>,
+    belongs_to_collection: Option<TmdbCollection>,
     #[allow(dead_code)]
     budget: Option<i64>,
     #[allow(dead_code)]
@@ -491,14 +651,18 @@ struct TmdbMovieDetails {
     spoken_languages: Vec<TmdbLanguage>,
     credits: Option<TmdbCredits>,
     release_dates: Option<TmdbReleaseDates>,
+    keywords: Option<TmdbMovieKeywords>,
+    videos: Option<TmdbVideos>,
 }
 
 #[derive(Deserialize)]
 struct TmdbTvDetails {
     id: i64,
     name: String,
+    original_name: Option<String>,
     overview: Option<String>,
     first_air_date: Option<String>,
+    last_air_date: Option<String>,
     poster_path: Option<String>,
     backdrop_path: Option<String>,
     status: Option<String>,
@@ -507,6 +671,7 @@ struct TmdbTvDetails {
     vote_average: Option<f64>,
     tagline: Option<String>,
     original_language: Option<String>,
+    homepage: Option<String>,
     #[serde(default)]
     episode_run_time: Vec<i64>,
     #[serde(default)]
@@ -514,25 +679,83 @@ struct TmdbTvDetails {
     #[serde(default)]
     networks: Vec<TmdbNamedItem>,
     #[serde(default)]
+    production_companies: Vec<TmdbNamedItem>,
+    #[serde(default)]
     origin_country: Vec<String>,
     #[serde(default)]
     spoken_languages: Vec<TmdbLanguage>,
     credits: Option<TmdbTvCredits>,
     external_ids: Option<TmdbExternalIds>,
     content_ratings: Option<TmdbContentRatings>,
+    keywords: Option<TmdbTvKeywords>,
+    #[serde(default)]
+    created_by: Vec<TmdbCreatedBy>,
+    videos: Option<TmdbVideos>,
 }
 
 #[derive(Deserialize)]
+struct TmdbCollection {
+    id: i64,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct TmdbVideos {
+    #[serde(default)]
+    results: Vec<TmdbVideo>,
+}
+
+#[derive(Deserialize)]
+struct TmdbVideo {
+    key: String,
+    name: String,
+    site: String,
+    #[serde(rename = "type")]
+    video_type: String,
+}
+
+fn tmdb_video_is_trailer(video: &TmdbVideo) -> bool {
+    video.site.eq_ignore_ascii_case("youtube")
+        && (video.video_type.eq_ignore_ascii_case("trailer")
+            || video.video_type.eq_ignore_ascii_case("teaser"))
+}
+
+fn build_parental_rating(country_code: &str, rating: &str) -> String {
+    let rating = rating.trim();
+    if country_code.eq_ignore_ascii_case("US") {
+        return rating.to_string();
+    }
+    if country_code.eq_ignore_ascii_case("DE") {
+        return format!("FSK-{rating}");
+    }
+    format!("{}-{rating}", country_code.to_ascii_uppercase())
+}
+
+fn normalize_tmdb_series_status(status: &str) -> Option<&'static str> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "continuing" | "pilot" | "returning" | "returning series" => Some("Continuing"),
+        "ended" | "cancelled" | "canceled" => Some("Ended"),
+        "unreleased" => Some("Unreleased"),
+        _ => None,
+    }
+}
+
+#[derive(Default, Deserialize)]
 struct TmdbTvCredits {
     #[serde(default)]
     cast: Vec<TmdbTvCastMember>,
+    #[serde(default)]
+    crew: Vec<TmdbCrewMember>,
 }
 
 #[derive(Deserialize)]
 struct TmdbTvCastMember {
+    id: i64,
     name: String,
     character: Option<String>,
     profile_path: Option<String>,
+    #[serde(default)]
+    order: i64,
     #[serde(default)]
     roles: Vec<TmdbTvRole>,
 }
@@ -560,6 +783,30 @@ struct TmdbLanguage {
     #[allow(dead_code)]
     iso_639_1: Option<String>,
     name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TmdbMovieKeywords {
+    #[serde(default)]
+    keywords: Vec<TmdbKeyword>,
+}
+
+#[derive(Deserialize)]
+struct TmdbTvKeywords {
+    #[serde(default)]
+    results: Vec<TmdbKeyword>,
+}
+
+#[derive(Deserialize)]
+struct TmdbKeyword {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct TmdbCreatedBy {
+    id: i64,
+    name: String,
+    profile_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -645,17 +892,48 @@ struct TmdbNamedItem {
     name: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct TmdbCredits {
     #[serde(default)]
     cast: Vec<TmdbCastMember>,
+    #[serde(default)]
+    crew: Vec<TmdbCrewMember>,
 }
 
 #[derive(Deserialize)]
 struct TmdbCastMember {
+    id: i64,
     name: String,
     character: Option<String>,
     profile_path: Option<String>,
+    #[serde(default)]
+    order: i64,
+}
+
+#[derive(Deserialize)]
+struct TmdbCrewMember {
+    id: i64,
+    name: String,
+    department: Option<String>,
+    job: Option<String>,
+    profile_path: Option<String>,
+}
+
+pub(crate) fn tmdb_crew_person_type(department: &str, job: &str) -> Option<&'static str> {
+    if department.eq_ignore_ascii_case("directing") && job.eq_ignore_ascii_case("director") {
+        Some("Director")
+    } else if department.eq_ignore_ascii_case("production") && job.eq_ignore_ascii_case("producer")
+    {
+        Some("Producer")
+    } else if department.eq_ignore_ascii_case("writing")
+        && ["writer", "screenplay", "novel"]
+            .iter()
+            .any(|candidate| job.eq_ignore_ascii_case(candidate))
+    {
+        Some("Writer")
+    } else {
+        None
+    }
 }
 
 pub async fn tmdb_movie_images(
@@ -758,4 +1036,52 @@ pub async fn tmdb_movie_images(
     }
 
     Ok(images)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        TmdbVideo, build_parental_rating, normalize_tmdb_series_status, tmdb_crew_person_type,
+        tmdb_video_is_trailer,
+    };
+
+    #[test]
+    fn crew_mapping_matches_jellyfin_tmdb_provider() {
+        assert_eq!(
+            tmdb_crew_person_type("Directing", "Director"),
+            Some("Director")
+        );
+        assert_eq!(
+            tmdb_crew_person_type("Production", "Producer"),
+            Some("Producer")
+        );
+        for job in ["Writer", "Screenplay", "Novel"] {
+            assert_eq!(tmdb_crew_person_type("Writing", job), Some("Writer"));
+        }
+        assert_eq!(tmdb_crew_person_type("Camera", "Director"), None);
+    }
+
+    #[test]
+    fn trailer_and_series_status_mapping_match_jellyfin_tmdb_provider() {
+        let trailer = TmdbVideo {
+            key: "abc".to_string(),
+            name: "Official Trailer".to_string(),
+            site: "YouTube".to_string(),
+            video_type: "Teaser".to_string(),
+        };
+        assert!(tmdb_video_is_trailer(&trailer));
+        assert_eq!(
+            normalize_tmdb_series_status("Returning Series"),
+            Some("Continuing")
+        );
+        assert_eq!(normalize_tmdb_series_status("Canceled"), Some("Ended"));
+        assert_eq!(normalize_tmdb_series_status("In Production"), None);
+    }
+
+    #[test]
+    fn parental_rating_prefix_matches_jellyfin_tmdb_provider() {
+        assert_eq!(build_parental_rating("US", "TV-14"), "TV-14");
+        assert_eq!(build_parental_rating("CN", "IIA"), "CN-IIA");
+        assert_eq!(build_parental_rating("DE", "12"), "FSK-12");
+    }
 }

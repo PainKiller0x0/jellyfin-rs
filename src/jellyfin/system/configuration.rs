@@ -485,6 +485,8 @@ fn default_server_configuration() -> Value {
         "MinResumePct": 5,
         "MaxResumePct": 90,
         "MinResumeDurationSeconds": 300,
+        "DummyChapterDuration": 0,
+        "ChapterImageResolution": "MatchSource",
         "UICulture": "zh-CN",
         "EnableDashboardResponseCaching": true,
         "EnableExternalContentInSuggestions": false,

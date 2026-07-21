@@ -209,6 +209,8 @@ pub async fn deserialize_mediainfo(
                 name: c.name.clone(),
                 marker_type: c.marker_type.clone(),
                 source: "mediainfo".to_string(),
+                image_path: None,
+                image_date_modified: None,
             })
             .collect();
         crate::chapters::save_chapters(db, item_id, &chapters).await?;

@@ -13,8 +13,12 @@ use crate::{
         libraries::Entity as Libraries,
         media_items::{self, Entity as MediaItems},
         media_streams::{Entity as MediaStreams, Model as MediaStreamModel},
+        user_data::{self, Entity as UserData},
     },
-    library::models::{MediaItem, MediaStreamRow, child_video_source_json_for_item},
+    library::models::{
+        MediaItem, MediaStreamRow, MediaStreamSelectionPreferences, SubtitlePlaybackMode,
+        apply_media_source_user_preferences, child_video_source_json_for_item,
+    },
 };
 
 type EpisodeVersionKey = (String, Option<i64>, i64);
@@ -40,6 +44,69 @@ impl From<media_items::Model> for VideoSourceRow {
             size_bytes: item.size_bytes,
         }
     }
+}
+
+impl From<&MediaItem> for VideoSourceRow {
+    fn from(item: &MediaItem) -> Self {
+        Self {
+            id: item.id.clone(),
+            title: item.title.clone(),
+            path: item.path.clone(),
+            container: item.container.clone().unwrap_or_else(|| "bin".to_string()),
+            runtime_ticks: item.runtime_ticks,
+            size_bytes: item.size_bytes,
+        }
+    }
+}
+
+fn stack_info_for_source(row: &VideoSourceRow) -> Option<(String, i64)> {
+    let parsed = crate::library::naming::parse_media_name(Path::new(&row.path), "movies");
+    Some((parsed.stack_key?, parsed.stack_part?))
+}
+
+fn retain_primary_stack_parts(rows: &mut Vec<VideoSourceRow>) {
+    let mut first_parts = HashMap::<String, i64>::new();
+    for row in rows.iter() {
+        if let Some((key, part)) = stack_info_for_source(row) {
+            first_parts
+                .entry(key)
+                .and_modify(|first| *first = (*first).min(part))
+                .or_insert(part);
+        }
+    }
+    rows.retain(|row| {
+        stack_info_for_source(row).is_none_or(|(key, part)| first_parts.get(&key) == Some(&part))
+    });
+    rows.sort_by(|left, right| {
+        stack_info_for_source(right)
+            .is_some()
+            .cmp(&stack_info_for_source(left).is_some())
+            .then_with(|| left.title.cmp(&right.title))
+    });
+}
+
+fn retain_primary_stack_parts_by_parent(rows: &mut Vec<(String, VideoSourceRow)>) {
+    let mut first_parts = HashMap::<(String, String), i64>::new();
+    for (parent_id, row) in rows.iter() {
+        if let Some((key, part)) = stack_info_for_source(row) {
+            first_parts
+                .entry((parent_id.clone(), key))
+                .and_modify(|first| *first = (*first).min(part))
+                .or_insert(part);
+        }
+    }
+    rows.retain(|(parent_id, row)| {
+        stack_info_for_source(row)
+            .is_none_or(|(key, part)| first_parts.get(&(parent_id.clone(), key)) == Some(&part))
+    });
+    rows.sort_by(|(left_parent, left), (right_parent, right)| {
+        left_parent.cmp(right_parent).then_with(|| {
+            stack_info_for_source(right)
+                .is_some()
+                .cmp(&stack_info_for_source(left).is_some())
+                .then_with(|| left.title.cmp(&right.title))
+        })
+    });
 }
 
 async fn visible_media_item(
@@ -122,6 +189,158 @@ pub(crate) async fn media_streams_for_items(
     Ok(stream_map)
 }
 
+pub(crate) async fn apply_user_stream_preferences_to_sources(
+    db: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    item_id: &str,
+    media_sources: &mut [JsonValue],
+) -> anyhow::Result<()> {
+    if media_sources.is_empty() {
+        return Ok(());
+    }
+
+    let mut item_ids = vec![item_id.to_string()];
+    item_ids.extend(
+        media_sources
+            .iter()
+            .filter_map(|source| source.get("Id").and_then(JsonValue::as_str))
+            .filter(|id| !id.is_empty())
+            .map(ToString::to_string),
+    );
+    item_ids.sort();
+    item_ids.dedup();
+
+    let base_preferences = user_stream_preferences_from_config(
+        &crate::jellyfin::auth::user_configuration(db, user_id).await,
+    );
+    let remembered = user_stream_memory_by_item_id(db, user_id, &item_ids).await?;
+
+    apply_preferences_to_sources_with_memory(
+        item_id,
+        media_sources,
+        &base_preferences,
+        &remembered,
+    );
+
+    Ok(())
+}
+
+pub(crate) async fn apply_user_stream_preferences_to_source_map(
+    db: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    source_map: &mut HashMap<String, Vec<JsonValue>>,
+) -> anyhow::Result<()> {
+    if source_map.is_empty() {
+        return Ok(());
+    }
+
+    let mut item_ids = Vec::new();
+    for (item_id, sources) in source_map.iter() {
+        item_ids.push(item_id.clone());
+        item_ids.extend(
+            sources
+                .iter()
+                .filter_map(|source| source.get("Id").and_then(JsonValue::as_str))
+                .filter(|id| !id.is_empty())
+                .map(ToString::to_string),
+        );
+    }
+    item_ids.sort();
+    item_ids.dedup();
+
+    let base_preferences = user_stream_preferences_from_config(
+        &crate::jellyfin::auth::user_configuration(db, user_id).await,
+    );
+    let remembered = user_stream_memory_by_item_id(db, user_id, &item_ids).await?;
+
+    for (item_id, sources) in source_map.iter_mut() {
+        apply_preferences_to_sources_with_memory(item_id, sources, &base_preferences, &remembered);
+    }
+
+    Ok(())
+}
+
+fn apply_preferences_to_sources_with_memory(
+    item_id: &str,
+    media_sources: &mut [JsonValue],
+    base_preferences: &MediaStreamSelectionPreferences,
+    remembered: &HashMap<String, (Option<i64>, Option<i64>)>,
+) {
+    for source in media_sources {
+        let source_id = source.get("Id").and_then(JsonValue::as_str);
+        let mut preferences = base_preferences.clone();
+        if let Some((audio, subtitle)) = source_id
+            .and_then(|id| remembered.get(id))
+            .or_else(|| remembered.get(item_id))
+            .copied()
+        {
+            preferences.remembered_audio_stream_index = audio;
+            preferences.remembered_subtitle_stream_index = subtitle;
+        }
+        apply_media_source_user_preferences(source, &preferences);
+    }
+}
+
+fn user_stream_preferences_from_config(config: &JsonValue) -> MediaStreamSelectionPreferences {
+    MediaStreamSelectionPreferences {
+        audio_languages: normalize_user_language(config, "AudioLanguagePreference"),
+        subtitle_languages: normalize_user_language(config, "SubtitleLanguagePreference"),
+        subtitle_mode: SubtitlePlaybackMode::from_jellyfin_value(
+            config.get("SubtitleMode").and_then(JsonValue::as_str),
+        ),
+        play_default_audio_track: config
+            .get("PlayDefaultAudioTrack")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(true),
+        remember_audio_selections: config
+            .get("RememberAudioSelections")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(true),
+        remember_subtitle_selections: config
+            .get("RememberSubtitleSelections")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(true),
+        remembered_audio_stream_index: None,
+        remembered_subtitle_stream_index: None,
+    }
+}
+
+fn normalize_user_language(config: &JsonValue, key: &str) -> Vec<String> {
+    config
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(crate::jellyfin::system::normalize_language_codes)
+        .unwrap_or_default()
+}
+
+async fn user_stream_memory_by_item_id(
+    db: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    item_ids: &[String],
+) -> anyhow::Result<HashMap<String, (Option<i64>, Option<i64>)>> {
+    let mut remembered = HashMap::new();
+    if item_ids.is_empty() {
+        return Ok(remembered);
+    }
+
+    for chunk in item_ids.chunks(500) {
+        let rows = UserData::find()
+            .filter(user_data::Column::UserId.eq(user_id))
+            .filter(user_data::Column::ItemId.is_in(chunk.iter().map(|id| id.as_str())))
+            .all(db)
+            .await
+            .context("failed to load remembered media stream selections")?;
+        for row in rows {
+            remembered.insert(
+                row.item_id,
+                (row.audio_stream_index, row.subtitle_stream_index),
+            );
+        }
+    }
+
+    Ok(remembered)
+}
+
 fn media_stream_model_to_json(model: &MediaStreamModel, item_id: &str) -> JsonValue {
     MediaStreamRow {
         stream_index: model.stream_index,
@@ -184,16 +403,22 @@ pub(crate) async fn child_video_sources(
         .await
         .with_context(|| format!("failed to find video children for: {parent_id}"))?;
 
-    let mut sources = Vec::new();
+    let mut visible_rows = Vec::new();
     for row in rows {
         if !include_private && !visible_media_item(db, &row).await? {
             continue;
         }
+        visible_rows.push(VideoSourceRow::from(row));
+    }
+    retain_primary_stack_parts(&mut visible_rows);
+
+    let mut sources = Vec::new();
+    for row in visible_rows {
         let video_id = row.id;
         let title = row.title;
         let path = row.path;
         let source_name = media_source_file_name(&path, &title);
-        let container = row.container.unwrap_or_else(|| "bin".to_string());
+        let container = row.container;
         let size = row.size_bytes;
         let runtime_ticks = row.runtime_ticks;
 
@@ -247,6 +472,7 @@ pub(crate) async fn batch_child_video_sources(
             source_rows.push((row.parent_id.clone(), VideoSourceRow::from(row)));
         }
     }
+    retain_primary_stack_parts_by_parent(&mut source_rows);
 
     let stream_map = if include_streams {
         let mut source_ids = source_rows
@@ -292,30 +518,42 @@ pub(crate) async fn episode_version_sources(
         return Ok(Vec::new());
     }
 
-    let mut query = MediaItems::find()
-        .filter(media_items::Column::ParentId.eq(&item.parent_id))
-        .filter(media_items::Column::ItemType.eq("Episode"))
-        .filter(media_items::Column::EpisodeNumber.eq(item.episode_number.unwrap_or_default()));
-    query = if let Some(season_number) = item.season_number {
-        query.filter(media_items::Column::SeasonNumber.eq(season_number))
-    } else {
-        query.filter(media_items::Column::SeasonNumber.is_null())
-    };
-    let rows = query
+    let children = MediaItems::find()
+        .filter(media_items::Column::ParentId.eq(&item.id))
+        .filter(media_items::Column::ItemType.eq("Video"))
         .all(db)
         .await
-        .with_context(|| format!("failed to find episode versions for: {}", item.id))?;
-    let mut visible_rows = Vec::new();
-    for row in rows {
+        .with_context(|| format!("failed to find child episode versions for: {}", item.id))?;
+    let mut rows = if children.is_empty() {
+        let mut query = MediaItems::find()
+            .filter(media_items::Column::ParentId.eq(&item.parent_id))
+            .filter(media_items::Column::ItemType.eq("Episode"))
+            .filter(media_items::Column::EpisodeNumber.eq(item.episode_number.unwrap_or_default()));
+        query = if let Some(season_number) = item.season_number {
+            query.filter(media_items::Column::SeasonNumber.eq(season_number))
+        } else {
+            query.filter(media_items::Column::SeasonNumber.is_null())
+        };
+        query
+            .all(db)
+            .await
+            .with_context(|| format!("failed to find episode versions for: {}", item.id))?
+    } else {
+        children
+    };
+    let uses_child_versions = rows
+        .first()
+        .is_some_and(|row| row.parent_id == item.id && row.item_type == "Video");
+    let mut visible_rows = uses_child_versions
+        .then(|| vec![VideoSourceRow::from(item)])
+        .unwrap_or_default();
+    for row in rows.drain(..) {
         if include_private || visible_media_item(db, &row).await? {
-            visible_rows.push(row);
+            visible_rows.push(VideoSourceRow::from(row));
         }
     }
-
-    let mut rows = visible_rows
-        .into_iter()
-        .map(VideoSourceRow::from)
-        .collect::<Vec<_>>();
+    let mut rows = visible_rows;
+    retain_primary_stack_parts(&mut rows);
     sort_episode_version_sources_for_item(&mut rows, &item.id);
 
     let mut sources = Vec::new();
@@ -397,11 +635,42 @@ pub(crate) async fn batch_episode_version_sources(
         }
     }
 
+    let episode_ids = episode_items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let child_rows = MediaItems::find()
+        .filter(media_items::Column::ParentId.is_in(episode_ids))
+        .filter(media_items::Column::ItemType.eq("Video"))
+        .all(db)
+        .await
+        .with_context(|| "failed to batch find child episode versions")?;
+    let mut child_grouped: HashMap<String, Vec<VideoSourceRow>> = HashMap::new();
+    for row in child_rows {
+        if include_private || visible_media_item(db, &row).await? {
+            child_grouped
+                .entry(row.parent_id.clone())
+                .or_default()
+                .push(VideoSourceRow::from(row));
+        }
+    }
+
     let stream_map = if include_streams {
         let mut source_ids: Vec<String> = grouped
             .values()
             .flat_map(|rows| rows.iter().map(|row| row.id.clone()))
             .collect();
+        source_ids.extend(
+            child_grouped
+                .values()
+                .flat_map(|rows| rows.iter().map(|row| row.id.clone())),
+        );
+        source_ids.extend(
+            episode_items
+                .iter()
+                .filter(|item| child_grouped.contains_key(&item.id))
+                .map(|item| item.id.clone()),
+        );
         source_ids.sort();
         source_ids.dedup();
         media_streams_for_items(db, &source_ids)
@@ -416,11 +685,17 @@ pub(crate) async fn batch_episode_version_sources(
         let Some(key) = episode_version_key(item) else {
             continue;
         };
-        let Some(rows) = grouped.get(&key) else {
+        let mut rows = if let Some(children) = child_grouped.get(&item.id) {
+            let mut rows = Vec::with_capacity(children.len() + 1);
+            rows.push(VideoSourceRow::from(item));
+            rows.extend(children.clone());
+            retain_primary_stack_parts(&mut rows);
+            rows
+        } else if let Some(rows) = grouped.get(&key) {
+            rows.clone()
+        } else {
             continue;
         };
-
-        let mut rows = rows.clone();
         sort_episode_version_sources_for_item(&mut rows, &item.id);
 
         let sources = rows
@@ -492,7 +767,7 @@ pub async fn subtitle_stream_path(
         .filter(crate::entities::media_streams::Column::ItemId.eq(item_id))
         .filter(crate::entities::media_streams::Column::StreamIndex.eq(stream_index))
         .filter(crate::entities::media_streams::Column::StreamType.eq("Subtitle"))
-        .filter(crate::entities::media_streams::Column::IsExternal.eq(1))
+        .filter(crate::entities::media_streams::Column::IsExternal.eq(1_i64))
         .one(db)
         .await
         .with_context(|| format!("failed to find subtitle stream: {item_id}:{stream_index}"))?;
@@ -502,8 +777,8 @@ pub async fn subtitle_stream_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_episode_version_sources, child_video_sources, episode_version_sources,
-        media_streams_for_item,
+        VideoSourceRow, batch_episode_version_sources, child_video_sources,
+        episode_version_sources, media_streams_for_item, retain_primary_stack_parts,
     };
     use crate::entities::{
         media_items::{self, Entity as MediaItems},
@@ -511,6 +786,34 @@ mod tests {
     };
     use crate::library::models::MediaItem;
     use sea_orm::{DatabaseConnection, EntityTrait, Set};
+
+    #[test]
+    fn multipart_files_are_not_exposed_as_alternate_media_sources() {
+        let mut rows = [
+            ("4k-2", "/movies/Movie/Movie 4K CD2.mkv"),
+            ("1080-1", "/movies/Movie/Movie 1080p CD1.mkv"),
+            ("standalone", "/movies/Movie/Movie Directors Cut.mkv"),
+            ("4k-1", "/movies/Movie/Movie 4K CD1.mkv"),
+            ("1080-2", "/movies/Movie/Movie 1080p CD2.mkv"),
+        ]
+        .into_iter()
+        .map(|(id, path)| VideoSourceRow {
+            id: id.to_string(),
+            title: id.to_string(),
+            path: path.to_string(),
+            container: "mkv".to_string(),
+            runtime_ticks: None,
+            size_bytes: None,
+        })
+        .collect::<Vec<_>>();
+
+        retain_primary_stack_parts(&mut rows);
+        let ids = rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&"4k-1".to_string()));
+        assert!(ids.contains(&"1080-1".to_string()));
+        assert!(ids.contains(&"standalone".to_string()));
+    }
 
     #[tokio::test]
     async fn child_video_sources_hide_private_versions_unless_requested() {
@@ -743,6 +1046,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn episode_version_sources_include_owned_video_children() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        insert_test_media_item(
+            &db,
+            "owned-episode",
+            "Pilot",
+            "/tmp/show/Season 1/Show.S01E01.2160p.mkv",
+            "tv",
+            "season",
+            "Episode",
+            0,
+            1,
+            Some(200),
+            Some(1),
+            Some(1),
+        )
+        .await;
+        insert_test_media_item(
+            &db,
+            "owned-1080",
+            "Pilot",
+            "/tmp/show/Season 1/Show.S01E01.1080p.mkv",
+            "tv",
+            "owned-episode",
+            "Video",
+            0,
+            1,
+            Some(100),
+            Some(1),
+            Some(1),
+        )
+        .await;
+        let mut item = episode_item("owned-episode", 200);
+        item.path = "/tmp/show/Season 1/Show.S01E01.2160p.mkv".to_string();
+
+        let sources = episode_version_sources(&db, &item, false).await.unwrap();
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source["Id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["owned-episode", "owned-1080"]
+        );
+        let batch = batch_episode_version_sources(&db, &[item], false, false)
+            .await
+            .unwrap();
+        assert_eq!(batch["owned-episode"].len(), 2);
+    }
+
     fn episode_item(id: &str, size_bytes: i64) -> MediaItem {
         MediaItem {
             id: id.to_string(),
@@ -752,17 +1107,37 @@ mod tests {
             collection_type: "tvshows".to_string(),
             parent_id: "season".to_string(),
             item_type: "Episode".to_string(),
+            extra_type: None,
+            video_type: None,
+            iso_type: None,
+            video_3d_format: None,
             is_folder: false,
             container: Some("mkv".to_string()),
             overview: None,
             official_rating: None,
+            custom_rating: None,
             extended_video_type: None,
+            original_title: None,
+            sort_name: None,
+            forced_sort_name: None,
+            lock_data: false,
+            locked_fields: Vec::new(),
+            tagline: None,
+            collection_name: None,
+            original_language: None,
+            series_status: None,
+            home_page_url: None,
+            remote_trailers: Vec::new(),
+            production_locations: Vec::new(),
             production_year: None,
             premiere_date: None,
+            end_date: None,
             runtime_ticks: None,
+            display_order: None,
             size_bytes: Some(size_bytes),
             season_number: Some(1),
             episode_number: Some(1),
+            episode_number_end: None,
             community_rating: None,
             critic_rating: None,
             created_at: 1,
@@ -775,6 +1150,7 @@ mod tests {
             play_count: 0,
             last_played_at: None,
             image_tags: None,
+            ..Default::default()
         }
     }
 

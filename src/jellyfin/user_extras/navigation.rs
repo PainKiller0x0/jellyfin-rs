@@ -327,7 +327,10 @@ pub async fn shows_upcoming(
     );
     let rows = state
         .db
-        .query_all_raw(crate::db::helpers::pg_statement(&sql, vec![user_id.into()]))
+        .query_all_raw(crate::db::helpers::pg_statement(
+            &sql,
+            vec![user_id.as_str().into()],
+        ))
         .await
         .unwrap_or_default();
 
@@ -337,8 +340,8 @@ pub async fn shows_upcoming(
         .into_iter()
         .skip(start_index)
         .take(limit)
-        .map(|i| crate::jellyfin::common::strip_nulls(i.to_jellyfin_json()))
         .collect::<Vec<_>>();
+    let page = crate::jellyfin::items::enrich_item_list(&state.db, &user_id, page).await;
     Json(json!({ "Items": page, "TotalRecordCount": total, "StartIndex": start_index }))
         .into_response()
 }
@@ -834,6 +837,7 @@ mod tests {
             tmdb_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             douban_cookie: RwLock::new(None),
             scan_lock: tokio::sync::Mutex::new(()),
+            chapter_image_task_cancel: tokio::sync::Mutex::new(None),
             playback_sessions: RwLock::new(HashMap::new()),
             session_capabilities: RwLock::new(HashMap::new()),
             admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),

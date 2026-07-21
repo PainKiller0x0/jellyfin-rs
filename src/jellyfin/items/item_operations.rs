@@ -991,7 +991,7 @@ pub async fn delete_item_subtitle(
         .filter(media_streams::Column::ItemId.eq(&item_id))
         .filter(media_streams::Column::StreamIndex.eq(index))
         .filter(media_streams::Column::StreamType.eq("Subtitle"))
-        .filter(media_streams::Column::IsExternal.eq(1))
+        .filter(media_streams::Column::IsExternal.eq(1_i64))
         .one(&state.db)
         .await;
 

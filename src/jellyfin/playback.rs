@@ -4,6 +4,7 @@ mod user_data;
 
 pub use media_streams::subtitle_stream_path;
 pub(crate) use media_streams::{
+    apply_user_stream_preferences_to_source_map, apply_user_stream_preferences_to_sources,
     batch_child_video_sources, batch_episode_version_sources, child_video_sources,
     episode_version_sources, media_streams_for_item, media_streams_for_items,
 };

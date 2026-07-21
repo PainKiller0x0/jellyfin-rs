@@ -253,6 +253,8 @@ async fn user_data_json(
                 .iter()
                 .filter_map(|row| row.rating)
                 .max_by(f64::total_cmp);
+            let audio_stream_index = latest_stream_index(&rows, |row| row.audio_stream_index);
+            let subtitle_stream_index = latest_stream_index(&rows, |row| row.subtitle_stream_index);
             Ok(json!({
                 "ItemId": item_id,
                 "Key": item_id,
@@ -262,6 +264,8 @@ async fn user_data_json(
                 "PlayedPercentage": played_percentage,
                 "PlayCount": play_count,
                 "LastPlayedDate": last_played_at.map(unix_to_jellyfin_date),
+                "AudioStreamIndex": audio_stream_index,
+                "SubtitleStreamIndex": subtitle_stream_index,
                 "Rating": rating,
                 "Likes": null,
                 "UnplayedItemCount": null,
@@ -276,11 +280,23 @@ async fn user_data_json(
             "PlayedPercentage": null,
             "PlayCount": 0,
             "LastPlayedDate": null,
+            "AudioStreamIndex": null,
+            "SubtitleStreamIndex": null,
             "Rating": null,
             "Likes": null,
             "UnplayedItemCount": null,
         })),
     }
+}
+
+fn latest_stream_index(
+    rows: &[user_data::Model],
+    value: impl Fn(&user_data::Model) -> Option<i64>,
+) -> Option<i64> {
+    rows.iter()
+        .filter_map(|row| value(row).map(|stream_index| (row.updated_at, stream_index)))
+        .max_by_key(|(updated_at, _)| *updated_at)
+        .map(|(_, stream_index)| stream_index)
 }
 
 fn rating_from_request(query: &HashMap<String, String>, body: Option<&JsonValue>) -> Option<f64> {
@@ -321,6 +337,17 @@ fn optional_f64(body: &JsonValue, key: &str) -> Option<Option<f64>> {
     }
 }
 
+fn optional_i64(body: &JsonValue, key: &str) -> Option<Option<i64>> {
+    match body.get(key)? {
+        JsonValue::Null => Some(None),
+        value => value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+            .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
+            .map(Some),
+    }
+}
+
 fn optional_jellyfin_date(body: &JsonValue, key: &str) -> Option<Option<i64>> {
     match body.get(key)? {
         JsonValue::Null => Some(None),
@@ -357,6 +384,12 @@ fn apply_user_item_data_update(active: &mut user_data::ActiveModel, body: &JsonV
     }
     if let Some(value) = optional_jellyfin_date(body, "LastPlayedDate") {
         active.last_played_at = Set(value);
+    }
+    if let Some(value) = optional_i64(body, "AudioStreamIndex") {
+        active.audio_stream_index = Set(value);
+    }
+    if let Some(value) = optional_i64(body, "SubtitleStreamIndex") {
+        active.subtitle_stream_index = Set(value);
     }
     if let Some(value) = optional_f64(body, "Rating").or_else(|| {
         body.get("Likes")
@@ -744,6 +777,8 @@ mod tests {
             active.playback_position_ticks = Set(10);
             active.play_count = Set(3);
             active.last_played_at = Set(Some(100));
+            active.audio_stream_index = Set(Some(2));
+            active.subtitle_stream_index = Set(Some(5));
             active.rating = Set(Some(4.5));
         })
         .await
@@ -760,6 +795,8 @@ mod tests {
         assert_eq!(data["Played"], true);
         assert_eq!(data["PlaybackPositionTicks"], 250);
         assert_eq!(data["PlayCount"], 3);
+        assert_eq!(data["AudioStreamIndex"], 2);
+        assert_eq!(data["SubtitleStreamIndex"], 5);
         assert_eq!(data["Rating"], 4.5);
         assert_eq!(data["LastPlayedDate"], "1970-01-01T00:01:40Z");
     }

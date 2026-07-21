@@ -9,6 +9,11 @@ pub struct Model {
     pub created_at: i64,
     pub overview: Option<String>,
     pub tmdb_id: Option<String>,
+    pub imdb_id: Option<String>,
+    pub home_page_url: Option<String>,
+    pub premiere_date: Option<String>,
+    pub end_date: Option<String>,
+    pub production_locations: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

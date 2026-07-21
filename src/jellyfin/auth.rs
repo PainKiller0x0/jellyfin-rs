@@ -1279,7 +1279,7 @@ async fn public_users_inner(
     }
 
     let models = Users::find()
-        .filter(users::Column::IsDisabled.eq(0))
+        .filter(users::Column::IsDisabled.eq(0_i64))
         .order_by_asc(users::Column::Username)
         .all(db)
         .await
@@ -1498,7 +1498,7 @@ async fn ensure_enabled_admin_remains(
     let enabled_admin_count = Users::find()
         .filter(users::Column::Id.ne(user_id))
         .filter(users::Column::IsAdmin.ne(0))
-        .filter(users::Column::IsDisabled.eq(0))
+        .filter(users::Column::IsDisabled.eq(0_i64))
         .all(db)
         .await
         .context("failed to count enabled administrators")?
@@ -2516,7 +2516,7 @@ fn default_user_configuration() -> JsonValue {
     })
 }
 
-async fn user_configuration(db: &DatabaseConnection, user_id: &str) -> JsonValue {
+pub(crate) async fn user_configuration(db: &DatabaseConnection, user_id: &str) -> JsonValue {
     let saved = app_setting(db, &user_configuration_key(user_id), "").await;
     let saved = serde_json::from_str(&saved).unwrap_or(JsonValue::Null);
     merge_user_configuration(default_user_configuration(), &saved)
@@ -4265,6 +4265,7 @@ mod tests {
             tmdb_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             douban_cookie: RwLock::new(None),
             scan_lock: tokio::sync::Mutex::new(()),
+            chapter_image_task_cancel: tokio::sync::Mutex::new(None),
             playback_sessions: RwLock::new(HashMap::<String, PlaybackSession>::new()),
             session_capabilities: RwLock::new(HashMap::new()),
             admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),

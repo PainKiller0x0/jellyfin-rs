@@ -124,6 +124,16 @@ pub async fn playback_info(
             if let Some(max_streaming_bitrate) = max_streaming_bitrate {
                 apply_max_streaming_bitrate_to_sources(&mut media_sources, max_streaming_bitrate);
             }
+            if let Err(error) = super::apply_user_stream_preferences_to_sources(
+                &state.db,
+                &user_id,
+                &item.id,
+                &mut media_sources,
+            )
+            .await
+            {
+                return internal_error(error);
+            }
             if let Some(token) = request_token(&headers, &query) {
                 append_access_token_to_media_sources(&mut media_sources, &token);
             }
@@ -230,6 +240,14 @@ fn query_json_i64(value: &JsonValue, key: &str) -> Option<i64> {
                     .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
             })
     })
+}
+
+fn reported_stream_index(
+    query: &HashMap<String, String>,
+    body: Option<&JsonValue>,
+    key: &str,
+) -> Option<i64> {
+    query_i64(query, key).or_else(|| body.and_then(|value| query_json_i64(value, key)))
 }
 
 fn stream_url_with_token(url: &str, token: &str) -> Option<String> {
@@ -382,6 +400,17 @@ async fn playback_progress_inner(
         }
     };
     if let Err(error) = result {
+        return internal_error(error);
+    }
+    if let Err(error) = upsert_playback_track_selections(
+        &state.db,
+        &user_id,
+        persistence_item_id,
+        reported_stream_index(&query, Some(&body), "AudioStreamIndex"),
+        reported_stream_index(&query, Some(&body), "SubtitleStreamIndex"),
+    )
+    .await
+    {
         return internal_error(error);
     }
 
@@ -1064,6 +1093,48 @@ pub(crate) async fn upsert_playback_position(
     Ok(())
 }
 
+async fn upsert_playback_track_selections(
+    db: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    item_id: &str,
+    audio_stream_index: Option<i64>,
+    subtitle_stream_index: Option<i64>,
+) -> anyhow::Result<()> {
+    if audio_stream_index.is_none() && subtitle_stream_index.is_none() {
+        return Ok(());
+    }
+
+    let item_ids = super::user_data::playback_user_data_item_ids(db, item_id).await?;
+    let now = now_unix();
+    for target_id in item_ids {
+        let existing = UserData::find_by_id((user_id.to_string(), target_id.clone()))
+            .one(db)
+            .await?;
+        if let Some(model) = existing {
+            let mut active: user_data::ActiveModel = model.into();
+            if audio_stream_index.is_some() {
+                active.audio_stream_index = Set(audio_stream_index);
+            }
+            if subtitle_stream_index.is_some() {
+                active.subtitle_stream_index = Set(subtitle_stream_index);
+            }
+            active.updated_at = Set(now);
+            active.update(db).await?;
+        } else {
+            let active = user_data::ActiveModel {
+                user_id: Set(user_id.to_string()),
+                item_id: Set(target_id),
+                audio_stream_index: Set(audio_stream_index),
+                subtitle_stream_index: Set(subtitle_stream_index),
+                updated_at: Set(now),
+                ..Default::default()
+            };
+            UserData::insert(active).exec(db).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn finish_playback_position(
     db: &sea_orm::DatabaseConnection,
     user_id: &str,
@@ -1160,6 +1231,17 @@ pub async fn playing_item_start(
             return internal_error(error);
         }
     }
+    if let Err(error) = upsert_playback_track_selections(
+        &state.db,
+        &user_id,
+        &item_id,
+        reported_stream_index(&query, body_value, "AudioStreamIndex"),
+        reported_stream_index(&query, body_value, "SubtitleStreamIndex"),
+    )
+    .await
+    {
+        return internal_error(error);
+    }
 
     // Save RunTimeTicks if provided
     if let Some(rt) = body
@@ -1236,6 +1318,17 @@ pub async fn playing_item_stop(
 
     if let Err(error) =
         finish_playback_position(&state.db, &user_id, &item_id, position_ticks, runtime_ticks).await
+    {
+        return internal_error(error);
+    }
+    if let Err(error) = upsert_playback_track_selections(
+        &state.db,
+        &user_id,
+        &item_id,
+        reported_stream_index(&query, None, "AudioStreamIndex"),
+        reported_stream_index(&query, None, "SubtitleStreamIndex"),
+    )
+    .await
     {
         return internal_error(error);
     }
@@ -1321,6 +1414,17 @@ pub async fn playing_item_progress(
         if let Err(error) = result {
             return internal_error(error);
         }
+    }
+    if let Err(error) = upsert_playback_track_selections(
+        &state.db,
+        &user_id,
+        &item_id,
+        reported_stream_index(&query, body_value, "AudioStreamIndex"),
+        reported_stream_index(&query, body_value, "SubtitleStreamIndex"),
+    )
+    .await
+    {
+        return internal_error(error);
     }
 
     let play_session_id = playback_report_session_id(&query, body_value, &user_id, &item_id);
@@ -1652,6 +1756,7 @@ mod tests {
             tmdb_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             douban_cookie: RwLock::new(None),
             scan_lock: tokio::sync::Mutex::new(()),
+            chapter_image_task_cancel: tokio::sync::Mutex::new(None),
             playback_sessions: RwLock::new(HashMap::<String, PlaybackSession>::new()),
             session_capabilities: RwLock::new(HashMap::new()),
             admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),

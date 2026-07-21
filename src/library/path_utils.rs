@@ -16,6 +16,7 @@ pub struct ResolvedPathInfo {
     pub path: String,
     pub is_directory: bool,
     pub size_bytes: Option<i64>,
+    pub created_at: i64,
     pub modified_at: i64,
 }
 
@@ -113,6 +114,7 @@ pub fn resolve_path_info(path: &Path) -> anyhow::Result<ResolvedPathInfo> {
         path: normalized_path,
         is_directory,
         size_bytes: (!is_directory).then(|| i64::try_from(metadata.len()).unwrap_or(i64::MAX)),
+        created_at: system_time_to_unix(metadata.created().unwrap_or(UNIX_EPOCH)),
         modified_at: system_time_to_unix(metadata.modified().unwrap_or(UNIX_EPOCH)),
     })
 }

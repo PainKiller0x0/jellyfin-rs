@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         tmdb_http_client: Arc::new(RwLock::new(tmdb_http_client)),
         douban_cookie: RwLock::new(douban_cookie),
         scan_lock: tokio::sync::Mutex::new(()),
+        chapter_image_task_cancel: tokio::sync::Mutex::new(None),
         playback_sessions: RwLock::new(HashMap::new()),
         session_capabilities: RwLock::new(HashMap::new()),
         admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),
@@ -103,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     db::seed_default_data(&state).await?;
+    jellyfin::system::start_scheduled_task_scheduler(state.clone()).await;
     if app::state::should_scan_on_startup() {
         let scan_state = state.clone();
         tokio::spawn(async move {

@@ -2,16 +2,20 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{OriginalUri, Path, State},
+    extract::{OriginalUri, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sea_orm::EntityTrait;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
     app::state::AppState,
-    entities::media_items::Entity as MediaItems,
+    entities::{
+        media_items::Entity as MediaItems,
+        provider_ids::{self, Entity as ProviderIds},
+    },
     jellyfin::{common::internal_error, providers},
     library::douban_metadata,
 };
@@ -145,8 +149,22 @@ fn remote_search_item_type(path: &str) -> &str {
 pub async fn apply_remote_search(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
+    Query(query): Query<ApplyRemoteSearchQuery>,
     Json(body): Json<Value>,
 ) -> Response {
+    match apply_tmdb_remote_search(&state, &item_id, &body, query.replace_all_images).await {
+        Ok(Some(true)) => return StatusCode::NO_CONTENT.into_response(),
+        Ok(Some(false)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "Error": "Item not found" })),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(error) => return internal_error(error),
+    }
+
     let body = enrich_remote_search_result(&state, &item_id, body).await;
     let mut update = json!({});
     if let Some(name) = body.get("Name").cloned() {
@@ -185,6 +203,103 @@ pub async fn apply_remote_search(
             .into_response(),
         Err(error) => internal_error(error),
     }
+}
+
+#[derive(Deserialize)]
+pub struct ApplyRemoteSearchQuery {
+    #[serde(
+        rename = "replaceAllImages",
+        alias = "ReplaceAllImages",
+        default = "default_replace_all_images"
+    )]
+    replace_all_images: bool,
+}
+
+fn default_replace_all_images() -> bool {
+    true
+}
+
+async fn apply_tmdb_remote_search(
+    state: &AppState,
+    item_id: &str,
+    body: &Value,
+    replace_all_images: bool,
+) -> anyhow::Result<Option<bool>> {
+    let Some(tmdb_id) = body
+        .get("ProviderIds")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get("Tmdb"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(item) = MediaItems::find_by_id(item_id.to_string())
+        .one(&state.db)
+        .await?
+    else {
+        return Ok(Some(false));
+    };
+    if !matches!(item.item_type.as_str(), "Movie" | "Series") {
+        return Ok(None);
+    }
+    let Some(api_key) = state
+        .tmdb_api_key
+        .read()
+        .await
+        .clone()
+        .filter(|key| !key.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let normalized = super::item_operations::normalize_item_update_body(json!({
+        "ProviderIds": body.get("ProviderIds").cloned().unwrap_or_else(|| json!({}))
+    }))
+    .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    let provider_ids = normalized
+        .get("ProviderIds")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    ProviderIds::delete_many()
+        .filter(provider_ids::Column::ItemId.eq(item_id))
+        .exec(&state.db)
+        .await?;
+    for (provider, provider_item_id) in provider_ids {
+        if let Some(provider_item_id) = provider_item_id.as_str() {
+            crate::db::provider_ids::upsert(&state.db, item_id, &provider, provider_item_id)
+                .await?;
+        }
+    }
+    // Ensure the selected ID wins even if a client used non-canonical casing.
+    crate::db::provider_ids::upsert(&state.db, item_id, "Tmdb", tmdb_id).await?;
+
+    if replace_all_images {
+        crate::library::tmdb_metadata::remove_tmdb_image_assets(&state.db, item_id).await?;
+    }
+
+    let tmdb_base_url = state.tmdb_proxy_url.read().await.clone();
+    let tmdb_client = state.tmdb_http_client().await;
+    crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(
+        &state.db,
+        item_id,
+        &item.item_type,
+        std::path::Path::new(&item.path),
+        &api_key,
+        &tmdb_client,
+        tmdb_base_url.as_deref(),
+        crate::library::tmdb_metadata::MetadataRefreshPolicy {
+            refresh_metadata: true,
+            replace_metadata: true,
+            refresh_images: true,
+            replace_images: replace_all_images,
+            force_refresh: true,
+        },
+    )
+    .await?;
+    Ok(Some(true))
 }
 
 async fn enrich_remote_search_result(state: &AppState, item_id: &str, body: Value) -> Value {
@@ -237,14 +352,37 @@ async fn enrich_remote_search_result(state: &AppState, item_id: &str, body: Valu
 
     let tmdb_base_url = state.tmdb_proxy_url.read().await.clone();
     let tmdb_client = state.tmdb_http_client().await;
+    let metadata_language = crate::db::settings::get_non_empty_or_default(
+        &state.db,
+        "PreferredMetadataLanguage",
+        "zh-CN",
+    )
+    .await;
+    let metadata_country_code =
+        crate::db::settings::get_non_empty_or_default(&state.db, "MetadataCountryCode", "CN").await;
     let details = if item_type.eq_ignore_ascii_case("Series") {
-        providers::tmdb_tv_details(&tmdb_client, &api_key, tmdb_id, tmdb_base_url.as_deref()).await
+        providers::tmdb_tv_details(
+            &tmdb_client,
+            &api_key,
+            tmdb_id,
+            tmdb_base_url.as_deref(),
+            &metadata_language,
+            &metadata_country_code,
+        )
+        .await
     } else if item_type.eq_ignore_ascii_case("Person") {
         providers::tmdb_person_details(&tmdb_client, &api_key, tmdb_id, tmdb_base_url.as_deref())
             .await
     } else {
-        providers::tmdb_movie_details(&tmdb_client, &api_key, tmdb_id, tmdb_base_url.as_deref())
-            .await
+        providers::tmdb_movie_details(
+            &tmdb_client,
+            &api_key,
+            tmdb_id,
+            tmdb_base_url.as_deref(),
+            &metadata_language,
+            &metadata_country_code,
+        )
+        .await
     };
 
     match details {

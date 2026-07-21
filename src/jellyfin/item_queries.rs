@@ -361,7 +361,20 @@ pub async fn list_media_items(
         (items, total)
     } else {
         let has_search = search_term.is_some();
-        let has_filters = query_value_any(query, &["Filters", "filters"]).is_some();
+        let has_filters = query_value_any(query, &["Filters", "filters"]).is_some()
+            || query_contains_any(
+                query,
+                &[
+                    "VideoTypes",
+                    "videoTypes",
+                    "Is3D",
+                    "is3D",
+                    "Years",
+                    "years",
+                    "Containers",
+                    "containers",
+                ],
+            );
         let original_parent_id = parent_id;
         let parent_id = parent_id.unwrap_or("movies");
         let parent_is_collection = if original_parent_id.is_some() {
@@ -602,6 +615,18 @@ async fn list_global_media_items_page(
         }
     }
 
+    if let Some(video_types) = query_ids_any(query, &["VideoTypes", "videoTypes"]) {
+        push_video_type_condition(&mut conditions, &mut filter_values, &video_types);
+    }
+
+    if let Some(is_3d) = query_optional_bool(query, &["Is3D", "is3D"]) {
+        conditions.push(if is_3d {
+            "media_items.video_3d_format IS NOT NULL".to_string()
+        } else {
+            "media_items.video_3d_format IS NULL".to_string()
+        });
+    }
+
     if let Some(filters) = query_value_any(query, &["Filters", "filters"]) {
         let filters = filters.to_ascii_lowercase();
         if filters.contains("isfavorite") {
@@ -800,6 +825,48 @@ fn push_static_in_condition(conditions: &mut Vec<String>, column: &str, items: &
     conditions.push(format!("{column} IN ({quoted})"));
 }
 
+fn push_video_type_condition(
+    conditions: &mut Vec<String>,
+    values: &mut Vec<sea_orm::Value>,
+    video_types: &[String],
+) {
+    if video_types.is_empty() {
+        return;
+    }
+
+    let has_video_file = video_types
+        .iter()
+        .any(|video_type| video_type.eq_ignore_ascii_case("VideoFile"));
+    let explicit_types = video_types
+        .iter()
+        .filter(|video_type| !video_type.eq_ignore_ascii_case("VideoFile"))
+        .collect::<Vec<_>>();
+    let mut parts = Vec::new();
+    if !explicit_types.is_empty() {
+        let placeholders = explicit_types
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("media_items.video_type IN ({placeholders})"));
+        values.extend(
+            explicit_types
+                .into_iter()
+                .map(|value| value.as_str().into()),
+        );
+    }
+    if has_video_file {
+        parts.push(
+            "(media_items.video_type = 'VideoFile' OR (media_items.video_type IS NULL AND media_items.item_type IN ('Movie','Episode','Video')))"
+                .to_string(),
+        );
+    }
+
+    if !parts.is_empty() {
+        conditions.push(format!("({})", parts.join(" OR ")));
+    }
+}
+
 pub async fn list_trailers(
     db: &DatabaseConnection,
     user_id: &str,
@@ -829,7 +896,7 @@ pub async fn list_trailers(
 /// Includes the media_items columns + user_data join.
 fn media_item_select_sql_from_person(where_clause: &str) -> String {
     format!(
-        r#"SELECT mi.id, mi.title, mi.path, mi.library_id, libraries.collection_type, mi.parent_id, mi.item_type, mi.is_folder, mi.is_public, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.premiere_date, mi.runtime_ticks, mi.size_bytes, mi.season_number, mi.episode_number, mi.community_rating, mi.critic_rating, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? LEFT JOIN libraries ON libraries.id = mi.library_id {where_clause}"#
+        r#"SELECT mi.id, mi.title, mi.path, mi.library_id, libraries.collection_type, mi.parent_id, mi.item_type, mi.extra_type, mi.video_type, mi.iso_type, mi.video_3d_format, mi.is_folder, mi.is_public, mi.container, mi.overview, mi.official_rating, mi.custom_rating, mi.extended_video_type, mi.original_title, mi.sort_name, mi.forced_sort_name, mi.lock_data, mi.locked_fields, mi.tagline, mi.collection_name, mi.original_language, mi.preferred_metadata_language, mi.preferred_metadata_country_code, mi.series_status, mi.air_days, mi.air_time, mi.home_page_url, mi.remote_trailers, mi.production_locations, mi.production_year, mi.premiere_date, mi.end_date, mi.runtime_ticks, mi.aspect_ratio, mi.width, mi.height, mi.has_subtitles, mi.photo_metadata, mi.display_order, mi.size_bytes, mi.season_number, mi.episode_number, mi.episode_number_end, mi.airs_before_episode_number, mi.airs_after_season_number, mi.airs_before_season_number, mi.series_name, mi.community_rating, mi.critic_rating, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at FROM media_people mp JOIN media_items mi ON mi.id = mp.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? LEFT JOIN libraries ON libraries.id = mi.library_id {where_clause}"#
     )
 }
 
@@ -845,7 +912,7 @@ async fn is_collection_or_playlist(db: &DatabaseConnection, item_id: &str) -> an
 }
 
 fn linked_children_select_sql() -> String {
-    r#"SELECT mi.id, mi.title, mi.path, mi.library_id, libraries.collection_type, mi.parent_id, mi.item_type, mi.is_folder, mi.is_public, mi.container, mi.overview, mi.official_rating, mi.extended_video_type, mi.production_year, mi.premiere_date, mi.runtime_ticks, mi.size_bytes, mi.season_number, mi.episode_number, mi.community_rating, mi.critic_rating, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? LEFT JOIN libraries ON libraries.id = mi.library_id WHERE lc.parent_id = ? AND mi.is_public = 1 ORDER BY lc.sort_order ASC"#.to_string()
+    r#"SELECT mi.id, mi.title, mi.path, mi.library_id, libraries.collection_type, mi.parent_id, mi.item_type, mi.extra_type, mi.video_type, mi.iso_type, mi.video_3d_format, mi.is_folder, mi.is_public, mi.container, mi.overview, mi.official_rating, mi.custom_rating, mi.extended_video_type, mi.original_title, mi.sort_name, mi.forced_sort_name, mi.lock_data, mi.locked_fields, mi.tagline, mi.collection_name, mi.original_language, mi.preferred_metadata_language, mi.preferred_metadata_country_code, mi.series_status, mi.air_days, mi.air_time, mi.home_page_url, mi.remote_trailers, mi.production_locations, mi.production_year, mi.premiere_date, mi.end_date, mi.runtime_ticks, mi.aspect_ratio, mi.width, mi.height, mi.has_subtitles, mi.photo_metadata, mi.display_order, mi.size_bytes, mi.season_number, mi.episode_number, mi.episode_number_end, mi.airs_before_episode_number, mi.airs_after_season_number, mi.airs_before_season_number, mi.series_name, mi.community_rating, mi.critic_rating, mi.created_at, mi.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at FROM linked_children lc JOIN media_items mi ON mi.id = lc.item_id LEFT JOIN user_data ud ON ud.item_id = mi.id AND ud.user_id = ? LEFT JOIN libraries ON libraries.id = mi.library_id WHERE lc.parent_id = ? AND mi.is_public = 1 ORDER BY lc.sort_order ASC"#.to_string()
 }
 
 pub async fn latest_media_items(
@@ -935,7 +1002,7 @@ pub async fn resume_media_items(
 ) -> anyhow::Result<Vec<MediaItem>> {
     let mut items = decode_media_items(
         &db.query_all_raw(crate::db::helpers::pg_statement(
-            r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.is_public, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.premiere_date, media_items.runtime_ticks, media_items.size_bytes, media_items.season_number, media_items.episode_number, media_items.community_rating, media_items.critic_rating, media_items.created_at, media_items.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at
+            r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.extra_type, media_items.video_type, media_items.iso_type, media_items.video_3d_format, media_items.is_folder, media_items.is_public, media_items.container, media_items.overview, media_items.official_rating, media_items.custom_rating, media_items.extended_video_type, media_items.original_title, media_items.sort_name, media_items.forced_sort_name, media_items.lock_data, media_items.locked_fields, media_items.tagline, media_items.collection_name, media_items.original_language, media_items.preferred_metadata_language, media_items.preferred_metadata_country_code, media_items.series_status, media_items.air_days, media_items.air_time, media_items.home_page_url, media_items.remote_trailers, media_items.production_locations, media_items.production_year, media_items.premiere_date, media_items.end_date, media_items.runtime_ticks, media_items.aspect_ratio, media_items.width, media_items.height, media_items.has_subtitles, media_items.photo_metadata, media_items.display_order, media_items.size_bytes, media_items.season_number, media_items.episode_number, media_items.episode_number_end, media_items.airs_before_episode_number, media_items.airs_after_season_number, media_items.airs_before_season_number, media_items.series_name, media_items.community_rating, media_items.critic_rating, media_items.created_at, media_items.modified_at, COALESCE(ud.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(ud.played, CAST(0 AS bigint)) AS played, COALESCE(ud.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, ud.played_percentage AS played_percentage, COALESCE(ud.play_count, CAST(0 AS bigint)) AS play_count, ud.last_played_at AS last_played_at
                FROM user_data ud
                JOIN media_items ON media_items.id = ud.item_id
                LEFT JOIN libraries ON libraries.id = media_items.library_id
@@ -1012,7 +1079,7 @@ async fn find_media_item_with_clause(
 
 pub fn media_item_select_sql(where_clause: &str) -> String {
     format!(
-        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.is_public, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.premiere_date, media_items.runtime_ticks, media_items.size_bytes, media_items.season_number, media_items.episode_number, media_items.community_rating, media_items.critic_rating, media_items.created_at, media_items.modified_at, COALESCE(user_data.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(user_data.played, CAST(0 AS bigint)) AS played, COALESCE(user_data.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, user_data.played_percentage AS played_percentage, COALESCE(user_data.play_count, CAST(0 AS bigint)) AS play_count, user_data.last_played_at AS last_played_at FROM media_items LEFT JOIN user_data ON user_data.item_id = media_items.id AND user_data.user_id = ? LEFT JOIN libraries ON libraries.id = media_items.library_id {where_clause}"#
+        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.extra_type, media_items.video_type, media_items.iso_type, media_items.video_3d_format, media_items.is_folder, media_items.is_public, media_items.container, media_items.overview, media_items.official_rating, media_items.custom_rating, media_items.extended_video_type, media_items.original_title, media_items.sort_name, media_items.forced_sort_name, media_items.lock_data, media_items.locked_fields, media_items.tagline, media_items.collection_name, media_items.original_language, media_items.preferred_metadata_language, media_items.preferred_metadata_country_code, media_items.series_status, media_items.air_days, media_items.air_time, media_items.home_page_url, media_items.remote_trailers, media_items.production_locations, media_items.production_year, media_items.premiere_date, media_items.end_date, media_items.runtime_ticks, media_items.aspect_ratio, media_items.width, media_items.height, media_items.has_subtitles, media_items.photo_metadata, media_items.display_order, media_items.size_bytes, media_items.season_number, media_items.episode_number, media_items.episode_number_end, media_items.airs_before_episode_number, media_items.airs_after_season_number, media_items.airs_before_season_number, media_items.series_name, media_items.community_rating, media_items.critic_rating, media_items.created_at, media_items.modified_at, COALESCE(user_data.is_favorite, CAST(0 AS bigint)) AS is_favorite, COALESCE(user_data.played, CAST(0 AS bigint)) AS played, COALESCE(user_data.playback_position_ticks, CAST(0 AS bigint)) AS playback_position_ticks, user_data.played_percentage AS played_percentage, COALESCE(user_data.play_count, CAST(0 AS bigint)) AS play_count, user_data.last_played_at AS last_played_at FROM media_items LEFT JOIN user_data ON user_data.item_id = media_items.id AND user_data.user_id = ? LEFT JOIN libraries ON libraries.id = media_items.library_id {where_clause}"#
     )
 }
 
@@ -1044,6 +1111,7 @@ pub(crate) async fn batch_item_image_tags<S: AsRef<str>>(
     for chunk in item_ids.chunks(100) {
         let models = ImageAssets::find()
             .filter(Column::ItemId.is_in(chunk.iter().map(|id| id.as_ref())))
+            .filter(Column::ImageType.ne("Chapter"))
             .order_by_asc(Column::ImageType)
             .order_by_asc(Column::ImageIndex)
             .all(db)
@@ -1154,6 +1222,14 @@ fn query_bool(query: &HashMap<String, String>, key: &str, default: bool) -> bool
         .unwrap_or(default)
 }
 
+fn query_optional_bool(query: &HashMap<String, String>, keys: &[&str]) -> Option<bool> {
+    query_value_any(query, keys).and_then(|value| match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Some(true),
+        "0" | "false" | "no" => Some(false),
+        _ => None,
+    })
+}
+
 fn apply_item_filters(items: &mut Vec<MediaItem>, query: &HashMap<String, String>) {
     if let Some(search_term) = query_value_any(query, &["SearchTerm", "searchTerm"]) {
         let search_term = search_term.to_ascii_lowercase();
@@ -1231,6 +1307,9 @@ fn apply_item_filters(items: &mut Vec<MediaItem>, query: &HashMap<String, String
                 containers.iter().any(|c| c.eq_ignore_ascii_case(container))
             })
         });
+    }
+    if let Some(is_3d) = query_optional_bool(query, &["Is3D", "is3D"]) {
+        items.retain(|item| item.video_3d_format.is_some() == is_3d);
     }
 }
 

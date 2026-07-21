@@ -1,17 +1,80 @@
-use std::path::Path;
+use std::{path::Path, sync::OnceLock};
 
 use regex::Regex;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ParsedName {
     pub title: String,
+    pub premiere_date: Option<String>,
     pub season_number: Option<i64>,
     pub episode_number: Option<i64>,
     pub ending_episode_number: Option<i64>,
     pub stack_key: Option<String>,
     pub stack_part: Option<i64>,
     pub version: Option<String>,
+    pub video_3d_format: Option<String>,
     pub extended_video_types: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParsedBookName {
+    pub title: String,
+    pub series_name: Option<String>,
+    pub index_number: Option<i64>,
+    pub parent_index_number: Option<i64>,
+    pub production_year: Option<i64>,
+}
+
+/// Match Emby.Naming.Book.BookFileNameParser, including comic volume/chapter suffixes.
+pub fn parse_book_name(value: &str) -> ParsedBookName {
+    let patterns = [
+        r#"^(?P<series>.+?)(?:\s\((?:[0-9]{4})\))?\s#(?P<index>[0-9]+)(?:\.0)?(?:\s\(of\s[0-9]+\))?(?:\s\((?P<year>[0-9]{4})\))?$"#,
+        r#"^(?P<title>.+?)\s\((?P<series>.+?),\s#(?P<index>[0-9]+)\)(?:\.0)?(?:\s\((?P<year>[0-9]{4})\))?$"#,
+        r#"^(?P<index>[0-9]+)(?:\.0)?\s-\s(?P<title>.+?)(?:\s\((?P<year>[0-9]{4})\))?$"#,
+        r#"^(?P<title>.*)\((?P<year>[0-9]{4})\)$"#,
+        r#"^(?P<title>.*)$"#,
+    ];
+
+    for pattern in patterns {
+        let regex = Regex::new(pattern).expect("book name regex must compile");
+        let Some(captures) = regex.captures(value) else {
+            continue;
+        };
+        let title = captures
+            .name("title")
+            .map(|capture| capture.as_str().trim().to_string())
+            .unwrap_or_default();
+        let comic =
+            Regex::new(r#"^(?P<title>.+?)(?:\sv(?P<volume>[0-9]+))?(?:\sc(?P<chapter>[0-9]+))?$"#)
+                .expect("comic book regex must compile");
+        let comic_captures = (!title.is_empty())
+            .then(|| comic.captures(&title))
+            .flatten();
+        let comic_number = |name: &str| {
+            comic_captures
+                .as_ref()
+                .and_then(|captures| captures.name(name))
+                .and_then(|capture| capture.as_str().parse::<i64>().ok())
+        };
+        let comic_chapter = comic_number("chapter");
+        let comic_volume = comic_number("volume");
+        return ParsedBookName {
+            title,
+            series_name: captures
+                .name("series")
+                .map(|capture| capture.as_str().trim().to_string()),
+            index_number: captures
+                .name("index")
+                .and_then(|capture| capture.as_str().parse::<i64>().ok())
+                .or(comic_chapter),
+            parent_index_number: comic_volume,
+            production_year: captures
+                .name("year")
+                .and_then(|capture| capture.as_str().parse::<i64>().ok()),
+        };
+    }
+
+    ParsedBookName::default()
 }
 
 pub fn parse_media_name(path: &Path, collection_type: &str) -> ParsedName {
@@ -26,39 +89,56 @@ pub fn parse_media_name(path: &Path, collection_type: &str) -> ParsedName {
         .unwrap_or_default();
 
     if collection_type == "tvshows" || collection_type == "tv" {
-        parse_episode_name(stem, folder)
+        parse_episode_name(&episode_parser_path(path), stem, folder)
     } else {
         parse_video_name(stem)
     }
 }
 
-fn parse_episode_name(stem: &str, folder: &str) -> ParsedName {
+fn parse_episode_name(path: &str, stem: &str, folder: &str) -> ParsedName {
     let normalized = normalize_separators(stem);
-    let mut parsed = ParsedName::default();
+    let mut parsed = ParsedName {
+        video_3d_format: parse_video_3d_format(path),
+        ..ParsedName::default()
+    };
+
+    if let Some((premiere_date, title)) = parse_episode_date(stem) {
+        parsed.premiere_date = Some(premiere_date);
+        parsed.title = title;
+        parsed.version = parse_version(stem);
+        parsed.extended_video_types = parse_extended_video_types(stem);
+        return parsed;
+    }
 
     for (pattern, style) in episode_patterns() {
-        if let Some(captures) = pattern.captures(&normalized) {
-            parsed.season_number = captures
-                .name("season")
-                .and_then(|value| value.as_str().parse().ok());
-            parsed.episode_number = captures
-                .name("episode")
-                .and_then(|value| value.as_str().parse().ok());
-            parsed.ending_episode_number = captures
-                .name("ending")
-                .and_then(|value| value.as_str().parse().ok());
+        if let Some(captures) = pattern.captures(path) {
+            parsed.season_number = capture_i64(&captures, &["season", "seasonnumber"], &[1]);
+            if parsed
+                .season_number
+                .is_some_and(is_invalid_episode_season_number)
+            {
+                continue;
+            }
+            parsed.episode_number = capture_i64(&captures, &["episode", "epnumber"], &[2]);
+            if parsed.episode_number.is_none() {
+                continue;
+            }
+            parsed.ending_episode_number =
+                capture_i64(&captures, &["ending", "endingepnumber"], &[])
+                    .filter(|_| ending_episode_capture_is_valid(path, &captures));
 
             let title_part = captures.name("title").map(|value| value.as_str());
             parsed.title = match style {
                 EpisodeStyle::Named => episode_title_after_marker(stem)
                     .unwrap_or_else(|| clean_title(title_part.unwrap_or(stem))),
-                EpisodeStyle::TrailingTitle => clean_title(
+                EpisodeStyle::TrailingTitle => trailing_episode_title(path, stem, &captures),
+                EpisodeStyle::FolderTitle => clean_title(folder),
+                EpisodeStyle::SeriesName => clean_title(
                     captures
-                        .name("name")
+                        .name("seriesname")
                         .map(|value| value.as_str())
                         .unwrap_or(stem),
                 ),
-                EpisodeStyle::FolderTitle => clean_title(folder),
             };
             if parsed.title.is_empty() {
                 parsed.title = clean_title(stem);
@@ -67,15 +147,6 @@ fn parse_episode_name(stem: &str, folder: &str) -> ParsedName {
             parsed.extended_video_types = parse_extended_video_types(stem);
             return parsed;
         }
-    }
-
-    if let Some((episode, ending)) = parse_chinese_episode_number(stem) {
-        parsed.episode_number = Some(episode);
-        parsed.ending_episode_number = ending;
-        parsed.title = clean_title(stem);
-        parsed.version = parse_version(stem);
-        parsed.extended_video_types = parse_extended_video_types(stem);
-        return parsed;
     }
 
     if let Some((season, episode)) = parse_compact_episode(&normalized) {
@@ -87,10 +158,55 @@ fn parse_episode_name(stem: &str, folder: &str) -> ParsedName {
         return parsed;
     }
 
+    if let Some((episode, ending)) = parse_chinese_episode_number(stem) {
+        parsed.episode_number = Some(episode);
+        parsed.ending_episode_number = ending;
+        parsed.title = clean_title(stem);
+        parsed.version = parse_version(stem);
+        parsed.extended_video_types = parse_extended_video_types(stem);
+        return parsed;
+    }
+
     parsed.title = clean_title(stem);
     parsed.version = parse_version(stem);
     parsed.extended_video_types = parse_extended_video_types(stem);
     parsed
+}
+
+fn parse_episode_date(value: &str) -> Option<(String, String)> {
+    static YEAR_FIRST: OnceLock<Regex> = OnceLock::new();
+    static DAY_FIRST: OnceLock<Regex> = OnceLock::new();
+    let year_first = YEAR_FIRST.get_or_init(|| {
+        Regex::new(r"(?P<year>[0-9]{4})[._ -](?P<month>[0-9]{2})[._ -](?P<day>[0-9]{2})")
+            .expect("year-first episode date regex must compile")
+    });
+    let day_first = DAY_FIRST.get_or_init(|| {
+        Regex::new(r"(?P<day>[0-9]{2})[._ -](?P<month>[0-9]{2})[._ -](?P<year>[0-9]{4})")
+            .expect("day-first episode date regex must compile")
+    });
+    let captures = year_first
+        .captures(value)
+        .or_else(|| day_first.captures(value))?;
+    let year = captures.name("year")?.as_str().parse::<i32>().ok()?;
+    let month = captures.name("month")?.as_str().parse::<u32>().ok()?;
+    let day = captures.name("day")?.as_str().parse::<u32>().ok()?;
+    let date = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+    let matched = captures.get(0)?;
+    let mut without_date = value.to_string();
+    without_date.replace_range(matched.range(), " ");
+    Some((
+        date.format("%Y-%m-%d").to_string(),
+        clean_title(&without_date),
+    ))
+}
+
+fn episode_parser_path(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    if path.contains('/') {
+        path
+    } else {
+        format!("/{path}")
+    }
 }
 
 fn parse_chinese_episode_number(value: &str) -> Option<(i64, Option<i64>)> {
@@ -112,6 +228,7 @@ fn parse_video_name(stem: &str) -> ParsedName {
     let mut parsed = ParsedName {
         title: clean_title(stem),
         version: parse_version(stem),
+        video_3d_format: parse_video_3d_format(stem),
         extended_video_types: parse_extended_video_types(stem),
         ..ParsedName::default()
     };
@@ -128,7 +245,10 @@ fn parse_video_name(stem: &str) -> ParsedName {
                 .map(|value| value.as_str())
                 .unwrap_or(stem);
             parsed.title = clean_title(title);
-            parsed.stack_key = Some(stack_key(&parsed.title));
+            // Stack identity must retain edition/version tokens. Jellyfin groups
+            // "Movie 4K CD1/CD2" separately from "Movie 1080p CD1/CD2" even
+            // though both editions have the same cleaned display title.
+            parsed.stack_key = Some(stack_key(title));
             parsed.stack_part = captures
                 .name("part")
                 .and_then(|value| part_number(value.as_str()));
@@ -139,51 +259,207 @@ fn parse_video_name(stem: &str) -> ParsedName {
     parsed
 }
 
+/// Match Jellyfin's Format3DParser rules and enum mapping.
+pub fn parse_video_3d_format(value: &str) -> Option<String> {
+    const DELIMITERS: &[char] = &['(', ')', '-', '.', '_', '[', ']', ' '];
+    let tokens = value
+        .split(DELIMITERS)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+
+    for (preceding, token, format) in [
+        (Some("3d"), "hsbs", "HalfSideBySide"),
+        (Some("3d"), "sbs", "HalfSideBySide"),
+        (Some("3d"), "htab", "HalfTopAndBottom"),
+        (Some("3d"), "tab", "HalfTopAndBottom"),
+        (None, "fsbs", "FullSideBySide"),
+        (None, "hsbs", "HalfSideBySide"),
+        (None, "sbs", "HalfSideBySide"),
+        (None, "ftab", "FullTopAndBottom"),
+        (None, "htab", "HalfTopAndBottom"),
+        (None, "tab", "HalfTopAndBottom"),
+        (None, "sbs3d", "HalfSideBySide"),
+        (None, "mvc", "MVC"),
+    ] {
+        let matched = match preceding {
+            Some(preceding) => tokens.windows(2).any(|pair| {
+                pair[0].eq_ignore_ascii_case(preceding) && pair[1].eq_ignore_ascii_case(token)
+            }),
+            None => tokens
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(token)),
+        };
+        if matched {
+            return Some(format.to_string());
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy)]
 enum EpisodeStyle {
     Named,
     TrailingTitle,
     FolderTitle,
+    SeriesName,
 }
 
-fn episode_patterns() -> Vec<(Regex, EpisodeStyle)> {
-    [
+fn episode_patterns() -> &'static [(Regex, EpisodeStyle)] {
+    static PATTERNS: OnceLock<Vec<(Regex, EpisodeStyle)>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
         (
-            r#"(?i)^(?P<title>.*?)[ ._\-\[]*s(?P<season>[0-9]{1,4})[ ._\-\]]*e(?P<episode>[0-9]{1,3})(?:[ ._\-]*(?:e|x)?(?P<ending>[0-9]{1,3}))?(?:\b|[^0-9]).*$"#,
+            // Jellyfin/Kodi standard: foo.s01.e01, foo.s01_e01, S01E02 foo, S01 - E02.
+            r#"(?i).*(?:/)(?P<title>.*?)[s](?P<season>[0-9]{1,4})[\]\[ ._-]*[e](?P<episode>[0-9]{1,4})(?:[\]\[ ._-]*(?:[ex]|-[ex]?)(?P<ending>[0-9]{1,4}))?[^/]*$"#,
             EpisodeStyle::Named,
         ),
         (
-            r#"(?i)^(?P<title>.*?)[ ._\-\[]*(?P<season>[0-9]{1,4})x(?P<episode>[0-9]{1,3})(?:[ ._\-]*(?:x|e)?(?P<ending>[0-9]{1,3}))?(?:\b|[^0-9]).*$"#,
-            EpisodeStyle::Named,
-        ),
-        (
-            r#"(?i)^(?P<title>.*?)(?:season|s)[ ._\-]*(?P<season>[0-9]{1,4})[ ._\-]+(?:episode|e)[ ._\-]*(?P<episode>[0-9]{1,3})(?:[ ._\-]*(?P<ending>[0-9]{1,3}))?.*$"#,
-            EpisodeStyle::Named,
-        ),
-        (
-            r#"(?i)^episode[ ._\-]*(?P<episode>[0-9]{1,4})(?:[ ._\-]*(?P<ending>[0-9]{1,4}))?(?:[ ._\-]+(?P<name>.+))?$"#,
+            // Kodi standard: foo.ep01, foo.EP_01.
+            r#"(?i).*(?:/)(?P<title>.*?)[._ -]ep_?(?P<episode>[0-9]{1,4})(?:[._ -]+(?P<name>[^/]+))?$"#,
             EpisodeStyle::TrailingTitle,
         ),
         (
-            r#"(?i)^(?P<episode>[0-9]{1,3})(?:[ ._\-]*(?P<ending>[0-9]{2,3}))?[ ._\-]+(?P<name>.+)$"#,
+            // Kodi standard: foo.E01., foo.e01.
+            r#"(?i).*(?:/)(?P<title>.*?)[._ -]e(?P<episode>[0-9]{1,4})(?:[._ -]+(?P<name>[^/]+))?$"#,
             EpisodeStyle::TrailingTitle,
         ),
         (
-            r#"(?i)^\[(?:[^\]]+)\][ ._\-]*(?P<title>.+?)[ ._\-]*\[(?P<episode>[0-9]{1,4})\].*$"#,
+            // Multiple 1x02 - 1x03 / 1x02 - 1e03 naming.
+            r#"(?i).*(?:/)(?P<title>.*?)(?P<season>[0-9]{1,4})x(?P<episode>[0-9]{1,3})(?:\s*-\s*[0-9]{1,4}[xe](?P<ending>[0-9]{1,3}))+[^/]*$"#,
             EpisodeStyle::Named,
         ),
         (
-            r#"(?i)^\[(?P<episode>[0-9]{1,4})\].*$"#,
+            // 1x02 / 01x02 / 2009x03.
+            r#"(?i).*(?:/)(?P<title>.*?)(?P<season>[0-9]{1,4})x(?P<episode>[0-9]{1,4})(?:[\]\[ ._-]*(?:[ex]|-[ex]?)(?P<ending>[0-9]{1,4}))?[^/]*$"#,
+            EpisodeStyle::Named,
+        ),
+        (
+            // Series Season X Episode Y - Title / Series S3 E9 - Title.
+            r#"(?i).*(?:/)(?P<title>.*?)(?:season|s)[ ._-]*(?P<season>[0-9]{1,4})[ ._-]+(?:episode|e)[ ._-]*(?P<episode>[0-9]{1,4})(?:[ ._-]*(?P<ending>[0-9]{1,4}))?[^/]*$"#,
+            EpisodeStyle::Named,
+        ),
+        (
+            // Episode 16 / Episode 16 - Title.
+            r#"(?i).*(?:/)episode[ ._-]*(?P<episode>[0-9]{1,4})(?:[ ._-]*(?P<ending>[0-9]{1,4}))?(?:[ ._-]+(?P<name>[^/]+))?$"#,
+            EpisodeStyle::TrailingTitle,
+        ),
+        (
+            // Season 1/01 episode title.avi.
+            r#"(?i).*(?:/)season[._ ](?P<season>[0-9]{1,4})/(?P<episode>[0-9]{1,3})(?:[ ._-]+(?P<name>[^/]+))?$"#,
+            EpisodeStyle::TrailingTitle,
+        ),
+        (
+            // Name - 101.mkv and anime-style absolute episode numbers.
+            r#"(?i).*(?:/)(?P<seriesname>[^/]+?)[\s_]+-[\s_]+(?P<episode>[0-9]{1,4})(?:-(?P<ending>[0-9]{2,4}))?(?:[\s_]*(?:\[[^\]]+\]|\([^\)]+\)))*[\s_]*(?:\.[^.]+)?$"#,
+            EpisodeStyle::SeriesName,
+        ),
+        (
+            // blah - 01.avi / blah - 01 - title.avi.
+            r#"(?i).*(?:/)(?P<seriesname>[^/]+?)\s+-\s+(?P<episode>[0-9]{1,3})(?:-(?P<ending>[0-9]{2,3}))?(?P<name>[^/]*)$"#,
+            EpisodeStyle::TrailingTitle,
+        ),
+        (
+            // 01 - blah.avi / 01.blah.avi.
+            r#"(?i).*(?:/)(?P<episode>[0-9]{1,3})(?:-(?P<ending>[0-9]{2,3}))?\s?[-.]\s?(?P<name>[^/]+)$"#,
+            EpisodeStyle::TrailingTitle,
+        ),
+        (
+            // [Group] Anime Name [04][1080p].
+            r#"(?i).*(?:/)(?:\[[^\]]+\]\s*)?(?P<title>\[[^\]]+\]|[^\[\]/]+?)\s*\[(?P<episode>[0-9]{1,4})\][^/]*$"#,
+            EpisodeStyle::Named,
+        ),
+        (
+            r#"(?i).*(?:/)\[(?P<episode>[0-9]{1,4})\][^/]*$"#,
             EpisodeStyle::FolderTitle,
         ),
         (
-            r#"(?i)^(?P<episode>[0-9]{1,4})$"#,
+            r#"(?i).*(?:/)(?P<episode>[0-9]{1,4})\.[^.]+$"#,
             EpisodeStyle::TrailingTitle,
         ),
-    ]
-    .into_iter()
-    .map(|(pattern, style)| (Regex::new(pattern).expect("episode regex must compile"), style))
-    .collect()
+        ]
+        .into_iter()
+        .map(|(pattern, style)| (Regex::new(pattern).expect("episode regex must compile"), style))
+        .collect()
+    })
+}
+
+fn capture_i64(captures: &regex::Captures<'_>, names: &[&str], indexes: &[usize]) -> Option<i64> {
+    names
+        .iter()
+        .find_map(|name| {
+            captures
+                .name(name)
+                .and_then(|value| parse_number_token(value.as_str()))
+        })
+        .or_else(|| {
+            indexes.iter().find_map(|index| {
+                captures
+                    .get(*index)
+                    .and_then(|value| parse_number_token(value.as_str()))
+            })
+        })
+}
+
+fn parse_number_token(value: &str) -> Option<i64> {
+    let digits = value
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn trailing_episode_title(path: &str, stem: &str, captures: &regex::Captures<'_>) -> String {
+    let Some(name) = captures.name("name").map(|value| value.as_str()) else {
+        return clean_title(stem);
+    };
+    let name = strip_captured_extension(path, name)
+        .trim_matches(|c: char| c.is_whitespace() || ".-_[](){}".contains(c));
+    if name.is_empty() {
+        return clean_title(stem);
+    }
+    let extension_only_tail = path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.eq_ignore_ascii_case(name))
+        .unwrap_or(false);
+    if extension_only_tail && stem.chars().all(|ch| ch.is_ascii_digit()) {
+        clean_title(stem)
+    } else {
+        clean_title(name)
+    }
+}
+
+fn strip_captured_extension<'a>(path: &str, value: &'a str) -> &'a str {
+    let Some((_, extension)) = path.rsplit_once('.') else {
+        return value;
+    };
+    let suffix_len = extension.len() + 1;
+    if value.len() > suffix_len
+        && value
+            .get(value.len() - extension.len()..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(extension))
+        && value.as_bytes().get(value.len() - suffix_len) == Some(&b'.')
+    {
+        &value[..value.len() - suffix_len]
+    } else {
+        value
+    }
+}
+
+fn is_invalid_episode_season_number(season: i64) -> bool {
+    (200..1928).contains(&season) || season > 2500
+}
+
+fn ending_episode_capture_is_valid(path: &str, captures: &regex::Captures<'_>) -> bool {
+    let Some(ending) = captures
+        .name("ending")
+        .or_else(|| captures.name("endingepnumber"))
+    else {
+        return true;
+    };
+    path[ending.end()..]
+        .chars()
+        .next()
+        .is_none_or(|next| !next.is_ascii_digit() && !matches!(next, 'i' | 'I' | 'p' | 'P'))
 }
 
 fn parse_compact_episode(value: &str) -> Option<(i64, i64)> {
@@ -264,7 +540,7 @@ fn parse_extended_video_types(stem: &str) -> Vec<String> {
 fn clean_title(value: &str) -> String {
     let mut title = replace_title_separators(value);
     title = Regex::new(
-        r#"(?i)[\{\[\(]\s*(?:tmdb(?:id)?|douban(?:id)?|imdb(?:id)?|tvdb(?:id)?)\s*[-=]\s*[^\}\]\)]+[\}\]\)]"#,
+        r#"(?i)[\{\[\(]\s*(?:tmdb(?:id)?|douban(?:id)?|imdb(?:id)?|tvdb(?:id)?|tvmaze(?:id)?|tvrage(?:id)?|anidb(?:id)?|anilist(?:id)?|anisearch(?:id)?)\s*[-=]\s*[^\}\]\)]+[\}\]\)]"#,
     )
     .expect("provider tag regex must compile")
     .replace_all(&title, " ")
@@ -311,12 +587,23 @@ fn clean_title(value: &str) -> String {
         "pcm",
         "bluray",
         "blu ray",
+        "dvd",
+        "hddvd",
         "bdrip",
         "web dl",
         "web-dl",
         "webrip",
         "hdtv",
         "remux",
+        "3d",
+        "fsbs",
+        "hsbs",
+        "sbs",
+        "ftab",
+        "htab",
+        "tab",
+        "sbs3d",
+        "mvc",
         "amzn",
         "nf",
         "hulu",
@@ -460,6 +747,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_jellyfin_book_names() {
+        for (name, title, series, index, parent_index, year) in [
+            (
+                "Sherlock Holmes #2 (1890)",
+                "",
+                Some("Sherlock Holmes"),
+                Some(2),
+                None,
+                Some(1890),
+            ),
+            (
+                "A Study in Scarlet (Sherlock Holmes, #1) (1887)",
+                "A Study in Scarlet",
+                Some("Sherlock Holmes"),
+                Some(1),
+                None,
+                Some(1887),
+            ),
+            (
+                "2 - The Sign of the Four (1890)",
+                "The Sign of the Four",
+                None,
+                Some(2),
+                None,
+                Some(1890),
+            ),
+            (
+                "Captain Marvel Adventures v01 c120",
+                "Captain Marvel Adventures v01 c120",
+                None,
+                Some(120),
+                Some(1),
+                None,
+            ),
+        ] {
+            let parsed = parse_book_name(name);
+            assert_eq!(parsed.title, title, "{name}");
+            assert_eq!(parsed.series_name.as_deref(), series, "{name}");
+            assert_eq!(parsed.index_number, index, "{name}");
+            assert_eq!(parsed.parent_index_number, parent_index, "{name}");
+            assert_eq!(parsed.production_year, year, "{name}");
+        }
+    }
+
+    #[test]
     fn parses_common_episode_numbers() {
         let parsed = parse_media_name(Path::new("Show.Name.S01E02.Title.1080p.mkv"), "tvshows");
         assert_eq!(parsed.season_number, Some(1));
@@ -473,6 +805,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_jellyfin_kodi_episode_aliases() {
+        let parsed = parse_media_name(Path::new("Show.EP_01.Title.mkv"), "tvshows");
+        assert_eq!(parsed.episode_number, Some(1));
+        assert_eq!(parsed.title, "Title");
+
+        let parsed = parse_media_name(Path::new("Show.E01.Title.1080p.mkv"), "tvshows");
+        assert_eq!(parsed.episode_number, Some(1));
+        assert_eq!(parsed.title, "Title");
+
+        let parsed = parse_media_name(Path::new("Show - 01 - Pilot.mkv"), "tvshows");
+        assert_eq!(parsed.episode_number, Some(1));
+        assert_eq!(parsed.title, "Pilot");
+
+        let parsed = parse_media_name(Path::new("/media/Show/Season 1/01 Pilot.mkv"), "tvshows");
+        assert_eq!(parsed.season_number, Some(1));
+        assert_eq!(parsed.episode_number, Some(1));
+        assert_eq!(parsed.title, "Pilot");
+    }
+
+    #[test]
+    fn parses_jellyfin_date_based_episodes() {
+        let parsed = parse_media_name(Path::new("Daily.Show.2026.07.21.Guest.mkv"), "tvshows");
+        assert_eq!(parsed.premiere_date.as_deref(), Some("2026-07-21"));
+        assert_eq!(parsed.season_number, None);
+        assert_eq!(parsed.episode_number, None);
+        assert_eq!(parsed.title, "Daily Show Guest");
+
+        let parsed = parse_media_name(Path::new("Daily Show 21-07-2026.mkv"), "tvshows");
+        assert_eq!(parsed.premiere_date.as_deref(), Some("2026-07-21"));
+        assert_eq!(parsed.episode_number, None);
+    }
+
+    #[test]
     fn parses_multi_episode_ranges() {
         let parsed = parse_media_name(Path::new("Show.S02E03-E04.mkv"), "tvshows");
         assert_eq!(parsed.season_number, Some(2));
@@ -483,6 +848,16 @@ mod tests {
         assert_eq!(parsed.season_number, Some(2));
         assert_eq!(parsed.episode_number, Some(5));
         assert_eq!(parsed.ending_episode_number, Some(6));
+
+        let parsed = parse_media_name(Path::new("Show.1x02 - 1x03.mkv"), "tvshows");
+        assert_eq!(parsed.season_number, Some(1));
+        assert_eq!(parsed.episode_number, Some(2));
+        assert_eq!(parsed.ending_episode_number, Some(3));
+
+        let parsed = parse_media_name(Path::new("Show.S09E14-1080p.mkv"), "tvshows");
+        assert_eq!(parsed.season_number, Some(9));
+        assert_eq!(parsed.episode_number, Some(14));
+        assert_eq!(parsed.ending_episode_number, None);
     }
 
     #[test]
@@ -520,7 +895,10 @@ mod tests {
     fn parses_stack_parts_and_versions() {
         let parsed = parse_media_name(Path::new("Movie.Name.Extended.4K.HDR.CD2.mkv"), "movies");
         assert_eq!(parsed.title, "Movie Name");
-        assert_eq!(parsed.stack_key.as_deref(), Some("movie name"));
+        assert_eq!(
+            parsed.stack_key.as_deref(),
+            Some("movie name extended 4k hdr")
+        );
         assert_eq!(parsed.stack_part, Some(2));
         assert_eq!(parsed.version.as_deref(), Some("4K HDR Extended"));
     }
@@ -540,5 +918,27 @@ mod tests {
             "movies",
         );
         assert_eq!(parsed.title, "F1：狂飙飞车 F1 The Movie");
+    }
+
+    #[test]
+    fn parses_jellyfin_3d_format_rules() {
+        for (name, expected) in [
+            ("Super movie.3d.hsbs.mp4", Some("HalfSideBySide")),
+            ("Super movie.3d.sbs.mp4", Some("HalfSideBySide")),
+            ("Super movie.3d.htab.mp4", Some("HalfTopAndBottom")),
+            ("Super movie.3d.tab.mp4", Some("HalfTopAndBottom")),
+            ("Super movie.fsbs.mp4", Some("FullSideBySide")),
+            ("Super movie.ftab.mp4", Some("FullTopAndBottom")),
+            ("Super movie.sbs3d.mp4", Some("HalfSideBySide")),
+            ("Super movie.3d.mvc.mp4", Some("MVC")),
+            ("Super movie.3d.mp4", None),
+            ("Super movie [3d].mp4", None),
+        ] {
+            assert_eq!(parse_video_3d_format(name).as_deref(), expected, "{name}");
+        }
+
+        let parsed = parse_media_name(Path::new("Oblivion.3d.hsbs.mkv"), "movies");
+        assert_eq!(parsed.title, "Oblivion");
+        assert_eq!(parsed.video_3d_format.as_deref(), Some("HalfSideBySide"));
     }
 }

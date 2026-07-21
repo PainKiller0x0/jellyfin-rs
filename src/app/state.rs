@@ -38,6 +38,7 @@ pub struct AppState {
     pub tmdb_http_client: Arc<RwLock<reqwest::Client>>,
     pub douban_cookie: RwLock<Option<String>>,
     pub scan_lock: Mutex<()>,
+    pub chapter_image_task_cancel: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     pub playback_sessions: RwLock<HashMap<String, PlaybackSession>>,
     pub session_capabilities: RwLock<HashMap<String, SessionCapabilities>>,
     pub admin_http_log_seq: AtomicU64,

@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -77,6 +78,7 @@ pub use configuration::{
     update_named_configuration, update_remote_access, update_server_configuration,
     update_startup_configuration, update_startup_user,
 };
+pub(crate) use localization::normalize_language_codes;
 pub use localization::{
     localization_countries, localization_cultures, localization_options, parental_ratings,
 };
@@ -1540,7 +1542,7 @@ pub(super) async fn first_admin_user(
     db: &DatabaseConnection,
 ) -> anyhow::Result<Option<(String, String)>> {
     let Some(model) = Users::find()
-        .filter(users::Column::IsAdmin.eq(1))
+        .filter(users::Column::IsAdmin.eq(1_i64))
         .order_by_asc(users::Column::CreatedAt)
         .one(db)
         .await?
@@ -1551,7 +1553,10 @@ pub(super) async fn first_admin_user(
 }
 
 pub async fn scheduled_tasks(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(vec![scan_library_task_for_state(&state).await])
+    Json(vec![
+        scan_library_task_for_state(&state).await,
+        chapter_images_task_for_state(&state).await,
+    ])
 }
 
 pub async fn scheduled_task(
@@ -1562,7 +1567,7 @@ pub async fn scheduled_task(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    Json(scan_library_task_for_state(&state).await).into_response()
+    Json(scheduled_task_for_state(&state, &task_id).await).into_response()
 }
 
 pub async fn scheduled_task_triggers(
@@ -1573,7 +1578,7 @@ pub async fn scheduled_task_triggers(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    Json(scan_library_triggers(&state.db).await).into_response()
+    Json(scheduled_task_triggers_value(&state.db, &task_id).await).into_response()
 }
 
 pub async fn update_scheduled_task_triggers(
@@ -1589,13 +1594,8 @@ pub async fn update_scheduled_task_triggers(
         Err(error) => return validation_error_response(error),
     };
 
-    match set_app_setting(
-        &state.db,
-        "ScheduledTask.scan-library.Triggers",
-        &triggers.to_string(),
-    )
-    .await
-    {
+    let key = format!("ScheduledTask.{task_id}.Triggers");
+    match set_app_setting(&state.db, &key, &triggers.to_string()).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error),
     }
@@ -1608,7 +1608,11 @@ pub async fn start_scheduled_task(
     if !is_known_scheduled_task(&task_id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    crate::jellyfin::items::scan_handler(state).await
+    match task_id.as_str() {
+        "scan-library" => crate::jellyfin::items::scan_handler(state).await,
+        "RefreshChapterImages" => start_chapter_images_task(state).await,
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 pub async fn stop_scheduled_task(
@@ -1619,13 +1623,123 @@ pub async fn stop_scheduled_task(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    if task_id == "RefreshChapterImages" {
+        if let Some(cancel) = state.chapter_image_task_cancel.lock().await.as_ref() {
+            let _ = cancel.send(true);
+        }
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
     let now = now_unix();
     upsert_task_result(&state, &task_id, "Cancelled", now, now, None).await;
     StatusCode::NO_CONTENT.into_response()
 }
 
 fn is_known_scheduled_task(task_id: &str) -> bool {
-    task_id == "scan-library"
+    matches!(task_id, "scan-library" | "RefreshChapterImages")
+}
+
+async fn scheduled_task_for_state(state: &AppState, task_id: &str) -> JsonValue {
+    match task_id {
+        "RefreshChapterImages" => chapter_images_task_for_state(state).await,
+        _ => scan_library_task_for_state(state).await,
+    }
+}
+
+async fn start_chapter_images_task(State(state): State<Arc<AppState>>) -> Response {
+    if !queue_chapter_images_task(state, None).await {
+        return Json(json!({ "Running": true, "AlreadyRunning": true })).into_response();
+    }
+    Json(json!({ "Running": true })).into_response()
+}
+
+async fn queue_chapter_images_task(state: Arc<AppState>, max_runtime: Option<Duration>) -> bool {
+    let (cancel, mut cancellation) = tokio::sync::watch::channel(false);
+    {
+        let mut current = state.chapter_image_task_cancel.lock().await;
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(cancel);
+    }
+
+    tokio::spawn(async move {
+        let start = now_unix();
+        upsert_task_result(
+            &state,
+            "RefreshChapterImages",
+            "Running",
+            start,
+            start,
+            Some("Chapter image refresh is running"),
+        )
+        .await;
+        let refresh =
+            crate::chapters::refresh_all_chapter_images(&state.db, &state.sa_config.ffmpeg_path);
+        tokio::pin!(refresh);
+        let result = match max_runtime {
+            Some(limit) => tokio::select! {
+                result = &mut refresh => ChapterImageTaskOutcome::Finished(result),
+                _ = cancellation.changed() => ChapterImageTaskOutcome::Cancelled,
+                _ = tokio::time::sleep(limit) => ChapterImageTaskOutcome::TimedOut(limit),
+            },
+            None => tokio::select! {
+                result = &mut refresh => ChapterImageTaskOutcome::Finished(result),
+                _ = cancellation.changed() => ChapterImageTaskOutcome::Cancelled,
+            },
+        };
+        let end = now_unix();
+        let (status, message) = match result {
+            ChapterImageTaskOutcome::Finished(Ok(stats)) if stats.failed == 0 => (
+                "Completed",
+                format!("Refreshed chapter images for {} item(s)", stats.processed),
+            ),
+            ChapterImageTaskOutcome::Finished(Ok(stats)) => (
+                "Failed",
+                format!(
+                    "Refreshed {} item(s); {} item(s) failed",
+                    stats.processed, stats.failed
+                ),
+            ),
+            ChapterImageTaskOutcome::Finished(Err(error)) => ("Failed", format!("{error:#}")),
+            ChapterImageTaskOutcome::Cancelled => (
+                "Cancelled",
+                "Chapter image refresh was cancelled".to_string(),
+            ),
+            ChapterImageTaskOutcome::TimedOut(limit) => (
+                "Cancelled",
+                format!(
+                    "Chapter image refresh exceeded its maximum runtime of {} seconds",
+                    limit.as_secs()
+                ),
+            ),
+        };
+        upsert_task_result(
+            &state,
+            "RefreshChapterImages",
+            status,
+            start,
+            end,
+            Some(&message),
+        )
+        .await;
+        state.chapter_image_task_cancel.lock().await.take();
+        log_activity(
+            &state,
+            "Refresh chapter images",
+            "ChapterImages",
+            None,
+            None,
+        )
+        .await;
+    });
+    true
+}
+
+enum ChapterImageTaskOutcome {
+    Finished(anyhow::Result<crate::chapters::ChapterImageRefreshStats>),
+    Cancelled,
+    TimedOut(Duration),
 }
 
 pub async fn repositories(State(state): State<Arc<AppState>>) -> Response {
@@ -1742,6 +1856,22 @@ async fn scan_library_task_for_state(state: &AppState) -> JsonValue {
     scan_library_task_value(&state.db, is_running).await
 }
 
+async fn chapter_images_task_for_state(state: &AppState) -> JsonValue {
+    let result = last_task_result(&state.db, "RefreshChapterImages").await;
+    let is_running = state.chapter_image_task_cancel.lock().await.is_some();
+    json!({
+        "Name": "Extract chapter images",
+        "State": if is_running { "Running" } else { "Idle" },
+        "Id": "RefreshChapterImages",
+        "Key": "RefreshChapterImages",
+        "Description": "Extracts chapter images for eligible video libraries.",
+        "Category": "Library",
+        "IsHidden": false,
+        "LastExecutionResult": result,
+        "Triggers": chapter_images_triggers(&state.db).await,
+    })
+}
+
 async fn scan_library_task_value(db: &DatabaseConnection, is_running: bool) -> JsonValue {
     let scan_result = last_task_result(db, "scan-library").await;
     json!({
@@ -1762,6 +1892,136 @@ async fn scan_library_triggers(db: &DatabaseConnection) -> JsonValue {
         .ok()
         .and_then(|value| normalize_scheduled_task_triggers(value).ok())
         .unwrap_or_else(default_scan_library_triggers)
+}
+
+async fn scheduled_task_triggers_value(db: &DatabaseConnection, task_id: &str) -> JsonValue {
+    match task_id {
+        "RefreshChapterImages" => chapter_images_triggers(db).await,
+        _ => scan_library_triggers(db).await,
+    }
+}
+
+async fn chapter_images_triggers(db: &DatabaseConnection) -> JsonValue {
+    serde_json::from_str(&app_setting(db, "ScheduledTask.RefreshChapterImages.Triggers", "").await)
+        .ok()
+        .and_then(|value| normalize_scheduled_task_triggers(value).ok())
+        .unwrap_or_else(|| {
+            json!([{
+                "Type": "DailyTrigger",
+                "TimeOfDayTicks": 2 * 60 * 60 * 10_000_000_i64,
+                "MaxRuntimeTicks": 4 * 60 * 60 * 10_000_000_i64,
+            }])
+        })
+}
+
+const SCHEDULE_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
+const TICKS_PER_DAY: i64 = 24 * 60 * 60 * TICKS_PER_SECOND;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DailyTaskSchedule {
+    delay: Duration,
+    max_runtime: Option<Duration>,
+}
+
+pub async fn start_scheduled_task_scheduler(state: Arc<AppState>) {
+    recover_stale_chapter_image_task(&state).await;
+    tokio::spawn(async move {
+        loop {
+            let triggers = chapter_images_triggers(&state.db).await;
+            let Some(schedule) =
+                next_daily_task_schedule(&triggers, chrono::Local::now().naive_local())
+            else {
+                tokio::time::sleep(SCHEDULE_RELOAD_INTERVAL).await;
+                continue;
+            };
+
+            let wait = schedule.delay.min(SCHEDULE_RELOAD_INTERVAL);
+            tokio::time::sleep(wait).await;
+            if wait < schedule.delay {
+                continue;
+            }
+
+            if !queue_chapter_images_task(state.clone(), schedule.max_runtime).await {
+                tracing::info!(
+                    "scheduled chapter image refresh skipped because the task is already running"
+                );
+            }
+            // Move beyond an exact wall-clock match before calculating tomorrow's trigger.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+async fn recover_stale_chapter_image_task(state: &AppState) {
+    let was_running = last_task_result(&state.db, "RefreshChapterImages")
+        .await
+        .and_then(|result| {
+            result
+                .get("Status")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("Running");
+    if was_running {
+        let now = now_unix();
+        upsert_task_result(
+            state,
+            "RefreshChapterImages",
+            "Cancelled",
+            now,
+            now,
+            Some("Chapter image refresh was interrupted by a server restart"),
+        )
+        .await;
+    }
+}
+
+fn next_daily_task_schedule(
+    triggers: &JsonValue,
+    now: chrono::NaiveDateTime,
+) -> Option<DailyTaskSchedule> {
+    triggers
+        .as_array()?
+        .iter()
+        .filter(|trigger| trigger.get("Type").and_then(JsonValue::as_str) == Some("DailyTrigger"))
+        .filter_map(|trigger| {
+            let time_of_day_ticks = trigger.get("TimeOfDayTicks")?.as_i64()?;
+            let due = next_daily_trigger(now, time_of_day_ticks)?;
+            let delay = (due - now).to_std().ok()?;
+            let max_runtime = trigger
+                .get("MaxRuntimeTicks")
+                .and_then(JsonValue::as_i64)
+                .and_then(ticks_to_duration);
+            Some(DailyTaskSchedule { delay, max_runtime })
+        })
+        .min_by_key(|schedule| schedule.delay)
+}
+
+fn next_daily_trigger(
+    now: chrono::NaiveDateTime,
+    time_of_day_ticks: i64,
+) -> Option<chrono::NaiveDateTime> {
+    if !(0..TICKS_PER_DAY).contains(&time_of_day_ticks) {
+        return None;
+    }
+    let whole_seconds = time_of_day_ticks / TICKS_PER_SECOND;
+    let nanoseconds = (time_of_day_ticks % TICKS_PER_SECOND) * 100;
+    let time = chrono::NaiveTime::from_num_seconds_from_midnight_opt(
+        u32::try_from(whole_seconds).ok()?,
+        u32::try_from(nanoseconds).ok()?,
+    )?;
+    let date = if now.time() > time {
+        now.date().succ_opt()?
+    } else {
+        now.date()
+    };
+    Some(date.and_time(time))
+}
+
+fn ticks_to_duration(ticks: i64) -> Option<Duration> {
+    let nanoseconds = u64::try_from(ticks).ok()?.checked_mul(100)?;
+    Some(Duration::from_nanos(nanoseconds))
 }
 
 fn default_scan_library_triggers() -> JsonValue {
@@ -2318,8 +2578,8 @@ async fn play_activity_rows(
     };
     let sql = format!(
         r#"SELECT pwd.user_id, users.username, pwd.item_id, mi.title, mi.item_type, mi.runtime_ticks,
-                  SUM(pwd.play_count) AS play_count,
-                  SUM(pwd.watch_seconds) AS watch_seconds,
+                  SUM(pwd.play_count)::BIGINT AS play_count,
+                  SUM(pwd.watch_seconds)::BIGINT AS watch_seconds,
                   MAX(pwd.last_played_at) AS last_played_at
            FROM playback_watch_days pwd
            JOIN media_items mi ON mi.id = pwd.item_id
@@ -2341,8 +2601,8 @@ async fn play_activity_rows(
             let item_name = row.get_str("title")?;
             let item_type = row.get_str("item_type")?;
             let runtime_ticks = row.get_opt_i64("runtime_ticks")?;
-            let play_count = row.get_i64("play_count").unwrap_or_default();
-            let watch_seconds = row.get_i64("watch_seconds").unwrap_or_default();
+            let play_count = row.get_i64("play_count")?;
+            let watch_seconds = row.get_i64("watch_seconds")?;
             let watch_ticks = watch_seconds.saturating_mul(TICKS_PER_SECOND);
             let last_played_at = row.get_opt_i64("last_played_at")?;
             Ok(json!({
@@ -2374,8 +2634,8 @@ async fn playback_stats_overview(db: &DatabaseConnection, days: i64) -> anyhow::
 
     let totals = db
         .query_one_raw(crate::db::helpers::pg_statement(
-            r#"SELECT COALESCE(SUM(watch_seconds), 0) AS watch_seconds,
-                      COALESCE(SUM(play_count), 0) AS play_count,
+            r#"SELECT COALESCE(SUM(watch_seconds), 0)::BIGINT AS watch_seconds,
+                      COALESCE(SUM(play_count), 0)::BIGINT AS play_count,
                       COUNT(DISTINCT user_id) AS user_count,
                       COUNT(DISTINCT item_id) AS item_count
                FROM playback_watch_days"#,
@@ -2394,7 +2654,7 @@ async fn playback_stats_overview(db: &DatabaseConnection, days: i64) -> anyhow::
 
     let today_watch_seconds = db
         .query_one_raw(crate::db::helpers::pg_statement(
-            "SELECT COALESCE(SUM(watch_seconds), 0) AS watch_seconds FROM playback_watch_days WHERE day = ?",
+            "SELECT COALESCE(SUM(watch_seconds), 0)::BIGINT AS watch_seconds FROM playback_watch_days WHERE day = ?",
             vec![today.clone().into()],
         ))
         .await?
@@ -2425,8 +2685,8 @@ async fn playback_stats_daily(
 ) -> anyhow::Result<Vec<JsonValue>> {
     let rows = db
         .query_all_raw(crate::db::helpers::pg_statement(
-            r#"SELECT day, COALESCE(SUM(watch_seconds), 0) AS watch_seconds,
-                      COALESCE(SUM(play_count), 0) AS play_count
+            r#"SELECT day, COALESCE(SUM(watch_seconds), 0)::BIGINT AS watch_seconds,
+                      COALESCE(SUM(play_count), 0)::BIGINT AS play_count
                FROM playback_watch_days
                WHERE day >= ? AND day <= ?
                GROUP BY day
@@ -2469,8 +2729,8 @@ async fn playback_stats_top_users(
         .query_all_raw(crate::db::helpers::pg_statement(
             r#"SELECT pwd.user_id,
                       COALESCE(NULLIF(users.display_name, ''), NULLIF(users.username, ''), pwd.user_id) AS user_name,
-                      COALESCE(SUM(pwd.watch_seconds), 0) AS watch_seconds,
-                      COALESCE(SUM(pwd.play_count), 0) AS play_count
+                      COALESCE(SUM(pwd.watch_seconds), 0)::BIGINT AS watch_seconds,
+                      COALESCE(SUM(pwd.play_count), 0)::BIGINT AS play_count
                FROM playback_watch_days pwd
                LEFT JOIN users ON users.id = pwd.user_id
                WHERE pwd.day >= ?
@@ -2504,8 +2764,8 @@ async fn playback_stats_top_items(
                 r#"SELECT pwd.item_id, mi.title, mi.item_type,
                           {series_id_sql} AS series_id,
                           {series_name_sql} AS series_name,
-                          COALESCE(SUM(pwd.watch_seconds), 0) AS watch_seconds,
-                          COALESCE(SUM(pwd.play_count), 0) AS play_count
+                          COALESCE(SUM(pwd.watch_seconds), 0)::BIGINT AS watch_seconds,
+                          COALESCE(SUM(pwd.play_count), 0)::BIGINT AS play_count
                    FROM playback_watch_days pwd
                    LEFT JOIN media_items mi ON mi.id = pwd.item_id
                    {series_join_sql}
@@ -2545,8 +2805,8 @@ async fn playback_stats_top_series(
         .query_all_raw(crate::db::helpers::pg_statement(
             &format!(
                 r#"SELECT series_id, series_name,
-                          COALESCE(SUM(watch_seconds), 0) AS watch_seconds,
-                          COALESCE(SUM(play_count), 0) AS play_count,
+                          COALESCE(SUM(watch_seconds), 0)::BIGINT AS watch_seconds,
+                          COALESCE(SUM(play_count), 0)::BIGINT AS play_count,
                           COUNT(DISTINCT item_id) AS item_count
                    FROM (
                      SELECT pwd.item_id,
@@ -3064,6 +3324,7 @@ pub async fn last_task_result(db: &DatabaseConnection, task_id: &str) -> Option<
 fn scheduled_task_name(task_id: &str) -> &str {
     match task_id {
         "scan-library" => "Scan media library",
+        "RefreshChapterImages" => "Extract chapter images",
         _ => task_id,
     }
 }
@@ -5079,12 +5340,13 @@ mod tests {
     use super::{
         CameraUploadQuery, CustomQueryRequest, DeviceRecord, FALLBACK_FONTS_PATH,
         TmdbApiKeyRequest, TmdbProxyUrlRequest, activity_log_entry_json, activity_log_query,
-        camera_upload_history_value, client_log_document, client_log_file_name,
-        default_branding_options, default_plugin_repositories, default_scan_library_triggers,
-        device_info, device_options_result, empty_query_result, fallback_font_entries,
-        fallback_font_mime_type, fallback_font_path, game_system_display_name, image_by_name_info,
-        is_known_scheduled_task, is_safe_fallback_font_name, is_safe_log_name, items_access_value,
-        last_task_result, live_tv_channel_mapping_options, live_tv_channel_mapping_options_value,
+        camera_upload_history_value, chapter_images_task_for_state, client_log_document,
+        client_log_file_name, default_branding_options, default_plugin_repositories,
+        default_scan_library_triggers, device_info, device_options_result, empty_query_result,
+        fallback_font_entries, fallback_font_mime_type, fallback_font_path,
+        game_system_display_name, image_by_name_info, is_known_scheduled_task,
+        is_safe_fallback_font_name, is_safe_log_name, items_access_value, last_task_result,
+        live_tv_channel_mapping_options, live_tv_channel_mapping_options_value,
         live_tv_default_listing_provider, live_tv_default_listing_provider_value,
         live_tv_default_tuner_host, live_tv_default_tuner_host_value, live_tv_guide_info,
         live_tv_info, live_tv_recording_folders, live_tv_timer_defaults,
@@ -5110,8 +5372,10 @@ mod tests {
         validate_path_request_from_inputs, web_strings_value,
     };
     use super::{
-        DeviceIdQuery, DirectoryContentsQuery, ParentPathQuery, ValidatePathRequest,
-        device_options_key, set_app_setting,
+        DailyTaskSchedule, DeviceIdQuery, DirectoryContentsQuery, ParentPathQuery,
+        ValidatePathRequest, device_options_key, next_daily_task_schedule, next_daily_trigger,
+        queue_chapter_images_task, recover_stale_chapter_image_task, set_app_setting,
+        upsert_task_result,
     };
     use crate::app::state::AppState;
     use crate::app::state::{PlaybackSession, PlaybackState, SessionCapabilities};
@@ -5126,7 +5390,7 @@ mod tests {
         response::IntoResponse,
     };
     use sea_orm::{DatabaseConnection, EntityTrait, PaginatorTrait, Set};
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, sync::Arc, time::Duration};
     use tokio::sync::{RwLock, broadcast};
     use uuid::Uuid;
 
@@ -5736,6 +6000,7 @@ mod tests {
     #[test]
     fn start_scheduled_task_rejects_unknown_task() {
         assert!(is_known_scheduled_task("scan-library"));
+        assert!(is_known_scheduled_task("RefreshChapterImages"));
         assert!(!is_known_scheduled_task("missing"));
     }
 
@@ -5752,6 +6017,110 @@ mod tests {
         assert_eq!(task["State"], "Idle");
         assert!(task["Triggers"].as_array().is_some());
         assert!(task["LastExecutionResult"].is_null());
+
+        let state = test_state(db);
+        let chapter_task = chapter_images_task_for_state(&state).await;
+        assert_eq!(chapter_task["Id"], "RefreshChapterImages");
+        assert_eq!(chapter_task["Name"], "Extract chapter images");
+        assert_eq!(chapter_task["Triggers"][0]["Type"], "DailyTrigger");
+        assert_eq!(
+            chapter_task["Triggers"][0]["TimeOfDayTicks"],
+            72_000_000_000_i64
+        );
+    }
+
+    #[test]
+    fn daily_trigger_uses_local_wall_clock_and_rolls_to_tomorrow() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).unwrap();
+        let two_am_ticks = 2 * 60 * 60 * 10_000_000_i64;
+
+        let before = date.and_hms_opt(1, 30, 0).unwrap();
+        assert_eq!(
+            next_daily_trigger(before, two_am_ticks),
+            Some(date.and_hms_opt(2, 0, 0).unwrap())
+        );
+
+        let exact = date.and_hms_opt(2, 0, 0).unwrap();
+        assert_eq!(next_daily_trigger(exact, two_am_ticks), Some(exact));
+
+        let after = date.and_hms_opt(2, 0, 1).unwrap();
+        assert_eq!(
+            next_daily_trigger(after, two_am_ticks),
+            Some(date.succ_opt().unwrap().and_hms_opt(2, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn daily_schedule_selects_nearest_trigger_and_its_runtime_limit() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 7, 21)
+            .unwrap()
+            .and_hms_opt(1, 0, 0)
+            .unwrap();
+        let triggers = serde_json::json!([
+            {
+                "Type": "DailyTrigger",
+                "TimeOfDayTicks": 4 * 60 * 60 * 10_000_000_i64,
+                "MaxRuntimeTicks": 8 * 60 * 60 * 10_000_000_i64
+            },
+            {
+                "Type": "DailyTrigger",
+                "TimeOfDayTicks": 2 * 60 * 60 * 10_000_000_i64,
+                "MaxRuntimeTicks": 4 * 60 * 60 * 10_000_000_i64
+            },
+            { "Type": "StartupTrigger" }
+        ]);
+
+        assert_eq!(
+            next_daily_task_schedule(&triggers, now),
+            Some(DailyTaskSchedule {
+                delay: Duration::from_secs(60 * 60),
+                max_runtime: Some(Duration::from_secs(4 * 60 * 60)),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn chapter_image_task_rejects_concurrent_execution() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        let state = Arc::new(test_state(db));
+        let (cancel, _cancellation) = tokio::sync::watch::channel(false);
+        *state.chapter_image_task_cancel.lock().await = Some(cancel);
+
+        assert!(!queue_chapter_images_task(state.clone(), None).await);
+        assert_eq!(
+            chapter_images_task_for_state(&state).await["State"],
+            "Running"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_chapter_image_task_is_cancelled_on_startup() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        let state = test_state(db);
+        upsert_task_result(
+            &state,
+            "RefreshChapterImages",
+            "Running",
+            1,
+            1,
+            Some("running"),
+        )
+        .await;
+
+        recover_stale_chapter_image_task(&state).await;
+
+        let result = last_task_result(&state.db, "RefreshChapterImages")
+            .await
+            .unwrap();
+        assert_eq!(result["Status"], "Cancelled");
+        assert_eq!(
+            result["ErrorMessage"],
+            "Chapter image refresh was interrupted by a server restart"
+        );
     }
 
     #[tokio::test]
@@ -6163,7 +6532,8 @@ mod tests {
         assert_eq!(hourly[0]["PlayCount"], 2);
 
         let durations = usage_stats_duration_histogram_items(&rows);
-        assert_eq!(durations[0]["Count"], 2);
+        assert_eq!(durations[1]["Name"], "<30m");
+        assert_eq!(durations[1]["Count"], 2);
 
         let by_user = usage_stats_breakdown_items(&rows, "User").unwrap();
         assert_eq!(by_user.len(), 2);
@@ -6768,6 +7138,7 @@ mod tests {
             tmdb_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             douban_cookie: RwLock::new(None),
             scan_lock: tokio::sync::Mutex::new(()),
+            chapter_image_task_cancel: tokio::sync::Mutex::new(None),
             playback_sessions: RwLock::new(HashMap::new()),
             session_capabilities: RwLock::new(HashMap::new()),
             admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),

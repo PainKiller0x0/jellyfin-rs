@@ -32,11 +32,7 @@ use crate::{
         media_tags::{self, Entity as MediaTags},
         provider_ids::{self, Entity as ProviderIds},
     },
-    jellyfin::{
-        auth::query_user_id_or_request,
-        common::{internal_error, strip_nulls},
-        item_queries,
-    },
+    jellyfin::{auth::query_user_id_or_request, common::internal_error, item_queries},
     library::{models::media_source_json_with_streams, scanner::scan_media_library_if_idle},
     playback::streaming::readable_media_path,
     util::{now_unix, stable_text_id},
@@ -851,6 +847,113 @@ pub async fn scan_handler(State(state): State<Arc<AppState>>) -> Response {
     Json(json!({ "Scanning": true })).into_response()
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum RefreshMode {
+    #[default]
+    None,
+    ValidationOnly,
+    Default,
+    FullRefresh,
+}
+
+impl RefreshMode {
+    fn parse(value: Option<&str>) -> anyhow::Result<Self> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::None);
+        };
+        match value.to_ascii_lowercase().as_str() {
+            "none" | "0" => Ok(Self::None),
+            "validationonly" | "validation_only" | "1" => Ok(Self::ValidationOnly),
+            "default" | "2" => Ok(Self::Default),
+            "fullrefresh" | "full_refresh" | "3" => Ok(Self::FullRefresh),
+            _ => anyhow::bail!("invalid metadata refresh mode: {value}"),
+        }
+    }
+}
+
+fn refresh_query_value<'a>(query: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    query
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn query_bool(query: &HashMap<String, String>, name: &str) -> anyhow::Result<bool> {
+    match refresh_query_value(query, name).map(str::trim) {
+        None | Some("") => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("true") || value == "1" => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("false") || value == "0" => Ok(false),
+        Some(value) => anyhow::bail!("invalid boolean value for {name}: {value}"),
+    }
+}
+
+fn item_refresh_policy(
+    query: &HashMap<String, String>,
+) -> anyhow::Result<crate::library::tmdb_metadata::MetadataRefreshPolicy> {
+    let metadata_mode = RefreshMode::parse(refresh_query_value(query, "metadataRefreshMode"))?;
+    let image_mode = RefreshMode::parse(refresh_query_value(query, "imageRefreshMode"))?;
+    let requested_replace_metadata = query_bool(query, "replaceAllMetadata")?;
+    let requested_replace_images = query_bool(query, "replaceAllImages")?;
+    let replace_metadata = metadata_mode == RefreshMode::FullRefresh && requested_replace_metadata;
+    let replace_images = image_mode == RefreshMode::FullRefresh && requested_replace_images;
+    Ok(crate::library::tmdb_metadata::MetadataRefreshPolicy {
+        refresh_metadata: metadata_mode > RefreshMode::ValidationOnly,
+        replace_metadata,
+        refresh_images: image_mode > RefreshMode::ValidationOnly,
+        replace_images,
+        force_refresh: metadata_mode == RefreshMode::FullRefresh
+            || image_mode == RefreshMode::FullRefresh,
+    })
+}
+
+pub async fn item_refresh_handler(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    match MediaItems::find_by_id(item_id.clone()).one(&state.db).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return internal_error(error.into()),
+    }
+    let policy = match item_refresh_policy(&query) {
+        Ok(policy) => policy,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "Error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let regenerate_trickplay = match query_bool(&query, "regenerateTrickplay") {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "Error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    tokio::spawn(async move {
+        if regenerate_trickplay {
+            tracing::debug!(
+                "trickplay regeneration was requested for {item_id}; metadata refresh will invalidate source-derived state"
+            );
+        }
+        if let Err(error) =
+            crate::library::scanner::refresh_media_item(&state, &item_id, policy).await
+        {
+            tracing::warn!(
+                "item metadata refresh failed for {item_id}: {}",
+                crate::library::tmdb_metadata::redact_tmdb_error(&error)
+            );
+        }
+    });
+    StatusCode::NO_CONTENT.into_response()
+}
+
 pub async fn external_id_infos() -> Response {
     Json(external_id_infos_value()).into_response()
 }
@@ -1298,8 +1401,8 @@ pub async fn audiobooks_next_up(
                 .into_iter()
                 .skip(start_index)
                 .take(limit)
-                .map(|item| strip_nulls(item.to_jellyfin_json()))
                 .collect::<Vec<_>>();
+            let page = crate::jellyfin::items::enrich_item_list(&state.db, &user_id, page).await;
             Json(json!({
                 "Items": page,
                 "TotalRecordCount": total,
@@ -1439,11 +1542,11 @@ mod tests {
         MAX_MERGE_VERSION_IDS, MergeVersionsResult, UploadSubtitleRequest, alternate_sources_inner,
         audiobooks_next_up, audiobooks_next_up_inner, available_recording_options,
         available_recording_options_value, delete_alternate_sources_inner, delete_lyrics_inner,
-        item_counts_inner, item_lyrics_inner, lyrics_value_from_text, merge_versions_inner,
-        metadata_editor_info_inner, metadata_ids_from_query_or_body, metadata_reset_inner,
-        normalize_metadata_ids, parse_lrc_timestamp, stop_encodings, subtitle_format,
-        subtitle_list_inner, subtitle_list_result_inner, subtitle_provider_info, subtitle_suffix,
-        upload_lyrics_inner, upload_subtitle_inner,
+        item_counts_inner, item_lyrics_inner, item_refresh_policy, lyrics_value_from_text,
+        merge_versions_inner, metadata_editor_info_inner, metadata_ids_from_query_or_body,
+        metadata_reset_inner, normalize_metadata_ids, parse_lrc_timestamp, stop_encodings,
+        subtitle_format, subtitle_list_inner, subtitle_list_result_inner, subtitle_provider_info,
+        subtitle_suffix, upload_lyrics_inner, upload_subtitle_inner,
     };
     use crate::entities::{
         libraries::{self, Entity as Libraries},
@@ -1465,6 +1568,51 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::{RwLock, broadcast};
     use uuid::Uuid;
+
+    #[test]
+    fn item_refresh_defaults_to_no_remote_providers() {
+        let policy = item_refresh_policy(&HashMap::new()).unwrap();
+        assert!(!policy.refresh_metadata);
+        assert!(!policy.refresh_images);
+        assert!(!policy.replace_metadata);
+        assert!(!policy.replace_images);
+        assert!(!policy.force_refresh);
+    }
+
+    #[test]
+    fn item_refresh_modes_and_replace_flags_follow_jellyfin_contract() {
+        let query = HashMap::from([
+            ("MetadataRefreshMode".to_string(), "FullRefresh".to_string()),
+            ("imageRefreshMode".to_string(), "3".to_string()),
+            ("ReplaceAllMetadata".to_string(), "true".to_string()),
+            ("replaceAllImages".to_string(), "1".to_string()),
+        ]);
+        let policy = item_refresh_policy(&query).unwrap();
+        assert!(policy.refresh_metadata);
+        assert!(policy.refresh_images);
+        assert!(policy.replace_metadata);
+        assert!(policy.replace_images);
+        assert!(policy.force_refresh);
+
+        let query = HashMap::from([
+            ("metadataRefreshMode".to_string(), "Default".to_string()),
+            ("imageRefreshMode".to_string(), "ValidationOnly".to_string()),
+            ("replaceAllMetadata".to_string(), "true".to_string()),
+            ("replaceAllImages".to_string(), "true".to_string()),
+        ]);
+        let policy = item_refresh_policy(&query).unwrap();
+        assert!(policy.refresh_metadata);
+        assert!(!policy.refresh_images);
+        assert!(!policy.replace_metadata);
+        assert!(!policy.replace_images);
+        assert!(!policy.force_refresh);
+    }
+
+    #[test]
+    fn item_refresh_rejects_invalid_query_values() {
+        let query = HashMap::from([("metadataRefreshMode".to_string(), "Everything".to_string())]);
+        assert!(item_refresh_policy(&query).is_err());
+    }
 
     #[tokio::test]
     async fn lyrics_report_missing() {
@@ -2398,6 +2546,7 @@ mod tests {
             tmdb_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             douban_cookie: RwLock::new(None),
             scan_lock: tokio::sync::Mutex::new(()),
+            chapter_image_task_cancel: tokio::sync::Mutex::new(None),
             playback_sessions: RwLock::new(HashMap::new()),
             session_capabilities: RwLock::new(HashMap::new()),
             admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),

@@ -10,6 +10,8 @@ pub struct Model {
     pub name: String,
     pub marker_type: Option<String>,
     pub source: String,
+    pub image_path: Option<String>,
+    pub image_date_modified: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }

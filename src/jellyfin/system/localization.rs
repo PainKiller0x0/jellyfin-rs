@@ -43,6 +43,42 @@ pub async fn localization_countries() -> impl IntoResponse {
     )
 }
 
+pub(crate) fn normalize_language_codes(language: &str) -> Vec<String> {
+    let language = language.trim();
+    if language.is_empty() {
+        return Vec::new();
+    }
+
+    if let Some(culture) = CULTURES
+        .iter()
+        .find(|culture| culture.name.eq_ignore_ascii_case(language))
+    {
+        if culture.name.contains('-') {
+            vec![culture.name.to_string()]
+        } else {
+            culture
+                .three_letter
+                .iter()
+                .map(|code| (*code).to_string())
+                .collect()
+        }
+    } else if let Some(culture) = CULTURES.iter().find(|culture| {
+        culture.two_letter.eq_ignore_ascii_case(language)
+            || culture
+                .three_letter
+                .iter()
+                .any(|code| code.eq_ignore_ascii_case(language))
+    }) {
+        culture
+            .three_letter
+            .iter()
+            .map(|code| (*code).to_string())
+            .collect()
+    } else {
+        vec![language.to_string()]
+    }
+}
+
 pub async fn parental_ratings() -> impl IntoResponse {
     Json(
         PARENTAL_RATINGS
@@ -556,6 +592,19 @@ const CULTURES: &[CultureInfo] = &[
         three_letter: &["zho", "chi"],
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_language_codes;
+
+    #[test]
+    fn language_normalization_matches_stream_language_codes() {
+        assert_eq!(normalize_language_codes("en"), vec!["eng"]);
+        assert_eq!(normalize_language_codes("eng"), vec!["eng"]);
+        assert_eq!(normalize_language_codes("zh"), vec!["zho", "chi"]);
+        assert_eq!(normalize_language_codes("zh-CN"), vec!["zh-CN"]);
+    }
+}
 
 const COUNTRIES: &[CountryInfo] = &[
     CountryInfo {

@@ -122,6 +122,7 @@ async fn person_detail(
     }
 
     let image_tags = person_images(&state.db, &person.id).await?;
+    let metadata = person_dto_metadata(&person);
 
     let user_id = query
         .get("UserId")
@@ -145,11 +146,13 @@ async fn person_detail(
         "Etag": person.id,
         "Path": "",
         "Overview": person.overview.unwrap_or_default(),
-        "ProductionYear": null,
-        "PremiereDate": null,
-        "EndDate": null,
+        "ProductionYear": metadata.production_year,
+        "PremiereDate": metadata.premiere_date,
+        "EndDate": metadata.end_date,
+        "HomePageUrl": person.home_page_url,
+        "ProductionLocations": metadata.production_locations,
         "SortName": person.name,
-        "ProviderIds": {},
+        "ProviderIds": metadata.provider_ids,
         "CanDelete": false,
         "CanDownload": false,
         "PlayAccess": "Full",
@@ -473,6 +476,12 @@ async fn find_person_by_name(
         id: model.id,
         name: model.name,
         overview: model.overview,
+        tmdb_id: model.tmdb_id,
+        imdb_id: model.imdb_id,
+        home_page_url: model.home_page_url,
+        premiere_date: model.premiere_date,
+        end_date: model.end_date,
+        production_locations: model.production_locations,
     }))
 }
 
@@ -671,13 +680,57 @@ struct PersonRow {
     id: String,
     name: String,
     overview: Option<String>,
+    tmdb_id: Option<String>,
+    imdb_id: Option<String>,
+    home_page_url: Option<String>,
+    premiere_date: Option<String>,
+    end_date: Option<String>,
+    production_locations: Option<String>,
+}
+
+struct PersonDtoMetadata {
+    production_year: Option<i64>,
+    premiere_date: Option<String>,
+    end_date: Option<String>,
+    production_locations: Vec<String>,
+    provider_ids: serde_json::Map<String, JsonValue>,
+}
+
+fn person_dto_metadata(person: &PersonRow) -> PersonDtoMetadata {
+    let mut provider_ids = serde_json::Map::new();
+    if let Some(tmdb_id) = person.tmdb_id.as_ref().filter(|value| !value.is_empty()) {
+        provider_ids.insert("Tmdb".to_string(), json!(tmdb_id));
+    }
+    if let Some(imdb_id) = person.imdb_id.as_ref().filter(|value| !value.is_empty()) {
+        provider_ids.insert("IMDB".to_string(), json!(imdb_id));
+    }
+    PersonDtoMetadata {
+        production_year: person
+            .premiere_date
+            .as_deref()
+            .and_then(crate::util::year_from_yyyy_mm_dd),
+        premiere_date: person
+            .premiere_date
+            .as_deref()
+            .and_then(crate::util::yyyy_mm_dd_to_jellyfin_date),
+        end_date: person
+            .end_date
+            .as_deref()
+            .and_then(crate::util::yyyy_mm_dd_to_jellyfin_date),
+        production_locations: person
+            .production_locations
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+            .unwrap_or_default(),
+        provider_ids,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        artist_person_types, count_tagged_items, fetch_tagged_items, has_person_relation,
-        serve_person_image,
+        artist_person_types, count_tagged_items, fetch_tagged_items, find_person_by_name,
+        has_person_relation, person_dto_metadata, serve_person_image,
     };
     use crate::entities::{
         image_assets::{self, Entity as ImageAssets},
@@ -708,6 +761,45 @@ mod tests {
             artist_person_types(true, Some("Artist")),
             vec!["albumartist", "audioalbumartist"]
         );
+    }
+
+    #[tokio::test]
+    async fn person_dto_metadata_round_trips_tmdb_fields() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        let id = format!("person-dto-{}", uuid::Uuid::new_v4().simple());
+        let name = format!("Person DTO {id}");
+        People::insert(people::ActiveModel {
+            id: Set(id),
+            name: Set(name.clone()),
+            created_at: Set(1),
+            tmdb_id: Set(Some("98765".to_string())),
+            imdb_id: Set(Some("nm1234567".to_string())),
+            home_page_url: Set(Some("https://person.example".to_string())),
+            premiere_date: Set(Some("1980-02-03".to_string())),
+            end_date: Set(Some("2024-04-05".to_string())),
+            production_locations: Set(Some(r#"["Shanghai, China"]"#.to_string())),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+
+        let person = find_person_by_name(&db, &name).await.unwrap().unwrap();
+        let metadata = person_dto_metadata(&person);
+        assert_eq!(metadata.production_year, Some(1980));
+        assert_eq!(
+            metadata.premiere_date.as_deref(),
+            Some("1980-02-03T00:00:00.0000000Z")
+        );
+        assert_eq!(
+            metadata.end_date.as_deref(),
+            Some("2024-04-05T00:00:00.0000000Z")
+        );
+        assert_eq!(metadata.production_locations, ["Shanghai, China"]);
+        assert_eq!(metadata.provider_ids["Tmdb"], "98765");
+        assert_eq!(metadata.provider_ids["IMDB"], "nm1234567");
     }
 
     #[tokio::test]

@@ -666,7 +666,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/items/{item_id}/playbackinfo",
             get(playback::playback_info).post(playback::playback_info),
         )
-        .route("/Items/{item_id}/Refresh", post(items::scan_handler))
+        .route(
+            "/Items/{item_id}/Refresh",
+            post(items::item_refresh_handler),
+        )
         .route("/Items/{item_id}/Similar", get(items::similar_items))
         .route("/items/{item_id}/similar", get(items::similar_items))
         .route("/Albums/{item_id}/Similar", get(items::similar_items))

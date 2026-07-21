@@ -40,9 +40,43 @@ struct Ipv4ProbeProxy {
 pub struct MediaProbe {
     pub runtime_ticks: Option<i64>,
     pub size_bytes: Option<i64>,
+    pub container: Option<String>,
+    pub video_3d_format: Option<String>,
+    pub audio_metadata: ProbedAudioMetadata,
     pub streams: Vec<ProbedStream>,
+    pub chapters: Vec<ProbedChapter>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProbedAudioMetadata {
+    pub title: Option<String>,
+    pub forced_sort_name: Option<String>,
+    pub album: Option<String>,
+    pub overview: Option<String>,
+    pub production_year: Option<i64>,
+    pub premiere_date: Option<String>,
+    pub index_number: Option<i64>,
+    pub parent_index_number: Option<i64>,
+    pub series_name: Option<String>,
+    pub artists: Vec<String>,
+    pub album_artists: Vec<String>,
+    pub composers: Vec<String>,
+    pub conductors: Vec<String>,
+    pub lyricists: Vec<String>,
+    pub writers: Vec<String>,
+    pub arrangers: Vec<String>,
+    pub engineers: Vec<String>,
+    pub mixers: Vec<String>,
+    pub remixers: Vec<String>,
+    pub narrators: Vec<String>,
+    pub illustrators: Vec<String>,
+    pub lyrics: Option<String>,
+    pub genres: Vec<String>,
+    pub studios: Vec<String>,
+    pub provider_ids: Vec<(String, String)>,
+}
+
+#[derive(Clone, Default)]
 pub struct ProbedStream {
     pub stream_index: i64,
     pub stream_type: String,
@@ -84,6 +118,11 @@ pub struct ProbedStream {
     pub is_forced: bool,
     pub is_hearing_impaired: bool,
     pub is_original: Option<bool>,
+}
+
+pub struct ProbedChapter {
+    pub start_position_ticks: i64,
+    pub name: String,
 }
 
 pub fn probe_media(path: &Path) -> Option<MediaProbe> {
@@ -131,6 +170,106 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
             let redirected_path = Path::new(redirected_url.as_str());
             probe_media_once(redirected_path, Some(&redirected_url)).ok()
         }
+    }
+}
+
+pub fn probe_video_media(
+    path: &Path,
+    video_type: Option<&str>,
+    iso_type: Option<&str>,
+) -> Option<MediaProbe> {
+    if video_type == Some("Iso") && iso_type == Some("BluRay") {
+        return probe_media(&bluray_iso_input_path(path));
+    }
+    let Some(video_type @ ("Dvd" | "BluRay")) = video_type else {
+        return probe_media(path);
+    };
+    let plan = crate::library::disc::probe_plan(path, video_type)?;
+    let first = plan.files.first()?;
+    let mut probe = probe_media(first)?;
+
+    if video_type == "Dvd" {
+        let mut runtime_ticks = probe.runtime_ticks;
+        for file in plan.files.iter().skip(1) {
+            let part = probe_media(file)?;
+            runtime_ticks = runtime_ticks
+                .zip(part.runtime_ticks)
+                .map(|(total, part)| total.saturating_add(part));
+        }
+        probe.runtime_ticks = runtime_ticks;
+    } else {
+        probe.runtime_ticks = plan.runtime_ticks.or(probe.runtime_ticks);
+        if !plan.chapter_ticks.is_empty() {
+            probe.chapters = plan
+                .chapter_ticks
+                .into_iter()
+                .enumerate()
+                .map(|(index, start_position_ticks)| ProbedChapter {
+                    start_position_ticks,
+                    name: format!("Chapter {}", index + 1),
+                })
+                .collect();
+        }
+        if !plan.streams.is_empty() {
+            let ffmpeg_video = probe
+                .streams
+                .iter()
+                .find(|stream| stream.stream_type == "Video")
+                .cloned();
+            let mut streams = plan
+                .streams
+                .into_iter()
+                .enumerate()
+                .map(|(index, stream)| probed_stream_from_disc(index as i64, stream))
+                .collect::<Vec<_>>();
+            if let (Some(ffmpeg), Some(bluray)) = (
+                ffmpeg_video,
+                streams
+                    .iter_mut()
+                    .find(|stream| stream.stream_type == "Video"),
+            ) {
+                // Jellyfin rebuilds the BDInfo stream list, then fills fields
+                // BDInfo lacks from ffprobe's first playable m2ts stream.
+                bluray.codec = ffmpeg.codec;
+                bluray.bit_rate = bluray.bit_rate.or(ffmpeg.bit_rate);
+                bluray.width = bluray.width.or(ffmpeg.width);
+                bluray.height = bluray.height.or(ffmpeg.height);
+                bluray.color_range = ffmpeg.color_range;
+                bluray.color_space = ffmpeg.color_space;
+                bluray.color_transfer = ffmpeg.color_transfer;
+                bluray.color_primaries = ffmpeg.color_primaries;
+                bluray.bit_depth = bluray.bit_depth.or(ffmpeg.bit_depth);
+                bluray.pixel_format = ffmpeg.pixel_format;
+            }
+            probe.streams = streams;
+        }
+    }
+
+    Some(probe)
+}
+
+fn bluray_iso_input_path(path: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("bluray:{}", path.to_string_lossy()))
+}
+
+fn probed_stream_from_disc(index: i64, stream: crate::library::disc::DiscStream) -> ProbedStream {
+    ProbedStream {
+        stream_index: index,
+        stream_type: stream.stream_type,
+        codec: Some(stream.codec),
+        language: stream.language,
+        bit_rate: stream.bit_rate,
+        width: stream.width,
+        height: stream.height,
+        average_frame_rate: stream.average_frame_rate,
+        real_frame_rate: stream.average_frame_rate,
+        reference_frame_rate: stream.average_frame_rate,
+        channels: stream.channels,
+        channel_layout: stream.channel_layout,
+        sample_rate: stream.sample_rate,
+        bit_depth: stream.bit_depth,
+        is_interlaced: stream.is_interlaced,
+        ..Default::default()
     }
 }
 
@@ -196,6 +335,7 @@ fn run_ffprobe(path: &Path, is_remote: bool, http_proxy: Option<&str>) -> Option
         .arg("json")
         .arg("-show_format")
         .arg("-show_streams")
+        .arg("-show_chapters")
         .arg("-show_frames")
         .arg("-read_intervals")
         .arg("%+#1");
@@ -739,6 +879,7 @@ fn media_probe_from_ffprobe_response(response: FfprobeResponse) -> MediaProbe {
     let FfprobeResponse {
         streams,
         frames,
+        chapters,
         format,
     } = response;
     let frames_by_stream = frames
@@ -775,10 +916,24 @@ fn media_probe_from_ffprobe_response(response: FfprobeResponse) -> MediaProbe {
         .and_then(|format| format.size.as_deref())
         .and_then(parse_i64)
         .filter(|size| *size > 0);
+    let container = format
+        .as_ref()
+        .and_then(|format| format.format_name.as_deref())
+        .and_then(normalize_probe_container);
+    let video_3d_format = format
+        .as_ref()
+        .and_then(|format| tag_value(format.tags.as_ref(), "stereo_mode"))
+        .filter(|mode| mode.eq_ignore_ascii_case("left_right"))
+        .map(|_| "FullSideBySide".to_string());
+    let audio_metadata = probed_audio_metadata(&streams, format.as_ref());
 
     MediaProbe {
         runtime_ticks,
         size_bytes,
+        container,
+        video_3d_format,
+        audio_metadata,
+        chapters: probed_chapters_from_ffprobe(chapters),
         streams: streams
             .into_iter()
             .filter_map(|stream| {
@@ -790,29 +945,269 @@ fn media_probe_from_ffprobe_response(response: FfprobeResponse) -> MediaProbe {
     }
 }
 
+fn probed_audio_metadata(
+    streams: &[FfprobeStream],
+    format: Option<&FfprobeFormat>,
+) -> ProbedAudioMetadata {
+    // Jellyfin merges the first audio stream tags with the format tags, with
+    // format tags taking precedence. Lower-casing here preserves ffprobe's
+    // case-insensitive tag semantics for all subsequent lookups.
+    let mut tags = HashMap::new();
+    if let Some(stream_tags) = streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("audio"))
+        .and_then(|stream| stream.tags.as_ref())
+    {
+        merge_probe_tags(&mut tags, stream_tags);
+    }
+    if let Some(format_tags) = format.and_then(|format| format.tags.as_ref()) {
+        merge_probe_tags(&mut tags, format_tags);
+    }
+    if tags.is_empty() {
+        return ProbedAudioMetadata::default();
+    }
+
+    let premiere_date = first_tag(
+        &tags,
+        &[
+            "originaldate",
+            "retaildate",
+            "retail date",
+            "retail_date",
+            "date_released",
+            "date",
+            "creation_time",
+        ],
+    )
+    .and_then(normalize_probe_date);
+    let production_year = tag_number(&tags, "date")
+        .filter(|year| (1..=9999).contains(year))
+        .or_else(|| {
+            premiere_date
+                .as_deref()
+                .and_then(|date| date.get(..4))
+                .and_then(|year| year.parse().ok())
+        });
+    let artists = first_tag(&tags, &["artists"])
+        .map(|value| split_distinct(value, &['/', ';'], false, false))
+        .unwrap_or_else(|| {
+            first_tag(&tags, &["artist"])
+                .map(|value| split_distinct(value, &['/', ';', '|', '\\'], true, false))
+                .unwrap_or_default()
+        });
+    let mut album_artists = first_tag(&tags, &["albumartist", "album artist", "album_artist"])
+        .map(|value| split_distinct(value, &['/', ';', '|', '\\'], true, false))
+        .unwrap_or_default();
+    if album_artists.is_empty() {
+        album_artists.clone_from(&artists);
+    }
+    let genres = first_tag(&tags, &["genre"])
+        .map(|value| split_distinct(value, &['/', ';', ','], false, false))
+        .unwrap_or_default();
+    let studios = ["organization", "ensemble", "publisher", "label"]
+        .into_iter()
+        .filter_map(|key| tag(&tags, key))
+        .flat_map(|value| split_distinct(value, &['/', ';', '|', '\\'], false, true))
+        .filter(|studio| {
+            !artists
+                .iter()
+                .chain(album_artists.iter())
+                .any(|artist| artist.eq_ignore_ascii_case(studio))
+        })
+        .collect::<Vec<_>>();
+
+    let mut provider_ids = Vec::new();
+    for (provider, keys) in [
+        (
+            "MusicBrainzAlbumArtist",
+            &["musicbrainz album artist id", "musicbrainz_albumartistid"][..],
+        ),
+        (
+            "MusicBrainzArtist",
+            &["musicbrainz artist id", "musicbrainz_artistid"][..],
+        ),
+        (
+            "MusicBrainzAlbum",
+            &["musicbrainz album id", "musicbrainz_albumid"][..],
+        ),
+        (
+            "MusicBrainzReleaseGroup",
+            &["musicbrainz release group id", "musicbrainz_releasegroupid"][..],
+        ),
+        (
+            "MusicBrainzTrack",
+            &["musicbrainz release track id", "musicbrainz_releasetrackid"][..],
+        ),
+        (
+            "MusicBrainzRecording",
+            &["musicbrainz track id", "musicbrainz_trackid"][..],
+        ),
+    ] {
+        if let Some(id) = first_tag(&tags, keys).and_then(first_musicbrainz_id) {
+            provider_ids.push((provider.to_string(), id));
+        }
+    }
+
+    ProbedAudioMetadata {
+        title: first_tag(&tags, &["title", "title-eng"]).map(ToString::to_string),
+        forced_sort_name: first_tag(&tags, &["sort_name", "title-sort", "titlesort"])
+            .map(ToString::to_string),
+        album: tag(&tags, "album").map(ToString::to_string),
+        overview: first_tag(&tags, &["synopsis", "description", "desc", "comment"])
+            .map(ToString::to_string),
+        production_year,
+        premiere_date,
+        index_number: tag_number(&tags, "track"),
+        parent_index_number: tag_number(&tags, "disc"),
+        series_name: first_tag(&tags, &["series", "show_name", "show"]).map(ToString::to_string),
+        artists,
+        album_artists,
+        composers: split_tag(&tags, "composer"),
+        conductors: split_tag(&tags, "conductor"),
+        lyricists: split_tag(&tags, "lyricist"),
+        writers: split_tag(&tags, "writer"),
+        arrangers: split_tag(&tags, "arranger"),
+        engineers: split_tag(&tags, "engineer"),
+        mixers: split_tag(&tags, "mixer"),
+        remixers: split_tag(&tags, "remixer"),
+        narrators: split_tag(&tags, "narrator"),
+        illustrators: split_tag(&tags, "illustrator"),
+        lyrics: first_tag(
+            &tags,
+            &[
+                "syncedlyrics",
+                "synced lyrics",
+                "lyrics",
+                "unsyncedlyrics",
+                "unsynced lyrics",
+            ],
+        )
+        .map(ToString::to_string),
+        genres,
+        studios: distinct_strings(studios),
+        provider_ids,
+    }
+}
+
+fn merge_probe_tags(target: &mut HashMap<String, String>, source: &HashMap<String, String>) {
+    for (key, value) in source {
+        if let Some(value) = sanitized_tag(value) {
+            target.insert(key.trim().to_ascii_lowercase(), value.to_string());
+        }
+    }
+}
+
+fn sanitized_tag(value: &str) -> Option<&str> {
+    let value = value.split('\0').next().unwrap_or_default().trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn tag<'a>(tags: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    tags.get(&key.to_ascii_lowercase())
+        .and_then(|value| sanitized_tag(value))
+}
+
+fn first_tag<'a>(tags: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| tag(tags, key))
+}
+
+fn tag_number(tags: &HashMap<String, String>, key: &str) -> Option<i64> {
+    tag(tags, key)?
+        .split(['/', '-', ' '])
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn normalize_probe_date(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Some(date) = crate::util::normalize_yyyy_mm_dd(value) {
+        return Some(date);
+    }
+    let year = value.get(..4)?.parse::<i64>().ok()?;
+    (1..=9999)
+        .contains(&year)
+        .then(|| format!("{year:04}-01-01"))
+}
+
+fn split_tag(tags: &HashMap<String, String>, key: &str) -> Vec<String> {
+    tag(tags, key)
+        .map(|value| split_distinct(value, &['/', ';', '|', '\\'], false, false))
+        .unwrap_or_default()
+}
+
+fn split_distinct(
+    value: &str,
+    delimiters: &[char],
+    split_featuring: bool,
+    allow_comma: bool,
+) -> Vec<String> {
+    let value = if split_featuring {
+        value
+            .replace(" featuring ", " | ")
+            .replace(" Featuring ", " | ")
+            .replace(" feat. ", " | ")
+            .replace(" Feat. ", " | ")
+    } else {
+        value.to_string()
+    };
+    let delimiters = if allow_comma && !value.chars().any(|ch| delimiters.contains(&ch)) {
+        vec![',']
+    } else {
+        delimiters.to_vec()
+    };
+    distinct_strings(
+        value
+            .split(|ch| delimiters.contains(&ch) || ch == '\u{1f}')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect(),
+    )
+}
+
+fn distinct_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(value.to_ascii_lowercase()))
+        .collect()
+}
+
+fn first_musicbrainz_id(value: &str) -> Option<String> {
+    value
+        .split(['/', ';', '|', '\\', '\u{1f}'])
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 impl ProbedStream {
     fn from_ffprobe(
         stream: FfprobeStream,
         frame: Option<&FfprobeFrame>,
         has_hdr10_plus: bool,
     ) -> Option<Self> {
-        if stream
-            .disposition
-            .as_ref()
-            .is_some_and(|disposition| disposition.attached_pic.unwrap_or(0) != 0)
-        {
-            return None;
-        }
-
+        let disposition = stream.disposition.as_ref();
+        let is_attached_pic =
+            disposition.is_some_and(|disposition| disposition.attached_pic.unwrap_or(0) != 0);
         let stream_type = match stream.codec_type.as_deref()? {
+            "video" if is_attached_pic => "EmbeddedImage",
             "video" => "Video",
             "audio" => "Audio",
             "subtitle" => "Subtitle",
+            "attachment" => "Attachment",
             _ => return None,
         }
         .to_string();
         let language = tag_value(stream.tags.as_ref(), "language");
-        let mut title = tag_value(stream.tags.as_ref(), "title");
+        let mut title = if matches!(stream_type.as_str(), "Attachment" | "EmbeddedImage") {
+            tag_value(stream.tags.as_ref(), "filename")
+                .or_else(|| tag_value(stream.tags.as_ref(), "title"))
+        } else {
+            tag_value(stream.tags.as_ref(), "title")
+        };
         let comment = tag_value(stream.tags.as_ref(), "comment");
         if title.is_none() {
             let handler = tag_value(stream.tags.as_ref(), "handler_name");
@@ -884,7 +1279,6 @@ impl ProbedStream {
         );
         let (video_range, video_range_type) =
             video_range(&stream_type, color_transfer.as_deref(), has_hdr10_plus);
-        let disposition = stream.disposition.as_ref();
 
         Some(Self {
             stream_index: stream.index,
@@ -943,13 +1337,31 @@ struct FfprobeResponse {
     streams: Vec<FfprobeStream>,
     #[serde(default)]
     frames: Option<Vec<FfprobeFrame>>,
+    #[serde(default)]
+    chapters: Vec<FfprobeChapter>,
     format: Option<FfprobeFormat>,
 }
 
 #[derive(Deserialize)]
 struct FfprobeFormat {
+    format_name: Option<String>,
     duration: Option<String>,
     size: Option<String>,
+    tags: Option<HashMap<String, String>>,
+}
+
+fn normalize_probe_container(value: &str) -> Option<String> {
+    value.split(',').find_map(|format| {
+        let format = format.trim().to_ascii_lowercase();
+        match format.as_str() {
+            "mpegvideo" => Some("mpeg".to_string()),
+            "mpegts" => Some("ts".to_string()),
+            "matroska" => Some("mkv".to_string()),
+            "mov" | "mp4" | "m4a" | "3gp" | "3g2" | "mj2" => Some("mp4".to_string()),
+            "" => None,
+            _ => Some(format),
+        }
+    })
 }
 
 #[derive(Deserialize)]
@@ -1018,6 +1430,12 @@ struct FfprobeFrame {
 struct FfprobeSideData {
     side_data_type: Option<String>,
     rotation: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct FfprobeChapter {
+    start_time: Option<String>,
+    tags: Option<HashMap<String, String>>,
 }
 
 fn tag_value(tags: Option<&HashMap<String, String>>, key: &str) -> Option<String> {
@@ -1232,6 +1650,25 @@ fn video_range(
     (Some("SDR".to_string()), Some("SDR".to_string()))
 }
 
+fn probed_chapters_from_ffprobe(chapters: Vec<FfprobeChapter>) -> Vec<ProbedChapter> {
+    chapters
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, chapter)| {
+            let seconds = chapter.start_time.as_deref()?.parse::<f64>().ok()?;
+            let start_position_ticks = (seconds * 1000.0).round() as i64 * 10_000;
+            let mut name = tag_value(chapter.tags.as_ref(), "title").unwrap_or_default();
+            if name.trim().is_empty() || parse_duration_seconds(&name).is_some() {
+                name = format!("Chapter {}", index + 1);
+            }
+            Some(ProbedChapter {
+                start_position_ticks,
+                name,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1253,6 +1690,155 @@ mod tests {
 
         assert_eq!(probe.runtime_ticks, Some(125_000_000));
         assert_eq!(probe.size_bytes, Some(987_654_321));
+    }
+
+    #[test]
+    fn bluray_iso_uses_ffmpeg_bluray_input_protocol() {
+        assert_eq!(
+            bluray_iso_input_path(Path::new("/media/Movie.iso")).to_string_lossy(),
+            "bluray:/media/Movie.iso"
+        );
+    }
+
+    #[test]
+    fn media_probe_extracts_full_sbs_stereo_mode_like_jellyfin() {
+        let response: FfprobeResponse = serde_json::from_str(
+            r#"{
+                "format": {"tags": {"STEREO_MODE": "left_right"}},
+                "streams": []
+            }"#,
+        )
+        .unwrap();
+
+        let probe = media_probe_from_ffprobe_response(response);
+
+        assert_eq!(probe.video_3d_format.as_deref(), Some("FullSideBySide"));
+    }
+
+    #[test]
+    fn media_probe_normalizes_audio_tags_like_jellyfin() {
+        let response: FfprobeResponse = serde_json::from_str(
+            r#"{
+                "format": {
+                    "tags": {
+                        "TITLE": "Format Title",
+                        "ALBUM": "Album One",
+                        "ARTIST": "Artist One feat. Artist Two",
+                        "ALBUM_ARTIST": "Album Artist",
+                        "COMPOSER": "Composer One;Composer Two",
+                        "GENRE": "Rock,Pop",
+                        "LABEL": "Label One",
+                        "TRACK": "3/12",
+                        "DISC": "2/3",
+                        "DATE": "2024-07-09",
+                        "MUSICBRAINZ_ALBUMID": "album-id/ignored-id",
+                        "MUSICBRAINZ_TRACKID": "recording-id"
+                    }
+                },
+                "streams": [{
+                    "index": 0,
+                    "codec_type": "audio",
+                    "tags": {"title": "Stream Title", "narrator": "Narrator One"}
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let metadata = media_probe_from_ffprobe_response(response).audio_metadata;
+
+        assert_eq!(metadata.title.as_deref(), Some("Format Title"));
+        assert_eq!(metadata.album.as_deref(), Some("Album One"));
+        assert_eq!(metadata.artists, ["Artist One", "Artist Two"]);
+        assert_eq!(metadata.album_artists, ["Album Artist"]);
+        assert_eq!(metadata.composers, ["Composer One", "Composer Two"]);
+        assert_eq!(metadata.narrators, ["Narrator One"]);
+        assert_eq!(metadata.genres, ["Rock", "Pop"]);
+        assert_eq!(metadata.studios, ["Label One"]);
+        assert_eq!(metadata.index_number, Some(3));
+        assert_eq!(metadata.parent_index_number, Some(2));
+        assert_eq!(metadata.premiere_date.as_deref(), Some("2024-07-09"));
+        assert_eq!(metadata.production_year, Some(2024));
+        assert!(
+            metadata
+                .provider_ids
+                .contains(&("MusicBrainzAlbum".to_string(), "album-id".to_string()))
+        );
+        assert!(metadata.provider_ids.contains(&(
+            "MusicBrainzRecording".to_string(),
+            "recording-id".to_string()
+        )));
+    }
+
+    #[test]
+    fn media_probe_extracts_chapters_like_jellyfin() {
+        let response: FfprobeResponse = serde_json::from_str(
+            r#"{
+                "chapters": [
+                    {"start_time": "0.000000", "tags": {"title": "00:00:00.000"}},
+                    {"start_time": "12.345600", "tags": {"title": "Opening"}}
+                ],
+                "streams": []
+            }"#,
+        )
+        .unwrap();
+
+        let probe = media_probe_from_ffprobe_response(response);
+
+        assert_eq!(probe.chapters.len(), 2);
+        assert_eq!(probe.chapters[0].start_position_ticks, 0);
+        assert_eq!(probe.chapters[0].name, "Chapter 1");
+        assert_eq!(probe.chapters[1].start_position_ticks, 123_460_000);
+        assert_eq!(probe.chapters[1].name, "Opening");
+    }
+
+    #[test]
+    fn media_probe_extracts_attachment_streams_like_jellyfin() {
+        let response: FfprobeResponse = serde_json::from_str(
+            r#"{
+                "streams": [
+                    {
+                        "index": 0,
+                        "codec_type": "video",
+                        "codec_name": "h264"
+                    },
+                    {
+                        "index": 5,
+                        "codec_type": "attachment",
+                        "codec_name": "ttf",
+                        "codec_tag_string": "[0][0][0][0]",
+                        "tags": {
+                            "filename": "Font.ttf",
+                            "mimetype": "application/x-truetype-font",
+                            "comment": "subtitle font"
+                        }
+                    },
+                    {
+                        "index": 6,
+                        "codec_type": "video",
+                        "codec_name": "mjpeg",
+                        "disposition": { "attached_pic": 1 },
+                        "tags": {
+                            "filename": "cover.jpg",
+                            "comment": "cover"
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let probe = media_probe_from_ffprobe_response(response);
+
+        assert_eq!(probe.streams.len(), 3);
+        assert_eq!(probe.streams[0].stream_type, "Video");
+        assert_eq!(probe.streams[1].stream_type, "Attachment");
+        assert_eq!(probe.streams[1].codec.as_deref(), Some("ttf"));
+        assert_eq!(probe.streams[1].codec_tag, None);
+        assert_eq!(probe.streams[1].title.as_deref(), Some("Font.ttf"));
+        assert_eq!(probe.streams[1].comment.as_deref(), Some("subtitle font"));
+        assert_eq!(probe.streams[2].stream_type, "EmbeddedImage");
+        assert_eq!(probe.streams[2].codec.as_deref(), Some("mjpeg"));
+        assert_eq!(probe.streams[2].title.as_deref(), Some("cover.jpg"));
     }
 
     #[test]

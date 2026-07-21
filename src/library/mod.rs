@@ -1,4 +1,5 @@
 pub mod classify;
+pub mod disc;
 pub mod douban_metadata;
 pub mod image_processing;
 pub mod images;
@@ -6,6 +7,7 @@ pub mod metadata;
 pub mod models;
 pub mod naming;
 pub mod path_utils;
+pub mod photo;
 pub mod probe;
 pub mod scanner;
 pub mod storage;

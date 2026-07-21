@@ -16,7 +16,6 @@ use crate::{
             latest_media_items, library_views, list_media_items, list_trailers, resume_media_items,
         },
     },
-    library::models::MediaItem,
     util::stable_text_id,
 };
 
@@ -108,7 +107,7 @@ pub async fn resume_items(
             let start = query_start_index(&query);
             let limit = query_limit(&query, total);
             let page = items.into_iter().skip(start).take(limit).collect();
-            let enriched = super::enrich_resume_items(&state.db, page).await;
+            let enriched = super::enrich_resume_items(&state.db, &user_id, page).await;
             Json(base_item_query_result_with_total(enriched, total, start)).into_response()
         }
         Err(error) => internal_error(error),
@@ -135,34 +134,16 @@ pub async fn trailers(
     let user_id = query_user_id_or_request(&query, &request_user_id);
     match list_trailers(&state.db, &user_id, &query).await {
         Ok((items, total)) => {
-            media_list_response_with_total(items, total, query_start_index(&query))
+            let items = super::enrich_item_list(&state.db, &user_id, items).await;
+            Json(base_item_query_result_with_total(
+                items,
+                total,
+                query_start_index(&query),
+            ))
+            .into_response()
         }
         Err(error) => internal_error(error),
     }
-}
-
-pub fn media_list_response(items: Vec<MediaItem>) -> Response {
-    let total = items.len();
-    Json(media_query_result(items, total, 0)).into_response()
-}
-
-pub fn media_list_response_with_total(
-    items: Vec<MediaItem>,
-    total: usize,
-    start_index: usize,
-) -> Response {
-    Json(media_query_result(items, total, start_index)).into_response()
-}
-
-fn media_query_result(items: Vec<MediaItem>, total: usize, start_index: usize) -> Value {
-    base_item_query_result_with_total(
-        items
-            .into_iter()
-            .map(|item| strip_nulls(item.to_jellyfin_json()))
-            .collect(),
-        total,
-        start_index,
-    )
 }
 
 fn base_item_query_result(items: Vec<Value>, start_index: usize) -> Value {

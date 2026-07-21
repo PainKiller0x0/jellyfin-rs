@@ -13,6 +13,8 @@ pub struct Model {
     pub played_percentage: Option<f64>,
     pub play_count: i64,
     pub last_played_at: Option<i64>,
+    pub audio_stream_index: Option<i64>,
+    pub subtitle_stream_index: Option<i64>,
     pub updated_at: i64,
     pub rating: Option<f64>,
 }

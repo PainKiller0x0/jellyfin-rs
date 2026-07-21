@@ -16,8 +16,6 @@ use crate::{
     library::models::MediaItem,
 };
 
-use super::media_list_response;
-
 fn visible_media_item_sql(alias: &str) -> String {
     format!(
         "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
@@ -27,8 +25,10 @@ fn visible_media_item_sql(alias: &str) -> String {
 pub async fn similar_items(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
+    Extension(request_user_id): Extension<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    let user_id = query_user_id_or_request(&query, &request_user_id);
     let limit = query
         .get("Limit")
         .and_then(|v| v.parse::<usize>().ok())
@@ -36,7 +36,10 @@ pub async fn similar_items(
     match similar_items_inner(&state.db, &item_id, limit).await {
         Ok(mut items) => {
             let _ = item_queries::attach_item_image_tags(&state.db, &mut items).await;
-            media_list_response(items)
+            let total = items.len();
+            let items = crate::jellyfin::items::enrich_item_list(&state.db, &user_id, items).await;
+            Json(json!({ "Items": items, "TotalRecordCount": total, "StartIndex": 0 }))
+                .into_response()
         }
         Err(error) => internal_error(error),
     }
@@ -85,7 +88,7 @@ async fn similar_items_inner(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.is_folder, media_items.is_public, media_items.container, media_items.overview, media_items.official_rating, media_items.extended_video_type, media_items.production_year, media_items.premiere_date, media_items.runtime_ticks, media_items.size_bytes, media_items.season_number, media_items.episode_number, media_items.community_rating, media_items.critic_rating, media_items.created_at, media_items.modified_at, CAST(0 AS bigint) AS is_favorite, CAST(0 AS bigint) AS played, CAST(0 AS bigint) AS playback_position_ticks, NULL AS played_percentage, CAST(0 AS bigint) AS play_count, NULL AS last_played_at FROM media_items LEFT JOIN libraries ON libraries.id = media_items.library_id WHERE media_items.id IN ({placeholders})"#
+        r#"SELECT media_items.id, media_items.title, media_items.path, media_items.library_id, libraries.collection_type, media_items.parent_id, media_items.item_type, media_items.extra_type, media_items.video_type, media_items.iso_type, media_items.video_3d_format, media_items.is_folder, media_items.is_public, media_items.container, media_items.overview, media_items.official_rating, media_items.custom_rating, media_items.extended_video_type, media_items.original_title, media_items.sort_name, media_items.forced_sort_name, media_items.lock_data, media_items.locked_fields, media_items.tagline, media_items.collection_name, media_items.original_language, media_items.preferred_metadata_language, media_items.preferred_metadata_country_code, media_items.series_status, media_items.air_days, media_items.air_time, media_items.home_page_url, media_items.remote_trailers, media_items.production_locations, media_items.production_year, media_items.premiere_date, media_items.end_date, media_items.runtime_ticks, media_items.aspect_ratio, media_items.width, media_items.height, media_items.has_subtitles, media_items.photo_metadata, media_items.display_order, media_items.size_bytes, media_items.season_number, media_items.episode_number, media_items.episode_number_end, media_items.airs_before_episode_number, media_items.airs_after_season_number, media_items.airs_before_season_number, media_items.series_name, media_items.community_rating, media_items.critic_rating, media_items.created_at, media_items.modified_at, CAST(0 AS bigint) AS is_favorite, CAST(0 AS bigint) AS played, CAST(0 AS bigint) AS playback_position_ticks, NULL AS played_percentage, CAST(0 AS bigint) AS play_count, NULL AS last_played_at FROM media_items LEFT JOIN libraries ON libraries.id = media_items.library_id WHERE media_items.id IN ({placeholders})"#
     );
 
     let mut values: Vec<SeaValue> = Vec::new();
@@ -722,6 +725,7 @@ mod tests {
             tmdb_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             douban_cookie: RwLock::new(None),
             scan_lock: tokio::sync::Mutex::new(()),
+            chapter_image_task_cancel: tokio::sync::Mutex::new(None),
             playback_sessions: RwLock::new(HashMap::new()),
             session_capabilities: RwLock::new(HashMap::new()),
             admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),

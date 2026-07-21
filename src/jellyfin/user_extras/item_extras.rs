@@ -13,11 +13,7 @@ use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
     entities::{library_paths, library_paths::Entity as LibraryPaths},
-    jellyfin::{
-        auth::query_user_id_or_request,
-        common::{internal_error, strip_nulls},
-        item_queries,
-    },
+    jellyfin::{auth::query_user_id_or_request, common::internal_error, item_queries},
     library::{models::MediaItem, path_utils},
 };
 
@@ -153,7 +149,10 @@ async fn item_extra_array(
 ) -> Response {
     let user_id = query_user_id_or_request(query, request_user_id);
     match item_extras(&state.db, &user_id, item_id, kind).await {
-        Ok(items) => Json(media_items_json(items)).into_response(),
+        Ok(items) => {
+            Json(crate::jellyfin::items::enrich_item_list(&state.db, &user_id, items).await)
+                .into_response()
+        }
         Err(error) => internal_error(error),
     }
 }
@@ -179,9 +178,9 @@ async fn item_theme_result_value(
     kind: ExtraKind,
 ) -> anyhow::Result<serde_json::Value> {
     let user_id = query_user_id_or_request(query, request_user_id);
-    item_extras(&state.db, &user_id, item_id, kind)
-        .await
-        .map(|items| theme_result(items, item_id))
+    let items = item_extras(&state.db, &user_id, item_id, kind).await?;
+    let items = crate::jellyfin::items::enrich_item_list(&state.db, &user_id, items).await;
+    Ok(theme_result(items, item_id))
 }
 
 async fn item_extras(
@@ -193,6 +192,7 @@ async fn item_extras(
     let target_visible = visible_media_item_sql("media_items");
     let child_visible = visible_media_item_sql("child");
     let item_visible = visible_media_item_sql("media_items");
+    let kind_filter = kind.sql_filter();
     let sql = item_queries::media_item_select_sql(&format!(
         r#"WHERE media_items.id IN (
             WITH RECURSIVE target(id, root_id) AS (
@@ -211,7 +211,7 @@ async fn item_extras(
                 JOIN tree ON child.parent_id = tree.id AND {child_visible}
             )
             SELECT id FROM tree WHERE id <> (SELECT id FROM target)
-        ) AND media_items.is_folder = 0 AND {item_visible}
+        ) AND media_items.is_folder = 0 AND ({kind_filter}) AND {item_visible}
         ORDER BY media_items.title ASC"#
     ));
     let rows = db
@@ -237,7 +237,35 @@ enum ExtraKind {
 }
 
 impl ExtraKind {
+    fn sql_filter(self) -> &'static str {
+        match self {
+            Self::Trailer => "media_items.extra_type = 'Trailer' OR media_items.extra_type IS NULL",
+            Self::SpecialFeature => {
+                "media_items.extra_type IN ('Unknown','BehindTheScenes','Clip','DeletedScene','Interview','Sample','Scene','Featurette','Short') OR media_items.extra_type IS NULL"
+            }
+            Self::ThemeSong => {
+                "media_items.extra_type = 'ThemeSong' OR media_items.extra_type IS NULL"
+            }
+            Self::ThemeVideo => {
+                "media_items.extra_type = 'ThemeVideo' OR media_items.extra_type IS NULL"
+            }
+        }
+    }
+
     fn matches(self, item: &MediaItem) -> bool {
+        if let Some(extra_type) = item
+            .extra_type
+            .as_deref()
+            .and_then(crate::library::classify::ExtraType::from_jellyfin_str)
+        {
+            return match self {
+                Self::Trailer => extra_type == crate::library::classify::ExtraType::Trailer,
+                Self::SpecialFeature => extra_type.is_display_special_feature(),
+                Self::ThemeSong => extra_type == crate::library::classify::ExtraType::ThemeSong,
+                Self::ThemeVideo => extra_type == crate::library::classify::ExtraType::ThemeVideo,
+            };
+        }
+
         let haystack = format!(
             "{} {} {}",
             item.title.to_ascii_lowercase(),
@@ -272,15 +300,7 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
 }
 
-fn media_items_json(items: Vec<MediaItem>) -> Vec<serde_json::Value> {
-    items
-        .into_iter()
-        .map(|item| strip_nulls(item.to_jellyfin_json()))
-        .collect()
-}
-
-fn theme_result(items: Vec<MediaItem>, owner_id: &str) -> serde_json::Value {
-    let items = media_items_json(items);
+fn theme_result(items: Vec<serde_json::Value>, owner_id: &str) -> serde_json::Value {
     json!({
         "Items": items,
         "TotalRecordCount": items.len(),
@@ -299,8 +319,9 @@ async fn item_intros_value(
     items.sort_by(|left, right| left.title.cmp(&right.title).then(left.id.cmp(&right.id)));
     items.dedup_by(|left, right| left.id == right.id);
     let total = items.len();
+    let items = crate::jellyfin::items::enrich_item_list(db, user_id, items).await;
     Ok(json!({
-        "Items": media_items_json(items),
+        "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0,
     }))
@@ -418,7 +439,10 @@ pub async fn item_instant_mix(
     }
     .await
     {
-        Ok(items) => instant_mix_response(items),
+        Ok(items) => {
+            let items = crate::jellyfin::items::enrich_item_list(&state.db, &user_id, items).await;
+            instant_mix_response(items)
+        }
         Err(error) => internal_error(error),
     }
 }
@@ -457,7 +481,10 @@ async fn artist_instant_mix_for_value(
     }
     .await
     {
-        Ok(items) => instant_mix_response(items),
+        Ok(items) => {
+            let items = crate::jellyfin::items::enrich_item_list(&state.db, &user_id, items).await;
+            instant_mix_response(items)
+        }
         Err(error) => internal_error(error),
     }
 }
@@ -496,7 +523,10 @@ async fn music_genre_instant_mix_for_value(
     }
     .await
     {
-        Ok(items) => instant_mix_response(items),
+        Ok(items) => {
+            let items = crate::jellyfin::items::enrich_item_list(&state.db, &user_id, items).await;
+            instant_mix_response(items)
+        }
         Err(error) => internal_error(error),
     }
 }
@@ -759,10 +789,10 @@ fn include_item_types(query: &HashMap<String, String>) -> Vec<String> {
     }
 }
 
-fn instant_mix_response(items: Vec<MediaItem>) -> Response {
+fn instant_mix_response(items: Vec<serde_json::Value>) -> Response {
     let total = items.len();
     Json(json!({
-        "Items": items.into_iter().map(|item| strip_nulls(item.to_jellyfin_json())).collect::<Vec<_>>(),
+        "Items": items,
         "TotalRecordCount": total,
         "StartIndex": 0
     }))
@@ -976,7 +1006,10 @@ pub async fn user_item_local_trailers(
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Response {
     match item_extras(&state.db, &user_id, &item_id, ExtraKind::Trailer).await {
-        Ok(items) => Json(media_items_json(items)).into_response(),
+        Ok(items) => {
+            Json(crate::jellyfin::items::enrich_item_list(&state.db, &user_id, items).await)
+                .into_response()
+        }
         Err(error) => internal_error(error),
     }
 }
@@ -987,7 +1020,10 @@ pub async fn user_item_special_features(
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Response {
     match item_extras(&state.db, &user_id, &item_id, ExtraKind::SpecialFeature).await {
-        Ok(items) => Json(media_items_json(items)).into_response(),
+        Ok(items) => {
+            Json(crate::jellyfin::items::enrich_item_list(&state.db, &user_id, items).await)
+                .into_response()
+        }
         Err(error) => internal_error(error),
     }
 }
@@ -1052,17 +1088,37 @@ mod tests {
             collection_type: "movies".to_string(),
             parent_id: "m1".to_string(),
             item_type: item_type.to_string(),
+            extra_type: None,
+            video_type: None,
+            iso_type: None,
+            video_3d_format: None,
             is_folder: false,
             container: None,
             overview: None,
             official_rating: None,
+            custom_rating: None,
             extended_video_type: None,
+            original_title: None,
+            sort_name: None,
+            forced_sort_name: None,
+            lock_data: false,
+            locked_fields: Vec::new(),
+            tagline: None,
+            collection_name: None,
+            original_language: None,
+            series_status: None,
+            home_page_url: None,
+            remote_trailers: Vec::new(),
+            production_locations: Vec::new(),
             production_year: None,
             premiere_date: None,
+            end_date: None,
             runtime_ticks: None,
+            display_order: None,
             size_bytes: None,
             season_number: None,
             episode_number: None,
+            episode_number_end: None,
             community_rating: None,
             critic_rating: None,
             created_at: 0,
@@ -1075,6 +1131,7 @@ mod tests {
             play_count: 0,
             last_played_at: None,
             image_tags: None,
+            ..Default::default()
         }
     }
 
@@ -1099,8 +1156,10 @@ mod tests {
 
     #[tokio::test]
     async fn instant_mix_responses_include_start_index() {
-        let response =
-            instant_mix_response(vec![item("Song", "Music/song.mp3", "Audio")]).into_response();
+        let response = instant_mix_response(vec![crate::jellyfin::common::strip_nulls(
+            item("Song", "Music/song.mp3", "Audio").to_jellyfin_json(),
+        )])
+        .into_response();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["TotalRecordCount"], 1);
@@ -1827,6 +1886,8 @@ mod tests {
             name: Set(name.to_string()),
             marker_type: Set(Some(marker_type.to_string())),
             source: Set("test".to_string()),
+            image_path: Set(None),
+            image_date_modified: Set(None),
             created_at: Set(1),
             updated_at: Set(1),
         })
@@ -1848,6 +1909,7 @@ mod tests {
             tmdb_http_client: Arc::new(RwLock::new(reqwest::Client::new())),
             douban_cookie: RwLock::new(None),
             scan_lock: tokio::sync::Mutex::new(()),
+            chapter_image_task_cancel: tokio::sync::Mutex::new(None),
             playback_sessions: RwLock::new(HashMap::new()),
             session_capabilities: RwLock::new(HashMap::new()),
             admin_http_log_seq: std::sync::atomic::AtomicU64::new(0),

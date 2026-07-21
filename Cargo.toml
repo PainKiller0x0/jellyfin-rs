@@ -10,7 +10,7 @@ anyhow = "1.0"
 argon2 = "0.5"
 axum = { version = "0.8", features = ["macros", "ws"] }
 base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 cpu = "0.2.0"
 fastrand = "2.5"
 getrandom = "0.4"
@@ -19,7 +19,7 @@ regex = "1.13"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sea-orm = { version = "2.0", default-features = false, features = ["runtime-tokio", "sqlx-postgres", "macros"] }
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1.53", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
@@ -29,8 +29,10 @@ walkdir = "2.5"
 notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+kamadak-exif = "0.6"
 dashmap = "6"
 xdb-parse = "0.2"
+bdinfo-rs-core = "2.0"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"

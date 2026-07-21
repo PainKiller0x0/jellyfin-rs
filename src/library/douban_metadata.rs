@@ -3,13 +3,14 @@ use std::{path::Path, time::Duration};
 use anyhow::Context;
 use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, COOKIE, REFERER, USER_AGENT};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
-    sea_query::OnConflict,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    Set, sea_query::OnConflict,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
+    db::row_ext::QueryResultExt,
     entities::{
         genres::{self, Entity as Genres},
         image_assets::{self, Entity as ImageAssets},
@@ -171,35 +172,44 @@ pub async fn fill_missing_douban(
     db: &DatabaseConnection,
     cookie: Option<&str>,
 ) -> anyhow::Result<usize> {
-    let candidates = MediaItems::find()
-        .filter(media_items::Column::IsFolder.eq(1))
-        .filter(media_items::Column::ItemType.is_in(["Movie", "Series"]))
-        .all(db)
+    let candidates = db
+        .query_all_raw(crate::db::helpers::pg_statement(
+            r#"SELECT mi.id,
+                      mi.title,
+                      mi.path,
+                      mi.item_type,
+                      p.provider_item_id AS douban_id
+               FROM media_items mi
+               LEFT JOIN provider_ids p
+                 ON p.item_id = mi.id AND p.provider = 'Douban'
+               WHERE mi.item_type IN ('Movie', 'Series')
+                 AND mi.lock_data = 0
+                 AND (
+                     p.provider_item_id IS NULL
+                     OR mi.overview IS NULL
+                     OR mi.production_year IS NULL
+                     OR mi.premiere_date IS NULL
+                     OR NOT EXISTS (
+                         SELECT 1
+                         FROM image_assets ia
+                         WHERE ia.item_id = mi.id AND ia.image_type = 'Primary'
+                     )
+                 )"#,
+            vec![],
+        ))
         .await?;
-    let mut rows = Vec::new();
-    for item in candidates {
-        let douban_id = crate::db::provider_ids::get(db, &item.id, DOUBAN_PROVIDER).await?;
-        let has_primary_image = ImageAssets::find()
-            .filter(image_assets::Column::ItemId.eq(&item.id))
-            .filter(image_assets::Column::ImageType.eq("Primary"))
-            .one(db)
-            .await?
-            .is_some();
-        if douban_id.is_none()
-            || item.overview.is_none()
-            || item.production_year.is_none()
-            || item.premiere_date.is_none()
-            || !has_primary_image
-        {
-            rows.push(DoubanFillTarget {
-                id: item.id,
-                title: item.title,
-                path: item.path,
-                item_type: item.item_type,
-                douban_id,
-            });
-        }
-    }
+    let rows = candidates
+        .into_iter()
+        .filter_map(|row| {
+            Some(DoubanFillTarget {
+                id: row.get_str("id").ok()?,
+                title: row.get_str("title").unwrap_or_default(),
+                path: row.get_str("path").unwrap_or_default(),
+                item_type: row.get_str("item_type").ok()?,
+                douban_id: row.get_opt_str("douban_id").ok().flatten(),
+            })
+        })
+        .collect::<Vec<_>>();
 
     if rows.is_empty() {
         return Ok(0);
@@ -236,8 +246,8 @@ pub async fn fill_missing_douban(
             continue;
         }
 
-        let (name, year) =
-            parse_lookup_name(Path::new(&path)).unwrap_or_else(|| clean_title_year(&title));
+        let (name, year) = crate::library::tmdb_metadata::parse_lookup_title_year(Path::new(&path))
+            .unwrap_or_else(|| clean_title_year(&title));
         if should_skip_douban_lookup(&name) {
             tracing::debug!("fill_missing_douban: skipped generic folder name '{name}'");
             continue;
@@ -510,8 +520,13 @@ async fn apply_subject_metadata(
         .await
         .with_context(|| format!("failed to load item for Douban metadata: {item_id}"))?
     {
+        let overview_locked =
+            crate::library::tmdb_metadata::metadata_field_locked(&item, "Overview");
+        let runtime_locked = crate::library::tmdb_metadata::metadata_field_locked(&item, "Runtime");
+        let genres_locked = crate::library::tmdb_metadata::metadata_field_locked(&item, "Genres");
+        let cast_locked = crate::library::tmdb_metadata::metadata_field_locked(&item, "Cast");
         let mut active: media_items::ActiveModel = item.clone().into();
-        if item.overview.is_none() {
+        if !overview_locked && item.overview.is_none() {
             active.overview = Set(subject.overview.clone());
         }
         if item.production_year.is_none() {
@@ -523,7 +538,7 @@ async fn apply_subject_metadata(
         if item.community_rating.is_none() {
             active.community_rating = Set(subject.community_rating);
         }
-        if item.runtime_ticks.is_none() {
+        if !runtime_locked && item.runtime_ticks.is_none() {
             active.runtime_ticks = Set(subject.runtime_ticks);
         }
         active.updated_at = Set(crate::util::now_unix());
@@ -531,18 +546,22 @@ async fn apply_subject_metadata(
             .update(db)
             .await
             .with_context(|| format!("failed to apply Douban metadata for item: {item_id}"))?;
-    }
 
-    upsert_named_relations(
-        db,
-        item_id,
-        "genres",
-        "media_genres",
-        "genre_id",
-        &subject.genres,
-    )
-    .await?;
-    upsert_people(db, item_id, &subject.people).await?;
+        if !genres_locked {
+            upsert_named_relations(
+                db,
+                item_id,
+                "genres",
+                "media_genres",
+                "genre_id",
+                &subject.genres,
+            )
+            .await?;
+        }
+        if !cast_locked {
+            upsert_people(db, item_id, &subject.people).await?;
+        }
+    }
 
     let client = crate::util::http_client().context("failed to build Douban image client")?;
     if let Some(image_url) = subject
@@ -853,35 +872,6 @@ fn score_subject(subject: &DoubanSubject, query: &str, year: Option<i64>, expect
         score += 5;
     }
     score
-}
-
-fn parse_lookup_name(path: &Path) -> Option<(String, Option<i64>)> {
-    let name = path.file_name()?.to_str()?;
-    let cleaned = remove_provider_tags(name);
-    let (title, year) = clean_title_year(&cleaned);
-    (!title.is_empty()).then_some((title, year))
-}
-
-fn remove_provider_tags(value: &str) -> String {
-    let mut result = value.to_string();
-    for (open, close) in [('{', '}'), ('[', ']')] {
-        while let (Some(start), Some(end)) = (result.rfind(open), result.rfind(close)) {
-            if start >= end {
-                break;
-            }
-            let tag = result[start + 1..end].to_ascii_lowercase();
-            if tag.starts_with("tmdb-")
-                || tag.starts_with("tmdbid=")
-                || tag.starts_with("douban-")
-                || tag.starts_with("doubanid=")
-            {
-                result.replace_range(start..=end, "");
-            } else {
-                break;
-            }
-        }
-    }
-    result
 }
 
 fn should_skip_douban_lookup(name: &str) -> bool {

@@ -122,8 +122,6 @@ fn quote_ident(value: &str) -> String {
 
 #[cfg(test)]
 pub async fn test_db() -> Option<DatabaseConnection> {
-    use uuid::Uuid;
-
     let database_url = std::env::var("JELLYFIN_RS_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("JELLYFIN_RS_DATABASE_URL"))
         .ok()
@@ -144,19 +142,15 @@ pub async fn test_db() -> Option<DatabaseConnection> {
         }
     };
 
-    let schema = format!("test_{}", Uuid::new_v4().simple());
-    let quoted_schema = quote_ident(&schema);
-    for sql in [
-        format!("CREATE SCHEMA {quoted_schema}"),
-        format!("SET search_path TO {quoted_schema}"),
-    ] {
-        if let Err(error) = db
-            .execute_raw(Statement::from_string(DbBackend::Postgres, sql))
-            .await
-        {
-            eprintln!("skipping database test: failed to initialize schema: {error}");
-            return None;
-        }
+    if let Err(error) = db
+        .execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SET search_path TO pg_temp".to_string(),
+        ))
+        .await
+    {
+        eprintln!("skipping database test: failed to initialize temporary schema: {error}");
+        return None;
     }
 
     if let Err(error) = migrate(&db).await {

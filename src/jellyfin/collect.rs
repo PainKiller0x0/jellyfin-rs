@@ -1233,7 +1233,7 @@ async fn visible_media_items(
         .collect::<HashSet<_>>();
     let media_parent_ids = MediaItems::find()
         .filter(media_items::Column::Id.is_in(parent_ids_vec))
-        .filter(media_items::Column::IsPublic.eq(1))
+        .filter(media_items::Column::IsPublic.eq(1_i64))
         .all(db)
         .await?
         .into_iter()

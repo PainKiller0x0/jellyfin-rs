@@ -12,11 +12,7 @@ use serde_json::{Value, json};
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
-    jellyfin::{
-        auth::query_user_id_or_request,
-        common::{internal_error, strip_nulls},
-        item_queries,
-    },
+    jellyfin::{auth::query_user_id_or_request, common::internal_error, item_queries},
 };
 
 fn visible_media_item_sql(alias: &str) -> String {
@@ -67,11 +63,11 @@ async fn movie_recommendations_inner(
     let media_visible = visible_media_item_sql("media_items");
     let related_visible = visible_media_item_sql("mi_rel");
 
-    // Get recently played Movie folders (is_folder=1, item_type='Movie')
+    // Jellyfin Movie items may be file-backed, ISO, DVD, or Blu-ray paths.
     let recent_movies = db
         .query_all_raw(crate::db::helpers::pg_statement(
             &format!(
-                "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' AND {media_visible} AND user_data.played = 1 AND user_data.play_count > 0 {} ORDER BY user_data.last_played_at DESC LIMIT 12",
+                "{} WHERE media_items.item_type = 'Movie' AND {media_visible} AND user_data.played = 1 AND user_data.play_count > 0 {} ORDER BY user_data.last_played_at DESC LIMIT 12",
                 crate::jellyfin::item_queries::media_item_select_sql(""),
                 parent_id.map(|_p| "AND media_items.library_id = ?").unwrap_or(""),
             ),
@@ -92,7 +88,7 @@ async fn movie_recommendations_inner(
     if recent_movies.is_empty() {
         // Category: Top rated movies
         let top_rated_sql = format!(
-            "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' AND {media_visible} AND media_items.community_rating IS NOT NULL {} ORDER BY media_items.community_rating DESC LIMIT ?",
+            "{} WHERE media_items.item_type = 'Movie' AND {media_visible} AND media_items.community_rating IS NOT NULL {} ORDER BY media_items.community_rating DESC LIMIT ?",
             crate::jellyfin::item_queries::media_item_select_sql(""),
             parent_id
                 .map(|_| "AND media_items.library_id = ?")
@@ -109,8 +105,9 @@ async fn movie_recommendations_inner(
         {
             let items = crate::jellyfin::item_queries::decode_media_items(&rows)?;
             if !items.is_empty() {
+                let items = crate::jellyfin::items::enrich_item_list(db, user_id, items).await;
                 categories.push(json!({
-                    "Items": items.into_iter().map(|i| i.to_jellyfin_json()).collect::<Vec<_>>(),
+                    "Items": items,
                     "RecommendationType": "SimilarToRecentlyPlayed",
                     "BaselineItemName": "Top Rated",
                     "CategoryId": category_counter,
@@ -124,7 +121,7 @@ async fn movie_recommendations_inner(
 
         // Category: Recently added movies
         let recent_sql = format!(
-            "{} WHERE media_items.is_folder = 1 AND media_items.item_type = 'Movie' AND {media_visible} {} ORDER BY media_items.created_at DESC LIMIT ?",
+            "{} WHERE media_items.item_type = 'Movie' AND {media_visible} {} ORDER BY media_items.created_at DESC LIMIT ?",
             crate::jellyfin::item_queries::media_item_select_sql(""),
             parent_id
                 .map(|_| "AND media_items.library_id = ?")
@@ -141,8 +138,9 @@ async fn movie_recommendations_inner(
         {
             let items = crate::jellyfin::item_queries::decode_media_items(&rows)?;
             if !items.is_empty() {
+                let items = crate::jellyfin::items::enrich_item_list(db, user_id, items).await;
                 categories.push(json!({
-                    "Items": items.into_iter().map(|i| i.to_jellyfin_json()).collect::<Vec<_>>(),
+                    "Items": items,
                     "RecommendationType": "HasActorFromRecentlyPlayed",
                     "BaselineItemName": "Recently Added",
                     "CategoryId": category_counter,
@@ -190,8 +188,9 @@ async fn movie_recommendations_inner(
             .await?;
         let items = crate::jellyfin::item_queries::decode_media_items(&items)?;
         if !items.is_empty() {
+            let items = crate::jellyfin::items::enrich_item_list(db, user_id, items).await;
             categories.push(json!({
-                "Items": items.into_iter().map(|i| i.to_jellyfin_json()).collect::<Vec<_>>(),
+                "Items": items,
                 "RecommendationType": "SimilarToRecentlyPlayed",
                 "BaselineItemName": recent_movies[0].title.clone(),
                 "CategoryId": category_counter,
@@ -247,8 +246,9 @@ async fn movie_recommendations_inner(
             .await?;
         let items = crate::jellyfin::item_queries::decode_media_items(&items)?;
         if !items.is_empty() {
+            let items = crate::jellyfin::items::enrich_item_list(db, user_id, items).await;
             categories.push(json!({
-                "Items": items.into_iter().map(|i| i.to_jellyfin_json()).collect::<Vec<_>>(),
+                "Items": items,
                 "RecommendationType": "HasActorFromRecentlyPlayed",
                 "BaselineItemName": recent_movies[0].title.clone(),
                 "CategoryId": category_counter,
@@ -274,7 +274,7 @@ pub async fn user_suggestions(
     let (sql, vals) = if let Some(pid) = parent_id {
         (
             format!(
-                "{} WHERE media_items.is_folder = 1 AND media_items.item_type IN ('Movie', 'Series') AND {visible} AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC",
+                "{} WHERE (media_items.item_type = 'Movie' OR (media_items.item_type = 'Series' AND media_items.is_folder = 1)) AND {visible} AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC",
                 crate::jellyfin::item_queries::media_item_select_sql(
                     "AND media_items.library_id = ?"
                 )
@@ -284,7 +284,7 @@ pub async fn user_suggestions(
     } else {
         (
             format!(
-                "{} WHERE media_items.is_folder = 1 AND media_items.item_type IN ('Movie', 'Series') AND {visible} AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC",
+                "{} WHERE (media_items.item_type = 'Movie' OR (media_items.item_type = 'Series' AND media_items.is_folder = 1)) AND {visible} AND COALESCE(user_data.played, 0) = 0 ORDER BY media_items.created_at DESC",
                 crate::jellyfin::item_queries::media_item_select_sql("")
             ),
             vec![user_id.clone().into()],
@@ -302,30 +302,8 @@ pub async fn user_suggestions(
             let total = items.len();
             items = items.into_iter().skip(start).take(limit).collect();
 
-            let image_tags_map = if !items.is_empty() {
-                let ids = items
-                    .iter()
-                    .map(|item| item.id.as_str())
-                    .collect::<Vec<_>>();
-                item_queries::batch_item_image_tags(&state.db, &ids)
-                    .await
-                    .unwrap_or_default()
-            } else {
-                std::collections::HashMap::new()
-            };
-
-            let json_items: Vec<Value> = items
-                .into_iter()
-                .map(|i| {
-                    let mut json = strip_nulls(i.to_jellyfin_json());
-                    if let Some(tags) = image_tags_map.get(&i.id) {
-                        if let Some(primary) = tags.get("Primary") {
-                            json["PrimaryImageTag"] = primary.clone();
-                        }
-                    }
-                    json
-                })
-                .collect();
+            let json_items =
+                crate::jellyfin::items::enrich_item_list(&state.db, &user_id, items).await;
 
             Json(json!({ "Items": json_items, "TotalRecordCount": total, "StartIndex": start }))
                 .into_response()
@@ -377,7 +355,7 @@ pub async fn home_section_items(
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(total);
                     let page = items.into_iter().skip(start).take(limit).collect();
-                    let enriched = super::enrich_resume_items(&state.db, page).await;
+                    let enriched = super::enrich_resume_items(&state.db, &user_id, page).await;
                     Json(json!({ "Items": enriched, "TotalRecordCount": total, "StartIndex": start }))
                         .into_response()
                 }

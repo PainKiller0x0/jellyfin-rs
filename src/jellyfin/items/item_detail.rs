@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::Path as FsPath, sync::Arc};
 
 use anyhow::Context;
 use axum::{
@@ -176,7 +176,7 @@ async fn item_json_with_provider_ids(
     // Combine provider_ids and image_assets into one query
     let meta_rows = db
         .query_all_raw(crate::db::helpers::pg_statement(
-            "SELECT 'provider' AS src, provider AS key, provider_item_id AS val, NULL AS etag FROM provider_ids WHERE item_id = ? UNION ALL SELECT 'image' AS src, image_type AS key, NULL AS val, etag FROM image_assets WHERE item_id = ?",
+            "SELECT 'provider' AS src, provider AS key, provider_item_id AS val, NULL AS etag FROM provider_ids WHERE item_id = ? UNION ALL SELECT 'image' AS src, image_type AS key, NULL AS val, etag FROM image_assets WHERE item_id = ? AND image_type <> 'Chapter'",
             vec![item.id.clone().into(), item.id.clone().into()],
         ))
         .await
@@ -219,38 +219,21 @@ async fn item_json_with_provider_ids(
         value["PrimaryImageTag"] = json!(primary_image_tag);
     }
 
-    // Combine genres, tags, studios into one UNION ALL query
-    let rel_rows = db
-        .query_all_raw(crate::db::helpers::pg_statement(
-            r#"SELECT 'genre' AS kind, g.id, g.name FROM genres g JOIN media_genres mg ON mg.genre_id = g.id WHERE mg.item_id = ?
-               UNION ALL
-               SELECT 'tag' AS kind, t.id, t.name FROM tags t JOIN media_tags mt ON mt.tag_id = t.id WHERE mt.item_id = ?
-               UNION ALL
-               SELECT 'studio' AS kind, s.id, s.name FROM studios s JOIN media_studios ms ON ms.studio_id = s.id WHERE ms.item_id = ?"#,
-            vec![item.id.clone().into(), item.id.clone().into(), item.id.clone().into()],
-        ))
+    let mut relation_map =
+        batch_item_relations(db, user_id, std::slice::from_ref(&item.id)).await?;
+    apply_item_relations(
+        &mut value,
+        relation_map.remove(&item.id).unwrap_or_default(),
+    );
+    let (local_trailer_count, special_feature_count) = extra_counts_for_item(db, &item).await?;
+    value["LocalTrailerCount"] = json!(local_trailer_count);
+    value["SpecialFeatureCount"] = json!(special_feature_count);
+    if let Some(part_count) = batch_additional_part_counts(db, std::slice::from_ref(&item))
         .await
-        .with_context(|| format!("failed to load relations for item: {}", item.id))?;
-
-    let mut genres = Vec::new();
-    let mut tags = Vec::new();
-    let mut studios = Vec::new();
-    for row in &rel_rows {
-        let kind = row.get_str("kind").unwrap_or_default();
-        let id = row.get_str("id").unwrap_or_default();
-        let name = row.get_str("name").unwrap_or_default();
-        let entry = json!({"Name": name, "Id": id});
-        match kind.as_str() {
-            "genre" => genres.push(entry),
-            "tag" => tags.push(entry),
-            "studio" => studios.push(entry),
-            _ => {}
-        }
+        .get(&item.id)
+    {
+        value["PartCount"] = json!(part_count);
     }
-    value["GenreItems"] = Value::Array(genres);
-    value["TagItems"] = Value::Array(tags);
-    value["Studios"] = Value::Array(studios);
-    value["People"] = Value::Array(people_values(db, &item.id, Some(user_id)).await?);
 
     // For Movie/Episode folders, load child video media sources (multi-version support)
     if (item.item_type == "Movie" || item.item_type == "Episode") && item.is_folder {
@@ -259,7 +242,7 @@ async fn item_json_with_provider_ids(
                 .await
         {
             if !sources.is_empty() {
-                attach_media_sources(&mut value, sources);
+                attach_user_media_sources(db, user_id, &item.id, &mut value, sources).await?;
             }
         }
     } else if item.item_type == "Episode" {
@@ -267,15 +250,19 @@ async fn item_json_with_provider_ids(
             crate::jellyfin::playback::episode_version_sources(db, &item, include_private_sources)
                 .await?;
         if !sources.is_empty() {
-            attach_media_sources(&mut value, sources);
+            attach_user_media_sources(db, user_id, &item.id, &mut value, sources).await?;
         } else {
             let streams = crate::jellyfin::playback::media_streams_for_item(db, &item.id)
                 .await
                 .unwrap_or_default();
-            attach_media_sources(
+            attach_user_media_sources(
+                db,
+                user_id,
+                &item.id,
                 &mut value,
                 vec![media_source_json_with_streams(&item, streams)],
-            );
+            )
+            .await?;
         }
     } else if !item.is_folder {
         // For non-folder items (Episode/Video files), load media streams from DB
@@ -285,7 +272,7 @@ async fn item_json_with_provider_ids(
         if !streams.is_empty() {
             // Rebuild MediaSources with streams included
             let source = media_source_json_with_streams(&item, streams);
-            attach_media_sources(&mut value, vec![source]);
+            attach_user_media_sources(db, user_id, &item.id, &mut value, vec![source]).await?;
         }
     }
 
@@ -413,6 +400,7 @@ async fn item_json_with_provider_ids(
                         "StartPositionTicks": ch.start_position_ticks,
                         "Name": ch.name,
                         "MarkerType": ch.marker_type,
+                        "ImageTag": ch.image_path.as_ref().zip(ch.image_date_modified).and_then(|(path, modified)| (!path.is_empty()).then(|| crate::util::stable_text_id(&format!("chapter-image:{}:{}:{modified}", ch.item_id, ch.start_position_ticks)))),
                     })
                 })
                 .collect();
@@ -422,6 +410,56 @@ async fn item_json_with_provider_ids(
     }
 
     Ok(value)
+}
+
+async fn extra_counts_for_item(
+    db: &DatabaseConnection,
+    item: &MediaItem,
+) -> anyhow::Result<(i64, i64)> {
+    let owner_id = if !item.is_folder && !item.parent_id.is_empty() {
+        item.parent_id.as_str()
+    } else {
+        item.id.as_str()
+    };
+    let visible = visible_media_item_sql("media_items");
+    let row = db
+        .query_one_raw(crate::db::helpers::pg_statement(
+            &format!(
+                r#"SELECT
+                      COALESCE(SUM(CASE WHEN extra_type = 'Trailer' OR (extra_type IS NULL AND item_type = 'Trailer') THEN 1 ELSE 0 END), 0) AS local_trailer_count,
+                      COALESCE(SUM(CASE WHEN extra_type IN ('Unknown','BehindTheScenes','Clip','DeletedScene','Interview','Sample','Scene','Featurette','Short') THEN 1 ELSE 0 END), 0) AS special_feature_count
+                   FROM media_items
+                   WHERE parent_id = ? AND is_folder = 0 AND {visible}"#
+            ),
+            vec![owner_id.into()],
+        ))
+        .await
+        .with_context(|| format!("failed to load extra counts for item: {}", item.id))?;
+    let Some(row) = row else {
+        return Ok((0, 0));
+    };
+    Ok((
+        row.get_i64("local_trailer_count").unwrap_or(0),
+        row.get_i64("special_feature_count").unwrap_or(0),
+    ))
+}
+
+async fn attach_user_media_sources(
+    db: &DatabaseConnection,
+    user_id: &str,
+    item_id: &str,
+    value: &mut Value,
+    mut sources: Vec<Value>,
+) -> anyhow::Result<()> {
+    crate::jellyfin::playback::apply_user_stream_preferences_to_sources(
+        db,
+        user_id,
+        item_id,
+        &mut sources,
+    )
+    .await?;
+    attach_media_sources(value, sources);
+    Ok(())
 }
 
 fn attach_media_sources(value: &mut Value, sources: Vec<Value>) {
@@ -442,15 +480,124 @@ fn attach_media_sources(value: &mut Value, sources: Vec<Value>) {
             .and_then(Value::as_str)
             .is_some_and(|value| value.eq_ignore_ascii_case("Subtitle"))
     });
+    let has_lyrics = all_streams.iter().any(|stream| {
+        stream
+            .get("Type")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("Lyric"))
+    });
 
     value["MediaSources"] = Value::Array(sources);
     value["MediaSourceCount"] = json!(source_count);
-    value["PartCount"] = json!(source_count);
     value["EnableMediaSourceDisplay"] = json!(source_count > 1);
     if !all_streams.is_empty() {
         value["MediaStreams"] = Value::Array(all_streams);
         value["HasSubtitles"] = json!(has_subtitles);
+        value["HasLyrics"] = json!(has_lyrics);
     }
+}
+
+async fn batch_additional_part_counts(
+    db: &DatabaseConnection,
+    items: &[MediaItem],
+) -> HashMap<String, i64> {
+    let video_items = items
+        .iter()
+        .filter(|item| matches!(item.item_type.as_str(), "Movie" | "Episode"))
+        .collect::<Vec<_>>();
+    if video_items.is_empty() {
+        return HashMap::new();
+    }
+    let collection_types = video_items
+        .iter()
+        .map(|item| (item.id.as_str(), item.collection_type.as_str()))
+        .collect::<HashMap<_, _>>();
+
+    let mut children = HashMap::<String, Vec<(String, i64, i64)>>::new();
+    for chunk in video_items.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT parent_id, path FROM media_items WHERE parent_id IN ({placeholders}) AND item_type = 'Video' AND is_public = 1"
+        );
+        let values = chunk
+            .iter()
+            .map(|item| item.id.as_str().into())
+            .collect::<Vec<sea_orm::Value>>();
+        let Ok(rows) = db
+            .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
+            .await
+        else {
+            continue;
+        };
+        for row in rows {
+            let (Ok(parent_id), Ok(path)) = (row.get_str("parent_id"), row.get_str("path")) else {
+                continue;
+            };
+            let Some(collection_type) = collection_types.get(parent_id.as_str()) else {
+                continue;
+            };
+            if let Some(stack) = stack_part_info(&path, collection_type) {
+                children.entry(parent_id).or_default().push(stack);
+            }
+        }
+    }
+
+    let mut counts = HashMap::new();
+    for item in video_items {
+        let Some(parts) = children.get(&item.id) else {
+            continue;
+        };
+        let primary =
+            stack_part_info(&item.path, &item.collection_type).map(|(key, part, _)| (key, part));
+        let primary = primary.or_else(|| {
+            let mut groups = HashMap::<&str, (usize, i64, i64)>::new();
+            for (key, part, resolution) in parts {
+                groups
+                    .entry(key)
+                    .and_modify(|group| {
+                        group.0 += 1;
+                        group.1 = group.1.min(*part);
+                        group.2 = group.2.max(*resolution);
+                    })
+                    .or_insert((1, *part, *resolution));
+            }
+            groups
+                .into_iter()
+                .filter(|(_, (count, _, _))| *count > 1)
+                .max_by_key(|(_, (_, _, resolution))| *resolution)
+                .map(|(key, (_, first_part, _))| (key.to_string(), first_part))
+        });
+        let Some((stack_key, first_part)) = primary else {
+            continue;
+        };
+        let additional = parts
+            .iter()
+            .filter(|(key, part, _)| *key == stack_key && *part > first_part)
+            .count();
+        if additional > 0 {
+            counts.insert(
+                item.id.clone(),
+                i64::try_from(additional + 1).unwrap_or(i64::MAX),
+            );
+        }
+    }
+    counts
+}
+
+fn stack_part_info(path: &str, collection_type: &str) -> Option<(String, i64, i64)> {
+    let parsed = crate::library::naming::parse_media_name(FsPath::new(path), collection_type);
+    let version = parsed.version.unwrap_or_default().to_ascii_lowercase();
+    let resolution = [
+        ("2160p", 2160),
+        ("4k", 2160),
+        ("1080p", 1080),
+        ("720p", 720),
+        ("480p", 480),
+    ]
+    .into_iter()
+    .find_map(|(needle, rank)| version.contains(needle).then_some(rank))
+    .unwrap_or_default();
+    Some((parsed.stack_key?, parsed.stack_part?, resolution))
 }
 
 fn apply_episode_parent_images(
@@ -732,90 +879,161 @@ fn display_season_name(season_number: i64) -> String {
     }
 }
 
-#[allow(dead_code)]
-async fn relation_values(
-    db: &DatabaseConnection,
-    table: &str,
-    relation_table: &str,
-    relation_column: &str,
-    item_id: &str,
-) -> anyhow::Result<Vec<Value>> {
-    let sql = format!(
-        "SELECT {table}.id, {table}.name FROM {table} JOIN {relation_table} ON {relation_table}.{relation_column} = {table}.id WHERE {relation_table}.item_id = ? ORDER BY {table}.name ASC"
-    );
-    let rows = db
-        .query_all_raw(crate::db::helpers::pg_statement(&sql, vec![item_id.into()]))
-        .await
-        .with_context(|| format!("failed to list {table} for item: {item_id}"))?;
-    rows.iter()
-        .map(|row| -> anyhow::Result<Value> {
-            Ok(json!({
-                "Id": row.get_str("id")?,
-                "Name": row.get_str("name")?,
-            }))
-        })
-        .collect()
+#[derive(Default)]
+struct ItemRelations {
+    genres: Vec<Value>,
+    tags: Vec<Value>,
+    studios: Vec<Value>,
+    people: Vec<Value>,
 }
 
-async fn people_values(
-    db: &DatabaseConnection,
-    item_id: &str,
-    user_id: Option<&str>,
-) -> anyhow::Result<Vec<Value>> {
-    let rows = db
-        .query_all_raw(crate::db::helpers::pg_statement(
-            "SELECT people.id, people.name, media_people.role, media_people.person_type, ia.etag AS primary_image_tag FROM people JOIN media_people ON media_people.person_id = people.id LEFT JOIN image_assets ia ON ia.item_id = people.id AND ia.image_type = 'Primary' WHERE media_people.item_id = ? ORDER BY media_people.sort_order ASC, people.name ASC",
-            vec![item_id.into()],
-        ))
-        .await
-        .with_context(|| format!("failed to list people for item: {item_id}"))?;
-
-    // Batch load user data for all people
-    let person_ids: Vec<String> = rows
+fn apply_item_relations(value: &mut Value, relations: ItemRelations) {
+    value["Genres"] = Value::Array(
+        relations
+            .genres
+            .iter()
+            .filter_map(|entry| entry.get("Name").cloned())
+            .collect(),
+    );
+    value["Tags"] = Value::Array(
+        relations
+            .tags
+            .iter()
+            .filter_map(|entry| entry.get("Name").cloned())
+            .collect(),
+    );
+    value["GenreItems"] = Value::Array(relations.genres);
+    value["TagItems"] = Value::Array(relations.tags);
+    value["Studios"] = Value::Array(relations.studios);
+    let artist_items = relations
+        .people
         .iter()
-        .filter_map(|r| r.get_opt_str("id").ok().flatten())
-        .collect();
-    let fav_map = if let Some(uid) = user_id {
-        if !person_ids.is_empty() {
-            let ph = person_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "SELECT item_id, is_favorite FROM user_data WHERE user_id = ? AND item_id IN ({})",
-                ph
-            );
-            let mut vals: Vec<sea_orm::Value> = vec![uid.into()];
-            for pid in &person_ids {
-                vals.push(pid.as_str().into());
-            }
-            let fav_rows = db
-                .query_all_raw(crate::db::helpers::pg_statement(&sql, vals))
-                .await?;
-            let mut m: HashMap<String, bool> = HashMap::new();
-            for r in &fav_rows {
-                if let (Ok(pid), Ok(fav)) = (r.get_str("item_id"), r.get_i64("is_favorite")) {
-                    m.insert(pid, fav != 0);
-                }
-            }
-            m
-        } else {
-            HashMap::new()
-        }
-    } else {
-        HashMap::new()
-    };
+        .filter(|person| {
+            person
+                .get("Type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("Artist"))
+        })
+        .map(|person| {
+            json!({
+                "Name": person.get("Name").cloned().unwrap_or(Value::Null),
+                "Id": person.get("Id").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect::<Vec<_>>();
+    let album_artist_items = relations
+        .people
+        .iter()
+        .filter(|person| {
+            person
+                .get("Type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("AlbumArtist"))
+        })
+        .map(|person| {
+            json!({
+                "Name": person.get("Name").cloned().unwrap_or(Value::Null),
+                "Id": person.get("Id").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect::<Vec<_>>();
+    value["Artists"] = Value::Array(
+        artist_items
+            .iter()
+            .filter_map(|artist| artist.get("Name").cloned())
+            .collect(),
+    );
+    value["ArtistItems"] = Value::Array(artist_items);
+    value["AlbumArtist"] = album_artist_items
+        .first()
+        .and_then(|artist| artist.get("Name"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    value["AlbumArtists"] = Value::Array(album_artist_items);
+    value["People"] = Value::Array(relations.people);
+}
 
-    rows.iter()
-        .map(|row| -> anyhow::Result<Value> {
-            let id = row.get_str("id")?;
-            let is_favorite = fav_map.get(&id).copied().unwrap_or(false);
-            let mut value = json!({
-                "Id": id,
+async fn batch_item_relations(
+    db: &DatabaseConnection,
+    user_id: &str,
+    item_ids: &[String],
+) -> anyhow::Result<HashMap<String, ItemRelations>> {
+    let mut result = HashMap::<String, ItemRelations>::new();
+    for chunk in item_ids.chunks(100) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            r#"SELECT mg.item_id, 'genre' AS kind, g.id, g.name
+               FROM media_genres mg JOIN genres g ON g.id = mg.genre_id
+               WHERE mg.item_id IN ({placeholders})
+               UNION ALL
+               SELECT mt.item_id, 'tag' AS kind, t.id, t.name
+               FROM media_tags mt JOIN tags t ON t.id = mt.tag_id
+               WHERE mt.item_id IN ({placeholders})
+               UNION ALL
+               SELECT ms.item_id, 'studio' AS kind, s.id, s.name
+               FROM media_studios ms JOIN studios s ON s.id = ms.studio_id
+               WHERE ms.item_id IN ({placeholders})
+               ORDER BY item_id, kind, name, id"#
+        );
+        let mut values = Vec::with_capacity(chunk.len() * 3);
+        for _ in 0..3 {
+            values.extend(chunk.iter().map(|id| id.as_str().into()));
+        }
+        let rows = db
+            .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
+            .await
+            .context("failed to batch-load item relations")?;
+        for row in &rows {
+            let item_id = row.get_str("item_id")?;
+            let entry = json!({
+                "Id": row.get_str("id")?,
+                "Name": row.get_str("name")?,
+            });
+            let relations = result.entry(item_id).or_default();
+            match row.get_str("kind")?.as_str() {
+                "genre" => relations.genres.push(entry),
+                "tag" => relations.tags.push(entry),
+                "studio" => relations.studios.push(entry),
+                _ => {}
+            }
+        }
+
+        let people_sql = format!(
+            r#"SELECT mp.item_id, people.id, people.name, people.tmdb_id,
+                      mp.role, mp.person_type,
+                      COALESCE(ud.is_favorite, 0) AS is_favorite,
+                      (SELECT ia.etag FROM image_assets ia
+                       WHERE ia.item_id = people.id AND ia.image_type = 'Primary'
+                       ORDER BY ia.image_index ASC, ia.id ASC LIMIT 1) AS primary_image_tag
+               FROM media_people mp
+               JOIN people ON people.id = mp.person_id
+               LEFT JOIN user_data ud ON ud.item_id = people.id AND ud.user_id = ?
+               WHERE mp.item_id IN ({placeholders})
+               ORDER BY mp.item_id, mp.sort_order ASC, people.name ASC, people.id ASC, mp.person_type ASC"#
+        );
+        let mut values: Vec<sea_orm::Value> = vec![user_id.into()];
+        values.extend(chunk.iter().map(|id| id.as_str().into()));
+        let people_rows = db
+            .query_all_raw(crate::db::helpers::pg_statement(&people_sql, values))
+            .await
+            .context("failed to batch-load item people")?;
+        for row in &people_rows {
+            let item_id = row.get_str("item_id")?;
+            let person_id = row.get_str("id")?;
+            let mut provider_ids = serde_json::Map::new();
+            if let Some(tmdb_id) = row.get_opt_str("tmdb_id")?.filter(|id| !id.is_empty()) {
+                provider_ids.insert("Tmdb".to_string(), json!(tmdb_id));
+            }
+            let mut person = json!({
+                "Id": person_id,
                 "Name": row.get_str("name")?,
                 "Role": row.get_opt_str("role")?,
                 "Type": row.get_opt_str("person_type")?,
+                "ProviderIds": provider_ids,
                 "UserData": {
-                    "ItemId": id,
-                    "Key": id,
-                    "IsFavorite": is_favorite,
+                    "ItemId": person_id,
+                    "Key": person_id,
+                    "IsFavorite": row.get_i64("is_favorite").unwrap_or(0) != 0,
                     "Played": false,
                     "PlayCount": 0,
                     "PlaybackPositionTicks": 0,
@@ -826,23 +1044,26 @@ async fn people_values(
                     "UnplayedItemCount": null,
                 },
             });
-            if let Some(tag) = row.get_opt_str("primary_image_tag")? {
-                if !tag.is_empty() {
-                    value["PrimaryImageTag"] = json!(tag);
-                }
+            if let Some(tag) = row
+                .get_opt_str("primary_image_tag")?
+                .filter(|tag| !tag.is_empty())
+            {
+                person["PrimaryImageTag"] = json!(tag);
             }
-            Ok(value)
-        })
-        .collect()
+            result.entry(item_id).or_default().people.push(person);
+        }
+    }
+    Ok(result)
 }
 
-/// Batch-enrich episode, season, and series list items with Jellyfin-compatible
-/// parent links, counts, and inherited image tags.
-pub async fn enrich_episode_list(
+/// Batch-enrich BaseItemDto list items with persisted metadata relations,
+/// provider IDs, media sources, and TV parent/count fields.
+pub async fn enrich_item_list(
     db: &DatabaseConnection,
     user_id: &str,
-    items: Vec<MediaItem>,
+    mut items: Vec<MediaItem>,
 ) -> Vec<Value> {
+    let _ = crate::jellyfin::item_queries::attach_item_image_tags(db, &mut items).await;
     // Collect unique episode parent IDs and season IDs for parent lookups.
     let parent_lookup_ids: Vec<&str> = items
         .iter()
@@ -883,6 +1104,9 @@ pub async fn enrich_episode_list(
 
     let item_ids: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
     let provider_map = crate::jellyfin::item_queries::batch_item_provider_ids(db, &item_ids)
+        .await
+        .unwrap_or_default();
+    let mut relation_map = batch_item_relations(db, user_id, &item_ids)
         .await
         .unwrap_or_default();
 
@@ -994,7 +1218,8 @@ pub async fn enrich_episode_list(
         }
     }
 
-    let media_source_map = list_media_source_map(db, &items).await;
+    let media_source_map = list_media_source_map(db, user_id, &items).await;
+    let additional_part_counts = batch_additional_part_counts(db, &items).await;
 
     let mut enriched_items = Vec::with_capacity(items.len());
     for item in items {
@@ -1002,6 +1227,7 @@ pub async fn enrich_episode_list(
         if let Some(provider_ids) = provider_map.get(&item.id) {
             val["ProviderIds"] = provider_ids.clone();
         }
+        apply_item_relations(&mut val, relation_map.remove(&item.id).unwrap_or_default());
         if item.item_type == "Episode" {
             if let Some(parent_info) = parent_info_map.get(&item.parent_id) {
                 apply_episode_parent_info(
@@ -1046,13 +1272,25 @@ pub async fn enrich_episode_list(
         if let Some(sources) = media_source_map.get(&item.id) {
             attach_media_sources(&mut val, sources.clone());
         }
+        if let Some(part_count) = additional_part_counts.get(&item.id) {
+            val["PartCount"] = json!(part_count);
+        }
         enriched_items.push(strip_nulls(val));
     }
     enriched_items
 }
 
+pub async fn enrich_episode_list(
+    db: &DatabaseConnection,
+    user_id: &str,
+    items: Vec<MediaItem>,
+) -> Vec<Value> {
+    enrich_item_list(db, user_id, items).await
+}
+
 async fn list_media_source_map(
     db: &DatabaseConnection,
+    user_id: &str,
     items: &[MediaItem],
 ) -> HashMap<String, Vec<Value>> {
     let mut source_map = HashMap::new();
@@ -1086,24 +1324,29 @@ async fn list_media_source_map(
         .filter(|item| is_direct_playable_list_item(item))
         .filter(|item| !source_map.contains_key(&item.id))
         .collect::<Vec<_>>();
-    if direct_items.is_empty() {
-        return source_map;
+    if !direct_items.is_empty() {
+        let direct_ids = direct_items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        let stream_map = crate::jellyfin::playback::media_streams_for_items(db, &direct_ids)
+            .await
+            .unwrap_or_default();
+        for item in direct_items {
+            let streams = stream_map.get(&item.id).cloned().unwrap_or_default();
+            source_map.insert(
+                item.id.clone(),
+                vec![media_source_json_with_streams(item, streams)],
+            );
+        }
     }
 
-    let direct_ids = direct_items
-        .iter()
-        .map(|item| item.id.clone())
-        .collect::<Vec<_>>();
-    let stream_map = crate::jellyfin::playback::media_streams_for_items(db, &direct_ids)
-        .await
-        .unwrap_or_default();
-    for item in direct_items {
-        let streams = stream_map.get(&item.id).cloned().unwrap_or_default();
-        source_map.insert(
-            item.id.clone(),
-            vec![media_source_json_with_streams(item, streams)],
-        );
-    }
+    let _ = crate::jellyfin::playback::apply_user_stream_preferences_to_source_map(
+        db,
+        user_id,
+        &mut source_map,
+    )
+    .await;
 
     source_map
 }
@@ -1116,120 +1359,71 @@ fn is_direct_playable_list_item(item: &MediaItem) -> bool {
         )
 }
 
-pub async fn enrich_resume_items(db: &DatabaseConnection, items: Vec<MediaItem>) -> Vec<Value> {
-    use std::collections::HashMap;
-
-    // Collect parent_ids for Episode items to look up series info
-    let parent_ids: Vec<&str> = items
+pub async fn enrich_resume_items(
+    db: &DatabaseConnection,
+    user_id: &str,
+    items: Vec<MediaItem>,
+) -> Vec<Value> {
+    let item_state = items
         .iter()
-        .filter(|i| i.item_type == "Episode")
-        .map(|i| i.parent_id.as_str())
-        .collect();
-
-    let parent_info_map = batch_episode_parent_info(db, &parent_ids).await;
-
-    let mut source_map: HashMap<String, Vec<Value>> = HashMap::new();
-    if !items.is_empty() {
-        for item in &items {
-            if item.is_folder {
-                // Folder items (Movie/Episode) - load child video sources
-                if let Ok(sources) =
-                    crate::jellyfin::playback::child_video_sources(db, &item.id, false).await
-                {
-                    if !sources.is_empty() {
-                        source_map.insert(item.id.clone(), sources);
-                    }
-                }
-            } else {
-                // Non-folder items - build MediaSource directly from the item itself
-                let stream_jsons = crate::jellyfin::playback::media_streams_for_item(db, &item.id)
-                    .await
-                    .unwrap_or_default();
-                let source = media_source_json_with_streams(item, stream_jsons);
-                source_map.insert(item.id.clone(), vec![source]);
+        .map(|item| {
+            (
+                item.item_type == "Episode",
+                item.runtime_ticks,
+                item.played_percentage,
+                item.playback_position_ticks,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut values = enrich_item_list(db, user_id, items).await;
+    for (value, (is_episode, runtime_ticks, played_percentage, playback_position_ticks)) in
+        values.iter_mut().zip(item_state)
+    {
+        if is_episode {
+            value["SupportsResume"] = json!(true);
+        }
+        if let Some(runtime_ticks) = runtime_ticks {
+            if value.get("RunTimeTicks").and_then(Value::as_i64).is_none() {
+                value["RunTimeTicks"] = json!(runtime_ticks);
             }
         }
-    }
-
-    items
-        .into_iter()
-        .map(|item| {
-            let mut value = item.to_jellyfin_json();
-
-            // Enrich Episode items with series/season info
-            if item.item_type == "Episode" {
-                if let Some(parent_info) = parent_info_map.get(&item.parent_id) {
-                    value["SeriesName"] = json!(parent_info.series_name.clone());
-                    value["SeriesId"] = json!(parent_info.series_id.clone());
-                    let season_name = parent_info
-                        .season_name
-                        .clone()
-                        .or_else(|| item.season_number.map(display_season_name));
-                    if let Some(season_name) = season_name {
-                        value["SeasonName"] = json!(season_name);
-                        value["SeasonId"] =
-                            json!(parent_info.season_id.as_deref().unwrap_or(&item.parent_id));
-                    }
-                }
-                value["SupportsResume"] = json!(true);
-            }
-
-            // Add MediaSources if available
-            if let Some(sources) = source_map.get(&item.id) {
-                if !sources.is_empty() {
-                    attach_media_sources(&mut value, sources.clone());
-
-                    // Get RunTimeTicks from first source if item doesn't have it
-                    if item.runtime_ticks.is_none() {
-                        if let Some(rt) = sources
-                            .first()
-                            .and_then(|s| s.get("RunTimeTicks"))
-                            .and_then(Value::as_i64)
-                            .filter(|v| *v > 0)
-                        {
-                            value["RunTimeTicks"] = json!(rt);
-                        }
-                    }
-                }
-            }
-
-            // Ensure RunTimeTicks is set from item if available
-            if item.runtime_ticks.is_some()
-                && value.get("RunTimeTicks").and_then(Value::as_i64).is_none()
+        if played_percentage.is_none() && playback_position_ticks > 0 {
+            if let Some(runtime_ticks) = value
+                .get("RunTimeTicks")
+                .and_then(Value::as_i64)
+                .filter(|runtime| *runtime > 0)
             {
-                value["RunTimeTicks"] = json!(item.runtime_ticks);
+                value["UserData"]["PlayedPercentage"] = json!(
+                    (playback_position_ticks as f64 / runtime_ticks as f64 * 100.0).min(100.0)
+                );
             }
-
-            // Calculate PlayedPercentage if not set
-            if item.played_percentage.is_none() && item.playback_position_ticks > 0 {
-                if let Some(rt) = value
-                    .get("RunTimeTicks")
-                    .and_then(Value::as_i64)
-                    .filter(|v| *v > 0)
-                {
-                    let pct = (item.playback_position_ticks as f64 / rt as f64 * 100.0).min(100.0);
-                    if let Some(ud) = value.get_mut("UserData") {
-                        ud["PlayedPercentage"] = json!(pct);
-                    }
-                }
-            }
-
-            strip_nulls(value)
-        })
-        .collect()
+        }
+        *value = strip_nulls(std::mem::take(value));
+    }
+    values
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_media_sources, enrich_episode_list, get_episode_parent_info,
-        item_json_with_provider_ids,
+        ItemRelations, apply_item_relations, attach_media_sources, batch_additional_part_counts,
+        enrich_episode_list, get_episode_parent_info, item_json_with_provider_ids,
     };
     use crate::entities::{
+        genres::{self, Entity as Genres},
         image_assets::{self, Entity as ImageAssets},
         libraries::{self, Entity as Libraries},
+        media_genres::{self, Entity as MediaGenres},
         media_items::{self, Entity as MediaItems},
+        media_people::{self, Entity as MediaPeople},
         media_streams::{self, Entity as MediaStreams},
+        media_studios::{self, Entity as MediaStudios},
+        media_tags::{self, Entity as MediaTags},
+        people::{self, Entity as People},
+        studios::{self, Entity as Studios},
+        tags::{self, Entity as Tags},
+        user_data::{self, Entity as UserData},
+        users::{self, Entity as Users},
     };
     use sea_orm::{DatabaseConnection, EntityTrait, Set};
     use serde_json::json;
@@ -1265,6 +1459,61 @@ mod tests {
         assert!(streams.iter().any(|stream| stream["Type"] == "Subtitle"));
         assert_eq!(value["MediaSourceCount"], 1);
         assert_eq!(value["EnableMediaSourceDisplay"], false);
+        assert!(value.get("PartCount").is_none());
+    }
+
+    #[tokio::test]
+    async fn stacked_movie_part_count_is_not_alternate_version_count() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        insert_library(&db, "movies-parts", "Movies", "movies").await;
+        insert_item_with_path(
+            &db,
+            "movie-parts",
+            "Movie",
+            "/tmp/movie-parts",
+            "movies-parts",
+            "movies-parts",
+            "Movie",
+            1,
+            1,
+            None,
+            None,
+            None,
+        )
+        .await;
+        for (id, path) in [
+            ("movie-cd1", "/tmp/movie-parts/Movie - cd1.mkv"),
+            ("movie-cd2", "/tmp/movie-parts/Movie - cd2.mkv"),
+        ] {
+            insert_item_with_path(
+                &db,
+                id,
+                id,
+                path,
+                "movies-parts",
+                "movie-parts",
+                "Video",
+                0,
+                1,
+                Some("mkv"),
+                None,
+                None,
+            )
+            .await;
+        }
+        let item =
+            crate::jellyfin::item_queries::find_media_item_for_admin(&db, "u1", "movie-parts")
+                .await
+                .unwrap()
+                .unwrap();
+
+        let counts = batch_additional_part_counts(&db, std::slice::from_ref(&item)).await;
+        assert_eq!(counts.get("movie-parts"), Some(&2));
+        let enriched = enrich_episode_list(&db, "u1", vec![item]).await;
+        assert_eq!(enriched[0]["PartCount"], 2);
+        assert_eq!(enriched[0]["MediaSourceCount"], 1);
     }
 
     #[test]
@@ -1481,6 +1730,216 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn item_detail_counts_local_extras_by_extra_type() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        insert_library(&db, "movies", "Movies", "movies").await;
+        insert_item_with_path(
+            &db,
+            "movie",
+            "Movie",
+            "/movies/Movie",
+            "movies",
+            "movies",
+            "Movie",
+            1,
+            1,
+            None,
+            None,
+            None,
+        )
+        .await;
+        insert_extra_item(
+            &db,
+            "trailer",
+            "Trailer",
+            "/movies/Movie/trailers/Trailer.mkv",
+            "movies",
+            "movie",
+            "Trailer",
+            "Trailer",
+            1,
+        )
+        .await;
+        insert_extra_item(
+            &db,
+            "behind",
+            "Behind the Scenes",
+            "/movies/Movie/extras/Behind the Scenes.mkv",
+            "movies",
+            "movie",
+            "Video",
+            "BehindTheScenes",
+            1,
+        )
+        .await;
+        insert_extra_item(
+            &db,
+            "hidden-behind",
+            "Hidden Behind the Scenes",
+            "/movies/Movie/extras/Hidden Behind the Scenes.mkv",
+            "movies",
+            "movie",
+            "Video",
+            "BehindTheScenes",
+            0,
+        )
+        .await;
+
+        let movie = crate::jellyfin::item_queries::find_media_item_for_admin(&db, "u1", "movie")
+            .await
+            .unwrap()
+            .unwrap();
+        let movie_json = item_json_with_provider_ids(&db, "u1", movie, true)
+            .await
+            .unwrap();
+
+        assert_eq!(movie_json["LocalTrailerCount"], 1);
+        assert_eq!(movie_json["SpecialFeatureCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn list_relations_match_item_detail_without_n_plus_one() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        insert_library(&db, "movies", "Movies", "movies").await;
+        insert_item(&db, "movie", "Movie", "movies", "Movie", 1, 1, None, None).await;
+        Users::insert(users::ActiveModel {
+            id: Set("u1".to_string()),
+            username: Set("u1".to_string()),
+            display_name: Set("User".to_string()),
+            is_admin: Set(0),
+            is_disabled: Set(0),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+
+        for (id, name) in [("genre-drama", "Drama"), ("genre-action", "Action")] {
+            Genres::insert(genres::ActiveModel {
+                id: Set(id.to_string()),
+                name: Set(name.to_string()),
+                created_at: Set(1),
+            })
+            .exec_without_returning(&db)
+            .await
+            .unwrap();
+            MediaGenres::insert(media_genres::ActiveModel {
+                item_id: Set("movie".to_string()),
+                genre_id: Set(id.to_string()),
+            })
+            .exec_without_returning(&db)
+            .await
+            .unwrap();
+        }
+        Tags::insert(tags::ActiveModel {
+            id: Set("tag-restored".to_string()),
+            name: Set("Restored".to_string()),
+            created_at: Set(1),
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+        MediaTags::insert(media_tags::ActiveModel {
+            item_id: Set("movie".to_string()),
+            tag_id: Set("tag-restored".to_string()),
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+        Studios::insert(studios::ActiveModel {
+            id: Set("studio-one".to_string()),
+            name: Set("Studio One".to_string()),
+            created_at: Set(1),
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+        MediaStudios::insert(media_studios::ActiveModel {
+            item_id: Set("movie".to_string()),
+            studio_id: Set("studio-one".to_string()),
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+
+        for (id, name, person_type, role, sort_order) in [
+            ("director", "Director", "Director", None, 1),
+            ("actor", "Actor", "Actor", Some("Lead"), 2),
+        ] {
+            People::insert(people::ActiveModel {
+                id: Set(id.to_string()),
+                name: Set(name.to_string()),
+                created_at: Set(1),
+                overview: Set(None),
+                tmdb_id: Set((id == "actor").then(|| "123".to_string())),
+                ..Default::default()
+            })
+            .exec_without_returning(&db)
+            .await
+            .unwrap();
+            MediaPeople::insert(media_people::ActiveModel {
+                item_id: Set("movie".to_string()),
+                person_id: Set(id.to_string()),
+                person_type: Set(person_type.to_string()),
+                role: Set(role.map(ToString::to_string)),
+                sort_order: Set(sort_order),
+            })
+            .exec_without_returning(&db)
+            .await
+            .unwrap();
+        }
+        insert_image(&db, "actor-primary", "actor", "Primary", "actor-tag").await;
+        UserData::insert(user_data::ActiveModel {
+            user_id: Set("u1".to_string()),
+            item_id: Set("director".to_string()),
+            is_favorite: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+
+        let detail_item =
+            crate::jellyfin::item_queries::find_media_item_for_admin(&db, "u1", "movie")
+                .await
+                .unwrap()
+                .unwrap();
+        let list_item = detail_item.clone();
+        let detail = crate::jellyfin::common::strip_nulls(
+            item_json_with_provider_ids(&db, "u1", detail_item, true)
+                .await
+                .unwrap(),
+        );
+        let list = enrich_episode_list(&db, "u1", vec![list_item]).await;
+        let list = &list[0];
+
+        for key in [
+            "Genres",
+            "GenreItems",
+            "Tags",
+            "TagItems",
+            "Studios",
+            "People",
+        ] {
+            assert_eq!(list[key], detail[key], "field {key} differs");
+        }
+        assert_eq!(list["Genres"], json!(["Action", "Drama"]));
+        assert_eq!(list["People"][0]["Id"], "director");
+        assert_eq!(list["People"][0]["UserData"]["IsFavorite"], true);
+        assert_eq!(list["People"][1]["Id"], "actor");
+        assert_eq!(list["People"][1]["Role"], "Lead");
+        assert_eq!(list["People"][1]["PrimaryImageTag"], "actor-tag");
+        assert_eq!(list["People"][1]["ProviderIds"]["Tmdb"], "123");
+    }
+
+    #[tokio::test]
     async fn media_library_list_exposes_external_subtitle_streams() {
         let Some(db) = crate::db::test_db().await else {
             return;
@@ -1679,6 +2138,38 @@ mod tests {
         .unwrap();
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_extra_item(
+        db: &DatabaseConnection,
+        id: &str,
+        title: &str,
+        path: &str,
+        library_id: &str,
+        parent_id: &str,
+        item_type: &str,
+        extra_type: &str,
+        is_public: i64,
+    ) {
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(title.to_string()),
+            path: Set(path.to_string()),
+            library_id: Set(library_id.to_string()),
+            parent_id: Set(parent_id.to_string()),
+            item_type: Set(item_type.to_string()),
+            extra_type: Set(Some(extra_type.to_string())),
+            is_folder: Set(0),
+            is_public: Set(is_public),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(db)
+        .await
+        .unwrap();
+    }
+
     async fn insert_image(
         db: &DatabaseConnection,
         id: &str,
@@ -1732,5 +2223,33 @@ mod tests {
         .exec_without_returning(db)
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn artist_people_populate_jellyfin_artist_fields() {
+        let mut value = json!({});
+        apply_item_relations(
+            &mut value,
+            ItemRelations {
+                people: vec![
+                    json!({"Id": "artist-1", "Name": "Artist One", "Type": "Artist"}),
+                    json!({"Id": "album-artist-1", "Name": "Album Artist", "Type": "AlbumArtist"}),
+                    json!({"Id": "actor-1", "Name": "Actor One", "Type": "Actor"}),
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(value["Artists"], json!(["Artist One"]));
+        assert_eq!(
+            value["ArtistItems"],
+            json!([{"Id": "artist-1", "Name": "Artist One"}])
+        );
+        assert_eq!(value["AlbumArtist"], "Album Artist");
+        assert_eq!(
+            value["AlbumArtists"],
+            json!([{"Id": "album-artist-1", "Name": "Album Artist"}])
+        );
+        assert_eq!(value["People"].as_array().unwrap().len(), 3);
     }
 }

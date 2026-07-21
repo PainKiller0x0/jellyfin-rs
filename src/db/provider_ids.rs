@@ -40,3 +40,55 @@ pub async fn upsert(
     .with_context(|| format!("failed to upsert {provider} provider id for item {item_id}"))?;
     Ok(())
 }
+
+pub async fn upsert_many(
+    db: &DatabaseConnection,
+    item_id: &str,
+    provider_ids: &[(String, String)],
+) -> anyhow::Result<()> {
+    if provider_ids.is_empty() {
+        return Ok(());
+    }
+    ProviderIds::insert_many(provider_ids.iter().map(|(provider, provider_item_id)| {
+        provider_ids::ActiveModel {
+            item_id: Set(item_id.to_string()),
+            provider: Set(provider.clone()),
+            provider_item_id: Set(provider_item_id.clone()),
+        }
+    }))
+    .on_conflict(
+        OnConflict::columns([provider_ids::Column::ItemId, provider_ids::Column::Provider])
+            .update_column(provider_ids::Column::ProviderItemId)
+            .to_owned(),
+    )
+    .exec_without_returning(db)
+    .await
+    .with_context(|| format!("failed to batch upsert provider ids for item {item_id}"))?;
+    Ok(())
+}
+
+pub async fn insert_missing_many(
+    db: &DatabaseConnection,
+    item_id: &str,
+    provider_ids: &[(String, String)],
+) -> anyhow::Result<()> {
+    if provider_ids.is_empty() {
+        return Ok(());
+    }
+    ProviderIds::insert_many(provider_ids.iter().map(|(provider, provider_item_id)| {
+        provider_ids::ActiveModel {
+            item_id: Set(item_id.to_string()),
+            provider: Set(provider.clone()),
+            provider_item_id: Set(provider_item_id.clone()),
+        }
+    }))
+    .on_conflict(
+        OnConflict::columns([provider_ids::Column::ItemId, provider_ids::Column::Provider])
+            .do_nothing()
+            .to_owned(),
+    )
+    .exec_without_returning(db)
+    .await
+    .with_context(|| format!("failed to batch insert missing provider ids for item {item_id}"))?;
+    Ok(())
+}

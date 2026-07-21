@@ -11,6 +11,132 @@ use crate::{
     util::{now_unix, stable_text_id},
 };
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ExternalAudioMetadata {
+    language: Option<String>,
+    title: Option<String>,
+    is_default: bool,
+    is_forced: bool,
+    is_hearing_impaired: bool,
+}
+
+pub async fn upsert_sidecar_audio(
+    db: &DatabaseConnection,
+    media_path: &Path,
+    item_id: &str,
+) -> anyhow::Result<()> {
+    let candidates = external_audio_candidates(media_path);
+    let streams = tokio::task::spawn_blocking(move || {
+        let mut streams = Vec::new();
+        for (path, metadata) in candidates {
+            let Some(probe) = crate::library::probe::probe_media(&path) else {
+                tracing::warn!("failed to probe external audio file {}", path.display());
+                continue;
+            };
+            for mut stream in probe
+                .streams
+                .into_iter()
+                .filter(|stream| stream.stream_type == "Audio")
+            {
+                stream.language = metadata.language.clone().or(stream.language);
+                stream.title = metadata.title.clone().or(stream.title);
+                stream.is_default = metadata.is_default;
+                stream.is_forced |= metadata.is_forced;
+                stream.is_hearing_impaired |= metadata.is_hearing_impaired;
+                streams.push((path.to_string_lossy().to_string(), stream));
+            }
+        }
+        streams
+    })
+    .await
+    .context("external audio probe task failed")?;
+
+    crate::library::storage::replace_external_audio_streams(db, item_id, &streams).await
+}
+
+pub async fn clear_sidecar_audio(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<()> {
+    crate::library::storage::replace_external_audio_streams(db, item_id, &[]).await
+}
+
+fn external_audio_candidates(
+    media_path: &Path,
+) -> Vec<(std::path::PathBuf, ExternalAudioMetadata)> {
+    let Some(parent) = media_path.parent() else {
+        return Vec::new();
+    };
+    let Some(media_stem) = media_path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Vec::new();
+    };
+    let mut candidates = std::fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() || !crate::library::classify::is_audio_path(&path) {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?;
+            external_audio_metadata(stem, media_stem).map(|metadata| (path, metadata))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    candidates
+}
+
+fn external_audio_metadata(stem: &str, media_stem: &str) -> Option<ExternalAudioMetadata> {
+    let prefix = stem.get(..media_stem.len())?;
+    if !prefix.eq_ignore_ascii_case(media_stem) {
+        return None;
+    }
+    let suffix = stem.get(media_stem.len()..)?;
+    if !suffix.is_empty() && !suffix.starts_with('.') {
+        return None;
+    }
+
+    let mut metadata = ExternalAudioMetadata::default();
+    let mut title = Vec::new();
+    for token in suffix.trim_start_matches('.').split('.') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.to_ascii_lowercase().as_str() {
+            "default" => metadata.is_default = true,
+            "foreign" | "forced" => metadata.is_forced = true,
+            "cc" | "hi" | "sdh" => metadata.is_hearing_impaired = true,
+            _ => {
+                if let Some(language) = normalize_external_language(token) {
+                    metadata.language.get_or_insert(language);
+                } else {
+                    title.push(token.to_string());
+                }
+            }
+        }
+    }
+    metadata.title = (!title.is_empty()).then(|| title.join("."));
+    Some(metadata)
+}
+
+fn normalize_external_language(language: &str) -> Option<String> {
+    let language = language.to_ascii_lowercase();
+    let normalized = match language.as_str() {
+        "chs" | "zh" | "zho" | "chi" | "cn" => "zh-CN",
+        "cht" | "tc" | "zh-tw" => "zh-TW",
+        "en" | "eng" => "en",
+        "ja" | "jpn" => "ja",
+        "ko" | "kor" => "ko",
+        "fr" | "fra" | "fre" => "fr",
+        "de" | "deu" | "ger" => "de",
+        "es" | "spa" => "es",
+        "it" | "ita" => "it",
+        "pt" | "por" | "pt-br" => language.as_str(),
+        "ru" | "rus" => "ru",
+        _ => return None,
+    };
+    Some(normalized.to_string())
+}
+
 pub async fn upsert_sidecar_subtitles(
     db: &DatabaseConnection,
     media_path: &Path,
@@ -38,7 +164,7 @@ pub async fn upsert_sidecar_subtitles(
 pub async fn clear_sidecar_subtitles(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<()> {
     let streams = MediaStreams::find()
         .filter(media_streams::Column::ItemId.eq(item_id))
-        .filter(media_streams::Column::IsExternal.eq(1))
+        .filter(media_streams::Column::IsExternal.eq(1_i64))
         .all(db)
         .await
         .context("failed to read existing subtitle streams")?;
@@ -151,7 +277,7 @@ fn is_subtitle_path_str(path: &str) -> bool {
 fn is_subtitle_extension(extension: &str) -> bool {
     matches!(
         extension.to_ascii_lowercase().as_str(),
-        "srt" | "ass" | "ssa" | "vtt" | "sub" | "smi" | "sami" | "mpl"
+        "ass" | "mks" | "sami" | "smi" | "srt" | "ssa" | "sub" | "sup" | "vtt" | "mpl"
     )
 }
 
@@ -279,6 +405,108 @@ mod tests {
             Path::new("绝命毒师.2008.S01E02.chs.ass"),
             "绝命毒师.2008.S01E01.第1集.1080p.BluRay.Remux.SDR.H.264"
         ));
+    }
+
+    #[test]
+    fn jellyfin_subtitle_extensions_are_recognized() {
+        for file in ["movie.mks", "movie.sup", "movie.sami"] {
+            assert!(is_subtitle_path(Path::new(file)), "{file}");
+        }
+    }
+
+    #[test]
+    fn external_audio_name_flags_follow_jellyfin_parser() {
+        let metadata =
+            external_audio_metadata("Movie.eng.commentary.default.forced.sdh", "Movie").unwrap();
+        assert_eq!(metadata.language.as_deref(), Some("en"));
+        assert_eq!(metadata.title.as_deref(), Some("commentary"));
+        assert!(metadata.is_default);
+        assert!(metadata.is_forced);
+        assert!(metadata.is_hearing_impaired);
+
+        assert!(external_audio_metadata("Movie.flac", "Movie").is_some());
+        assert!(external_audio_metadata("MovieExtended.eng", "Movie").is_none());
+    }
+
+    #[tokio::test]
+    async fn external_audio_streams_are_stable_after_embedded_streams() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        Libraries::insert(libraries::ActiveModel {
+            id: Set("external-audio-lib".to_string()),
+            name: Set("Movies".to_string()),
+            collection_type: Set("movies".to_string()),
+            created_at: Set(1),
+            updated_at: Set(1),
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+        MediaItems::insert(media_items::ActiveModel {
+            id: Set("external-audio-movie".to_string()),
+            title: Set("Movie".to_string()),
+            path: Set("/tmp/external-audio-movie.mkv".to_string()),
+            library_id: Set("external-audio-lib".to_string()),
+            parent_id: Set("external-audio-lib".to_string()),
+            item_type: Set("Movie".to_string()),
+            is_folder: Set(0),
+            is_public: Set(1),
+            modified_at: Set(1),
+            created_at: Set(1),
+            updated_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+        MediaStreams::insert(media_streams::ActiveModel {
+            id: Set("external-audio-video".to_string()),
+            item_id: Set("external-audio-movie".to_string()),
+            stream_index: Set(0),
+            stream_type: Set("Video".to_string()),
+            codec: Set(Some("h264".to_string())),
+            created_at: Set(1),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+        let streams = vec![(
+            "/tmp/external-audio-movie.eng.flac".to_string(),
+            crate::library::probe::ProbedStream {
+                stream_index: 0,
+                stream_type: "Audio".to_string(),
+                codec: Some("flac".to_string()),
+                language: Some("en".to_string()),
+                ..Default::default()
+            },
+        )];
+
+        for _ in 0..2 {
+            crate::library::storage::replace_external_audio_streams(
+                &db,
+                "external-audio-movie",
+                &streams,
+            )
+            .await
+            .unwrap();
+            let external = MediaStreams::find()
+                .filter(media_streams::Column::ItemId.eq("external-audio-movie"))
+                .filter(media_streams::Column::IsExternal.eq(1_i64))
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(external.stream_index, 1);
+            assert_eq!(external.stream_type, "Audio");
+            assert_eq!(external.codec.as_deref(), Some("flac"));
+            assert_eq!(external.language.as_deref(), Some("en"));
+            assert_eq!(
+                external.path.as_deref(),
+                Some("/tmp/external-audio-movie.eng.flac")
+            );
+        }
     }
 
     #[tokio::test]

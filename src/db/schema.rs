@@ -43,7 +43,7 @@ pub fn migrations() -> Vec<Migration> {
             "failed to create library paths library index",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS media_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, path TEXT NOT NULL UNIQUE, library_id TEXT NOT NULL, parent_id TEXT NOT NULL, item_type TEXT NOT NULL, is_folder BIGINT NOT NULL DEFAULT 0, is_public BIGINT NOT NULL DEFAULT 1, container TEXT, overview TEXT, official_rating TEXT, extended_video_type TEXT, production_year BIGINT, premiere_date TEXT, runtime_ticks BIGINT, size_bytes BIGINT, season_number BIGINT, episode_number BIGINT, modified_at BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL DEFAULT 0)"#,
+            r#"CREATE TABLE IF NOT EXISTS media_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, path TEXT NOT NULL UNIQUE, library_id TEXT NOT NULL, parent_id TEXT NOT NULL, item_type TEXT NOT NULL, extra_type TEXT, video_type TEXT, iso_type TEXT, video_3d_format TEXT, is_folder BIGINT NOT NULL DEFAULT 0, is_public BIGINT NOT NULL DEFAULT 1, container TEXT, overview TEXT, official_rating TEXT, custom_rating TEXT, extended_video_type TEXT, original_title TEXT, sort_name TEXT, forced_sort_name TEXT, lock_data BIGINT NOT NULL DEFAULT 0, locked_fields TEXT, tagline TEXT, collection_name TEXT, original_language TEXT, preferred_metadata_language TEXT, preferred_metadata_country_code TEXT, series_status TEXT, air_days TEXT, air_time TEXT, home_page_url TEXT, remote_trailers TEXT, production_locations TEXT, production_year BIGINT, premiere_date TEXT, end_date TEXT, runtime_ticks BIGINT, aspect_ratio TEXT, width BIGINT, height BIGINT, has_subtitles BIGINT NOT NULL DEFAULT 0, photo_metadata TEXT, display_order TEXT, size_bytes BIGINT, season_number BIGINT, episode_number BIGINT, episode_number_end BIGINT, airs_before_episode_number BIGINT, airs_after_season_number BIGINT, airs_before_season_number BIGINT, series_name TEXT, tmdb_metadata_version BIGINT NOT NULL DEFAULT 0, modified_at BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL DEFAULT 0)"#,
             "failed to migrate media_items",
         ),
         (
@@ -63,7 +63,7 @@ pub fn migrations() -> Vec<Migration> {
             "failed to create media stream item index",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS user_data (user_id TEXT NOT NULL, item_id TEXT NOT NULL, is_favorite BIGINT NOT NULL DEFAULT 0, played BIGINT NOT NULL DEFAULT 0, playback_position_ticks BIGINT NOT NULL DEFAULT 0, played_percentage DOUBLE PRECISION, play_count BIGINT NOT NULL DEFAULT 0, last_played_at BIGINT, updated_at BIGINT NOT NULL, PRIMARY KEY(user_id, item_id), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"#,
+            r#"CREATE TABLE IF NOT EXISTS user_data (user_id TEXT NOT NULL, item_id TEXT NOT NULL, is_favorite BIGINT NOT NULL DEFAULT 0, played BIGINT NOT NULL DEFAULT 0, playback_position_ticks BIGINT NOT NULL DEFAULT 0, played_percentage DOUBLE PRECISION, play_count BIGINT NOT NULL DEFAULT 0, last_played_at BIGINT, audio_stream_index BIGINT, subtitle_stream_index BIGINT, updated_at BIGINT NOT NULL, PRIMARY KEY(user_id, item_id), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"#,
             "failed to migrate user_data",
         ),
         (
@@ -71,7 +71,7 @@ pub fn migrations() -> Vec<Migration> {
             "failed to create user data item index",
         ),
         (
-            r#"CREATE TABLE IF NOT EXISTS people (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at BIGINT NOT NULL)"#,
+            r#"CREATE TABLE IF NOT EXISTS people (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at BIGINT NOT NULL, overview TEXT, tmdb_id TEXT, imdb_id TEXT, home_page_url TEXT, premiere_date TEXT, end_date TEXT, production_locations TEXT)"#,
             "failed to migrate people",
         ),
         (
@@ -184,12 +184,68 @@ pub fn optional_migrations() -> Vec<Migration> {
             "add media_items.official_rating",
         ),
         (
+            "ALTER TABLE media_items ADD COLUMN custom_rating TEXT",
+            "add media_items.custom_rating",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN extra_type TEXT",
+            "add media_items.extra_type",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN video_type TEXT",
+            "add media_items.video_type",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN iso_type TEXT",
+            "add media_items.iso_type",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN video_3d_format TEXT",
+            "add media_items.video_3d_format",
+        ),
+        (
             "ALTER TABLE media_items ADD COLUMN extended_video_type TEXT",
             "add media_items.extended_video_type",
         ),
         (
+            "ALTER TABLE media_items ADD COLUMN original_title TEXT",
+            "add media_items.original_title",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN sort_name TEXT",
+            "add media_items.sort_name",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN forced_sort_name TEXT",
+            "add media_items.forced_sort_name",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN lock_data BIGINT NOT NULL DEFAULT 0",
+            "add media_items.lock_data",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN locked_fields TEXT",
+            "add media_items.locked_fields",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN tagline TEXT",
+            "add media_items.tagline",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN production_locations TEXT",
+            "add media_items.production_locations",
+        ),
+        (
             "ALTER TABLE media_items ADD COLUMN runtime_ticks BIGINT",
             "add media_items.runtime_ticks",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN end_date TEXT",
+            "add media_items.end_date",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN display_order TEXT",
+            "add media_items.display_order",
         ),
         (
             "ALTER TABLE media_streams ADD COLUMN bit_rate BIGINT",
@@ -364,6 +420,14 @@ pub fn optional_migrations() -> Vec<Migration> {
             "add user_data.rating",
         ),
         (
+            "ALTER TABLE user_data ADD COLUMN audio_stream_index BIGINT",
+            "add user_data.audio_stream_index",
+        ),
+        (
+            "ALTER TABLE user_data ADD COLUMN subtitle_stream_index BIGINT",
+            "add user_data.subtitle_stream_index",
+        ),
+        (
             r#"CREATE TABLE IF NOT EXISTS linked_children (parent_id TEXT NOT NULL, item_id TEXT NOT NULL, sort_order BIGINT NOT NULL DEFAULT 0, PRIMARY KEY(parent_id, item_id), FOREIGN KEY(parent_id) REFERENCES media_items(id) ON DELETE CASCADE, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE)"#,
             "create linked_children table",
         ),
@@ -392,6 +456,10 @@ pub fn optional_migrations() -> Vec<Migration> {
             "add media_items.episode_number",
         ),
         (
+            "ALTER TABLE media_items ADD COLUMN episode_number_end BIGINT",
+            "add media_items.episode_number_end",
+        ),
+        (
             // Drop FK so image_assets can reference people IDs too
             "ALTER TABLE image_assets DROP CONSTRAINT IF EXISTS image_assets_item_id_fkey",
             "drop image_assets FK to allow person images",
@@ -410,12 +478,112 @@ pub fn optional_migrations() -> Vec<Migration> {
             "add people.tmdb_id",
         ),
         (
+            "ALTER TABLE people ADD COLUMN imdb_id TEXT",
+            "add people.imdb_id",
+        ),
+        (
+            "ALTER TABLE people ADD COLUMN home_page_url TEXT",
+            "add people.home_page_url",
+        ),
+        (
+            "ALTER TABLE people ADD COLUMN premiere_date TEXT",
+            "add people.premiere_date",
+        ),
+        (
+            "ALTER TABLE people ADD COLUMN end_date TEXT",
+            "add people.end_date",
+        ),
+        (
+            "ALTER TABLE people ADD COLUMN production_locations TEXT",
+            "add people.production_locations",
+        ),
+        (
             "ALTER TABLE media_items ADD COLUMN community_rating DOUBLE PRECISION",
             "add media_items.community_rating",
         ),
         (
             "ALTER TABLE media_items ADD COLUMN critic_rating DOUBLE PRECISION",
             "add media_items.critic_rating",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN tmdb_metadata_version BIGINT NOT NULL DEFAULT 0",
+            "add media_items.tmdb_metadata_version",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN collection_name TEXT",
+            "add media_items.collection_name",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN original_language TEXT",
+            "add media_items.original_language",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN series_status TEXT",
+            "add media_items.series_status",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN home_page_url TEXT",
+            "add media_items.home_page_url",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN remote_trailers TEXT",
+            "add media_items.remote_trailers",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN preferred_metadata_language TEXT",
+            "add media_items.preferred_metadata_language",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN preferred_metadata_country_code TEXT",
+            "add media_items.preferred_metadata_country_code",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN air_days TEXT",
+            "add media_items.air_days",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN air_time TEXT",
+            "add media_items.air_time",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN aspect_ratio TEXT",
+            "add media_items.aspect_ratio",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN width BIGINT",
+            "add media_items.width",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN height BIGINT",
+            "add media_items.height",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN has_subtitles BIGINT NOT NULL DEFAULT 0",
+            "add media_items.has_subtitles",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN photo_metadata TEXT",
+            "add media_items.photo_metadata",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN airs_before_episode_number BIGINT",
+            "add media_items.airs_before_episode_number",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN airs_after_season_number BIGINT",
+            "add media_items.airs_after_season_number",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN airs_before_season_number BIGINT",
+            "add media_items.airs_before_season_number",
+        ),
+        (
+            "ALTER TABLE media_items ADD COLUMN series_name TEXT",
+            "add media_items.series_name",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_tmdb_refresh ON media_items(item_type, tmdb_metadata_version) WHERE lock_data = 0",
+            "add media_items TMDb refresh index",
         ),
         // Performance indexes
         (
@@ -449,6 +617,18 @@ pub fn optional_migrations() -> Vec<Migration> {
         (
             "CREATE INDEX IF NOT EXISTS idx_media_items_parent_type ON media_items(parent_id, item_type)",
             "add media_items.parent_id+item_type index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_parent_extra_type ON media_items(parent_id, extra_type, title, id) WHERE extra_type IS NOT NULL AND is_public = 1",
+            "add media_items parent/extra_type index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_public_video_type ON media_items(video_type, id) WHERE is_public = 1 AND video_type IS NOT NULL",
+            "add media_items public video_type index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_public_video_3d ON media_items(id) WHERE is_public = 1 AND video_3d_format IS NOT NULL",
+            "add media_items public video_3d index",
         ),
         (
             "CREATE INDEX IF NOT EXISTS idx_media_items_public_parent_title_id ON media_items(parent_id, title, id) WHERE is_public = 1",
@@ -544,8 +724,40 @@ END $$"#,
             "add media_items public movie rating index",
         ),
         (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_public_movie_rating_v2 ON media_items(community_rating DESC, id) WHERE is_public = 1 AND item_type = 'Movie' AND community_rating IS NOT NULL",
+            "add media_items public movie rating index for all video types",
+        ),
+        (
             "CREATE INDEX IF NOT EXISTS idx_media_items_episode_versions ON media_items(parent_id, season_number, episode_number, size_bytes DESC, path) WHERE item_type = 'Episode'",
             "add media_items episode version lookup index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_provider_ids_provider_item_lookup ON provider_ids(provider, provider_item_id, item_id)",
+            "add provider_ids provider/item lookup index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_provider_ids_provider_item_id ON provider_ids(provider, item_id)",
+            "add provider_ids provider/item_id join index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_episode_metadata_candidates ON media_items(parent_id, season_number, episode_number, production_year, premiere_date, id) WHERE item_type = 'Episode'",
+            "add media_items episode metadata candidate index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_episode_range_lookup ON media_items(parent_id, season_number, episode_number, episode_number_end, id) WHERE item_type = 'Episode'",
+            "add media_items episode range lookup index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_season_metadata_candidates ON media_items(parent_id, season_number, production_year, premiere_date, id) WHERE item_type = 'Season'",
+            "add media_items season metadata candidate index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_items_unlocked_scrape_candidates ON media_items(item_type, id) WHERE lock_data = 0 AND item_type IN ('Movie', 'Series', 'Season', 'Episode')",
+            "add media_items unlocked scrape candidate index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_image_assets_primary_lookup ON image_assets(item_id) WHERE image_type = 'Primary'",
+            "add image_assets primary lookup index",
         ),
         (
             "CREATE INDEX IF NOT EXISTS idx_media_items_public_year ON media_items(production_year DESC) WHERE is_public = 1 AND production_year IS NOT NULL AND production_year > 0",
@@ -609,12 +821,20 @@ END $$"#,
         ),
         // --- StrmAssistant integration tables ---
         (
-            r#"CREATE TABLE IF NOT EXISTS chapters (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, start_position_ticks BIGINT NOT NULL, name TEXT NOT NULL DEFAULT '', marker_type TEXT, source TEXT NOT NULL DEFAULT 'manual', created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE)"#,
+            r#"CREATE TABLE IF NOT EXISTS chapters (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, start_position_ticks BIGINT NOT NULL, name TEXT NOT NULL DEFAULT '', marker_type TEXT, source TEXT NOT NULL DEFAULT 'manual', image_path TEXT, image_date_modified BIGINT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE)"#,
             "create chapters table",
         ),
         (
             "CREATE INDEX IF NOT EXISTS idx_chapters_item_id ON chapters(item_id)",
             "create chapters.item_id index",
+        ),
+        (
+            "ALTER TABLE chapters ADD COLUMN image_path TEXT",
+            "add chapters.image_path",
+        ),
+        (
+            "ALTER TABLE chapters ADD COLUMN image_date_modified BIGINT",
+            "add chapters.image_date_modified",
         ),
         (
             r#"CREATE TABLE IF NOT EXISTS audio_fingerprints (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, fingerprint BYTEA NOT NULL, duration_seconds DOUBLE PRECISION, created_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, UNIQUE(item_id))"#,

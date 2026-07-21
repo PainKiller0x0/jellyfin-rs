@@ -13,9 +13,15 @@ const LOCAL_FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_FFPROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_FFPROBE_RW_TIMEOUT_MICROS: &str = "5000000";
 const REMOTE_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const REMOTE_REDIRECT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(6);
 const REMOTE_PROBE_FAILURE_TTL: Duration = Duration::from_secs(300);
 
 static REMOTE_PROBE_FAILURES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+enum ProbeFailure {
+    EndpointUnavailable,
+    Failed,
+}
 
 #[derive(Default)]
 pub struct MediaProbe {
@@ -69,12 +75,57 @@ pub struct ProbedStream {
 
 pub fn probe_media(path: &Path) -> Option<MediaProbe> {
     let remote_url = remote_probe_url(path);
-    if let Some(url) = remote_url.as_ref() {
-        if !remote_probe_endpoint_available(url) {
-            return None;
+    match probe_media_once(path, remote_url.as_ref()) {
+        Ok(probe) => Some(probe),
+        Err(ProbeFailure::EndpointUnavailable) => None,
+        Err(ProbeFailure::Failed) => {
+            let redirected_url = remote_url
+                .as_ref()
+                .and_then(resolve_remote_probe_redirect)?;
+            if remote_url
+                .as_ref()
+                .is_some_and(|url| url.as_str() == redirected_url.as_str())
+            {
+                return None;
+            }
+            tracing::debug!(
+                "retrying remote media probe after redirect resolution: {} -> {}",
+                remote_url
+                    .as_ref()
+                    .map(redacted_probe_url)
+                    .unwrap_or_else(|| path.to_string_lossy().to_string()),
+                redacted_probe_url(&redirected_url)
+            );
+            let redirected_path = Path::new(redirected_url.as_str());
+            probe_media_once(redirected_path, Some(&redirected_url)).ok()
         }
     }
+}
 
+fn probe_media_once(
+    path: &Path,
+    remote_url: Option<&reqwest::Url>,
+) -> Result<MediaProbe, ProbeFailure> {
+    if let Some(url) = remote_url {
+        if !remote_probe_endpoint_available(url) {
+            return Err(ProbeFailure::EndpointUnavailable);
+        }
+    }
+    let output = run_ffprobe(path, remote_url.is_some()).ok_or(ProbeFailure::Failed)?;
+    let response = match serde_json::from_slice::<FfprobeResponse>(&output) {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                "failed to parse ffprobe output for {}: {error}",
+                redacted_probe_path(path)
+            );
+            return Err(ProbeFailure::Failed);
+        }
+    };
+    Ok(media_probe_from_ffprobe_response(response))
+}
+
+fn run_ffprobe(path: &Path, is_remote: bool) -> Option<Vec<u8>> {
     let ffprobe =
         std::env::var("JELLYFIN_RS_FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string());
     let analyze_duration = std::env::var("JELLYFIN_RS_FFPROBE_ANALYZE_DURATION")
@@ -103,7 +154,7 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
     if probe_size != "0" {
         command.arg("-probesize").arg(probe_size);
     }
-    if remote_url.is_some() {
+    if is_remote {
         command
             .arg("-rw_timeout")
             .arg(REMOTE_FFPROBE_RW_TIMEOUT_MICROS);
@@ -126,7 +177,7 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
     };
 
     let output = {
-        let timeout = ffprobe_timeout(remote_url.is_some());
+        let timeout = ffprobe_timeout(is_remote);
         let start = std::time::Instant::now();
         loop {
             match child.try_wait() {
@@ -159,9 +210,7 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
         return None;
     }
     let output = output.stdout;
-
-    let response = serde_json::from_slice::<FfprobeResponse>(&output).ok()?;
-    Some(media_probe_from_ffprobe_response(response))
+    Some(output)
 }
 
 fn ffprobe_timeout(is_remote: bool) -> Duration {
@@ -176,6 +225,76 @@ fn remote_probe_url(path: &Path) -> Option<reqwest::Url> {
     let value = path.to_string_lossy();
     let url = reqwest::Url::parse(&value).ok()?;
     matches!(url.scheme(), "http" | "https").then_some(url)
+}
+
+fn resolve_remote_probe_redirect(url: &reqwest::Url) -> Option<reqwest::Url> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(REMOTE_REDIRECT_RESOLVE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("jellyfin-rs")
+        .build()
+        .ok()?;
+
+    match resolve_remote_probe_redirect_with_method(&client, url, false) {
+        Ok(Some(url)) => return Some(url),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::debug!(
+                "failed to resolve remote media probe redirect with HEAD for {}: {error}",
+                redacted_probe_url(url)
+            );
+        }
+    }
+
+    match resolve_remote_probe_redirect_with_method(&client, url, true) {
+        Ok(url) => url,
+        Err(error) => {
+            tracing::debug!(
+                "failed to resolve remote media probe redirect for {}: {error}",
+                redacted_probe_url(url)
+            );
+            None
+        }
+    }
+}
+
+fn resolve_remote_probe_redirect_with_method(
+    client: &reqwest::blocking::Client,
+    url: &reqwest::Url,
+    use_get: bool,
+) -> Result<Option<reqwest::Url>, reqwest::Error> {
+    const MAX_REDIRECTS: usize = 5;
+
+    let original = url.clone();
+    let mut current = url.clone();
+    for _ in 0..MAX_REDIRECTS {
+        let response = if use_get {
+            client
+                .get(current.clone())
+                .header(reqwest::header::RANGE, "bytes=0-0")
+                .send()?
+        } else {
+            client.head(current.clone()).send()?
+        };
+        if let Some(next) = redirect_location(response.url(), &response) {
+            current = next;
+            continue;
+        }
+        return Ok((current.as_str() != original.as_str()).then_some(current));
+    }
+    Ok((current.as_str() != original.as_str()).then_some(current))
+}
+
+fn redirect_location(
+    base_url: &reqwest::Url,
+    response: &reqwest::blocking::Response,
+) -> Option<reqwest::Url> {
+    if !response.status().is_redirection() {
+        return None;
+    }
+    let location = response.headers().get(reqwest::header::LOCATION)?;
+    let location = location.to_str().ok()?;
+    base_url.join(location).ok()
 }
 
 fn remote_probe_endpoint_available(url: &reqwest::Url) -> bool {
@@ -881,6 +1000,58 @@ mod tests {
             remote_probe_endpoint_key(&url),
             Some("https://example.test:443".to_string())
         );
+    }
+
+    #[test]
+    fn remote_probe_redirect_resolution_follows_http_302() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let media_url = format!("http://{address}/media.mp4?token=2");
+        let media_url_for_server = media_url.clone();
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut served = 0usize;
+            while served < 2 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0u8; 1024];
+                        let read = stream.read(&mut buffer).unwrap_or_default();
+                        let request = String::from_utf8_lossy(&buffer[..read]);
+                        if request.contains("/openlist") {
+                            write!(
+                                stream,
+                                "HTTP/1.1 302 Found\r\nLocation: {media_url_for_server}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            .unwrap();
+                        } else {
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            .unwrap();
+                        }
+                        served += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let url = reqwest::Url::parse(&format!("http://{address}/openlist?sign=secret")).unwrap();
+
+        let redirected = resolve_remote_probe_redirect(&url).unwrap();
+
+        assert_eq!(redirected.as_str(), media_url);
+        handle.join().unwrap();
     }
 
     #[test]

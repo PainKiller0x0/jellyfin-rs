@@ -10,6 +10,7 @@ pub mod options;
 pub mod path_utils;
 pub mod photo;
 pub mod probe;
+pub mod refresh_queue;
 pub mod resource_governor;
 pub mod scanner;
 pub mod storage;

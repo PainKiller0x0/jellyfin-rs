@@ -10,7 +10,8 @@ use anyhow::Context;
 use chrono::Datelike;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{RwLock, mpsc};
 use walkdir::WalkDir;
 
 use crate::{
@@ -92,11 +93,12 @@ struct ScanRootResult {
     refresh_queued: usize,
 }
 
-struct ItemRefreshPipeline {
+struct RefreshJobStager {
     tx: mpsc::Sender<ItemRefreshJob>,
-    handle: tokio::task::JoinHandle<ItemRefreshWorkerStats>,
+    handle: tokio::task::JoinHandle<anyhow::Result<usize>>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct ItemRefreshJob {
     item: ScannedMediaItem,
     source_path: PathBuf,
@@ -106,6 +108,7 @@ struct ItemRefreshJob {
     scan_fingerprint: i64,
 }
 
+#[derive(Serialize, Deserialize)]
 struct PendingMediaProbe {
     media_path: PathBuf,
     probe_path: PathBuf,
@@ -350,15 +353,8 @@ pub async fn scan_media_libraries_if_idle(
     let douban_cookie = state.douban_cookie.read().await.clone();
     let tmdb_library_options =
         crate::library::tmdb_metadata::load_tmdb_library_provider_options(&scan_db).await?;
-    let refresh_pipeline = start_item_refresh_pipeline(
-        scan_db.clone(),
-        force_probe,
-        state.sa_config.ffmpeg_path.clone(),
-        api_key.clone(),
-        state.tmdb_proxy_url.clone(),
-        state.tmdb_http_client.clone(),
-        tmdb_library_options,
-    );
+    let scan_id = uuid::Uuid::new_v4().to_string();
+    let refresh_stager = start_refresh_job_stager(scan_db.clone(), scan_id.clone());
     let mut completed_library_ids = Vec::new();
     let mut total = 0usize;
     let mut unchanged = 0usize;
@@ -376,7 +372,7 @@ pub async fn scan_media_libraries_if_idle(
                 continue;
             }
             completed_library_ids.push(library_id.clone());
-            let refresh_tx = refresh_pipeline.tx.clone();
+            let refresh_tx = refresh_stager.tx.clone();
             let scan_states = scan_states.clone();
             let scan_context = scan_contexts.get(&library_id).copied().unwrap_or_default();
             tasks.spawn(async move {
@@ -408,14 +404,28 @@ pub async fn scan_media_libraries_if_idle(
         }
     }
 
-    drop(refresh_pipeline.tx);
-    let refresh_stats = match refresh_pipeline.handle.await {
-        Ok(stats) => stats,
-        Err(error) => {
-            tracing::warn!("item refresh pipeline task panicked: {error}");
-            ItemRefreshWorkerStats::default()
-        }
-    };
+    drop(refresh_stager.tx);
+    let staged_jobs = refresh_stager
+        .handle
+        .await
+        .context("refresh job stager task panicked")??;
+    tracing::info!("staged {staged_jobs} item refresh job(s) in PostgreSQL");
+
+    completed_library_ids.sort();
+    completed_library_ids.dedup();
+    remove_missing_media_items(&scan_db, &completed_library_ids, &all_seen).await?;
+
+    let refresh_stats = run_item_refresh_workers(
+        scan_db.clone(),
+        &scan_id,
+        force_probe,
+        state.sa_config.ffmpeg_path.clone(),
+        api_key.clone(),
+        state.tmdb_proxy_url.clone(),
+        state.tmdb_http_client.clone(),
+        tmdb_library_options,
+    )
+    .await;
     if force_probe && refresh_stats.probe_failed == 0 {
         if let Err(error) = set_media_probe_cache_current(&scan_db).await {
             tracing::warn!("failed to mark media probe cache current: {error:#}");
@@ -430,9 +440,15 @@ pub async fn scan_media_libraries_if_idle(
     )
     .await;
 
-    completed_library_ids.sort();
-    completed_library_ids.dedup();
-    remove_missing_media_items(&scan_db, &completed_library_ids, &all_seen).await?;
+    let queue_stats = crate::library::refresh_queue::stats(&scan_db, &scan_id).await?;
+    tracing::info!(
+        "PostgreSQL refresh queue scan_id={scan_id} pending={} running={} completed={} failed={}",
+        queue_stats.pending,
+        queue_stats.running,
+        queue_stats.completed,
+        queue_stats.failed
+    );
+    crate::library::refresh_queue::delete_completed(&scan_db, &scan_id).await?;
     tracing::info!(
         "media scan discovered {total} file item(s) across all libraries; queued {refresh_queued} item refresh job(s)"
     );
@@ -1093,129 +1109,209 @@ async fn queue_item_refresh(
     }
 }
 
-fn start_item_refresh_pipeline(
+fn start_refresh_job_stager(db: sea_orm::DatabaseConnection, scan_id: String) -> RefreshJobStager {
+    const STAGE_BATCH_SIZE: usize = 256;
+    let (tx, mut rx) = mpsc::channel::<ItemRefreshJob>(item_refresh_queue_capacity());
+    let handle = tokio::spawn(async move {
+        let mut staged = 0usize;
+        let mut batch = Vec::with_capacity(STAGE_BATCH_SIZE);
+        while let Some(job) = rx.recv().await {
+            batch.push(job);
+            if batch.len() >= STAGE_BATCH_SIZE {
+                staged += stage_refresh_job_batch(&db, &scan_id, &mut batch).await?;
+            }
+        }
+        staged += stage_refresh_job_batch(&db, &scan_id, &mut batch).await?;
+        Ok(staged)
+    });
+    RefreshJobStager { tx, handle }
+}
+
+async fn stage_refresh_job_batch(
+    db: &sea_orm::DatabaseConnection,
+    scan_id: &str,
+    batch: &mut Vec<ItemRefreshJob>,
+) -> anyhow::Result<usize> {
+    if batch.is_empty() {
+        return Ok(0);
+    }
+    let jobs = batch
+        .drain(..)
+        .map(|job| {
+            Ok(crate::library::refresh_queue::RefreshJobPayload {
+                library_id: job.item.library_id.clone(),
+                path: job.item.path.clone(),
+                payload: serde_json::to_value(job).context("failed to encode item refresh job")?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    crate::library::refresh_queue::enqueue_batch(db, scan_id, &jobs).await
+}
+
+async fn run_item_refresh_workers(
     db: sea_orm::DatabaseConnection,
+    preferred_scan_id: &str,
     force_probe: bool,
     ffmpeg_path: String,
     api_key: String,
     tmdb_proxy_url: Arc<RwLock<Option<String>>>,
     tmdb_http_client: Arc<RwLock<reqwest::Client>>,
     library_options: HashMap<String, crate::library::tmdb_metadata::TmdbLibraryProviderOptions>,
-) -> ItemRefreshPipeline {
+) -> ItemRefreshWorkerStats {
     let concurrency = item_refresh_concurrency();
-    let queue_capacity = item_refresh_queue_capacity();
-    let (tx, rx) = mpsc::channel::<ItemRefreshJob>(queue_capacity);
-    let handle = tokio::spawn(async move {
-        let chapter_image_settings =
-            Arc::new(crate::chapters::chapter_image_scan_settings(&db).await);
-        let dummy_chapter_duration_seconds = configured_dummy_chapter_duration_seconds(&db).await;
-        let library_options = Arc::new(library_options);
-        let receiver = Arc::new(Mutex::new(rx));
-        let mut workers = tokio::task::JoinSet::new();
-        tracing::info!(
-            "Jellyfin-style item refresh started concurrency={concurrency} queue_capacity={queue_capacity}"
-        );
+    let chapter_image_settings = Arc::new(crate::chapters::chapter_image_scan_settings(&db).await);
+    let dummy_chapter_duration_seconds = configured_dummy_chapter_duration_seconds(&db).await;
+    let library_options = Arc::new(library_options);
+    let preferred_scan_id = Arc::<str>::from(preferred_scan_id);
+    let mut workers = tokio::task::JoinSet::new();
+    tracing::info!(
+        "Jellyfin-style item refresh workers started concurrency={concurrency} source=PostgreSQL"
+    );
 
-        for worker_index in 0..concurrency {
-            let db = db.clone();
-            let receiver = receiver.clone();
-            let ffmpeg_path = ffmpeg_path.clone();
-            let api_key = api_key.clone();
-            let tmdb_proxy_url = tmdb_proxy_url.clone();
-            let tmdb_http_client = tmdb_http_client.clone();
-            let library_options = library_options.clone();
-            let chapter_image_settings = chapter_image_settings.clone();
-            workers.spawn(async move {
-                let mut stats = ItemRefreshWorkerStats::default();
-                loop {
-                    let job = {
-                        let mut receiver = receiver.lock().await;
-                        receiver.recv().await
-                    };
-                    let Some(job) = job else {
+    for worker_index in 0..concurrency {
+        let db = db.clone();
+        let ffmpeg_path = ffmpeg_path.clone();
+        let api_key = api_key.clone();
+        let tmdb_proxy_url = tmdb_proxy_url.clone();
+        let tmdb_http_client = tmdb_http_client.clone();
+        let library_options = library_options.clone();
+        let chapter_image_settings = chapter_image_settings.clone();
+        let preferred_scan_id = preferred_scan_id.clone();
+        workers.spawn(async move {
+            let mut stats = ItemRefreshWorkerStats::default();
+            let mut idle_rounds = 0usize;
+            loop {
+                let claimed = match crate::library::refresh_queue::claim_next(
+                    &db,
+                    &preferred_scan_id,
+                )
+                .await
+                {
+                    Ok(claimed) => claimed,
+                    Err(error) => {
+                        stats.failed += 1;
+                        tracing::warn!("failed to claim PostgreSQL refresh job: {error:#}");
                         break;
-                    };
-                    crate::library::resource_governor::wait_for_background_worker(worker_index, 1)
+                    }
+                };
+                let Some(claimed) = claimed else {
+                    idle_rounds += 1;
+                    if idle_rounds >= 3 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                };
+                idle_rounds = 0;
+                let job = match serde_json::from_str::<ItemRefreshJob>(&claimed.payload) {
+                    Ok(job) => job,
+                    Err(error) => {
+                        stats.failed += 1;
+                        let _ = crate::library::refresh_queue::fail(
+                            &db,
+                            claimed.id,
+                            &format!("invalid refresh payload: {error}"),
+                        )
                         .await;
-                    stats.completed += 1;
-                    match run_item_refresh_job(
-                        db.clone(),
-                        job,
-                        force_probe,
-                        &ffmpeg_path,
-                        dummy_chapter_duration_seconds,
-                        &chapter_image_settings,
-                        &api_key,
-                        tmdb_proxy_url.clone(),
-                        tmdb_http_client.clone(),
-                        &library_options,
-                    )
-                    .await
-                    {
-                        Ok(result) => {
-                            if result.metadata_completed {
-                                stats.metadata_completed += 1;
-                            }
-                            if result.metadata_deferred {
-                                stats.metadata_deferred += 1;
-                            }
-                            if result.metadata_failed {
-                                stats.metadata_failed += 1;
-                            }
-                            if result.probe_completed {
-                                stats.probe_completed += 1;
-                            }
-                            if result.probe_skipped {
-                                stats.probe_skipped += 1;
-                            }
-                            if result.probe_failed {
-                                stats.probe_failed += 1;
-                            }
+                        continue;
+                    }
+                };
+                crate::library::resource_governor::wait_for_background_worker(worker_index, 1)
+                    .await;
+                match run_item_refresh_job(
+                    db.clone(),
+                    job,
+                    force_probe,
+                    &ffmpeg_path,
+                    dummy_chapter_duration_seconds,
+                    &chapter_image_settings,
+                    &api_key,
+                    tmdb_proxy_url.clone(),
+                    tmdb_http_client.clone(),
+                    &library_options,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        stats.completed += 1;
+                        if result.metadata_completed {
+                            stats.metadata_completed += 1;
                         }
-                        Err(error) => {
+                        if result.metadata_deferred {
+                            stats.metadata_deferred += 1;
+                        }
+                        if result.metadata_failed {
+                            stats.metadata_failed += 1;
+                        }
+                        if result.probe_completed {
+                            stats.probe_completed += 1;
+                        }
+                        if result.probe_skipped {
+                            stats.probe_skipped += 1;
+                        }
+                        if result.probe_failed {
+                            stats.probe_failed += 1;
+                        }
+                        if let Err(error) =
+                            crate::library::refresh_queue::complete(&db, claimed.id).await
+                        {
                             stats.failed += 1;
-                            tracing::warn!("item refresh failed: {error:#}");
+                            tracing::warn!("failed to complete PostgreSQL refresh job: {error:#}");
                         }
                     }
-                }
-                stats
-            });
-        }
-
-        let mut stats = ItemRefreshWorkerStats::default();
-        while let Some(result) = workers.join_next().await {
-            match result {
-                Ok(worker_stats) => {
-                    stats.completed += worker_stats.completed;
-                    stats.metadata_completed += worker_stats.metadata_completed;
-                    stats.metadata_deferred += worker_stats.metadata_deferred;
-                    stats.metadata_failed += worker_stats.metadata_failed;
-                    stats.probe_completed += worker_stats.probe_completed;
-                    stats.probe_skipped += worker_stats.probe_skipped;
-                    stats.probe_failed += worker_stats.probe_failed;
-                    stats.failed += worker_stats.failed;
-                }
-                Err(error) => {
-                    stats.failed += 1;
-                    tracing::warn!("item refresh worker task panicked: {error}");
+                    Err(error) => {
+                        if let Err(queue_error) = crate::library::refresh_queue::fail(
+                            &db,
+                            claimed.id,
+                            &format!("{error:#}"),
+                        )
+                        .await
+                        {
+                            stats.failed += 1;
+                            tracing::warn!(
+                                "failed to record PostgreSQL refresh error: {queue_error:#}"
+                            );
+                        }
+                        tracing::warn!("item refresh failed: {error:#}");
+                    }
                 }
             }
-        }
+            stats
+        });
+    }
 
-        tracing::info!(
-            "Jellyfin-style item refresh completed {} job(s); metadata_completed={} metadata_deferred={} metadata_failed={} probe_completed={} probe_skipped={} probe_failed={} failed={}",
-            stats.completed,
-            stats.metadata_completed,
-            stats.metadata_deferred,
-            stats.metadata_failed,
-            stats.probe_completed,
-            stats.probe_skipped,
-            stats.probe_failed,
-            stats.failed
-        );
-        stats
-    });
-    ItemRefreshPipeline { tx, handle }
+    let mut stats = ItemRefreshWorkerStats::default();
+    while let Some(result) = workers.join_next().await {
+        match result {
+            Ok(worker_stats) => {
+                stats.completed += worker_stats.completed;
+                stats.metadata_completed += worker_stats.metadata_completed;
+                stats.metadata_deferred += worker_stats.metadata_deferred;
+                stats.metadata_failed += worker_stats.metadata_failed;
+                stats.probe_completed += worker_stats.probe_completed;
+                stats.probe_skipped += worker_stats.probe_skipped;
+                stats.probe_failed += worker_stats.probe_failed;
+                stats.failed += worker_stats.failed;
+            }
+            Err(error) => {
+                stats.failed += 1;
+                tracing::warn!("item refresh worker task panicked: {error}");
+            }
+        }
+    }
+
+    tracing::info!(
+        "Jellyfin-style item refresh completed {} job(s); metadata_completed={} metadata_deferred={} metadata_failed={} probe_completed={} probe_skipped={} probe_failed={} failed={}",
+        stats.completed,
+        stats.metadata_completed,
+        stats.metadata_deferred,
+        stats.metadata_failed,
+        stats.probe_completed,
+        stats.probe_skipped,
+        stats.probe_failed,
+        stats.failed
+    );
+    stats
 }
 
 #[allow(clippy::too_many_arguments)]

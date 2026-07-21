@@ -8,6 +8,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Set, sea_query::OnConflict,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     entities::{
@@ -31,7 +32,7 @@ use crate::{
     util::{now_unix, stable_text_id},
 };
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct ScannedMediaItem {
     pub id: String,
     pub title: String,

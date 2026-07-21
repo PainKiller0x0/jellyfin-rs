@@ -5,10 +5,11 @@ use std::{
 };
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use crate::util::{normalize_yyyy_mm_dd, year_from_yyyy_mm_dd};
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct ParsedMetadata {
     pub has_nfo: bool,
     pub title: Option<String>,
@@ -62,14 +63,14 @@ pub struct ParsedMetadata {
     pub images: Vec<ParsedImage>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedPerson {
     pub name: String,
     pub role: Option<String>,
     pub person_type: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedImage {
     pub image_type: String,
     pub path: String,

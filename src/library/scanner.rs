@@ -56,12 +56,10 @@ use crate::{
 
 const MEDIA_PROBE_CACHE_VERSION_KEY: &str = "media_probe_cache_version";
 const MEDIA_PROBE_CACHE_VERSION: &str = "6";
-const MIN_INGEST_QUEUE_CAPACITY: usize = 512;
-const MAX_INGEST_QUEUE_CAPACITY: usize = 4096;
-const MIN_MEDIA_PROBE_QUEUE_CAPACITY: usize = 32;
-const MAX_MEDIA_PROBE_QUEUE_CAPACITY: usize = 256;
-const METADATA_FETCH_MAX_ATTEMPTS: usize = 30;
-const METADATA_FETCH_RETRY_DELAY_SECS: u64 = 2;
+const MIN_ITEM_REFRESH_QUEUE_CAPACITY: usize = 512;
+const MAX_ITEM_REFRESH_QUEUE_CAPACITY: usize = 4096;
+const METADATA_DEPENDENCY_MAX_ATTEMPTS: usize = 30;
+const METADATA_DEPENDENCY_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SCAN_FINGERPRINT_VERSION: u64 = 2;
 
 #[derive(Default)]
@@ -91,25 +89,15 @@ struct ScanRootResult {
     scanned: usize,
     unchanged: usize,
     seen_paths: Vec<String>,
-    ingest_queued: usize,
+    refresh_queued: usize,
 }
 
-struct IngestPipeline {
-    tx: mpsc::Sender<IngestJob>,
-    handle: tokio::task::JoinHandle<IngestWorkerStats>,
+struct ItemRefreshPipeline {
+    tx: mpsc::Sender<ItemRefreshJob>,
+    handle: tokio::task::JoinHandle<ItemRefreshWorkerStats>,
 }
 
-struct MediaProbePipeline {
-    tx: mpsc::Sender<MediaProbeJob>,
-    handle: tokio::task::JoinHandle<MediaProbeWorkerStats>,
-}
-
-struct MetadataFetchPipeline {
-    tx: mpsc::UnboundedSender<MetadataFetchJob>,
-    handle: tokio::task::JoinHandle<()>,
-}
-
-struct IngestJob {
+struct ItemRefreshJob {
     item: ScannedMediaItem,
     source_path: PathBuf,
     parsed_metadata: ParsedMetadata,
@@ -124,19 +112,26 @@ struct PendingMediaProbe {
     allow_size_mismatch: bool,
 }
 
-struct IngestJobResult {
+struct LocalRefreshResult {
     stored_item_id: String,
-    metadata_queued: bool,
-    probe_queued: bool,
     probe_skipped: bool,
     scan_state_cacheable: bool,
+}
+
+#[derive(Default)]
+struct ItemRefreshResult {
+    metadata_completed: bool,
+    metadata_deferred: bool,
+    metadata_failed: bool,
+    probe_completed: bool,
+    probe_skipped: bool,
+    probe_failed: bool,
 }
 
 struct MediaProbeJob {
     item: ScannedMediaItem,
     media_path: PathBuf,
     probe_path: PathBuf,
-    scan_fingerprint: Option<i64>,
 }
 
 struct MediaProbeJobResult {
@@ -145,27 +140,20 @@ struct MediaProbeJobResult {
 
 struct MetadataFetchJob {
     item_id: String,
-    library_id: String,
     item_type: String,
     path: PathBuf,
     preserve_existing_metadata: bool,
-    attempts: usize,
-    retry_tx: mpsc::UnboundedSender<MetadataFetchJob>,
 }
 
 #[derive(Default)]
-struct IngestWorkerStats {
+struct ItemRefreshWorkerStats {
     completed: usize,
-    metadata_queued: usize,
-    probe_queued: usize,
+    metadata_completed: usize,
+    metadata_deferred: usize,
+    metadata_failed: usize,
+    probe_completed: usize,
     probe_skipped: usize,
-    failed: usize,
-}
-
-#[derive(Default)]
-struct MediaProbeWorkerStats {
-    completed: usize,
-    stream_probe_succeeded: usize,
+    probe_failed: usize,
     failed: usize,
 }
 
@@ -308,7 +296,6 @@ async fn force_refresh_media_probe(
             item: ScannedMediaItem::from_stored(item),
             media_path,
             probe_path,
-            scan_fingerprint: None,
         },
         dummy_chapter_duration_seconds,
         &state.sa_config.ffmpeg_path,
@@ -358,35 +345,25 @@ pub async fn scan_media_libraries_if_idle(
         tracing::info!("media probe cache version changed; forcing one-time media stream reprobe");
     }
 
-    let probe_pipeline = start_media_probe_pipeline(
-        scan_db.clone(),
-        force_probe.then(|| scan_db.clone()),
-        state.sa_config.ffmpeg_path.clone(),
-    );
     let mut tasks = tokio::task::JoinSet::new();
     let root_concurrency = scan_root_concurrency();
     let douban_cookie = state.douban_cookie.read().await.clone();
     let tmdb_library_options =
         crate::library::tmdb_metadata::load_tmdb_library_provider_options(&scan_db).await?;
-    let metadata_pipeline = start_metadata_fetch_pipeline(
+    let refresh_pipeline = start_item_refresh_pipeline(
         scan_db.clone(),
+        force_probe,
+        state.sa_config.ffmpeg_path.clone(),
         api_key.clone(),
         state.tmdb_proxy_url.clone(),
         state.tmdb_http_client.clone(),
-        douban_cookie,
         tmdb_library_options,
-    );
-    let ingest_pipeline = start_ingest_pipeline(
-        scan_db.clone(),
-        force_probe,
-        probe_pipeline.tx.clone(),
-        metadata_pipeline.tx.clone(),
     );
     let mut completed_library_ids = Vec::new();
     let mut total = 0usize;
     let mut unchanged = 0usize;
     let mut all_seen = Vec::new();
-    let mut ingest_queued = 0usize;
+    let mut refresh_queued = 0usize;
     let mut pending_roots = roots.into_iter();
     loop {
         while tasks.len() < root_concurrency {
@@ -399,7 +376,7 @@ pub async fn scan_media_libraries_if_idle(
                 continue;
             }
             completed_library_ids.push(library_id.clone());
-            let ingest_tx = ingest_pipeline.tx.clone();
+            let refresh_tx = refresh_pipeline.tx.clone();
             let scan_states = scan_states.clone();
             let scan_context = scan_contexts.get(&library_id).copied().unwrap_or_default();
             tasks.spawn(async move {
@@ -410,7 +387,7 @@ pub async fn scan_media_libraries_if_idle(
                     enable_photos,
                     scan_context,
                     scan_states,
-                    ingest_tx,
+                    refresh_tx,
                 )
                 .await
             });
@@ -424,57 +401,57 @@ pub async fn scan_media_libraries_if_idle(
                 total += result.scanned;
                 unchanged += result.unchanged;
                 all_seen.extend(result.seen_paths);
-                ingest_queued += result.ingest_queued;
+                refresh_queued += result.refresh_queued;
             }
             Ok(Err(e)) => tracing::warn!("library scan failed: {e:#}"),
             Err(e) => tracing::warn!("scan task panicked: {e}"),
         }
     }
 
-    drop(ingest_pipeline.tx);
-    let ingest_stats = match ingest_pipeline.handle.await {
+    drop(refresh_pipeline.tx);
+    let refresh_stats = match refresh_pipeline.handle.await {
         Ok(stats) => stats,
         Err(error) => {
-            tracing::warn!("ingest pipeline task panicked: {error}");
-            IngestWorkerStats::default()
+            tracing::warn!("item refresh pipeline task panicked: {error}");
+            ItemRefreshWorkerStats::default()
         }
     };
-    drop(probe_pipeline.tx);
-    drop(metadata_pipeline.tx);
-    let (probe_result, metadata_result) =
-        tokio::join!(probe_pipeline.handle, metadata_pipeline.handle);
-    match probe_result {
-        Ok(stats) => tracing::info!(
-            "media probe completed {} item(s); stream_probe_succeeded={} failed={}",
-            stats.completed,
-            stats.stream_probe_succeeded,
-            stats.failed
-        ),
-        Err(error) => tracing::warn!("media probe pipeline task panicked: {error}"),
+    if force_probe && refresh_stats.probe_failed == 0 {
+        if let Err(error) = set_media_probe_cache_current(&scan_db).await {
+            tracing::warn!("failed to mark media probe cache current: {error:#}");
+        }
     }
-    if let Err(error) = metadata_result {
-        tracing::warn!("metadata fetch pipeline task panicked: {error}");
-    }
+    run_post_scan_metadata_tasks(
+        &scan_db,
+        &api_key,
+        state.tmdb_proxy_url.clone(),
+        state.tmdb_http_client.clone(),
+        douban_cookie.as_deref(),
+    )
+    .await;
 
     completed_library_ids.sort();
     completed_library_ids.dedup();
     remove_missing_media_items(&scan_db, &completed_library_ids, &all_seen).await?;
     tracing::info!(
-        "media scan discovered {total} file item(s) across all libraries; queued {ingest_queued} ingest job(s)"
+        "media scan discovered {total} file item(s) across all libraries; queued {refresh_queued} item refresh job(s)"
     );
     tracing::info!("media scan skipped {unchanged} unchanged item(s) through fingerprint cache");
     tracing::info!(
-        "media ingest completed {} job(s); metadata_queued={} probe_queued={} probe_skipped={} failed={}",
-        ingest_stats.completed,
-        ingest_stats.metadata_queued,
-        ingest_stats.probe_queued,
-        ingest_stats.probe_skipped,
-        ingest_stats.failed
+        "item refresh completed {} job(s); metadata_completed={} metadata_deferred={} metadata_failed={} probe_completed={} probe_skipped={} probe_failed={} failed={}",
+        refresh_stats.completed,
+        refresh_stats.metadata_completed,
+        refresh_stats.metadata_deferred,
+        refresh_stats.metadata_failed,
+        refresh_stats.probe_completed,
+        refresh_stats.probe_skipped,
+        refresh_stats.probe_failed,
+        refresh_stats.failed
     );
-    if ingest_stats.probe_skipped > 0 {
+    if refresh_stats.probe_skipped > 0 {
         tracing::info!(
-            "media ingest reused cached probe data for {}/{} file item(s)",
-            ingest_stats.probe_skipped,
+            "item refresh reused cached probe data for {}/{} file item(s)",
+            refresh_stats.probe_skipped,
             total
         );
     }
@@ -489,13 +466,13 @@ async fn scan_root(
     enable_photos: bool,
     scan_context: i64,
     scan_states: Arc<HashMap<String, i64>>,
-    ingest_tx: mpsc::Sender<IngestJob>,
+    refresh_tx: mpsc::Sender<ItemRefreshJob>,
 ) -> anyhow::Result<ScanRootResult> {
     let mut scanned = 0usize;
     let mut unchanged = 0usize;
     let mut visited_entries = 0usize;
     let mut seen_paths = Vec::new();
-    let mut ingest_queued = 0usize;
+    let mut refresh_queued = 0usize;
     let mut sidecar_fingerprints = SidecarFingerprintCache::default();
     let stack_part_owners = movie_stack_part_owners(&root, &collection_type);
     let episode_version_owners = episode_version_owners(&root, &library_id, &collection_type);
@@ -649,7 +626,7 @@ async fn scan_root(
                     probe_path: path.to_path_buf(),
                     allow_size_mismatch: true,
                 });
-            let job = IngestJob {
+            let job = ItemRefreshJob {
                 item,
                 source_path: path.to_path_buf(),
                 parsed_metadata,
@@ -657,8 +634,8 @@ async fn scan_root(
                 media_probe,
                 scan_fingerprint,
             };
-            if queue_ingest(&ingest_tx, job).await {
-                ingest_queued += 1;
+            if queue_item_refresh(&refresh_tx, job).await {
+                refresh_queued += 1;
             }
             continue;
         }
@@ -921,7 +898,7 @@ async fn scan_root(
             probe_path: probe_target_path.to_path_buf(),
             allow_size_mismatch: is_strm_file,
         });
-        let job = IngestJob {
+        let job = ItemRefreshJob {
             item,
             source_path: path.to_path_buf(),
             parsed_metadata,
@@ -929,8 +906,8 @@ async fn scan_root(
             media_probe,
             scan_fingerprint,
         };
-        if queue_ingest(&ingest_tx, job).await {
-            ingest_queued += 1;
+        if queue_item_refresh(&refresh_tx, job).await {
+            refresh_queued += 1;
         }
     }
 
@@ -938,7 +915,7 @@ async fn scan_root(
         scanned,
         unchanged,
         seen_paths,
-        ingest_queued,
+        refresh_queued,
     })
 }
 
@@ -1100,12 +1077,15 @@ fn video_version_rank(version: Option<&str>) -> i64 {
     0
 }
 
-async fn queue_ingest(ingest_tx: &mpsc::Sender<IngestJob>, job: IngestJob) -> bool {
-    match ingest_tx.send(job).await {
+async fn queue_item_refresh(
+    refresh_tx: &mpsc::Sender<ItemRefreshJob>,
+    job: ItemRefreshJob,
+) -> bool {
+    match refresh_tx.send(job).await {
         Ok(()) => true,
         Err(error) => {
             tracing::warn!(
-                "ingest queue closed before job could be scheduled for {}",
+                "item refresh queue closed before job could be scheduled for {}",
                 error.0.item.path
             );
             false
@@ -1113,29 +1093,40 @@ async fn queue_ingest(ingest_tx: &mpsc::Sender<IngestJob>, job: IngestJob) -> bo
     }
 }
 
-fn start_ingest_pipeline(
+fn start_item_refresh_pipeline(
     db: sea_orm::DatabaseConnection,
     force_probe: bool,
-    probe_tx: mpsc::Sender<MediaProbeJob>,
-    metadata_tx: mpsc::UnboundedSender<MetadataFetchJob>,
-) -> IngestPipeline {
-    let concurrency = ingest_concurrency();
-    let queue_capacity = ingest_queue_capacity();
-    let (tx, rx) = mpsc::channel::<IngestJob>(queue_capacity);
+    ffmpeg_path: String,
+    api_key: String,
+    tmdb_proxy_url: Arc<RwLock<Option<String>>>,
+    tmdb_http_client: Arc<RwLock<reqwest::Client>>,
+    library_options: HashMap<String, crate::library::tmdb_metadata::TmdbLibraryProviderOptions>,
+) -> ItemRefreshPipeline {
+    let concurrency = item_refresh_concurrency();
+    let queue_capacity = item_refresh_queue_capacity();
+    let (tx, rx) = mpsc::channel::<ItemRefreshJob>(queue_capacity);
     let handle = tokio::spawn(async move {
+        let chapter_image_settings =
+            Arc::new(crate::chapters::chapter_image_scan_settings(&db).await);
+        let dummy_chapter_duration_seconds = configured_dummy_chapter_duration_seconds(&db).await;
+        let library_options = Arc::new(library_options);
         let receiver = Arc::new(Mutex::new(rx));
         let mut workers = tokio::task::JoinSet::new();
         tracing::info!(
-            "ingest pipeline started concurrency={concurrency} queue_capacity={queue_capacity}"
+            "Jellyfin-style item refresh started concurrency={concurrency} queue_capacity={queue_capacity}"
         );
 
         for worker_index in 0..concurrency {
             let db = db.clone();
             let receiver = receiver.clone();
-            let probe_tx = probe_tx.clone();
-            let metadata_tx = metadata_tx.clone();
+            let ffmpeg_path = ffmpeg_path.clone();
+            let api_key = api_key.clone();
+            let tmdb_proxy_url = tmdb_proxy_url.clone();
+            let tmdb_http_client = tmdb_http_client.clone();
+            let library_options = library_options.clone();
+            let chapter_image_settings = chapter_image_settings.clone();
             workers.spawn(async move {
-                let mut stats = IngestWorkerStats::default();
+                let mut stats = ItemRefreshWorkerStats::default();
                 loop {
                     let job = {
                         let mut receiver = receiver.lock().await;
@@ -1147,44 +1138,43 @@ fn start_ingest_pipeline(
                     crate::library::resource_governor::wait_for_background_worker(worker_index, 1)
                         .await;
                     stats.completed += 1;
-                    let scan_state = (
-                        job.item.path.clone(),
-                        job.item.library_id.clone(),
-                        job.scan_fingerprint,
-                    );
-                    match run_ingest_job(db.clone(), job, force_probe, &probe_tx, &metadata_tx)
-                        .await
+                    match run_item_refresh_job(
+                        db.clone(),
+                        job,
+                        force_probe,
+                        &ffmpeg_path,
+                        dummy_chapter_duration_seconds,
+                        &chapter_image_settings,
+                        &api_key,
+                        tmdb_proxy_url.clone(),
+                        tmdb_http_client.clone(),
+                        &library_options,
+                    )
+                    .await
                     {
                         Ok(result) => {
-                            if result.metadata_queued {
-                                stats.metadata_queued += 1;
+                            if result.metadata_completed {
+                                stats.metadata_completed += 1;
                             }
-                            if result.probe_queued {
-                                stats.probe_queued += 1;
+                            if result.metadata_deferred {
+                                stats.metadata_deferred += 1;
+                            }
+                            if result.metadata_failed {
+                                stats.metadata_failed += 1;
+                            }
+                            if result.probe_completed {
+                                stats.probe_completed += 1;
                             }
                             if result.probe_skipped {
                                 stats.probe_skipped += 1;
                             }
-                            if !result.probe_queued
-                                && result.scan_state_cacheable
-                                && let Err(error) = upsert_scan_state(
-                                    &db,
-                                    &scan_state.0,
-                                    &result.stored_item_id,
-                                    &scan_state.1,
-                                    scan_state.2,
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    "failed to persist scan fingerprint for {}: {error:#}",
-                                    scan_state.0
-                                );
+                            if result.probe_failed {
+                                stats.probe_failed += 1;
                             }
                         }
                         Err(error) => {
                             stats.failed += 1;
-                            tracing::warn!("ingest job failed: {error:#}");
+                            tracing::warn!("item refresh failed: {error:#}");
                         }
                     }
                 }
@@ -1192,45 +1182,179 @@ fn start_ingest_pipeline(
             });
         }
 
-        let mut stats = IngestWorkerStats::default();
+        let mut stats = ItemRefreshWorkerStats::default();
         while let Some(result) = workers.join_next().await {
             match result {
                 Ok(worker_stats) => {
                     stats.completed += worker_stats.completed;
-                    stats.metadata_queued += worker_stats.metadata_queued;
-                    stats.probe_queued += worker_stats.probe_queued;
+                    stats.metadata_completed += worker_stats.metadata_completed;
+                    stats.metadata_deferred += worker_stats.metadata_deferred;
+                    stats.metadata_failed += worker_stats.metadata_failed;
+                    stats.probe_completed += worker_stats.probe_completed;
                     stats.probe_skipped += worker_stats.probe_skipped;
+                    stats.probe_failed += worker_stats.probe_failed;
                     stats.failed += worker_stats.failed;
                 }
                 Err(error) => {
                     stats.failed += 1;
-                    tracing::warn!("ingest worker task panicked: {error}");
+                    tracing::warn!("item refresh worker task panicked: {error}");
                 }
             }
         }
 
         tracing::info!(
-            "ingest pipeline completed {} job(s); metadata_queued={} probe_queued={} probe_skipped={} failed={}",
+            "Jellyfin-style item refresh completed {} job(s); metadata_completed={} metadata_deferred={} metadata_failed={} probe_completed={} probe_skipped={} probe_failed={} failed={}",
             stats.completed,
-            stats.metadata_queued,
-            stats.probe_queued,
+            stats.metadata_completed,
+            stats.metadata_deferred,
+            stats.metadata_failed,
+            stats.probe_completed,
             stats.probe_skipped,
+            stats.probe_failed,
             stats.failed
         );
         stats
     });
-    IngestPipeline { tx, handle }
+    ItemRefreshPipeline { tx, handle }
 }
 
-async fn run_ingest_job(
+#[allow(clippy::too_many_arguments)]
+async fn run_item_refresh_job(
     db: sea_orm::DatabaseConnection,
-    mut job: IngestJob,
+    mut job: ItemRefreshJob,
     force_probe: bool,
-    probe_tx: &mpsc::Sender<MediaProbeJob>,
-    metadata_tx: &mpsc::UnboundedSender<MetadataFetchJob>,
-) -> anyhow::Result<IngestJobResult> {
+    ffmpeg_path: &str,
+    dummy_chapter_duration_seconds: i64,
+    chapter_image_settings: &crate::chapters::ChapterImageScanSettings,
+    api_key: &str,
+    tmdb_proxy_url: Arc<RwLock<Option<String>>>,
+    tmdb_http_client: Arc<RwLock<reqwest::Client>>,
+    library_options: &HashMap<String, crate::library::tmdb_metadata::TmdbLibraryProviderOptions>,
+) -> anyhow::Result<ItemRefreshResult> {
+    let mut result = ItemRefreshResult::default();
+    let local = run_local_refresh_job(&db, &mut job, force_probe).await?;
+    job.item.id = local.stored_item_id;
+
+    if let Some(metadata_job) =
+        metadata_fetch_job(&job.item, &job.source_path, job.parsed_metadata.has_nfo)
+    {
+        let provider_options = library_options
+            .get(&job.item.library_id)
+            .cloned()
+            .unwrap_or_default();
+        let tmdb_base_url = tmdb_proxy_url.read().await.clone();
+        let tmdb_client = tmdb_http_client.read().await.clone();
+        for attempt in 0..=METADATA_DEPENDENCY_MAX_ATTEMPTS {
+            match run_metadata_fetch_job(
+                db.clone(),
+                &metadata_job,
+                api_key,
+                &tmdb_client,
+                tmdb_base_url.as_deref(),
+                &provider_options,
+            )
+            .await
+            {
+                Ok(true) => {
+                    result.metadata_completed = true;
+                    break;
+                }
+                Ok(false) if attempt < METADATA_DEPENDENCY_MAX_ATTEMPTS => {
+                    tokio::time::sleep(METADATA_DEPENDENCY_RETRY_DELAY).await;
+                }
+                Ok(false) => {
+                    result.metadata_deferred = true;
+                    break;
+                }
+                Err(error) => {
+                    result.metadata_failed = true;
+                    tracing::warn!(
+                        "metadata provider failed during item refresh: {}",
+                        crate::library::tmdb_metadata::redact_tmdb_error(&error)
+                    );
+                    break;
+                }
+            }
+        }
+
+        if let Some(stored) = MediaItems::find_by_id(job.item.id.clone()).one(&db).await? {
+            job.item = ScannedMediaItem::from_stored(&stored);
+        }
+    }
+
+    let scan_state = (
+        job.item.path.clone(),
+        job.item.id.clone(),
+        job.item.library_id.clone(),
+        job.scan_fingerprint,
+    );
+    let Some(pending_probe) = job.media_probe.take() else {
+        persist_completed_scan_state(&db, &scan_state, local.scan_state_cacheable).await;
+        return Ok(result);
+    };
+
+    if local.probe_skipped {
+        result.probe_skipped = true;
+        persist_completed_scan_state(&db, &scan_state, local.scan_state_cacheable).await;
+        return Ok(result);
+    }
+
+    match run_media_probe_job(
+        db.clone(),
+        MediaProbeJob {
+            item: job.item,
+            media_path: pending_probe.media_path,
+            probe_path: pending_probe.probe_path,
+        },
+        dummy_chapter_duration_seconds,
+        ffmpeg_path,
+        chapter_image_settings,
+    )
+    .await
+    {
+        Ok(probe) if probe.stream_probe_succeeded => {
+            result.probe_completed = true;
+            persist_completed_scan_state(&db, &scan_state, true).await;
+        }
+        Ok(_) => result.probe_failed = true,
+        Err(error) => {
+            result.probe_failed = true;
+            tracing::warn!("ProbeProvider failed during item refresh: {error:#}");
+        }
+    }
+
+    Ok(result)
+}
+
+async fn persist_completed_scan_state(
+    db: &sea_orm::DatabaseConnection,
+    scan_state: &(String, String, String, i64),
+    cacheable: bool,
+) {
+    if cacheable
+        && let Err(error) = upsert_scan_state(
+            db,
+            &scan_state.0,
+            &scan_state.1,
+            &scan_state.2,
+            scan_state.3,
+        )
+        .await
+    {
+        tracing::warn!(
+            "failed to persist scan fingerprint for {}: {error:#}",
+            scan_state.0
+        );
+    }
+}
+
+async fn run_local_refresh_job(
+    db: &sea_orm::DatabaseConnection,
+    job: &mut ItemRefreshJob,
+    force_probe: bool,
+) -> anyhow::Result<LocalRefreshResult> {
     let cached_probe = match job.media_probe.as_ref() {
-        Some(pending) => cached_media_probe_for_job(&db, &job.item, pending, force_probe).await,
+        Some(pending) => cached_media_probe_for_job(db, &job.item, pending, force_probe).await,
         None => None,
     };
     if let Some(cached_probe) = cached_probe.as_ref() {
@@ -1264,20 +1388,20 @@ async fn run_ingest_job(
         }
     }
 
-    let stored_item_id = upsert_media_item(&db, &job.item).await?;
-    job.item.id = stored_item_id;
-    upsert_media_metadata(&db, &job.item.id, &job.parsed_metadata).await?;
+    let stored_item_id = upsert_media_item(db, &job.item).await?;
+    job.item.id = stored_item_id.clone();
+    upsert_media_metadata(db, &job.item.id, &job.parsed_metadata).await?;
     if job.clear_folder_metadata {
-        clear_scraped_folder_metadata(&db, &job.item.id).await;
+        clear_scraped_folder_metadata(db, &job.item.id).await;
     }
-    upsert_sidecar_images(&db, &job.source_path, &job.item.id).await?;
+    upsert_sidecar_images(db, &job.source_path, &job.item.id).await?;
     if job.item.item_type == "Photo" {
         let size_bytes = tokio::fs::metadata(&job.source_path)
             .await
             .ok()
             .and_then(|metadata| i64::try_from(metadata.len()).ok());
         upsert_image_asset(
-            &db,
+            db,
             &job.item.id,
             "Primary",
             0,
@@ -1286,31 +1410,24 @@ async fn run_ingest_job(
         )
         .await?;
     }
-    upsert_nfo_images(&db, &job.item.id, &job.parsed_metadata.images).await?;
+    upsert_nfo_images(db, &job.item.id, &job.parsed_metadata.images).await?;
 
-    let mut result = IngestJobResult {
-        stored_item_id: job.item.id.clone(),
-        metadata_queued: queue_metadata_fetch(
-            metadata_tx,
-            &job.item,
-            &job.source_path,
-            job.parsed_metadata.has_nfo,
-        ),
-        probe_queued: false,
+    let mut result = LocalRefreshResult {
+        stored_item_id,
         probe_skipped: false,
         scan_state_cacheable: cached_probe
             .as_ref()
             .is_none_or(|probe| !probe.probe_failed),
     };
 
-    let Some(pending_probe) = job.media_probe else {
+    let Some(_pending_probe) = job.media_probe.as_ref() else {
         return Ok(result);
     };
 
     if cached_probe.is_some() {
         result.probe_skipped = true;
         refresh_sidecar_streams(
-            &db,
+            db,
             &job.source_path,
             &job.item.id,
             !matches!(job.item.item_type.as_str(), "Audio" | "AudioBook"),
@@ -1319,21 +1436,8 @@ async fn run_ingest_job(
         return Ok(result);
     }
 
-    upsert_default_media_stream(&db, &job.item).await?;
-    upsert_sidecar_subtitles(&db, &job.source_path, &job.item.id).await?;
-    let probe_job = MediaProbeJob {
-        item: job.item,
-        media_path: pending_probe.media_path,
-        probe_path: pending_probe.probe_path,
-        scan_fingerprint: Some(job.scan_fingerprint),
-    };
-    probe_tx.send(probe_job).await.map_err(|error| {
-        anyhow::anyhow!(
-            "media probe queue closed before job could be scheduled for {}",
-            error.0.item.path
-        )
-    })?;
-    result.probe_queued = true;
+    upsert_default_media_stream(db, &job.item).await?;
+    upsert_sidecar_subtitles(db, &job.source_path, &job.item.id).await?;
 
     Ok(result)
 }
@@ -1404,239 +1508,30 @@ fn apply_cached_probe(item: &mut ScannedMediaItem, cached_probe: &CachedMediaPro
     }
 }
 
-fn start_media_probe_pipeline(
-    db: sea_orm::DatabaseConnection,
-    cache_version_db: Option<sea_orm::DatabaseConnection>,
-    ffmpeg_path: String,
-) -> MediaProbePipeline {
-    let concurrency = media_probe_concurrency();
-    let queue_capacity = media_probe_queue_capacity();
-    let (tx, rx) = mpsc::channel::<MediaProbeJob>(queue_capacity);
-    let handle = tokio::spawn(async move {
-        let dummy_chapter_duration_seconds = configured_dummy_chapter_duration_seconds(&db).await;
-        let chapter_image_settings = crate::chapters::chapter_image_scan_settings(&db).await;
-        let receiver = Arc::new(Mutex::new(rx));
-        let mut workers = tokio::task::JoinSet::new();
-        tracing::info!(
-            "media probe pipeline started concurrency={concurrency} queue_capacity={queue_capacity}"
-        );
-
-        for worker_index in 0..concurrency {
-            let db = db.clone();
-            let receiver = receiver.clone();
-            let ffmpeg_path = ffmpeg_path.clone();
-            let chapter_image_settings = chapter_image_settings.clone();
-            workers.spawn(async move {
-                let mut stats = MediaProbeWorkerStats::default();
-                loop {
-                    let job = {
-                        let mut receiver = receiver.lock().await;
-                        receiver.recv().await
-                    };
-                    let Some(job) = job else {
-                        break;
-                    };
-                    crate::library::resource_governor::wait_for_background_worker(worker_index, 1)
-                        .await;
-                    stats.completed += 1;
-                    let scan_state = job.scan_fingerprint.map(|fingerprint| {
-                        (
-                            job.item.path.clone(),
-                            job.item.id.clone(),
-                            job.item.library_id.clone(),
-                            fingerprint,
-                        )
-                    });
-                    match run_media_probe_job(
-                        db.clone(),
-                        job,
-                        dummy_chapter_duration_seconds,
-                        &ffmpeg_path,
-                        &chapter_image_settings,
-                    )
-                    .await
-                    {
-                        Ok(result) => {
-                            if result.stream_probe_succeeded {
-                                stats.stream_probe_succeeded += 1;
-                                if let Some((path, item_id, library_id, fingerprint)) = &scan_state
-                                    && let Err(error) = upsert_scan_state(
-                                        &db,
-                                        path,
-                                        item_id,
-                                        library_id,
-                                        *fingerprint,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "failed to persist probed scan fingerprint for {path}: {error:#}"
-                                    );
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            stats.failed += 1;
-                            tracing::warn!("media probe job failed: {error:#}");
-                        }
-                    }
-                }
-                stats
-            });
-        }
-
-        let mut stats = MediaProbeWorkerStats::default();
-        while let Some(result) = workers.join_next().await {
-            match result {
-                Ok(worker_stats) => {
-                    stats.completed += worker_stats.completed;
-                    stats.stream_probe_succeeded += worker_stats.stream_probe_succeeded;
-                    stats.failed += worker_stats.failed;
-                }
-                Err(error) => {
-                    stats.failed += 1;
-                    tracing::warn!("media probe worker task panicked: {error}");
-                }
-            }
-        }
-
-        tracing::info!(
-            "media probe pipeline completed {} item(s); stream_probe_succeeded={} failed={}",
-            stats.completed,
-            stats.stream_probe_succeeded,
-            stats.failed
-        );
-        if let Some(db) = cache_version_db {
-            if let Err(error) = set_media_probe_cache_current(&db).await {
-                tracing::warn!("failed to mark media probe cache current: {error:#}");
-            }
-        }
-        stats
-    });
-    MediaProbePipeline { tx, handle }
-}
-
-fn start_metadata_fetch_pipeline(
-    db: sea_orm::DatabaseConnection,
-    api_key: String,
-    tmdb_proxy_url: Arc<RwLock<Option<String>>>,
-    tmdb_http_client: Arc<RwLock<reqwest::Client>>,
-    douban_cookie: Option<String>,
-    library_options: HashMap<String, crate::library::tmdb_metadata::TmdbLibraryProviderOptions>,
-) -> MetadataFetchPipeline {
-    let (tx, mut rx) = mpsc::unbounded_channel::<MetadataFetchJob>();
-    let handle = tokio::spawn(async move {
-        let concurrency = metadata_fetch_concurrency();
-        let mut pending = tokio::task::JoinSet::new();
-        let mut queued = 0usize;
-        let mut completed = 0usize;
-        let mut failed = 0usize;
-        tracing::info!("metadata fetch pipeline started concurrency={concurrency}");
-
-        while let Some(job) = rx.recv().await {
-            queued += 1;
-            let active_limit = if crate::library::resource_governor::foreground_is_busy() {
-                1
-            } else {
-                concurrency
-            };
-            while pending.len() >= active_limit {
-                if metadata_job_finished(pending.join_next().await) {
-                    completed += 1;
-                } else {
-                    failed += 1;
-                }
-            }
-            let db = db.clone();
-            let api_key = api_key.clone();
-            let tmdb_proxy_url = tmdb_proxy_url.clone();
-            let tmdb_http_client = tmdb_http_client.clone();
-            let provider_options = library_options
-                .get(&job.library_id)
-                .cloned()
-                .unwrap_or_default();
-            pending.spawn(async move {
-                let tmdb_base_url = tmdb_proxy_url.read().await.clone();
-                let tmdb_client = tmdb_http_client.read().await.clone();
-                run_metadata_fetch_job(
-                    db,
-                    job,
-                    &api_key,
-                    &tmdb_client,
-                    tmdb_base_url.as_deref(),
-                    &provider_options,
-                )
-                .await
-            });
-        }
-
-        while let Some(result) = pending.join_next().await {
-            if metadata_job_finished(Some(result)) {
-                completed += 1;
-            } else {
-                failed += 1;
-            }
-        }
-
-        run_post_scan_metadata_tasks(
-            &db,
-            &api_key,
-            tmdb_proxy_url,
-            tmdb_http_client,
-            douban_cookie.as_deref(),
-        )
-        .await;
-        tracing::info!(
-            "metadata fetch pipeline completed {completed}/{queued} item(s); failed={failed}"
-        );
-    });
-    MetadataFetchPipeline { tx, handle }
-}
-
-fn metadata_job_finished(
-    result: Option<Result<anyhow::Result<()>, tokio::task::JoinError>>,
-) -> bool {
-    match result {
-        Some(Ok(Ok(()))) => true,
-        Some(Ok(Err(error))) => {
-            tracing::warn!(
-                "metadata fetch job failed: {}",
-                crate::library::tmdb_metadata::redact_tmdb_error(&error)
-            );
-            false
-        }
-        Some(Err(error)) => {
-            tracing::warn!("metadata fetch worker task panicked: {error}");
-            false
-        }
-        None => false,
-    }
-}
-
 async fn run_metadata_fetch_job(
     db: sea_orm::DatabaseConnection,
-    job: MetadataFetchJob,
+    job: &MetadataFetchJob,
     api_key: &str,
     tmdb_client: &reqwest::Client,
     tmdb_base_url: Option<&str>,
     provider_options: &crate::library::tmdb_metadata::TmdbLibraryProviderOptions,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if api_key.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     if metadata_item_is_locked(&db, &job.item_id).await {
-        return Ok(());
+        return Ok(true);
     }
     let Some(policy) =
         provider_options.automatic_policy(&job.item_type, job.preserve_existing_metadata)
     else {
-        return Ok(());
+        return Ok(true);
     };
 
     let metadata_ready = match job.item_type.as_str() {
         "Movie" | "Series" => {
             if tmdb_metadata_is_current(&db, &job.item_id, policy).await {
-                return Ok(());
+                return Ok(true);
             }
             crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(
                 &db,
@@ -1677,44 +1572,13 @@ async fn run_metadata_fetch_job(
     };
 
     if !metadata_ready && provider_options.metadata_enabled("Series") {
-        schedule_metadata_fetch_retry(job);
-    }
-    Ok(())
-}
-
-fn schedule_metadata_fetch_retry(mut job: MetadataFetchJob) {
-    if job.attempts >= METADATA_FETCH_MAX_ATTEMPTS {
         tracing::debug!(
-            "TMDb metadata dependency was not ready after {} attempt(s) for {} {} ({}); post-scan TMDb batch will retry it",
-            METADATA_FETCH_MAX_ATTEMPTS,
+            "metadata dependency is not ready for {} {}; deferring to the post-scan hierarchy refresh",
             job.item_type,
-            job.item_id,
-            job.path.display()
+            job.item_id
         );
-        return;
     }
-
-    job.attempts += 1;
-    let retry_number = job.attempts;
-    let item_type = job.item_type.clone();
-    let retry_tx = job.retry_tx.clone();
-
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(METADATA_FETCH_RETRY_DELAY_SECS)).await;
-        match retry_tx.send(job) {
-            Ok(()) => {
-                tracing::debug!(
-                    "metadata fetch retry queued for {item_type} after dependency wait attempt {retry_number}"
-                );
-            }
-            Err(error) => {
-                tracing::debug!(
-                    "metadata fetch queue closed before retry could be scheduled for {}",
-                    error.0.path.display()
-                );
-            }
-        }
-    });
+    Ok(metadata_ready)
 }
 
 async fn run_post_scan_metadata_tasks(
@@ -2222,34 +2086,21 @@ fn same_normalized_path(left: &std::path::Path, right: &std::path::Path) -> bool
         == path_utils::normalize_path(&right.to_string_lossy())
 }
 
-fn queue_metadata_fetch(
-    metadata_tx: &mpsc::UnboundedSender<MetadataFetchJob>,
+fn metadata_fetch_job(
     item: &ScannedMediaItem,
     path: &std::path::Path,
     preserve_existing_metadata: bool,
-) -> bool {
+) -> Option<MetadataFetchJob> {
     match item.item_type.as_str() {
         "Movie" | "Series" | "Season" | "Episode" => {}
-        _ => return false,
+        _ => return None,
     }
-    match metadata_tx.send(MetadataFetchJob {
+    Some(MetadataFetchJob {
         item_id: item.id.clone(),
-        library_id: item.library_id.clone(),
         item_type: item.item_type.clone(),
         path: path.to_path_buf(),
         preserve_existing_metadata,
-        attempts: 0,
-        retry_tx: metadata_tx.clone(),
-    }) {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(
-                "metadata fetch queue closed before job could be scheduled for {}",
-                error.0.path.display()
-            );
-            false
-        }
-    }
+    })
 }
 
 async fn metadata_item_is_locked(db: &sea_orm::DatabaseConnection, item_id: &str) -> bool {
@@ -2570,32 +2421,18 @@ async fn upsert_scan_state(
     Ok(())
 }
 
-fn media_probe_concurrency() -> usize {
-    crate::db::online_cpu_count().clamp(1, 32)
-}
-
 fn scan_root_concurrency() -> usize {
     crate::db::cpu_parallelism().clamp(1, 8)
 }
 
-fn ingest_concurrency() -> usize {
-    crate::db::cpu_parallelism().clamp(1, 8)
+fn item_refresh_concurrency() -> usize {
+    crate::db::online_cpu_count().clamp(1, 32)
 }
 
-fn metadata_fetch_concurrency() -> usize {
-    crate::db::online_cpu_count().div_ceil(2).clamp(1, 16)
-}
-
-fn ingest_queue_capacity() -> usize {
-    crate::db::cpu_parallelism()
-        .saturating_mul(512)
-        .clamp(MIN_INGEST_QUEUE_CAPACITY, MAX_INGEST_QUEUE_CAPACITY)
-}
-
-fn media_probe_queue_capacity() -> usize {
-    crate::db::cpu_parallelism().saturating_mul(32).clamp(
-        MIN_MEDIA_PROBE_QUEUE_CAPACITY,
-        MAX_MEDIA_PROBE_QUEUE_CAPACITY,
+fn item_refresh_queue_capacity() -> usize {
+    crate::db::cpu_parallelism().saturating_mul(512).clamp(
+        MIN_ITEM_REFRESH_QUEUE_CAPACITY,
+        MAX_ITEM_REFRESH_QUEUE_CAPACITY,
     )
 }
 
@@ -2878,8 +2715,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_root_skips_matching_fingerprint_before_ingest() {
-        let root = test_dir("scan_root_skips_matching_fingerprint_before_ingest");
+    async fn scan_root_skips_matching_fingerprint_before_refresh() {
+        let root = test_dir("scan_root_skips_matching_fingerprint_before_refresh");
         let media = root.join("Movie.mkv");
         fs::write(&media, b"video").unwrap();
         let resolved = path_utils::resolve_path_info(&media).unwrap();
@@ -2912,8 +2749,8 @@ mod tests {
     }
 
     #[test]
-    fn media_probe_concurrency_defaults_to_positive_value() {
-        assert!(media_probe_concurrency() > 0);
+    fn item_refresh_concurrency_defaults_to_positive_value() {
+        assert!(item_refresh_concurrency() > 0);
     }
 
     #[test]
@@ -2922,18 +2759,8 @@ mod tests {
     }
 
     #[test]
-    fn media_probe_queue_capacity_defaults_to_positive_value() {
-        assert!(media_probe_queue_capacity() > 0);
-    }
-
-    #[test]
-    fn ingest_concurrency_defaults_to_positive_value() {
-        assert!(ingest_concurrency() > 0);
-    }
-
-    #[test]
-    fn ingest_queue_capacity_defaults_to_positive_value() {
-        assert!(ingest_queue_capacity() > 0);
+    fn item_refresh_queue_capacity_defaults_to_positive_value() {
+        assert!(item_refresh_queue_capacity() > 0);
     }
 
     #[test]
@@ -3030,7 +2857,7 @@ mod tests {
                 break;
             }
         }
-        let episode_item = episode_item.expect("episode ingest job should be queued");
+        let episode_item = episode_item.expect("episode refresh job should be queued");
         assert_eq!(episode_item.season_number, Some(1));
         assert_eq!(episode_item.episode_number, Some(1));
         assert_eq!(episode_item.episode_number_end, Some(3));
@@ -3073,8 +2900,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_root_applies_local_nfo_scalars_to_ingest_item() {
-        let root = test_dir("scan_root_applies_local_nfo_scalars_to_ingest_item");
+    async fn scan_root_applies_local_nfo_scalars_to_refresh_item() {
+        let root = test_dir("scan_root_applies_local_nfo_scalars_to_refresh_item");
         let path = root.join("Movie One.mkv");
         fs::write(&path, []).unwrap();
         fs::write(
@@ -3124,7 +2951,7 @@ mod tests {
                 break;
             }
         }
-        let movie_item = movie_item.expect("movie ingest job should be queued");
+        let movie_item = movie_item.expect("movie refresh job should be queued");
         assert_eq!(movie_item.title, "NFO Movie One");
         assert_eq!(
             movie_item.original_title.as_deref(),
@@ -3190,7 +3017,7 @@ mod tests {
                 break;
             }
         }
-        let disc_job = disc_job.expect("DVD ingest job should be queued");
+        let disc_job = disc_job.expect("DVD refresh job should be queued");
         assert_eq!(disc_job.item.item_type, "Movie");
         assert_eq!(disc_job.item.video_type.as_deref(), Some("Dvd"));
         assert!(!disc_job.item.is_folder);
@@ -3218,7 +3045,7 @@ mod tests {
             .find(|job| job.item.item_type == "Photo")
             .expect("photo should be scanned");
         let photo_id = photo_job.item.id.clone();
-        ingest_without_running_probe(&db, photo_job).await;
+        refresh_without_running_probe(&db, photo_job).await;
         let photo = MediaItems::find_by_id(&photo_id)
             .one(&db)
             .await
@@ -3294,7 +3121,7 @@ mod tests {
         assert_eq!(book_job.item.production_year, Some(1890));
         assert_eq!(book_job.item.parent_id, "books");
         let book_id = book_job.item.id.clone();
-        ingest_without_running_probe(&db, book_job).await;
+        refresh_without_running_probe(&db, book_job).await;
         assert_eq!(
             media_stream_types(&db, &book_id).await,
             Vec::<String>::new()
@@ -3318,7 +3145,7 @@ mod tests {
         assert_eq!(audiobook_job.item.title, "The Spoken Book");
         assert_eq!(audiobook_job.item.production_year, Some(2024));
         let audiobook_id = audiobook_job.item.id.clone();
-        ingest_without_running_probe(&db, audiobook_job).await;
+        refresh_without_running_probe(&db, audiobook_job).await;
         assert_eq!(media_stream_types(&db, &audiobook_id).await, ["Audio"]);
 
         let music_video_root = test_dir("specialized_library_music_video");
@@ -3330,7 +3157,7 @@ mod tests {
             .find(|job| job.item.item_type == "MusicVideo")
             .expect("music video should be scanned");
         let music_video_id = music_video_job.item.id.clone();
-        ingest_without_running_probe(&db, music_video_job).await;
+        refresh_without_running_probe(&db, music_video_job).await;
         assert_eq!(media_stream_types(&db, &music_video_id).await, ["Video"]);
 
         for root in [photo_root, book_root, audiobook_root, music_video_root] {
@@ -3427,7 +3254,7 @@ mod tests {
         root: &std::path::Path,
         library_id: &str,
         collection: &str,
-    ) -> Vec<IngestJob> {
+    ) -> Vec<ItemRefreshJob> {
         scan_jobs_with_photos(root, library_id, collection, true).await
     }
 
@@ -3436,7 +3263,7 @@ mod tests {
         library_id: &str,
         collection: &str,
         enable_photos: bool,
-    ) -> Vec<IngestJob> {
+    ) -> Vec<ItemRefreshJob> {
         let (tx, mut rx) = mpsc::channel(64);
         scan_root(
             root.to_path_buf(),
@@ -3456,19 +3283,11 @@ mod tests {
         jobs
     }
 
-    async fn ingest_without_running_probe(
+    async fn refresh_without_running_probe(
         db: &sea_orm::DatabaseConnection,
-        job: IngestJob,
-    ) -> IngestJobResult {
-        let (probe_tx, mut probe_rx) = mpsc::channel(8);
-        let (metadata_tx, _metadata_rx) = mpsc::unbounded_channel();
-        let result = run_ingest_job(db.clone(), job, false, &probe_tx, &metadata_tx)
-            .await
-            .unwrap();
-        if result.probe_queued {
-            probe_rx.recv().await.expect("probe job should be queued");
-        }
-        result
+        mut job: ItemRefreshJob,
+    ) -> LocalRefreshResult {
+        run_local_refresh_job(db, &mut job, false).await.unwrap()
     }
 
     async fn media_stream_types(db: &sea_orm::DatabaseConnection, item_id: &str) -> Vec<String> {

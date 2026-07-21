@@ -504,6 +504,7 @@ async fn run_ffmpeg_image_extract(
     thumbnail: bool,
 ) -> anyhow::Result<()> {
     let mut command = tokio::process::Command::new(ffmpeg_path);
+    crate::util::lower_background_process_priority(command.as_std_mut());
     command.kill_on_drop(true);
     command
         .arg("-hide_banner")

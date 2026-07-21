@@ -36,3 +36,6 @@ bdinfo-rs-core = "2.0"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

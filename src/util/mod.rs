@@ -79,6 +79,23 @@ pub fn now_unix() -> i64 {
     system_time_to_unix(SystemTime::now())
 }
 
+#[cfg(unix)]
+pub fn lower_background_process_priority(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: pre_exec only invokes the async-signal-safe setpriority syscall
+    // and does not access memory shared with other threads in the child.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+pub fn lower_background_process_priority(_command: &mut std::process::Command) {}
+
 pub fn unix_to_jellyfin_date(timestamp: i64) -> String {
     chrono::DateTime::from_timestamp(timestamp.max(0), 0)
         .map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))

@@ -400,10 +400,21 @@ pub async fn delete_virtual_folder_path(
     }
 }
 
-pub async fn refresh_library(State(state): State<Arc<AppState>>) -> Response {
+pub async fn refresh_library(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
     if state.scan_lock.try_lock().is_err() {
         return Json(json!({ "Scanning": true, "AlreadyRunning": true })).into_response();
     }
+    let mut library_ids = query_string(&query, &["LibraryId", "libraryId"])
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    library_ids.sort();
+    library_ids.dedup();
 
     tokio::spawn(async move {
         let start = now_unix();
@@ -416,7 +427,11 @@ pub async fn refresh_library(State(state): State<Arc<AppState>>) -> Response {
             Some("Media library scan is running"),
         )
         .await;
-        let result = scan_media_library_if_idle(&state).await;
+        let result = if library_ids.is_empty() {
+            scan_media_library_if_idle(&state).await
+        } else {
+            crate::library::scanner::scan_media_libraries_if_idle(&state, &library_ids).await
+        };
         let end = now_unix();
         let (status, message) = match &result {
             Ok(Some(count)) => ("Completed", Some(format!("Scanned {count} items"))),
@@ -460,6 +475,7 @@ async fn virtual_folders_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<Va
             .or_default()
             .push(path.path);
     }
+    let mut options_by_library = crate::library::options::raw_options(db).await?;
 
     let folders = libraries
         .into_iter()
@@ -468,6 +484,9 @@ async fn virtual_folders_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<Va
             name: library.name,
             collection_type: library.collection_type,
             paths: paths_by_library.remove(&library.id).unwrap_or_default(),
+            options: crate::library::options::options_with_defaults(
+                options_by_library.remove(&library.id),
+            ),
         })
         .collect::<Vec<_>>();
 
@@ -502,6 +521,7 @@ async fn virtual_folders_inner(db: &DatabaseConnection) -> anyhow::Result<Vec<Va
                 "ItemId": folder.id,
                 "CollectionType": folder.collection_type,
                 "Locations": folder.paths,
+                "LibraryOptions": folder.options,
                 "ImageTags": image_tags,
                 "PrimaryImageTag": primary_image_tag,
                 "BackdropImageTags": backdrop_image_tags,
@@ -566,11 +586,23 @@ async fn upsert_library_path(
     let name = normalize_library_name(name)?;
     let path = path_utils::validate_library_path(&normalize_library_path_text(path)?)?;
 
-    let library_id = library_id_for_name(&name);
-    let collection_type = normalize_collection_type(collection_type, &name)?;
+    let existing_library = Libraries::find()
+        .filter(libraries::Column::Name.eq(&name))
+        .one(db)
+        .await?;
+    let library_id = existing_library
+        .as_ref()
+        .map(|library| library.id.clone())
+        .unwrap_or_else(|| library_id_for_name(&name));
+    let collection_type = existing_library
+        .as_ref()
+        .map(|library| library.collection_type.clone())
+        .unwrap_or(normalize_collection_type(collection_type, &name)?);
     let now = now_unix();
 
-    upsert_library(db, &library_id, &name, &collection_type, now).await?;
+    if existing_library.is_none() {
+        upsert_library(db, &library_id, &name, &collection_type, now).await?;
+    }
 
     let path_id = stable_text_id(&format!("library-path:{path}"));
     let existing = LibraryPaths::find_by_id(&path_id).one(db).await?;
@@ -593,10 +625,14 @@ async fn upsert_library_path(
 
 async fn delete_virtual_folder_inner(db: &DatabaseConnection, name: &str) -> anyhow::Result<bool> {
     let name = normalize_library_name(name)?;
-    let library_id = library_id_for_name(&name);
-    if Libraries::find_by_id(&library_id).one(db).await?.is_none() {
+    let Some(library) = Libraries::find()
+        .filter(libraries::Column::Name.eq(&name))
+        .one(db)
+        .await?
+    else {
         return Ok(false);
-    }
+    };
+    let library_id = library.id;
 
     let item_ids: Vec<String> = MediaItems::find()
         .filter(media_items::Column::LibraryId.eq(&library_id))
@@ -699,8 +735,15 @@ async fn delete_virtual_folder_path_inner(
 ) -> anyhow::Result<bool> {
     let name = normalize_library_name(name)?;
     let path = path_utils::canonicalize_path(&normalize_library_path_text(path)?)?;
+    let Some(library) = Libraries::find()
+        .filter(libraries::Column::Name.eq(&name))
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
     let result = LibraryPaths::delete_many()
-        .filter(library_paths::Column::LibraryId.eq(library_id_for_name(&name)))
+        .filter(library_paths::Column::LibraryId.eq(library.id))
         .filter(library_paths::Column::Path.eq(path))
         .exec(db)
         .await?;
@@ -714,7 +757,8 @@ async fn rename_virtual_folder_inner(
 ) -> anyhow::Result<bool> {
     let name = normalize_library_name(name)?;
     let new_name = normalize_library_name(new_name)?;
-    let Some(library) = Libraries::find_by_id(library_id_for_name(&name))
+    let Some(library) = Libraries::find()
+        .filter(libraries::Column::Name.eq(&name))
         .one(db)
         .await?
     else {
@@ -737,7 +781,14 @@ async fn update_virtual_folder_path_inner(
     let path = path_utils::canonicalize_path(&normalize_library_path_text(path)?)?;
     let target_path =
         path_utils::validate_library_path(&normalize_library_path_text(target_path)?)?;
-    let library_id = library_id_for_name(&name);
+    let Some(library) = Libraries::find()
+        .filter(libraries::Column::Name.eq(&name))
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let library_id = library.id;
     let Some(model) = LibraryPaths::find()
         .filter(library_paths::Column::LibraryId.eq(&library_id))
         .filter(library_paths::Column::Path.eq(path))
@@ -757,9 +808,18 @@ async fn update_library_options_inner(
     db: &DatabaseConnection,
     body: &Value,
 ) -> anyhow::Result<bool> {
-    let library_id = json_string(body, &["Id", "id"])
-        .or_else(|| json_string(body, &["Name", "name"]).map(|name| library_id_for_name(&name)))
-        .unwrap_or_default();
+    let library_id = if let Some(id) = json_string(body, &["Id", "id"]) {
+        id
+    } else if let Some(name) = json_string(body, &["Name", "name"]) {
+        Libraries::find()
+            .filter(libraries::Column::Name.eq(name))
+            .one(db)
+            .await?
+            .map(|library| library.id)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let library_id = normalize_library_id(&library_id)?;
     if Libraries::find_by_id(&library_id).one(db).await?.is_none() {
         return Ok(false);
@@ -910,6 +970,7 @@ struct VirtualFolder {
     name: String,
     collection_type: String,
     paths: Vec<String>,
+    options: Value,
 }
 
 fn library_options_result() -> Value {

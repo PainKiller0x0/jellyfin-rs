@@ -328,6 +328,7 @@ fn run_ffprobe(path: &Path, is_remote: bool, http_proxy: Option<&str>) -> Option
         .unwrap_or_else(|| "100000000".to_string());
 
     let mut command = Command::new(ffprobe);
+    crate::util::lower_background_process_priority(&mut command);
     command
         .arg("-v")
         .arg("warning")

@@ -1,7 +1,14 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context;
 use chrono::Datelike;
+use sea_orm::sea_query::OnConflict;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use walkdir::WalkDir;
@@ -14,6 +21,7 @@ use crate::{
         media_genres::{self, Entity as MediaGenres},
         media_items::{self, Entity as MediaItems},
         media_people::{self, Entity as MediaPeople},
+        media_scan_states::{self, Entity as MediaScanStates},
         media_studios::{self, Entity as MediaStudios},
         provider_ids::{self, Entity as ProviderIds},
     },
@@ -54,9 +62,34 @@ const MIN_MEDIA_PROBE_QUEUE_CAPACITY: usize = 32;
 const MAX_MEDIA_PROBE_QUEUE_CAPACITY: usize = 256;
 const METADATA_FETCH_MAX_ATTEMPTS: usize = 30;
 const METADATA_FETCH_RETRY_DELAY_SECS: u64 = 2;
+const SCAN_FINGERPRINT_VERSION: u64 = 2;
+
+#[derive(Default)]
+struct SidecarFingerprintCache {
+    by_directory: HashMap<PathBuf, u64>,
+}
+
+impl SidecarFingerprintCache {
+    fn for_media_path(&mut self, path: &std::path::Path) -> u64 {
+        let directory = if path.is_dir() {
+            Some(path)
+        } else {
+            path.parent()
+        };
+        let Some(directory) = directory else {
+            return 0;
+        };
+
+        *self
+            .by_directory
+            .entry(directory.to_path_buf())
+            .or_insert_with(|| sidecar_directory_fingerprint(directory))
+    }
+}
 
 struct ScanRootResult {
     scanned: usize,
+    unchanged: usize,
     seen_paths: Vec<String>,
     ingest_queued: usize,
 }
@@ -82,6 +115,7 @@ struct IngestJob {
     parsed_metadata: ParsedMetadata,
     clear_folder_metadata: bool,
     media_probe: Option<PendingMediaProbe>,
+    scan_fingerprint: i64,
 }
 
 struct PendingMediaProbe {
@@ -91,15 +125,18 @@ struct PendingMediaProbe {
 }
 
 struct IngestJobResult {
+    stored_item_id: String,
     metadata_queued: bool,
     probe_queued: bool,
     probe_skipped: bool,
+    scan_state_cacheable: bool,
 }
 
 struct MediaProbeJob {
     item: ScannedMediaItem,
     media_path: PathBuf,
     probe_path: PathBuf,
+    scan_fingerprint: Option<i64>,
 }
 
 struct MediaProbeJobResult {
@@ -271,6 +308,7 @@ async fn force_refresh_media_probe(
             item: ScannedMediaItem::from_stored(item),
             media_path,
             probe_path,
+            scan_fingerprint: None,
         },
         dummy_chapter_duration_seconds,
         &state.sa_config.ffmpeg_path,
@@ -281,7 +319,16 @@ async fn force_refresh_media_probe(
 }
 
 pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Option<usize>> {
-    let roots = media_roots(state).await?;
+    scan_media_libraries_if_idle(state, &[]).await
+}
+
+pub async fn scan_media_libraries_if_idle(
+    state: &AppState,
+    library_ids: &[String],
+) -> anyhow::Result<Option<usize>> {
+    let selected_library_ids =
+        (!library_ids.is_empty()).then(|| library_ids.iter().cloned().collect::<HashSet<_>>());
+    let roots = media_roots(state, selected_library_ids.as_ref()).await?;
     if roots.is_empty() {
         tracing::info!("media scan skipped because no media library paths are configured");
         return Ok(Some(0));
@@ -297,6 +344,14 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
 
     let scan_database_url = crate::db::database_url_from_env();
     let scan_db = crate::db::background_connection(&scan_database_url).await?;
+    let scanned_library_ids = roots
+        .iter()
+        .map(|(_, library_id, _, _)| library_id.clone())
+        .collect::<HashSet<_>>();
+    let scan_states = Arc::new(load_scan_states(&scan_db, &scanned_library_ids).await?);
+    let api_key = state.tmdb_api_key.read().await.clone().unwrap_or_default();
+    let scan_contexts =
+        scan_context_fingerprints(&scan_db, &scanned_library_ids, !api_key.is_empty()).await?;
 
     let force_probe = !media_probe_cache_is_current(&scan_db).await?;
     if force_probe {
@@ -310,7 +365,6 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
     );
     let mut tasks = tokio::task::JoinSet::new();
     let root_concurrency = scan_root_concurrency();
-    let api_key = state.tmdb_api_key.read().await.clone().unwrap_or_default();
     let douban_cookie = state.douban_cookie.read().await.clone();
     let tmdb_library_options =
         crate::library::tmdb_metadata::load_tmdb_library_provider_options(&scan_db).await?;
@@ -328,8 +382,9 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
         probe_pipeline.tx.clone(),
         metadata_pipeline.tx.clone(),
     );
-    let mut scanned_library_ids = Vec::new();
+    let mut completed_library_ids = Vec::new();
     let mut total = 0usize;
+    let mut unchanged = 0usize;
     let mut all_seen = Vec::new();
     let mut ingest_queued = 0usize;
     let mut pending_roots = roots.into_iter();
@@ -343,10 +398,21 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
                 tracing::warn!("media directory does not exist: {}", root.display());
                 continue;
             }
-            scanned_library_ids.push(library_id.clone());
+            completed_library_ids.push(library_id.clone());
             let ingest_tx = ingest_pipeline.tx.clone();
+            let scan_states = scan_states.clone();
+            let scan_context = scan_contexts.get(&library_id).copied().unwrap_or_default();
             tasks.spawn(async move {
-                scan_root(root, library_id, collection_type, enable_photos, ingest_tx).await
+                scan_root(
+                    root,
+                    library_id,
+                    collection_type,
+                    enable_photos,
+                    scan_context,
+                    scan_states,
+                    ingest_tx,
+                )
+                .await
             });
         }
 
@@ -356,6 +422,7 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
         match result {
             Ok(Ok(result)) => {
                 total += result.scanned;
+                unchanged += result.unchanged;
                 all_seen.extend(result.seen_paths);
                 ingest_queued += result.ingest_queued;
             }
@@ -389,12 +456,13 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
         tracing::warn!("metadata fetch pipeline task panicked: {error}");
     }
 
-    scanned_library_ids.sort();
-    scanned_library_ids.dedup();
-    remove_missing_media_items(&scan_db, &scanned_library_ids, &all_seen).await?;
+    completed_library_ids.sort();
+    completed_library_ids.dedup();
+    remove_missing_media_items(&scan_db, &completed_library_ids, &all_seen).await?;
     tracing::info!(
         "media scan discovered {total} file item(s) across all libraries; queued {ingest_queued} ingest job(s)"
     );
+    tracing::info!("media scan skipped {unchanged} unchanged item(s) through fingerprint cache");
     tracing::info!(
         "media ingest completed {} job(s); metadata_queued={} probe_queued={} probe_skipped={} failed={}",
         ingest_stats.completed,
@@ -419,11 +487,16 @@ async fn scan_root(
     library_id: String,
     collection_type: String,
     enable_photos: bool,
+    scan_context: i64,
+    scan_states: Arc<HashMap<String, i64>>,
     ingest_tx: mpsc::Sender<IngestJob>,
 ) -> anyhow::Result<ScanRootResult> {
     let mut scanned = 0usize;
+    let mut unchanged = 0usize;
+    let mut visited_entries = 0usize;
     let mut seen_paths = Vec::new();
     let mut ingest_queued = 0usize;
+    let mut sidecar_fingerprints = SidecarFingerprintCache::default();
     let stack_part_owners = movie_stack_part_owners(&root, &collection_type);
     let episode_version_owners = episode_version_owners(&root, &library_id, &collection_type);
 
@@ -435,6 +508,10 @@ async fn scan_root(
                 continue;
             }
         };
+        visited_entries += 1;
+        if visited_entries.is_multiple_of(64) {
+            crate::library::resource_governor::cooperative_scan_yield().await;
+        }
         let path = entry.path();
         if path == root {
             continue;
@@ -472,6 +549,17 @@ async fn scan_root(
                 continue;
             }
             seen_paths.push(path_string.clone());
+            let scan_fingerprint = media_scan_fingerprint(
+                path,
+                resolved.modified_at,
+                resolved.size_bytes,
+                scan_context,
+                &mut sidecar_fingerprints,
+            );
+            if scan_states.get(&path_string) == Some(&scan_fingerprint) {
+                unchanged += 1;
+                continue;
+            }
             let mut folder_type = tv_folder_type(path, &root, &collection_type);
             if collection_type == "homevideos" && !enable_photos && folder_type == "PhotoAlbum" {
                 folder_type = "Folder";
@@ -567,6 +655,7 @@ async fn scan_root(
                 parsed_metadata,
                 clear_folder_metadata: folder_type == "Folder",
                 media_probe,
+                scan_fingerprint,
             };
             if queue_ingest(&ingest_tx, job).await {
                 ingest_queued += 1;
@@ -645,6 +734,18 @@ async fn scan_root(
         };
 
         seen_paths.push(path_string.clone());
+        scanned += 1;
+        let scan_fingerprint = media_scan_fingerprint(
+            path,
+            resolved.modified_at,
+            resolved.size_bytes,
+            scan_context,
+            &mut sidecar_fingerprints,
+        );
+        if scan_states.get(&path_string) == Some(&scan_fingerprint) {
+            unchanged += 1;
+            continue;
+        }
         let parsed_metadata = parse_sidecar_metadata_for_item(path, &item_type).await;
         let parsed_name = parse_media_name(path, &collection_type);
         let collapsed_book_directory = (item_type == "Book")
@@ -826,15 +927,16 @@ async fn scan_root(
             parsed_metadata,
             clear_folder_metadata: false,
             media_probe,
+            scan_fingerprint,
         };
         if queue_ingest(&ingest_tx, job).await {
             ingest_queued += 1;
-            scanned += 1;
         }
     }
 
     Ok(ScanRootResult {
         scanned,
+        unchanged,
         seen_paths,
         ingest_queued,
     })
@@ -1027,7 +1129,7 @@ fn start_ingest_pipeline(
             "ingest pipeline started concurrency={concurrency} queue_capacity={queue_capacity}"
         );
 
-        for _ in 0..concurrency {
+        for worker_index in 0..concurrency {
             let db = db.clone();
             let receiver = receiver.clone();
             let probe_tx = probe_tx.clone();
@@ -1042,7 +1144,14 @@ fn start_ingest_pipeline(
                     let Some(job) = job else {
                         break;
                     };
+                    crate::library::resource_governor::wait_for_background_worker(worker_index, 1)
+                        .await;
                     stats.completed += 1;
+                    let scan_state = (
+                        job.item.path.clone(),
+                        job.item.library_id.clone(),
+                        job.scan_fingerprint,
+                    );
                     match run_ingest_job(db.clone(), job, force_probe, &probe_tx, &metadata_tx)
                         .await
                     {
@@ -1055,6 +1164,22 @@ fn start_ingest_pipeline(
                             }
                             if result.probe_skipped {
                                 stats.probe_skipped += 1;
+                            }
+                            if !result.probe_queued
+                                && result.scan_state_cacheable
+                                && let Err(error) = upsert_scan_state(
+                                    &db,
+                                    &scan_state.0,
+                                    &result.stored_item_id,
+                                    &scan_state.1,
+                                    scan_state.2,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "failed to persist scan fingerprint for {}: {error:#}",
+                                    scan_state.0
+                                );
                             }
                         }
                         Err(error) => {
@@ -1164,6 +1289,7 @@ async fn run_ingest_job(
     upsert_nfo_images(&db, &job.item.id, &job.parsed_metadata.images).await?;
 
     let mut result = IngestJobResult {
+        stored_item_id: job.item.id.clone(),
         metadata_queued: queue_metadata_fetch(
             metadata_tx,
             &job.item,
@@ -1172,6 +1298,9 @@ async fn run_ingest_job(
         ),
         probe_queued: false,
         probe_skipped: false,
+        scan_state_cacheable: cached_probe
+            .as_ref()
+            .is_none_or(|probe| !probe.probe_failed),
     };
 
     let Some(pending_probe) = job.media_probe else {
@@ -1196,6 +1325,7 @@ async fn run_ingest_job(
         item: job.item,
         media_path: pending_probe.media_path,
         probe_path: pending_probe.probe_path,
+        scan_fingerprint: Some(job.scan_fingerprint),
     };
     probe_tx.send(probe_job).await.map_err(|error| {
         anyhow::anyhow!(
@@ -1291,7 +1421,7 @@ fn start_media_probe_pipeline(
             "media probe pipeline started concurrency={concurrency} queue_capacity={queue_capacity}"
         );
 
-        for _ in 0..concurrency {
+        for worker_index in 0..concurrency {
             let db = db.clone();
             let receiver = receiver.clone();
             let ffmpeg_path = ffmpeg_path.clone();
@@ -1306,7 +1436,17 @@ fn start_media_probe_pipeline(
                     let Some(job) = job else {
                         break;
                     };
+                    crate::library::resource_governor::wait_for_background_worker(worker_index, 1)
+                        .await;
                     stats.completed += 1;
+                    let scan_state = job.scan_fingerprint.map(|fingerprint| {
+                        (
+                            job.item.path.clone(),
+                            job.item.id.clone(),
+                            job.item.library_id.clone(),
+                            fingerprint,
+                        )
+                    });
                     match run_media_probe_job(
                         db.clone(),
                         job,
@@ -1319,6 +1459,20 @@ fn start_media_probe_pipeline(
                         Ok(result) => {
                             if result.stream_probe_succeeded {
                                 stats.stream_probe_succeeded += 1;
+                                if let Some((path, item_id, library_id, fingerprint)) = &scan_state
+                                    && let Err(error) = upsert_scan_state(
+                                        &db,
+                                        path,
+                                        item_id,
+                                        library_id,
+                                        *fingerprint,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "failed to persist probed scan fingerprint for {path}: {error:#}"
+                                    );
+                                }
                             }
                         }
                         Err(error) => {
@@ -1381,7 +1535,12 @@ fn start_metadata_fetch_pipeline(
 
         while let Some(job) = rx.recv().await {
             queued += 1;
-            while pending.len() >= concurrency {
+            let active_limit = if crate::library::resource_governor::foreground_is_busy() {
+                1
+            } else {
+                concurrency
+            };
+            while pending.len() >= active_limit {
                 if metadata_job_finished(pending.join_next().await) {
                     completed += 1;
                 } else {
@@ -2224,7 +2383,10 @@ async fn tmdb_metadata_is_current(
         .is_some()
 }
 
-async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String, String, bool)>> {
+async fn media_roots(
+    state: &AppState,
+    selected_library_ids: Option<&HashSet<String>>,
+) -> anyhow::Result<Vec<(PathBuf, String, String, bool)>> {
     let paths = LibraryPaths::find()
         .order_by_asc(library_paths::Column::Path)
         .all(&state.db)
@@ -2241,53 +2403,187 @@ async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String, S
         .into_iter()
         .map(|library| (library.id.clone(), library))
         .collect::<std::collections::HashMap<_, _>>();
-    let library_options = crate::db::settings::find_by_prefix(&state.db, "LibraryOptions.")
-        .await?
-        .into_iter()
-        .filter_map(|setting| {
-            let library_id = setting.key.strip_prefix("LibraryOptions.")?.to_string();
-            let enable_photos = serde_json::from_str::<serde_json::Value>(&setting.value)
-                .ok()
-                .and_then(|options| {
-                    options
-                        .get("EnablePhotos")
-                        .or_else(|| options.get("enablePhotos"))
-                        .and_then(serde_json::Value::as_bool)
-                })
-                .unwrap_or(true);
-            Some((library_id, enable_photos))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
+    let library_options = crate::library::options::load_runtime_options(&state.db).await?;
 
     Ok(paths
         .into_iter()
         .filter_map(|path| {
+            if selected_library_ids.is_some_and(|selected| !selected.contains(&path.library_id)) {
+                return None;
+            }
             libraries.get(&path.library_id).map(|library| {
+                let options = library_options
+                    .get(&library.id)
+                    .cloned()
+                    .unwrap_or_default();
                 (
                     PathBuf::from(path_utils::normalize_path(&path.path)),
                     path.library_id,
                     library.collection_type.clone(),
-                    library_options.get(&library.id).copied().unwrap_or(true),
+                    options,
                 )
             })
+        })
+        .filter(|(_, _, _, options)| options.enabled)
+        .map(|(path, library_id, collection_type, options)| {
+            (path, library_id, collection_type, options.enable_photos)
         })
         .collect())
 }
 
+async fn load_scan_states(
+    db: &sea_orm::DatabaseConnection,
+    library_ids: &HashSet<String>,
+) -> anyhow::Result<HashMap<String, i64>> {
+    if library_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(MediaScanStates::find()
+        .filter(media_scan_states::Column::LibraryId.is_in(library_ids.iter().cloned()))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|state| (state.path, state.fingerprint))
+        .collect())
+}
+
+async fn scan_context_fingerprints(
+    db: &sea_orm::DatabaseConnection,
+    library_ids: &HashSet<String>,
+    tmdb_configured: bool,
+) -> anyhow::Result<HashMap<String, i64>> {
+    let options = crate::library::options::raw_options(db).await?;
+    let preferred_language = crate::db::settings::get(db, "PreferredMetadataLanguage").await?;
+    let metadata_country = crate::db::settings::get(db, "MetadataCountryCode").await?;
+    Ok(library_ids
+        .iter()
+        .map(|library_id| {
+            let mut hasher = DefaultHasher::new();
+            SCAN_FINGERPRINT_VERSION.hash(&mut hasher);
+            MEDIA_PROBE_CACHE_VERSION.hash(&mut hasher);
+            tmdb_configured.hash(&mut hasher);
+            preferred_language.hash(&mut hasher);
+            metadata_country.hash(&mut hasher);
+            options
+                .get(library_id)
+                .map(ToString::to_string)
+                .hash(&mut hasher);
+            (library_id.clone(), hasher.finish() as i64)
+        })
+        .collect())
+}
+
+fn media_scan_fingerprint(
+    path: &std::path::Path,
+    modified_at: i64,
+    size_bytes: Option<i64>,
+    scan_context: i64,
+    sidecar_fingerprints: &mut SidecarFingerprintCache,
+) -> i64 {
+    let mut hasher = DefaultHasher::new();
+    SCAN_FINGERPRINT_VERSION.hash(&mut hasher);
+    scan_context.hash(&mut hasher);
+    modified_at.hash(&mut hasher);
+    size_bytes.hash(&mut hasher);
+    sidecar_fingerprints.for_media_path(path).hash(&mut hasher);
+    hasher.finish() as i64
+}
+
+fn sidecar_directory_fingerprint(directory: &std::path::Path) -> u64 {
+    let mut sidecars = std::fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() || !is_scan_sidecar(&path) {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            Some((entry.file_name(), metadata.len(), modified))
+        })
+        .collect::<Vec<_>>();
+    sidecars.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = DefaultHasher::new();
+    sidecars.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn is_scan_sidecar(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "nfo"
+                    | "jpg"
+                    | "jpeg"
+                    | "png"
+                    | "webp"
+                    | "srt"
+                    | "ass"
+                    | "ssa"
+                    | "vtt"
+                    | "sub"
+                    | "smi"
+                    | "sami"
+                    | "mpl"
+                    | "lrc"
+                    | "mka"
+            )
+        })
+}
+
+async fn upsert_scan_state(
+    db: &sea_orm::DatabaseConnection,
+    path: &str,
+    item_id: &str,
+    library_id: &str,
+    fingerprint: i64,
+) -> anyhow::Result<()> {
+    MediaScanStates::insert(media_scan_states::ActiveModel {
+        path: Set(path.to_string()),
+        item_id: Set(item_id.to_string()),
+        library_id: Set(library_id.to_string()),
+        fingerprint: Set(fingerprint),
+        updated_at: Set(crate::util::now_unix()),
+    })
+    .on_conflict(
+        OnConflict::column(media_scan_states::Column::Path)
+            .update_columns([
+                media_scan_states::Column::ItemId,
+                media_scan_states::Column::LibraryId,
+                media_scan_states::Column::Fingerprint,
+                media_scan_states::Column::UpdatedAt,
+            ])
+            .to_owned(),
+    )
+    .exec(db)
+    .await?;
+    Ok(())
+}
+
 fn media_probe_concurrency() -> usize {
-    (crate::db::cpu_parallelism() / 4).clamp(1, 3)
+    crate::db::online_cpu_count().clamp(1, 32)
 }
 
 fn scan_root_concurrency() -> usize {
-    (crate::db::cpu_parallelism() / 4).clamp(1, 2)
+    crate::db::cpu_parallelism().clamp(1, 8)
 }
 
 fn ingest_concurrency() -> usize {
-    (crate::db::cpu_parallelism() / 4).clamp(1, 2)
+    crate::db::cpu_parallelism().clamp(1, 8)
 }
 
 fn metadata_fetch_concurrency() -> usize {
-    (crate::db::cpu_parallelism() / 4).clamp(1, 2)
+    crate::db::online_cpu_count().div_ceil(2).clamp(1, 16)
 }
 
 fn ingest_queue_capacity() -> usize {
@@ -2537,6 +2833,85 @@ mod tests {
     }
 
     #[test]
+    fn scan_fingerprint_changes_when_sidecar_changes() {
+        let root = test_dir("scan_fingerprint_changes_when_sidecar_changes");
+        let media = root.join("Movie.mkv");
+        let nfo = root.join("Movie.nfo");
+        fs::write(&media, b"video").unwrap();
+        fs::write(&nfo, b"<movie />").unwrap();
+
+        let before = media_scan_fingerprint(
+            &media,
+            10,
+            Some(5),
+            20,
+            &mut SidecarFingerprintCache::default(),
+        );
+        fs::write(&nfo, b"<movie><title>Changed</title></movie>").unwrap();
+        let after = media_scan_fingerprint(
+            &media,
+            10,
+            Some(5),
+            20,
+            &mut SidecarFingerprintCache::default(),
+        );
+
+        assert_ne!(before, after);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scan_fingerprint_reuses_sidecar_signature_within_a_directory() {
+        let root = test_dir("scan_fingerprint_reuses_sidecar_signature_within_a_directory");
+        let first = root.join("First.mkv");
+        let second = root.join("Second.mkv");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        fs::write(root.join("First.nfo"), b"<movie />").unwrap();
+        let mut cache = SidecarFingerprintCache::default();
+
+        media_scan_fingerprint(&first, 10, Some(5), 20, &mut cache);
+        media_scan_fingerprint(&second, 11, Some(6), 20, &mut cache);
+
+        assert_eq!(cache.by_directory.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn scan_root_skips_matching_fingerprint_before_ingest() {
+        let root = test_dir("scan_root_skips_matching_fingerprint_before_ingest");
+        let media = root.join("Movie.mkv");
+        fs::write(&media, b"video").unwrap();
+        let resolved = path_utils::resolve_path_info(&media).unwrap();
+        let fingerprint = media_scan_fingerprint(
+            &media,
+            resolved.modified_at,
+            resolved.size_bytes,
+            42,
+            &mut SidecarFingerprintCache::default(),
+        );
+        let states = Arc::new(HashMap::from([(resolved.path, fingerprint)]));
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let result = scan_root(
+            root.clone(),
+            "movies".to_string(),
+            "movies".to_string(),
+            true,
+            42,
+            states,
+            tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.scanned, 1);
+        assert_eq!(result.unchanged, 1);
+        assert!(rx.recv().await.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn media_probe_concurrency_defaults_to_positive_value() {
         assert!(media_probe_concurrency() > 0);
     }
@@ -2640,6 +3015,8 @@ mod tests {
             "tv".to_string(),
             "tvshows".to_string(),
             true,
+            0,
+            Arc::new(HashMap::new()),
             tx,
         )
         .await
@@ -2674,6 +3051,8 @@ mod tests {
             "tv".to_string(),
             "tvshows".to_string(),
             true,
+            0,
+            Arc::new(HashMap::new()),
             tx,
         )
         .await
@@ -2730,6 +3109,8 @@ mod tests {
             "movies".to_string(),
             "movies".to_string(),
             true,
+            0,
+            Arc::new(HashMap::new()),
             tx,
         )
         .await
@@ -2795,6 +3176,8 @@ mod tests {
             "movies".to_string(),
             "movies".to_string(),
             true,
+            0,
+            Arc::new(HashMap::new()),
             tx,
         )
         .await
@@ -3060,6 +3443,8 @@ mod tests {
             library_id.to_string(),
             collection.to_string(),
             enable_photos,
+            0,
+            Arc::new(HashMap::new()),
             tx,
         )
         .await

@@ -3,7 +3,9 @@ import type {
   CreateVirtualFolderPayload,
   DefaultDirectoryBrowser,
   DirectoryEntry,
+  LibraryOptions,
   LibraryPathPayload,
+  UpdateLibraryPathPayload,
   VirtualFolder
 } from '@/types/library';
 
@@ -30,6 +32,25 @@ export function deleteVirtualFolder(token: string, name: string) {
   });
 }
 
+export function renameVirtualFolder(token: string, name: string, newName: string) {
+  const params = new URLSearchParams({ Name: name, NewName: newName });
+  return request<void>(`/Library/VirtualFolders/Name?${params.toString()}`, {
+    method: 'POST',
+    token
+  });
+}
+
+export function updateLibraryOptions(token: string, id: string, options: LibraryOptions) {
+  return request<void>('/Library/VirtualFolders/LibraryOptions', {
+    method: 'POST',
+    token,
+    body: {
+      Id: id,
+      LibraryOptions: options
+    }
+  });
+}
+
 export function addLibraryPath(token: string, payload: LibraryPathPayload) {
   return request<void>('/Library/VirtualFolders/Paths', {
     method: 'POST',
@@ -51,8 +72,23 @@ export function deleteLibraryPath(token: string, payload: LibraryPathPayload) {
   );
 }
 
-export function refreshLibrary(token: string) {
-  return request<{ Scanning: boolean; AlreadyRunning?: boolean }>('/Library/Refresh', {
+export function updateLibraryPath(token: string, payload: UpdateLibraryPathPayload) {
+  return request<void>('/Library/VirtualFolders/Paths/Update', {
+    method: 'POST',
+    token,
+    body: {
+      Name: payload.name,
+      Path: payload.path,
+      PathInfo: {
+        Path: payload.newPath
+      }
+    }
+  });
+}
+
+export function refreshLibrary(token: string, libraryId?: string) {
+  const params = libraryId ? `?LibraryId=${encodeURIComponent(libraryId)}` : '';
+  return request<{ Scanning: boolean; AlreadyRunning?: boolean }>(`/Library/Refresh${params}`, {
     method: 'POST',
     token
   });

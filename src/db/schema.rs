@@ -47,6 +47,14 @@ pub fn migrations() -> Vec<Migration> {
             "failed to migrate media_items",
         ),
         (
+            r#"CREATE TABLE IF NOT EXISTS media_scan_state (path TEXT PRIMARY KEY, item_id TEXT NOT NULL UNIQUE, library_id TEXT NOT NULL, fingerprint BIGINT NOT NULL, updated_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, FOREIGN KEY(library_id) REFERENCES libraries(id) ON DELETE CASCADE)"#,
+            "failed to migrate media scan state",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_scan_state_library ON media_scan_state(library_id, path)",
+            "failed to create media scan state library index",
+        ),
+        (
             "CREATE INDEX IF NOT EXISTS idx_media_items_parent_id ON media_items(parent_id)",
             "failed to create media parent index",
         ),

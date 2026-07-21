@@ -4,6 +4,31 @@ export type VirtualFolder = {
   ItemId: string;
   CollectionType: string;
   Locations: string[];
+  LibraryOptions: LibraryOptions;
+};
+
+export type LibraryTypeOptions = {
+  Type: string;
+  MetadataFetchers?: string[];
+  ImageFetchers?: string[];
+  [key: string]: unknown;
+};
+
+export type LibraryOptions = {
+  Enabled?: boolean;
+  EnablePhotos?: boolean;
+  EnableRealtimeMonitor?: boolean;
+  EnableAutomaticSeriesGrouping?: boolean;
+  PreferredMetadataLanguage?: string | null;
+  MetadataCountryCode?: string | null;
+  SaveLocalMetadata?: boolean;
+  AutomaticallyAddToCollection?: boolean;
+  EnableChapterImageExtraction?: boolean;
+  ExtractChapterImagesDuringLibraryScan?: boolean;
+  EnableTrickplayImageExtraction?: boolean;
+  ExtractTrickplayImagesDuringLibraryScan?: boolean;
+  TypeOptions?: LibraryTypeOptions[];
+  [key: string]: unknown;
 };
 
 export type CreateVirtualFolderPayload = {
@@ -15,6 +40,10 @@ export type CreateVirtualFolderPayload = {
 export type LibraryPathPayload = {
   name: string;
   path: string;
+};
+
+export type UpdateLibraryPathPayload = LibraryPathPayload & {
+  newPath: string;
 };
 
 export type DirectoryEntry = {

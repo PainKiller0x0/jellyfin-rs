@@ -90,6 +90,7 @@ pub struct ScannedMediaItem {
 }
 
 pub struct CachedMediaProbe {
+    pub probe_failed: bool,
     pub runtime_ticks: Option<i64>,
     pub size_bytes: Option<i64>,
     pub title: String,
@@ -292,6 +293,7 @@ pub async fn cached_media_probe_if_current(
         .is_some();
     if has_failed_probe {
         return Ok(Some(CachedMediaProbe {
+            probe_failed: true,
             runtime_ticks: item.runtime_ticks,
             size_bytes: item.size_bytes,
             title: item.title,
@@ -336,6 +338,7 @@ pub async fn cached_media_probe_if_current(
     }
 
     Ok(Some(CachedMediaProbe {
+        probe_failed: false,
         runtime_ticks: item.runtime_ticks,
         size_bytes: item.size_bytes,
         title: item.title,

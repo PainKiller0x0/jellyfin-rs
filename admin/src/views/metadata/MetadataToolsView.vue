@@ -691,7 +691,7 @@ onMounted(async () => {
   padding: 12px 14px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
 
   span {
     min-width: 0;
@@ -733,7 +733,7 @@ onMounted(async () => {
   padding: 16px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
   box-shadow: 0 10px 26px rgba(15, 23, 42, 0.04);
 }
 
@@ -772,7 +772,7 @@ onMounted(async () => {
 .metadata-page__panel-head h2,
 .metadata-page__result h3 {
   margin: 0;
-  color: #0f172a;
+  color: var(--admin-text);
   font-size: 17px;
   line-height: 1.25;
 }
@@ -815,7 +815,7 @@ onMounted(async () => {
   }
 
   strong {
-    color: #0f172a;
+    color: var(--admin-text);
     font-size: 14px;
   }
 
@@ -870,9 +870,9 @@ onMounted(async () => {
   display: grid;
   gap: 12px;
   padding: 12px;
-  border: 1px solid #d8e7e2;
+  border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #f8fbfa;
+  background: var(--admin-surface-soft);
 }
 
 .metadata-page__reset-head {
@@ -926,7 +926,7 @@ onMounted(async () => {
   padding: 12px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
 }
 
 .metadata-page__result-main {
@@ -965,7 +965,7 @@ onMounted(async () => {
   display: -webkit-box;
   margin: 0;
   overflow: hidden;
-  color: #475569;
+  color: var(--admin-muted);
   font-size: 13px;
   line-height: 1.55;
   -webkit-box-orient: vertical;

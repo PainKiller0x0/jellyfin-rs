@@ -364,9 +364,14 @@ pub async fn upsert_media_item(
         if media_item_scan_matches(&existing, item)? {
             return Ok(id);
         }
+        let preserve_scraped_episode_title = existing.item_type == "Episode"
+            && item.item_type == "Episode"
+            && existing.tmdb_metadata_version > 0
+            && existing.overview.is_some();
         let preserve_folder_title = existing.item_type == item.item_type
             && existing.is_folder != 0
             && (existing.overview.is_some() || existing.premiere_date.is_some());
+        let preserve_existing_title = preserve_folder_title || preserve_scraped_episode_title;
         let preserve_production_year = existing.item_type == item.item_type
             && existing.premiere_date.is_some()
             && item.premiere_date.is_none();
@@ -378,7 +383,7 @@ pub async fn upsert_media_item(
                 });
 
         let mut active: media_items::ActiveModel = existing.clone().into();
-        active.title = Set(if preserve_folder_title {
+        active.title = Set(if preserve_existing_title {
             existing.title
         } else {
             item.title.clone()
@@ -534,11 +539,16 @@ fn media_item_scan_matches(
     item: &ScannedMediaItem,
 ) -> anyhow::Result<bool> {
     let existing_is_folder = existing.is_folder != 0;
+    let preserve_scraped_episode_title = existing.item_type == "Episode"
+        && item.item_type == "Episode"
+        && existing.tmdb_metadata_version > 0
+        && existing.overview.is_some();
     let preserve_folder_title = existing.item_type == item.item_type
         && existing_is_folder
         && (existing.overview.is_some() || existing.premiere_date.is_some());
+    let preserve_existing_title = preserve_folder_title || preserve_scraped_episode_title;
 
-    let title_matches = preserve_folder_title || existing.title == item.title;
+    let title_matches = preserve_existing_title || existing.title == item.title;
     let overview_matches = option_str_eq(
         existing.overview.as_deref(),
         item.overview.as_deref().or(existing.overview.as_deref()),
@@ -1207,7 +1217,7 @@ async fn resolve_named_values(
         .iter()
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
-        .filter(|value| seen.insert((*value).to_string()))
+        .filter(|value| seen.insert(value.to_ascii_lowercase()))
         .map(|value| {
             (
                 stable_text_id(&format!("{table}:{}", value.to_ascii_lowercase())),
@@ -1220,41 +1230,41 @@ async fn resolve_named_values(
     }
 
     upsert_named_values(db, kind, &candidates).await?;
-    let names = candidates
+    let ids = candidates
         .iter()
-        .map(|(_, name)| name.clone())
+        .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
     let existing = match kind {
         NamedRelationKind::Genre => Genres::find()
-            .filter(genres::Column::Name.is_in(names))
+            .filter(genres::Column::Id.is_in(ids.clone()))
             .all(db)
             .await?
             .into_iter()
-            .map(|value| (value.name, value.id))
+            .map(|value| (value.id, value.name))
             .collect::<HashMap<_, _>>(),
         NamedRelationKind::Tag => Tags::find()
-            .filter(tags::Column::Name.is_in(names))
+            .filter(tags::Column::Id.is_in(ids.clone()))
             .all(db)
             .await?
             .into_iter()
-            .map(|value| (value.name, value.id))
+            .map(|value| (value.id, value.name))
             .collect::<HashMap<_, _>>(),
         NamedRelationKind::Studio => Studios::find()
-            .filter(studios::Column::Name.is_in(names))
+            .filter(studios::Column::Id.is_in(ids))
             .all(db)
             .await?
             .into_iter()
-            .map(|value| (value.name, value.id))
+            .map(|value| (value.id, value.name))
             .collect::<HashMap<_, _>>(),
     };
 
     candidates
         .into_iter()
-        .map(|(_, name)| {
+        .map(|(id, name)| {
             existing
-                .get(&name)
+                .get(&id)
                 .cloned()
-                .map(|id| (id, name.clone()))
+                .map(|_| (id, name.clone()))
                 .ok_or_else(|| {
                     anyhow::anyhow!("failed to resolve {table} row after upsert: {name}")
                 })
@@ -1375,23 +1385,31 @@ async fn upsert_people(
     if metadata.people.is_empty() && !replace_empty {
         return Ok(());
     }
-    let people = metadata
-        .people
-        .iter()
-        .enumerate()
-        .map(|(sort_order, person)| DesiredPerson {
-            relation: PersonRelation {
-                person_id: stable_text_id(&format!(
-                    "people:{}",
-                    person.name.trim().to_ascii_lowercase()
-                )),
-                role: person.role.clone(),
-                person_type: person.person_type.clone(),
-                sort_order: i64::try_from(sort_order).unwrap_or(i64::MAX),
-            },
+    let mut people = Vec::new();
+    for (sort_order, person) in metadata.people.iter().enumerate() {
+        let relation = PersonRelation {
+            person_id: stable_text_id(&format!(
+                "people:{}",
+                person.name.trim().to_ascii_lowercase()
+            )),
+            role: person.role.clone(),
+            person_type: person.person_type.clone(),
+            sort_order: i64::try_from(sort_order).unwrap_or(i64::MAX),
+        };
+        // TMDb can return the same person more than once with the same type.
+        // De-duplicate before the batch upsert; PostgreSQL rejects a single
+        // INSERT that would update the same unique key twice.
+        if people.iter().any(|existing: &DesiredPerson| {
+            existing.relation.person_id == relation.person_id
+                && existing.relation.person_type == relation.person_type
+        }) {
+            continue;
+        }
+        people.push(DesiredPerson {
+            relation,
             name: person.name.trim().to_string(),
-        })
-        .collect::<Vec<_>>();
+        });
+    }
     if people_match(db, item_id, &people).await? {
         return Ok(());
     }
@@ -2031,6 +2049,35 @@ mod tests {
         let row = media_item_row(&db, &item.path).await;
         assert_eq!(row.title, "Renamed Movie");
         assert_ne!(row.updated_at, 123);
+    }
+
+    #[tokio::test]
+    async fn media_item_upsert_preserves_scraped_episode_title_on_rescan() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        let mut item = scanned_movie("episode-scraped-title", "第一集");
+        item.item_type = "Episode".to_string();
+        item.season_number = Some(1);
+        item.episode_number = Some(1);
+        upsert_media_item(&db, &item).await.unwrap();
+
+        let mut active: media_items::ActiveModel = MediaItems::find_by_id(item.id.clone())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        active.overview = Set(Some("已从 TMDB 获取的单集简介".to_string()));
+        active.tmdb_metadata_version = Set(1);
+        active.update(&db).await.unwrap();
+
+        item.title = "mp4".to_string();
+        upsert_media_item(&db, &item).await.unwrap();
+
+        let row = media_item_row(&db, &item.path).await;
+        assert_eq!(row.title, "第一集");
+        assert_eq!(row.overview.as_deref(), Some("已从 TMDB 获取的单集简介"));
     }
 
     #[tokio::test]

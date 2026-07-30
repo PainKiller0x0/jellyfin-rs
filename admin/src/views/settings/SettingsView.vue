@@ -454,7 +454,7 @@ onMounted(loadSettings);
   padding: 12px 14px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
 
   span {
     min-width: 0;
@@ -500,7 +500,7 @@ onMounted(loadSettings);
   padding: 16px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
   box-shadow: 0 10px 26px rgba(15, 23, 42, 0.04);
 }
 
@@ -527,7 +527,7 @@ onMounted(loadSettings);
   }
 
   h2 {
-    color: #0f172a;
+    color: var(--admin-text);
     font-size: 17px;
     line-height: 1.25;
   }
@@ -561,7 +561,7 @@ onMounted(loadSettings);
 
 .settings-page__form :deep(.el-form-item__label) {
   padding-bottom: 7px;
-  color: #334155;
+  color: var(--admin-text);
   font-weight: 700;
 }
 
@@ -579,9 +579,9 @@ onMounted(loadSettings);
   display: grid;
   gap: 10px;
   padding: 12px;
-  border: 1px solid #edf2f7;
+  border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #fbfdff;
+  background: var(--admin-surface-soft);
 }
 
 .settings-page__source-head {
@@ -596,7 +596,7 @@ onMounted(loadSettings);
   }
 
   h3 {
-    color: #1f2937;
+    color: var(--admin-text);
     font-size: 15px;
     line-height: 1.25;
   }
@@ -634,9 +634,9 @@ onMounted(loadSettings);
   align-items: center;
   min-height: 54px;
   padding: 10px 12px;
-  border: 1px solid #edf2f7;
+  border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #fbfdff;
+  background: var(--admin-surface-soft);
 }
 
 .settings-page__key-app {
@@ -646,7 +646,7 @@ onMounted(loadSettings);
 
   strong {
     overflow: hidden;
-    color: #0f172a;
+    color: var(--admin-text);
     font-size: 14px;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -662,10 +662,10 @@ onMounted(loadSettings);
   span {
     min-height: 28px;
     padding: 6px 9px;
-    border: 1px solid #e2e8f0;
+    border: 1px solid var(--admin-border);
     border-radius: 8px;
-    color: #475569;
-    background: #f8fafc;
+    color: var(--admin-muted);
+    background: var(--admin-surface-soft);
     font-size: 12px;
     line-height: 1.2;
   }

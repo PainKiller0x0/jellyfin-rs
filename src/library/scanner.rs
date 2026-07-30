@@ -1473,12 +1473,14 @@ async fn run_metadata_fetch_job(
     else {
         return Ok(());
     };
+    if matches!(job.item_type.as_str(), "Movie" | "Series" | "Episode")
+        && tmdb_metadata_is_current(&db, &job.item_id, policy).await
+    {
+        return Ok(());
+    }
 
     let metadata_ready = match job.item_type.as_str() {
         "Movie" | "Series" => {
-            if tmdb_metadata_is_current(&db, &job.item_id, policy).await {
-                return Ok(());
-            }
             crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(
                 &db,
                 &job.item_id,
@@ -2283,11 +2285,11 @@ fn scan_root_concurrency() -> usize {
 }
 
 fn ingest_concurrency() -> usize {
-    (crate::db::cpu_parallelism() / 4).clamp(1, 2)
+    crate::db::cpu_parallelism().clamp(1, 2)
 }
 
 fn metadata_fetch_concurrency() -> usize {
-    (crate::db::cpu_parallelism() / 4).clamp(1, 2)
+    crate::db::cpu_parallelism().clamp(1, 2)
 }
 
 fn ingest_queue_capacity() -> usize {

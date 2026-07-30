@@ -448,7 +448,7 @@ async fn serve_item_image(
     }
 
     let path = model.path.unwrap_or_default();
-    if !image_storage_path_allowed(&path) {
+    if !image_asset_path_allowed(db, &path).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     if image_format_from_query(query).is_none()
@@ -697,7 +697,7 @@ async fn collage_source_images(
         let Some(path) = row.get_opt_str("path")? else {
             continue;
         };
-        if image_storage_path_allowed(&path) {
+        if image_asset_path_allowed(db, &path).await {
             if let Ok(bytes) = tokio::fs::read(&path).await {
                 images.push(bytes);
             }
@@ -1011,6 +1011,11 @@ pub(crate) fn image_storage_path_allowed(path: &str) -> bool {
     )
 }
 
+async fn image_asset_path_allowed(db: &DatabaseConnection, path: &str) -> bool {
+    image_storage_path_allowed(path)
+        || crate::playback::streaming::readable_media_path(db, path).await
+}
+
 async fn find_user_avatar_path(user_id: &str) -> Option<PathBuf> {
     for path in user_avatar_paths(user_id) {
         if tokio::fs::metadata(&path).await.is_ok() {
@@ -1287,11 +1292,14 @@ pub(crate) fn add_art_tag_fallback(tags: &mut serde_json::Map<String, JsonValue>
 mod tests {
     use super::{
         MAX_IMAGE_BYTES, add_art_tag_fallback, canonical_image_type, collage_source_images,
-        decode_image_body, image_format_from_path, image_storage_path_allowed,
+        decode_image_body, image_asset_path_allowed, image_format_from_path,
+        image_storage_path_allowed,
         image_type_and_index, is_image_too_large, item_images_inner, with_tagged_image_cache,
     };
     use crate::entities::{
         image_assets::{self, Entity as ImageAssets},
+        libraries::{self, Entity as Libraries},
+        library_paths::{self, Entity as LibraryPaths},
         media_items::{self, Entity as MediaItems},
     };
     use sea_orm::{DatabaseConnection, EntityTrait, Set};
@@ -1317,6 +1325,48 @@ mod tests {
 
         let _ = fs::remove_file(image);
         let _ = fs::remove_file(sibling);
+    }
+
+    #[tokio::test]
+    async fn image_asset_path_allows_sidecars_inside_library_roots() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("jellyfin-rs-images-{}", uuid::Uuid::new_v4()));
+        let sibling =
+            std::env::temp_dir().join(format!("jellyfin-rs-images-other-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let poster = root.join("poster.jpg");
+        let outside = sibling.join("poster.jpg");
+        fs::write(&poster, b"poster").unwrap();
+        fs::write(&outside, b"outside").unwrap();
+
+        Libraries::insert(libraries::ActiveModel {
+            id: Set("sidecar-library".to_string()),
+            name: Set("Sidecar Library".to_string()),
+            collection_type: Set("movies".to_string()),
+            created_at: Set(1),
+            updated_at: Set(1),
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+        LibraryPaths::insert(library_paths::ActiveModel {
+            id: Set("sidecar-library-path".to_string()),
+            library_id: Set("sidecar-library".to_string()),
+            path: Set(root.to_string_lossy().to_string()),
+            created_at: Set(1),
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+
+        assert!(image_asset_path_allowed(&db, &poster.to_string_lossy()).await);
+        assert!(!image_asset_path_allowed(&db, &outside.to_string_lossy()).await);
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(sibling);
     }
 
     #[test]

@@ -7,6 +7,25 @@
   --admin-accent: #b45309;
   --admin-danger: #dc2626;
   --admin-bg: #f5f7fb;
+  --admin-surface: #ffffff;
+  --admin-surface-soft: #f8fafc;
+  --admin-hover: #f1f5f9;
+  --admin-code-bg: #0f172a;
+}
+
+html.dark {
+  color-scheme: dark;
+  --admin-border: #334155;
+  --admin-text: #e5e7eb;
+  --admin-muted: #94a3b8;
+  --admin-brand: #2dd4bf;
+  --admin-accent: #f59e0b;
+  --admin-danger: #f87171;
+  --admin-bg: #0f172a;
+  --admin-surface: #111827;
+  --admin-surface-soft: #1e293b;
+  --admin-hover: #1f2937;
+  --admin-code-bg: #020617;
 }
 
 * {
@@ -31,6 +50,10 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+html.dark body {
+  background: var(--admin-bg);
+}
+
 a {
   color: inherit;
   text-decoration: none;
@@ -42,4 +65,146 @@ a {
 
 .el-card {
   --el-card-border-radius: 8px;
+}
+
+html.dark .el-card,
+html.dark .el-dialog,
+html.dark .el-drawer,
+html.dark .el-message-box,
+html.dark .el-popover,
+html.dark .el-dropdown-menu,
+html.dark .el-select-dropdown,
+html.dark .el-picker-panel {
+  border-color: var(--admin-border);
+  background-color: var(--admin-surface);
+  color: var(--admin-text);
+}
+
+html.dark .el-menu,
+html.dark .el-menu-item,
+html.dark .el-sub-menu__title {
+  color: var(--admin-text);
+  background-color: var(--admin-surface);
+}
+
+html.dark .el-menu-item:hover,
+html.dark .el-sub-menu__title:hover {
+  background-color: var(--admin-hover);
+}
+
+html.dark .el-input__wrapper,
+html.dark .el-textarea__inner,
+html.dark .el-select__wrapper,
+html.dark .el-input-number,
+html.dark .el-checkbox-button,
+html.dark .el-radio-button__inner {
+  background-color: var(--admin-surface-soft);
+  box-shadow: 0 0 0 1px var(--admin-border) inset;
+}
+
+html.dark .el-table,
+html.dark .el-table tr,
+html.dark .el-table th.el-table__cell,
+html.dark .el-table td.el-table__cell {
+  color: var(--admin-text);
+  border-color: var(--admin-border);
+  background-color: var(--admin-surface);
+}
+
+html.dark .el-table th.el-table__cell,
+html.dark .el-table tr:hover > td.el-table__cell {
+  background-color: var(--admin-hover);
+}
+
+html.dark .el-form-item__label,
+html.dark .el-dialog__title,
+html.dark .el-drawer__title,
+html.dark .el-dropdown-menu__item {
+  color: var(--admin-text);
+}
+
+/* The admin pages intentionally use a few bespoke white cards. Keep those
+   surfaces readable when the global Element Plus dark variables are active. */
+html.dark .directory-picker__current,
+html.dark .dashboard-page__stat,
+html.dark .dashboard-page__panel,
+html.dark .dashboard-page__map-badge,
+html.dark .dashboard-page__map-legend,
+html.dark .dashboard-page__activity,
+html.dark .library-page__stat,
+html.dark .library-page__library-card,
+html.dark .library-page__type-option,
+html.dark .library-page__path-pill,
+html.dark .library-page__create-path-row,
+html.dark .metadata-page__stat,
+html.dark .metadata-page__panel,
+html.dark .metadata-page__result,
+html.dark .metadata-page__reset,
+html.dark .playback-stats-page__panel,
+html.dark .playback-stats-page__stat,
+html.dark .tasks-page__stat,
+html.dark .tasks-page__task-card,
+html.dark .users-page__stat,
+html.dark .users-page__user-card,
+html.dark .users-page__policy-group,
+html.dark .users-page__policy-switch,
+html.dark .settings-page__stat,
+html.dark .settings-page__panel,
+html.dark .settings-page__source,
+html.dark .settings-page__key-row,
+html.dark .login-page__panel {
+  border-color: var(--admin-border) !important;
+  background: var(--admin-surface) !important;
+  color: var(--admin-text) !important;
+}
+
+html.dark .dashboard-page__map-badge,
+html.dark .dashboard-page__map-legend,
+html.dark .dashboard-page__activity,
+html.dark .playback-stats-page__chart-day {
+  background: var(--admin-surface-soft) !important;
+}
+
+html.dark .dashboard-page__map-surface {
+  background:
+    linear-gradient(rgb(148 163 184 / 10%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(148 163 184 / 10%) 1px, transparent 1px),
+    var(--admin-surface) !important;
+}
+
+html.dark .dashboard-page__china-province {
+  fill: var(--admin-surface-soft);
+  stroke: var(--admin-border);
+}
+
+html.dark .users-page__card-actions,
+html.dark .users-page__policy-header,
+html.dark .users-page__policy-footer,
+html.dark .tasks-page__card-actions,
+html.dark .settings-page__tag-group,
+html.dark .metadata-page__result-meta {
+  background: var(--admin-surface-soft) !important;
+  border-color: var(--admin-border) !important;
+}
+
+html.dark .library-page__dialog-icon,
+html.dark .library-page__type-option-icon,
+html.dark .settings-page__panel-icon,
+html.dark .tasks-page__task-icon,
+html.dark .users-page__avatar {
+  background: #123b3a !important;
+}
+
+html.dark .metadata-page__panel-head h2,
+html.dark .metadata-page__result h3,
+html.dark .metadata-page__result p,
+html.dark .library-page__create-form .el-form-item__label,
+html.dark .users-page__quick-state,
+html.dark .settings-page__source,
+html.dark .tasks-page__task-meta {
+  color: var(--admin-text) !important;
+}
+
+html.dark .dashboard-page__log-stream {
+  background: var(--admin-code-bg) !important;
 }

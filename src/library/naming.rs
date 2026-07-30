@@ -78,10 +78,6 @@ pub fn parse_book_name(value: &str) -> ParsedBookName {
 }
 
 pub fn parse_media_name(path: &Path, collection_type: &str) -> ParsedName {
-    let stem = path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
     let folder = path
         .parent()
         .and_then(Path::file_name)
@@ -89,8 +85,17 @@ pub fn parse_media_name(path: &Path, collection_type: &str) -> ParsedName {
         .unwrap_or_default();
 
     if collection_type == "tvshows" || collection_type == "tv" {
-        parse_episode_name(&episode_parser_path(path), stem, folder)
+        let parser_path = episode_parser_path(path);
+        let parser_stem = Path::new(&parser_path)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        parse_episode_name(&parser_path, parser_stem, folder)
     } else {
+        let stem = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
         parse_video_name(stem)
     }
 }
@@ -112,14 +117,14 @@ fn parse_episode_name(path: &str, stem: &str, folder: &str) -> ParsedName {
 
     for (pattern, style) in episode_patterns() {
         if let Some(captures) = pattern.captures(path) {
-            parsed.season_number = capture_i64(&captures, &["season", "seasonnumber"], &[1]);
+            parsed.season_number = capture_i64(&captures, &["season", "seasonnumber"], &[]);
             if parsed
                 .season_number
                 .is_some_and(is_invalid_episode_season_number)
             {
                 continue;
             }
-            parsed.episode_number = capture_i64(&captures, &["episode", "epnumber"], &[2]);
+            parsed.episode_number = capture_i64(&captures, &["episode", "epnumber"], &[]);
             if parsed.episode_number.is_none() {
                 continue;
             }
@@ -201,7 +206,24 @@ fn parse_episode_date(value: &str) -> Option<(String, String)> {
 }
 
 fn episode_parser_path(path: &Path) -> String {
-    let path = path.to_string_lossy().replace('\\', "/");
+    let mut path = path.to_string_lossy().replace('\\', "/");
+    // SmartStrm preserves the source container in a wrapper before `.strm`,
+    // for example `EP64.(mp4).strm` or `01.(mkv).strm`.  Normalize that
+    // representation to a regular media filename so Jellyfin naming rules can
+    // still extract the episode number.
+    if path.to_ascii_lowercase().ends_with(".strm") {
+        let without_strm = &path[..path.len() - ".strm".len()];
+        static WRAPPED_CONTAINER: OnceLock<Regex> = OnceLock::new();
+        let wrapped_container = WRAPPED_CONTAINER.get_or_init(|| {
+            Regex::new(r#"(?i)\.\((?P<extension>[a-z0-9]{2,5})\)$"#)
+                .expect("wrapped STRM container regex must compile")
+        });
+        if wrapped_container.is_match(without_strm) {
+            path = wrapped_container
+                .replace(without_strm, ".$extension")
+                .into_owned();
+        }
+    }
     if path.contains('/') {
         path
     } else {
@@ -308,6 +330,16 @@ fn episode_patterns() -> &'static [(Regex, EpisodeStyle)] {
     static PATTERNS: OnceLock<Vec<(Regex, EpisodeStyle)>> = OnceLock::new();
     PATTERNS.get_or_init(|| {
         [
+        (
+            // Standalone SmartStrm/Kodi aliases: EP01, EP_01.
+            r#"(?i).*(?:/)ep_?(?P<episode>[0-9]{1,4})(?:\([0-9]+\))?(?:[._ -]+(?P<name>[^/]+))?$"#,
+            EpisodeStyle::TrailingTitle,
+        ),
+        (
+            // Standalone SmartStrm/Kodi aliases: E01.
+            r#"(?i).*(?:/)e(?P<episode>[0-9]{1,4})(?:\([0-9]+\))?(?:[._ -]+(?P<name>[^/]+))?$"#,
+            EpisodeStyle::TrailingTitle,
+        ),
         (
             // Jellyfin/Kodi standard: foo.s01.e01, foo.s01_e01, S01E02 foo, S01 - E02.
             r#"(?i).*(?:/)(?P<title>.*?)[s](?P<season>[0-9]{1,4})[\]\[ ._-]*[e](?P<episode>[0-9]{1,4})(?:[\]\[ ._-]*(?:[ex]|-[ex]?)(?P<ending>[0-9]{1,4}))?[^/]*$"#,
@@ -421,7 +453,7 @@ fn trailing_episode_title(path: &str, stem: &str, captures: &regex::Captures<'_>
         .rsplit_once('.')
         .map(|(_, extension)| extension.eq_ignore_ascii_case(name))
         .unwrap_or(false);
-    if extension_only_tail && stem.chars().all(|ch| ch.is_ascii_digit()) {
+    if extension_only_tail {
         clean_title(stem)
     } else {
         clean_title(name)
@@ -822,6 +854,37 @@ mod tests {
         assert_eq!(parsed.season_number, Some(1));
         assert_eq!(parsed.episode_number, Some(1));
         assert_eq!(parsed.title, "Pilot");
+    }
+
+    #[test]
+    fn parses_smartstrm_wrapped_episode_aliases() {
+        let parsed = parse_media_name(Path::new("美人心计/E01.(mkv).strm"), "tvshows");
+        assert_eq!(parsed.season_number, None);
+        assert_eq!(parsed.episode_number, Some(1));
+
+        let parsed =
+            parse_media_name(Path::new("知否知否应是绿肥红瘦/EP64.(mp4).strm"), "tvshows");
+        assert_eq!(parsed.season_number, None);
+        assert_eq!(parsed.episode_number, Some(64));
+        assert_ne!(parsed.title, "mp4");
+
+        let parsed = parse_media_name(Path::new("至尊红颜/01.(mp4).strm"), "tvshows");
+        assert_eq!(parsed.season_number, None);
+        assert_eq!(parsed.episode_number, Some(1));
+
+        let parsed = parse_media_name(
+            Path::new("假面骑士OOO（2010）/假面骑士 OOO.S01E27.(mkv).strm"),
+            "tvshows",
+        );
+        assert_eq!(parsed.season_number, Some(1));
+        assert_eq!(parsed.episode_number, Some(27));
+        assert_ne!(parsed.title, "mkv");
+
+        let parsed =
+            parse_media_name(Path::new("知否知否应是绿肥红瘦/EP62(1).(mp4).strm"), "tvshows");
+        assert_eq!(parsed.season_number, None);
+        assert_eq!(parsed.episode_number, Some(62));
+        assert_ne!(parsed.title, "mp4");
     }
 
     #[test]

@@ -2770,7 +2770,10 @@ async fn playback_stats_top_items(
                    LEFT JOIN media_items mi ON mi.id = pwd.item_id
                    {series_join_sql}
                    WHERE pwd.day >= ?
-                   GROUP BY pwd.item_id, mi.title, mi.item_type, series_id, series_name
+                   -- Use select-list ordinals for the derived series fields.  The
+                   -- joined media_items table also has a series_name column, so
+                   -- GROUP BY series_name is ambiguous in PostgreSQL.
+                   GROUP BY pwd.item_id, mi.title, mi.item_type, 4, 5
                    ORDER BY watch_seconds DESC, play_count DESC
                    LIMIT 10"#,
                 series_id_sql = playback_series_id_sql(),

@@ -19,7 +19,7 @@ export default defineConfig({
     }
   },
   shortcuts: {
-    'admin-surface': 'border border-slate-200 bg-white shadow-sm',
-    'admin-page': 'min-h-full bg-[#f5f7fb] p-4 sm:p-6'
+    'admin-surface': 'border border-[var(--admin-border)] bg-[var(--admin-surface)] shadow-sm',
+    'admin-page': 'min-h-full bg-[var(--admin-bg)] p-4 sm:p-6'
   }
 });

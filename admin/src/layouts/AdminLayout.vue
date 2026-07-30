@@ -110,6 +110,20 @@ async function handleCommand(command: string) {
         </div>
 
         <ElSpace :size="12">
+          <ElTooltip :content="appStore.darkMode ? '切换到日间模式' : '切换到夜间模式'" placement="bottom">
+            <ElButton
+              circle
+              text
+              class="admin-layout__theme-toggle"
+              :aria-label="appStore.darkMode ? '切换到日间模式' : '切换到夜间模式'"
+              @click="appStore.toggleDarkMode"
+            >
+              <ElIcon>
+                <Sunny v-if="appStore.darkMode" />
+                <Moon v-else />
+              </ElIcon>
+            </ElButton>
+          </ElTooltip>
           <ElTag effect="plain" type="success">Element Plus</ElTag>
           <ElDropdown trigger="click" @command="handleCommand">
             <button class="admin-layout__account" type="button">
@@ -152,7 +166,7 @@ async function handleCommand(command: string) {
   height: 100vh;
   overflow: hidden;
   border-right: 1px solid var(--admin-border);
-  background: #ffffff;
+  background: var(--admin-surface);
   transition: width 160ms ease;
 }
 
@@ -212,7 +226,7 @@ async function handleCommand(command: string) {
   justify-content: space-between;
   height: 64px;
   border-bottom: 1px solid var(--admin-border);
-  background: rgb(255 255 255 / 92%);
+  background: var(--admin-surface);
   backdrop-filter: blur(12px);
 }
 
@@ -259,8 +273,12 @@ async function handleCommand(command: string) {
   }
 
   &:hover {
-    background: #f1f5f9;
+    background: var(--admin-hover);
   }
+}
+
+.admin-layout__theme-toggle {
+  color: var(--admin-text);
 }
 
 @media (max-width: 760px) {

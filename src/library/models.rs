@@ -271,7 +271,15 @@ impl MediaItem {
         map.insert("Container".into(), opt_str(&self.container));
         map.insert("MediaType".into(), opt_str_val(media_type));
         map.insert("LocationType".into(), opt_str_val(location_type));
-        map.insert("IsFolder".into(), JsonValue::Bool(self.is_folder));
+        // Multi-version movie directories carry their playable sources on the
+        // parent item.  Advertise them as playable movies to Jellyfin clients;
+        // otherwise web clients navigate into an empty child listing instead
+        // of opening the playback details page.
+        let is_playable_movie = self.item_type == "Movie" && self.is_folder;
+        map.insert(
+            "IsFolder".into(),
+            JsonValue::Bool(self.is_folder && !is_playable_movie),
+        );
         map.insert("Overview".into(), opt_str(&self.overview));
         map.insert("OfficialRating".into(), opt_str(&self.official_rating));
         map.insert("CustomRating".into(), opt_str(&self.custom_rating));
@@ -809,6 +817,27 @@ fn remote_strm_target(path: &str) -> Option<String> {
         .then(|| crate::strm::read_strm_target(path).ok())
         .flatten()
         .filter(|target| crate::strm::is_remote_url(target))
+        .map(|target| rewrite_public_strm_target(&target))
+}
+
+pub(crate) fn rewrite_public_strm_target(target: &str) -> String {
+    let public_base = std::env::var("JELLYFIN_RS_STRM_PUBLIC_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| value.starts_with("http://") || value.starts_with("https://"));
+    rewrite_public_strm_target_with_base(target, public_base.as_deref())
+}
+
+fn rewrite_public_strm_target_with_base(target: &str, public_base: Option<&str>) -> String {
+    let Some(public_base) = public_base else {
+        return target.to_string();
+    };
+    for internal_base in ["http://127.0.0.1:8024", "http://localhost:8024"] {
+        if let Some(path_and_query) = target.strip_prefix(internal_base) {
+            return format!("{public_base}{path_and_query}");
+        }
+    }
+    target.to_string()
 }
 
 fn split_media_streams_and_attachments(
@@ -1313,12 +1342,19 @@ impl MediaStreamRow {
                 self.stream_index,
                 if codec.is_empty() { "srt" } else { codec }
             ))
+        } else if is_text_subtitle {
+            // Browser clients cannot consume an embedded subtitle stream directly.
+            // Expose text-based embedded tracks through the extraction endpoint as WebVTT.
+            Some(format!(
+                "/Videos/{item_id}/{item_id}/Subtitles/{}/Stream.vtt",
+                self.stream_index
+            ))
         } else {
             None
         };
 
         let delivery_method = if self.stream_type == "Subtitle" {
-            if self.is_external {
+            if self.is_external || is_text_subtitle {
                 Some("External")
             } else {
                 Some("Embed")
@@ -1710,9 +1746,34 @@ mod tests {
     use super::{
         MediaItem, MediaStreamRow, MediaStreamSelectionPreferences, SubtitlePlaybackMode,
         apply_media_source_user_preferences, attachment_mime_type, child_video_source_json,
-        media_source_json_with_streams,
+        media_source_json_with_streams, rewrite_public_strm_target_with_base,
     };
     use serde_json::json;
+
+    #[test]
+    fn public_strm_base_rewrites_only_local_smartstrm_targets() {
+        assert_eq!(
+            rewrite_public_strm_target_with_base(
+                "http://127.0.0.1:8024/smartstrm_fid/demo/movie.mkv?sign=x",
+                Some("https://smartstrm.example.test"),
+            ),
+            "https://smartstrm.example.test/smartstrm_fid/demo/movie.mkv?sign=x"
+        );
+        assert_eq!(
+            rewrite_public_strm_target_with_base(
+                "https://other.example.test/movie.mkv",
+                Some("https://smartstrm.example.test"),
+            ),
+            "https://other.example.test/movie.mkv"
+        );
+        assert_eq!(
+            rewrite_public_strm_target_with_base(
+                "http://127.0.0.1:8024/movie.mkv",
+                None,
+            ),
+            "http://127.0.0.1:8024/movie.mkv"
+        );
+    }
 
     #[test]
     fn media_sources_split_attachments_from_playable_streams() {
@@ -2099,11 +2160,18 @@ mod tests {
         assert_eq!(text["IsExtractableSubtitleStream"], true);
         assert_eq!(text["DisplayLanguage"], "eng");
         assert_eq!(text["Extradata"], "");
+        assert_eq!(text["DeliveryMethod"], "External");
+        assert_eq!(
+            text["DeliveryUrl"],
+            "/Videos/movie/movie/Subtitles/2/Stream.vtt"
+        );
 
         let pgs = subtitle_stream("hdmv_pgs_subtitle", false).to_jellyfin_json("movie");
         assert_eq!(pgs["IsTextSubtitleStream"], false);
         assert_eq!(pgs["IsPgsSubtitleStream"], true);
         assert_eq!(pgs["IsExtractableSubtitleStream"], true);
+        assert_eq!(pgs["DeliveryMethod"], "Embed");
+        assert!(pgs["DeliveryUrl"].is_null());
 
         let external = subtitle_stream("srt", true).to_jellyfin_json("movie");
         assert_eq!(external["DeliveryMethod"], "External");

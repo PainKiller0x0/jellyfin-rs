@@ -406,6 +406,12 @@ pub async fn list_media_items(
             }
         }
 
+        if !parent_is_collection {
+            if let Some(result) = list_library_parent_page(db, user_id, query, parent_id).await? {
+                return Ok(result);
+            }
+        }
+
         let rows = if parent_is_collection {
             let (sql, vals) = if let Some(like) = like_clause {
                 let base = linked_children_select_sql();
@@ -513,6 +519,114 @@ pub async fn list_media_items(
     };
 
     Ok(items)
+}
+
+/// Fast path for the library grid used by the desktop/web clients.
+///
+/// The general list path intentionally loads the complete parent tree before
+/// filtering and episode-version de-duplication. That is necessary for
+/// complex queries, but it makes a plain movie/series library page read every
+/// child before returning the requested 50/200 items. This fast path is only
+/// enabled when the query is a plain library-root name sort and the root has
+/// no direct Episode rows, so the result does not need in-memory de-duplication.
+async fn list_library_parent_page(
+    db: &DatabaseConnection,
+    user_id: &str,
+    query: &HashMap<String, String>,
+    parent_id: &str,
+) -> anyhow::Result<Option<(Vec<MediaItem>, usize)>> {
+    if query_value_any(query, &["ParentId", "parentId"]).is_none()
+        || query_contains_any(
+            query,
+            &[
+                "SearchTerm",
+                "Recursive",
+                "ListItemIds",
+                "IncludeItemTypes",
+                "IncludeSearchTypes",
+                "ExcludeItemTypes",
+                "MediaTypes",
+                "Filters",
+                "VideoTypes",
+                "Is3D",
+                "Years",
+                "Containers",
+                "GenreIds",
+                "TagIds",
+                "PersonIds",
+                "StudioIds",
+                "VideoCodecs",
+                "MinWidth",
+                "MaxWidth",
+            ],
+        )
+    {
+        return Ok(None);
+    }
+
+    let sort_by = primary_sort_value(query);
+    if !sort_by.is_empty() && !sort_by.eq_ignore_ascii_case("SortName") {
+        return Ok(None);
+    }
+
+    // A direct episode means the general path may need version de-duplication
+    // before paging. Keep that behavior unchanged for flat TV libraries.
+    let has_direct_episode = db
+        .query_one_raw(crate::db::helpers::pg_statement(
+            "SELECT 1 AS present FROM media_items WHERE parent_id = ? AND item_type = 'Episode' AND is_public = 1 LIMIT 1",
+            vec![parent_id.into()],
+        ))
+        .await?
+        .is_some();
+    if has_direct_episode {
+        return Ok(None);
+    }
+
+    let limit = query_u32(query, "Limit", 50).min(200) as usize;
+    let offset = query_u32(query, "StartIndex", 0) as usize;
+    let parent_visibility = "media_items.parent_id = ? AND media_items.is_public = 1 AND EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = ?)";
+    let item_scope = "media_items.item_type <> 'Episode'";
+
+    let total = db
+        .query_one_raw(crate::db::helpers::pg_statement(
+            &format!(
+                "SELECT COUNT(*) AS cnt FROM media_items WHERE {parent_visibility} AND {item_scope}"
+            ),
+            vec![parent_id.into(), parent_id.into()],
+        ))
+        .await?
+        .and_then(|row| row.get_i64("cnt").ok())
+        .unwrap_or_default()
+        .max(0) as usize;
+
+    let direction = if query
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("SortOrder"))
+        .is_some_and(|(_, value)| value.eq_ignore_ascii_case("Descending"))
+    {
+        "DESC"
+    } else {
+        "ASC"
+    };
+    let where_clause = format!(
+        "WHERE {parent_visibility} AND {item_scope} ORDER BY LOWER(media_items.title) {direction}, media_items.id {direction} LIMIT ? OFFSET ?"
+    );
+    let rows = db
+        .query_all_raw(crate::db::helpers::pg_statement(
+            &media_item_select_sql(&where_clause),
+            vec![
+                user_id.into(),
+                parent_id.into(),
+                parent_id.into(),
+                (limit as i64).into(),
+                (offset as i64).into(),
+            ],
+        ))
+        .await
+        .context("failed to list paged library media items")?;
+    let mut items = decode_media_items(&rows)?;
+    let _ = attach_item_image_tags(db, &mut items).await;
+    Ok(Some((items, total)))
 }
 
 async fn list_global_media_items_page(
@@ -1911,6 +2025,40 @@ mod tests {
         let (items, total) = super::list_media_items(&db, "u1", &query).await.unwrap();
         assert_eq!(total, 1);
         assert_eq!(items[0].id, "public");
+    }
+
+    #[tokio::test]
+    async fn list_media_items_pages_plain_library_children_in_name_order() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        insert_library(&db, "movies-paged", "Movies paged", "movies").await;
+        for (id, title) in [("movie-c", "Charlie"), ("movie-a", "Alpha"), ("movie-b", "Bravo")] {
+            insert_item(
+                &db,
+                id,
+                title,
+                &format!("/tmp/{id}.mkv"),
+                "movies-paged",
+                "movies-paged",
+                "Movie",
+                0,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
+
+        let mut query = HashMap::new();
+        query.insert("ParentId".to_string(), "movies-paged".to_string());
+        query.insert("StartIndex".to_string(), "1".to_string());
+        query.insert("Limit".to_string(), "1".to_string());
+        let (items, total) = super::list_media_items(&db, "u1", &query).await.unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(items.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["movie-b"]);
     }
 
     #[tokio::test]

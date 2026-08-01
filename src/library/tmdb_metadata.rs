@@ -177,13 +177,7 @@ impl MetadataRefreshPolicy {
 /// Extract TMDb ID from `{tmdb-XXXXX}`, `{tmdbid-XXXXX}`, or `[tmdbid=XXXXX]` in the path
 pub fn extract_tmdb_id(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
-    for (open, close) in [
-        ('{', '}'),
-        ('[', ']'),
-        ('(', ')'),
-        ('（', '）'),
-        ('【', '】'),
-    ] {
+    for (open, close) in [('{', '}'), ('[', ']'), ('(', ')')] {
         let Some((_, after_open)) = name.rsplit_once(open) else {
             continue;
         };
@@ -235,22 +229,16 @@ fn tmdb_id_from_tag(tag: &str) -> Option<String> {
 /// Clean title by removing `{tmdb-XXXXX}`, `{tmdbid-XXXXX}`, `[tmdbid=XXXXX]`, and `(YYYY)` tags
 pub fn clean_provider_tags(title: &str) -> String {
     let mut result = title.to_string();
-    for (open, close) in [
-        ('{', '}'),
-        ('[', ']'),
-        ('(', ')'),
-        ('（', '）'),
-        ('【', '】'),
-    ] {
+    for (open, close) in [('{', '}'), ('[', ']'), ('(', ')')] {
         if let (Some(start), Some(end)) = (result.rfind(open), result.rfind(close)) {
             if start < end {
-                let tag = &result[start + open.len_utf8()..end].to_ascii_lowercase();
+                let tag = &result[start + 1..end].to_ascii_lowercase();
                 if is_provider_id_tag(tag) {
-                    result.replace_range(start..end + close.len_utf8(), "");
+                    result.replace_range(start..=end, "");
                 } else if tag.len() == 4 && tag.chars().all(|c| c.is_ascii_digit()) {
                     if let Ok(y) = tag.parse::<i64>() {
                         if (1880..=2100).contains(&y) {
-                            result.replace_range(start..end + close.len_utf8(), "");
+                            result.replace_range(start..=end, "");
                         }
                     }
                 }
@@ -305,17 +293,14 @@ pub fn clean_title_with_year(title: &str) -> (String, Option<i64>) {
         }
     }
 
-    // Then extract a year from ASCII or common CJK brackets at the end.
-    for (open, close) in [('(', ')'), ('（', '）'), ('【', '】')] {
-        if let (Some(start), Some(end)) = (result.rfind(open), result.rfind(close)) {
-            if start < end {
-                let tag = result[start + open.len_utf8()..end].trim();
-                if let Ok(y) = tag.parse::<i64>() {
-                    if (1880..=2100).contains(&y) {
-                        year = Some(y);
-                        result.replace_range(start..end + close.len_utf8(), "");
-                        break;
-                    }
+    // Then extract year from (YYYY) at the end
+    if let (Some(start), Some(end)) = (result.rfind('('), result.rfind(')')) {
+        if start < end {
+            let tag = result[start + 1..end].trim();
+            if let Ok(y) = tag.parse::<i64>() {
+                if (1880..=2100).contains(&y) {
+                    year = Some(y);
+                    result.replace_range(start..=end, "");
                 }
             }
         }
@@ -502,7 +487,7 @@ fn clean_season_name(name: &str) -> String {
 fn season_prefix_regex() -> &'static regex::Regex {
     static REGEX: OnceLock<regex::Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        regex::Regex::new(r#"(?i)(^|[^a-z0-9])s(?P<number>\d{1,4})($|[^0-9].*)"#)
+        regex::Regex::new(r#"(?i)(^|[ ._\-\[\]])s(?P<number>\d{1,4})($|[ ._\-\[\]].*)"#)
             .expect("season prefix regex must compile")
     })
 }
@@ -2233,9 +2218,7 @@ pub(crate) fn parse_lookup_title_year(path: &Path) -> Option<(String, Option<i64
         .trim()
         .to_string();
     let naming_path = std::path::PathBuf::from(format!("{name}.mkv"));
-    let parsed_title = clean_provider_tags(
-        &crate::library::naming::parse_media_name(&naming_path, "movies").title,
-    );
+    let parsed_title = crate::library::naming::parse_media_name(&naming_path, "movies").title;
     let title = if parsed_title.is_empty() {
         fallback_title
     } else {
@@ -4260,14 +4243,6 @@ mod tests {
     }
 
     #[test]
-    fn decorated_cjk_season_folder_keeps_its_season_number() {
-        assert_eq!(
-            parse_season_number("老友记S02.Friends.1995.1080p.Blu-ray.x265"),
-            Some(2)
-        );
-    }
-
-    #[test]
     fn lookup_name_uses_jellyfin_file_naming_cleanup() {
         assert_eq!(
             parse_lookup_title_year(Path::new("Movie.Name.Extended.2024.2160p.BluRay.x265.mkv")),
@@ -4276,14 +4251,6 @@ mod tests {
         assert_eq!(
             parse_lookup_title_year(Path::new("Movie.Name (2024) {tmdb-123}")),
             Some(("Movie Name".to_string(), Some(2024)))
-        );
-        assert_eq!(
-            parse_lookup_title_year(Path::new("阿凡达1（2009）")),
-            Some(("阿凡达1".to_string(), Some(2009)))
-        );
-        assert_eq!(
-            clean_title_with_year("美人心计【2010】"),
-            ("美人心计".to_string(), Some(2010))
         );
     }
 

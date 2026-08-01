@@ -1,37 +1,35 @@
-use std::{collections::HashMap, io::SeekFrom, process::Stdio, sync::Arc};
+use std::{
+    collections::HashMap,
+    io::SeekFrom,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 use axum::{
+    Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
-    Json,
 };
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{EntityTrait, QueryOrder};
 use serde_json::json;
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt},
-    process::Command,
+    sync::RwLock,
 };
 use tokio_util::io::ReaderStream;
 
 use crate::{
     app::state::AppState,
-    entities::{
-        library_paths,
-        library_paths::Entity as LibraryPaths,
-        media_streams::{self, Entity as MediaStreams},
-    },
+    entities::{library_paths, library_paths::Entity as LibraryPaths},
     jellyfin::{
         auth::{request_user_id_and_admin_or_default, request_user_id_or_default},
         common::{ok_response, wants_json_response},
         routes::{find_media_item, find_media_item_for_admin, internal_error, not_found},
     },
-    library::{
-        models::{rewrite_public_strm_target, MediaItem},
-        path_utils,
-    },
+    library::{models::MediaItem, path_utils},
 };
 
 pub async fn stream_video(
@@ -271,89 +269,46 @@ pub async fn stream_audio_head(
 pub async fn stream_subtitle(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, index, format)): Path<(String, i64, String)>,
+    Path((item_id, index, _format)): Path<(String, i64, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(
-        state,
-        item_id,
-        None,
-        index,
-        format,
-        None,
-        headers,
-        query,
-        Method::GET,
-    )
-    .await
+    stream_subtitle_item(state, item_id, index, headers, query, Method::GET).await
 }
 
 pub async fn stream_subtitle_head(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, index, format)): Path<(String, i64, String)>,
+    Path((item_id, index, _format)): Path<(String, i64, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(
-        state,
-        item_id,
-        None,
-        index,
-        format,
-        None,
-        headers,
-        query,
-        Method::HEAD,
-    )
-    .await
+    stream_subtitle_item(state, item_id, index, headers, query, Method::HEAD).await
 }
 
 /// Subtitle streaming with mediaSourceId path segment for Emby client compatibility.
 pub async fn stream_subtitle_with_source(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, media_source_id, index, format)): Path<(String, String, i64, String)>,
+    Path((item_id, _media_source_id, index, _format)): Path<(String, String, i64, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(
-        state,
-        item_id,
-        Some(media_source_id),
-        index,
-        format,
-        None,
-        headers,
-        query,
-        Method::GET,
-    )
-    .await
+    // media_source_id is ignored; route to the same handler
+    stream_subtitle_item(state, item_id, index, headers, query, Method::GET).await
 }
 
 pub async fn stream_subtitle_with_source_head(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, media_source_id, index, format)): Path<(String, String, i64, String)>,
+    Path((item_id, _media_source_id, index, _format)): Path<(String, String, i64, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(
-        state,
-        item_id,
-        Some(media_source_id),
-        index,
-        format,
-        None,
-        headers,
-        query,
-        Method::HEAD,
-    )
-    .await
+    stream_subtitle_item(state, item_id, index, headers, query, Method::HEAD).await
 }
 
 /// Subtitle streaming with mediaSourceId and start position ticks (Emby compatibility).
 pub async fn stream_subtitle_with_ticks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, media_source_id, index, start_ticks, format)): Path<(
+    Path((item_id, _media_source_id, index, _start_ticks, _format)): Path<(
         String,
         String,
         i64,
@@ -362,24 +317,13 @@ pub async fn stream_subtitle_with_ticks(
     )>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(
-        state,
-        item_id,
-        Some(media_source_id),
-        index,
-        format,
-        Some(start_ticks),
-        headers,
-        query,
-        Method::GET,
-    )
-    .await
+    stream_subtitle_item(state, item_id, index, headers, query, Method::GET).await
 }
 
 pub async fn stream_subtitle_with_ticks_head(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, media_source_id, index, start_ticks, format)): Path<(
+    Path((item_id, _media_source_id, index, _start_ticks, _format)): Path<(
         String,
         String,
         i64,
@@ -388,27 +332,13 @@ pub async fn stream_subtitle_with_ticks_head(
     )>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(
-        state,
-        item_id,
-        Some(media_source_id),
-        index,
-        format,
-        Some(start_ticks),
-        headers,
-        query,
-        Method::HEAD,
-    )
-    .await
+    stream_subtitle_item(state, item_id, index, headers, query, Method::HEAD).await
 }
 
 async fn stream_subtitle_item(
     state: Arc<AppState>,
     item_id: String,
-    media_source_id: Option<String>,
     index: i64,
-    format: String,
-    start_ticks: Option<i64>,
     request_headers: HeaderMap,
     query: HashMap<String, String>,
     method: Method,
@@ -429,50 +359,16 @@ async fn stream_subtitle_item(
         return ok_response();
     }
 
-    let source_item =
-        match find_stream_media_item(&state.db, &user_id, &item_id, media_source_id.as_deref())
-            .await
-        {
-            Ok(Some(item)) => item,
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-            Err(error) => return internal_error(error),
-        };
-    let stream = match MediaStreams::find()
-        .filter(media_streams::Column::ItemId.eq(&source_item.id))
-        .filter(media_streams::Column::StreamIndex.eq(index))
-        .filter(media_streams::Column::StreamType.eq("Subtitle"))
-        .one(&state.db)
-        .await
+    let path = match crate::jellyfin::routes::subtitle_stream_path(&state.db, &item_id, index).await
     {
-        Ok(Some(stream)) => stream,
+        Ok(Some(path)) => path,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return internal_error(error.into()),
+        Err(error) => return internal_error(error),
     };
-
-    if stream.is_external != 0 {
-        let Some(path) = stream.path else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        return stream_external_subtitle(&state, &path, &format, method).await;
-    }
-
-    let codec = stream.codec.as_deref().unwrap_or_default();
-    if !is_extractable_text_subtitle(codec) {
-        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
-    }
-    stream_embedded_subtitle(&state, &source_item, index, &format, start_ticks, method).await
-}
-
-async fn stream_external_subtitle(
-    state: &AppState,
-    path: &str,
-    format: &str,
-    method: Method,
-) -> Response {
-    if !readable_media_path(&state.db, path).await {
+    if !readable_media_path(&state.db, &path).await {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let bytes = match tokio::fs::read(path).await {
+    let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(error) => {
             return (
@@ -483,7 +379,10 @@ async fn stream_external_subtitle(
         }
     };
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, subtitle_content_type(format));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
     headers.insert(
         header::CONTENT_LENGTH,
         HeaderValue::from_str(&bytes.len().to_string())
@@ -493,102 +392,6 @@ async fn stream_external_subtitle(
         (StatusCode::OK, headers, Body::empty()).into_response()
     } else {
         (StatusCode::OK, headers, Body::from(bytes)).into_response()
-    }
-}
-
-async fn stream_embedded_subtitle(
-    state: &AppState,
-    item: &MediaItem,
-    index: i64,
-    format: &str,
-    start_ticks: Option<i64>,
-    method: Method,
-) -> Response {
-    if !readable_media_path(&state.db, &item.path).await {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    if !format.eq_ignore_ascii_case("vtt") && !format.eq_ignore_ascii_case("webvtt") {
-        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
-    }
-
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, subtitle_content_type("vtt"));
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=86400"),
-    );
-    if method == Method::HEAD {
-        return (StatusCode::OK, headers, Body::empty()).into_response();
-    }
-
-    let input = match embedded_subtitle_input(item) {
-        Ok(input) => input,
-        Err(error) => return internal_error(error),
-    };
-    let mut command = Command::new(&state.sa_config.ffmpeg_path);
-    command.args(["-nostdin", "-v", "error"]);
-    if let Some(start_ticks) = start_ticks.filter(|value| *value > 0) {
-        command
-            .args(["-copyts", "-ss"])
-            .arg(format!("{:.3}", start_ticks as f64 / 10_000_000.0));
-    }
-    command
-        .arg("-i")
-        .arg(input)
-        .args(["-map", &format!("0:{index}"), "-f", "webvtt", "pipe:1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return internal_error(
-                anyhow::anyhow!(error).context("failed to start embedded subtitle extraction"),
-            );
-        }
-    };
-    let Some(mut stdout) = child.stdout.take() else {
-        return internal_error(anyhow::anyhow!("ffmpeg subtitle stdout was not available"));
-    };
-    let (mut writer, reader) = tokio::io::duplex(64 * 1024);
-    tokio::spawn(async move {
-        if tokio::io::copy(&mut stdout, &mut writer).await.is_err() {
-            let _ = child.kill().await;
-        }
-        drop(writer);
-        let _ = child.wait().await;
-    });
-    (
-        StatusCode::OK,
-        headers,
-        Body::from_stream(ReaderStream::new(reader)),
-    )
-        .into_response()
-}
-
-fn embedded_subtitle_input(item: &MediaItem) -> anyhow::Result<String> {
-    let path = std::path::Path::new(&item.path);
-    if crate::strm::is_strm_path(path) {
-        return Ok(crate::strm::resolve_strm_path(path)?
-            .to_string_lossy()
-            .to_string());
-    }
-    Ok(item.path.clone())
-}
-
-fn is_extractable_text_subtitle(codec: &str) -> bool {
-    matches!(
-        codec.to_ascii_lowercase().as_str(),
-        "srt" | "subrip" | "ass" | "ssa" | "webvtt" | "vtt" | "mov_text" | "text" | "ttml" | "dfxp"
-    )
-}
-
-fn subtitle_content_type(format: &str) -> HeaderValue {
-    if matches!(format.to_ascii_lowercase().as_str(), "vtt" | "webvtt") {
-        HeaderValue::from_static("text/vtt; charset=utf-8")
-    } else {
-        HeaderValue::from_static("text/plain; charset=utf-8")
     }
 }
 
@@ -801,9 +604,7 @@ fn playback_target_for_item(item: &MediaItem) -> anyhow::Result<PlaybackTarget> 
         let target = crate::strm::resolve_strm_path(path)?;
         let target_text = target.to_string_lossy().to_string();
         if crate::strm::is_remote_url(&target_text) {
-            return Ok(PlaybackTarget::RemoteUrl(rewrite_public_strm_target(
-                &target_text,
-            )));
+            return Ok(PlaybackTarget::RemoteUrl(target_text));
         }
         return Ok(PlaybackTarget::LocalPath(target));
     }
@@ -885,11 +686,47 @@ pub(crate) async fn readable_media_path(db: &sea_orm::DatabaseConnection, path: 
 }
 
 async fn library_roots(db: &sea_orm::DatabaseConnection) -> anyhow::Result<Vec<String>> {
+    {
+        let cache = library_roots_cache().read().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.loaded_at.elapsed() <= LIBRARY_ROOTS_CACHE_TTL
+        {
+            return Ok(cached.roots.clone());
+        }
+    }
+
+    // Recheck while holding the write lock so concurrent HEAD/GET/seek
+    // requests perform at most one database refresh per short TTL window.
+    let mut cache = library_roots_cache().write().await;
+    if let Some(cached) = cache.as_ref()
+        && cached.loaded_at.elapsed() <= LIBRARY_ROOTS_CACHE_TTL
+    {
+        return Ok(cached.roots.clone());
+    }
+
     let paths = LibraryPaths::find()
         .order_by_asc(library_paths::Column::Path)
         .all(db)
         .await?;
-    Ok(paths.into_iter().map(|path| path.path).collect())
+    let roots: Vec<String> = paths.into_iter().map(|path| path.path).collect();
+    *cache = Some(CachedLibraryRoots {
+        loaded_at: Instant::now(),
+        roots: roots.clone(),
+    });
+    Ok(roots)
+}
+
+const LIBRARY_ROOTS_CACHE_TTL: Duration = Duration::from_secs(3);
+
+struct CachedLibraryRoots {
+    loaded_at: Instant,
+    roots: Vec<String>,
+}
+
+static LIBRARY_ROOTS_CACHE: OnceLock<RwLock<Option<CachedLibraryRoots>>> = OnceLock::new();
+
+fn library_roots_cache() -> &'static RwLock<Option<CachedLibraryRoots>> {
+    LIBRARY_ROOTS_CACHE.get_or_init(|| RwLock::new(None))
 }
 
 /// GET /Audio/{id}/stream — alias for stream_audio
@@ -934,8 +771,11 @@ pub async fn stream_audio_container_head(
 
 #[cfg(test)]
 mod tests {
-    use super::{playback_target_for_item, PlaybackTarget};
+    use super::{
+        PlaybackTarget, parse_range_header, playback_target_for_item, remote_stream_redirect,
+    };
     use crate::library::models::MediaItem;
+    use axum::http::{StatusCode, header};
 
     #[test]
     fn playback_target_resolves_remote_strm_url() {
@@ -971,6 +811,26 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_strm_playback_is_a_redirect_without_body_buffering() {
+        let response = remote_stream_redirect("https://smartstrm.example/movie.mkv?sign=x");
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "https://smartstrm.example/movie.mkv?sign=x"
+        );
+    }
+
+    #[test]
+    fn range_parser_covers_browser_seek_shapes() {
+        assert_eq!(parse_range_header("bytes=0-99", 1_000).unwrap().len(), 100);
+        assert_eq!(parse_range_header("bytes=900-", 1_000).unwrap().start, 900);
+        assert_eq!(parse_range_header("bytes=-100", 1_000).unwrap().start, 900);
+        assert!(parse_range_header("bytes=1000-", 1_000).is_none());
+        assert!(parse_range_header("bytes=0-1,2-3", 1_000).is_none());
     }
 
     fn media_item(path: &str) -> MediaItem {

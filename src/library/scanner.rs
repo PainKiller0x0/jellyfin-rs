@@ -1473,14 +1473,12 @@ async fn run_metadata_fetch_job(
     else {
         return Ok(());
     };
-    if matches!(job.item_type.as_str(), "Movie" | "Series" | "Episode")
-        && tmdb_metadata_is_current(&db, &job.item_id, policy).await
-    {
-        return Ok(());
-    }
 
     let metadata_ready = match job.item_type.as_str() {
         "Movie" | "Series" => {
+            if tmdb_metadata_is_current(&db, &job.item_id, policy).await {
+                return Ok(());
+            }
             crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(
                 &db,
                 &job.item_id,

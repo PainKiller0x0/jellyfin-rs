@@ -34,8 +34,7 @@ pub async fn similar_items(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(12);
     match similar_items_inner(&state.db, &item_id, limit).await {
-        Ok(mut items) => {
-            let _ = item_queries::attach_item_image_tags(&state.db, &mut items).await;
+        Ok(items) => {
             let total = items.len();
             let items = crate::jellyfin::items::enrich_item_list(&state.db, &user_id, items).await;
             Json(json!({ "Items": items, "TotalRecordCount": total, "StartIndex": 0 }))

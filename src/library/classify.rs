@@ -671,16 +671,12 @@ pub fn tv_folder_type(path: &Path, root: &Path, collection_type: &str) -> &'stat
         "Folder"
     } else if path_depth(path, root) > 1
         && season_number_from_folder_name(name, parent_name).is_some()
+        // A decorated series folder can itself contain a real season folder,
+        // e.g. `Show.S01.2160p/S01`. In that shape the outer folder is the
+        // Series item; only a leaf season directory should become Season.
         && !directory_has_season_folder(path)
     {
         "Season"
-    } else if has_series_container_ancestor(path, root) {
-        // Once a directory has already established a Series, arbitrary source,
-        // OVA, extras and release folders below it must not become a second
-        // Series merely because they contain episode files.
-        "Folder"
-    } else if looks_like_series_folder_name(name) && directory_has_direct_tv_episode_file(path) {
-        "Series"
     } else if is_quality_or_range_folder_name(name)
         || (is_grouping_folder_name(name) && !directory_has_direct_tv_episode_file(path))
     {
@@ -793,8 +789,7 @@ fn movie_folder_type(path: &Path, _root: &Path) -> &'static str {
 
     if is_grouping_folder_name(name) || is_extra_folder_name(name) {
         "Folder"
-    } else if path.join("movie.nfo").is_file()
-        || folder_video_type(path).is_some()
+    } else if folder_video_type(path).is_some()
         || directory_is_movie_folder(path)
         || looks_like_movie_folder_name(name)
     {
@@ -874,36 +869,6 @@ fn directory_has_tv_content(path: &Path) -> bool {
     directory_has_season_folder(path) || directory_has_direct_tv_episode_file(path)
 }
 
-fn has_series_container_ancestor(path: &Path, root: &Path) -> bool {
-    let mut current = path.parent();
-    while let Some(ancestor) = current {
-        if ancestor == root {
-            break;
-        }
-        let name = ancestor
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        let depth = path_depth(ancestor, root);
-        let parent_is_grouping = ancestor
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .and_then(|name| name.to_str())
-            .is_some_and(is_grouping_folder_name);
-        if !is_grouping_folder_name(name)
-            && !is_quality_or_range_folder_name(name)
-            && (looks_like_series_folder_name(name)
-                || is_multi_season_range_name(name)
-                || depth == 1
-                || parent_is_grouping)
-        {
-            return true;
-        }
-        current = ancestor.parent();
-    }
-    false
-}
-
 fn directory_has_season_folder(path: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         return false;
@@ -929,17 +894,8 @@ fn directory_has_direct_tv_episode_file(path: &Path) -> bool {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.eq_ignore_ascii_case("tvshow.nfo"))
-                // Jellyfin accepts episode files whose names only contain an E/EP marker
-                // or even a bare number.  They may not yield an episode number during the
-                // initial naming pass, but their containing directory is still a Series.
-                // Requiring an already parsed number here turns valid single-season shows
-                // into Folder items and the scanner then clears their scraped metadata.
                 || (classify_media_path(&child, "tvshows").as_deref() == Some("Episode")
-                    && (child
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("strm"))
-                        || parse_media_name(&child, "tvshows").episode_number.is_some())))
+                    && parse_media_name(&child, "tvshows").episode_number.is_some()))
     })
 }
 
@@ -985,22 +941,15 @@ fn provider_tag_prefixes() -> &'static [&'static str] {
 }
 
 fn has_year_tag(name: &str) -> bool {
-    static YEAR_TAG: OnceLock<regex::Regex> = OnceLock::new();
-    YEAR_TAG
-        .get_or_init(|| {
-            regex::Regex::new(
-                r#"[\{\[\(（【]\s*(?P<year>(?:18|19|20)\d{2}|2100)\s*[\}\]\)）】]"#,
-            )
-            .expect("year tag regex must compile")
-        })
-        .captures_iter(name)
-        .filter_map(|captures| captures.name("year"))
-        .filter_map(|year| year.as_str().parse::<i64>().ok())
-        .any(|year| (1880..=2100).contains(&year))
+    bracket_tags(name).any(|tag| {
+        tag.trim()
+            .parse::<i64>()
+            .is_ok_and(|year| (1880..=2100).contains(&year))
+    })
 }
 
 fn bracket_tags(name: &str) -> impl Iterator<Item = &str> {
-    [('{', '}'), ('[', ']'), ('(', ')'), ('（', '）'), ('【', '】')]
+    [('{', '}'), ('[', ']'), ('(', ')')]
         .into_iter()
         .filter_map(move |(open, close)| {
             let (_, after_open) = name.rsplit_once(open)?;
@@ -1751,73 +1700,6 @@ mod tests {
             tv_folder_type(&foreign_series, &root, "tvshows"),
             "Series"
         );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn tv_folder_with_unparsed_direct_strm_files_is_series() {
-        let root = test_dir("tv_folder_with_unparsed_direct_strm_files_is_series");
-        let group = root.join("国产剧");
-        let e_series = group.join("美人心计");
-        let ep_series = group.join("知否知否应是绿肥红瘦");
-        let numeric_series =
-            group.join("[至尊红颜][2003][全42集][国语中字][1080P][38G]");
-        fs::create_dir_all(&e_series).unwrap();
-        fs::create_dir_all(&ep_series).unwrap();
-        fs::create_dir_all(&numeric_series).unwrap();
-        fs::write(e_series.join("E01.(mkv).strm"), []).unwrap();
-        fs::write(ep_series.join("EP64.(mp4).strm"), []).unwrap();
-        fs::write(numeric_series.join("01.(mp4).strm"), []).unwrap();
-
-        assert_eq!(tv_folder_type(&group, &root, "tvshows"), "Folder");
-        assert_eq!(tv_folder_type(&e_series, &root, "tvshows"), "Series");
-        assert_eq!(tv_folder_type(&ep_series, &root, "tvshows"), "Series");
-        assert_eq!(
-            tv_folder_type(&numeric_series, &root, "tvshows"),
-            "Series"
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn fullwidth_year_and_movie_nfo_identify_version_folders() {
-        let root = test_dir("fullwidth_year_and_movie_nfo_identify_version_folders");
-        let avatar = root.join("阿凡达1（2009）");
-        let f1 = root.join("F1：狂飙飞车");
-        fs::create_dir_all(&avatar).unwrap();
-        fs::create_dir_all(&f1).unwrap();
-        fs::write(avatar.join("阿凡达 (2009) 4K.mkv"), []).unwrap();
-        fs::write(avatar.join("阿凡达 (2009) 4K杜比.mp4"), []).unwrap();
-        fs::write(f1.join("2025.1080p.mkv"), []).unwrap();
-        fs::write(f1.join("2025.2160p.mkv"), []).unwrap();
-        fs::write(f1.join("movie.nfo"), []).unwrap();
-
-        assert_eq!(tv_folder_type(&avatar, &root, "movies"), "Movie");
-        assert_eq!(tv_folder_type(&f1, &root, "movies"), "Movie");
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn nested_release_and_extra_folders_do_not_become_duplicate_series() {
-        let root = test_dir("nested_release_and_extra_folders_do_not_become_duplicate_series");
-        let series = root.join("老友记 (1994)");
-        let season = series.join("老友记S01.Friends.1994.1080p");
-        let reunion = series.join("L 老友记重聚特辑");
-        let ova = series.join("ova").join("冬季篇");
-        fs::create_dir_all(&season).unwrap();
-        fs::create_dir_all(&reunion).unwrap();
-        fs::create_dir_all(&ova).unwrap();
-        fs::write(season.join("Friends.S01E01.mkv"), []).unwrap();
-        fs::write(reunion.join("老友记重聚特辑.2021.mp4"), []).unwrap();
-        fs::write(ova.join("SP01.strm"), []).unwrap();
-
-        assert_eq!(tv_folder_type(&series, &root, "tvshows"), "Series");
-        assert_eq!(tv_folder_type(&season, &root, "tvshows"), "Season");
-        assert_eq!(tv_folder_type(&reunion, &root, "tvshows"), "Folder");
-        assert_eq!(tv_folder_type(&ova, &root, "tvshows"), "Folder");
 
         let _ = fs::remove_dir_all(root);
     }

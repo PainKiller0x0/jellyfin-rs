@@ -364,14 +364,9 @@ pub async fn upsert_media_item(
         if media_item_scan_matches(&existing, item)? {
             return Ok(id);
         }
-        let preserve_scraped_episode_title = existing.item_type == "Episode"
-            && item.item_type == "Episode"
-            && existing.tmdb_metadata_version > 0
-            && existing.overview.is_some();
         let preserve_folder_title = existing.item_type == item.item_type
             && existing.is_folder != 0
             && (existing.overview.is_some() || existing.premiere_date.is_some());
-        let preserve_existing_title = preserve_folder_title || preserve_scraped_episode_title;
         let preserve_production_year = existing.item_type == item.item_type
             && existing.premiere_date.is_some()
             && item.premiere_date.is_none();
@@ -383,7 +378,7 @@ pub async fn upsert_media_item(
                 });
 
         let mut active: media_items::ActiveModel = existing.clone().into();
-        active.title = Set(if preserve_existing_title {
+        active.title = Set(if preserve_folder_title {
             existing.title
         } else {
             item.title.clone()
@@ -539,16 +534,11 @@ fn media_item_scan_matches(
     item: &ScannedMediaItem,
 ) -> anyhow::Result<bool> {
     let existing_is_folder = existing.is_folder != 0;
-    let preserve_scraped_episode_title = existing.item_type == "Episode"
-        && item.item_type == "Episode"
-        && existing.tmdb_metadata_version > 0
-        && existing.overview.is_some();
     let preserve_folder_title = existing.item_type == item.item_type
         && existing_is_folder
         && (existing.overview.is_some() || existing.premiere_date.is_some());
-    let preserve_existing_title = preserve_folder_title || preserve_scraped_episode_title;
 
-    let title_matches = preserve_existing_title || existing.title == item.title;
+    let title_matches = preserve_folder_title || existing.title == item.title;
     let overview_matches = option_str_eq(
         existing.overview.as_deref(),
         item.overview.as_deref().or(existing.overview.as_deref()),
@@ -2049,35 +2039,6 @@ mod tests {
         let row = media_item_row(&db, &item.path).await;
         assert_eq!(row.title, "Renamed Movie");
         assert_ne!(row.updated_at, 123);
-    }
-
-    #[tokio::test]
-    async fn media_item_upsert_preserves_scraped_episode_title_on_rescan() {
-        let Some(db) = crate::db::test_db().await else {
-            return;
-        };
-        let mut item = scanned_movie("episode-scraped-title", "第一集");
-        item.item_type = "Episode".to_string();
-        item.season_number = Some(1);
-        item.episode_number = Some(1);
-        upsert_media_item(&db, &item).await.unwrap();
-
-        let mut active: media_items::ActiveModel = MediaItems::find_by_id(item.id.clone())
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap()
-            .into();
-        active.overview = Set(Some("已从 TMDB 获取的单集简介".to_string()));
-        active.tmdb_metadata_version = Set(1);
-        active.update(&db).await.unwrap();
-
-        item.title = "mp4".to_string();
-        upsert_media_item(&db, &item).await.unwrap();
-
-        let row = media_item_row(&db, &item.path).await;
-        assert_eq!(row.title, "第一集");
-        assert_eq!(row.overview.as_deref(), Some("已从 TMDB 获取的单集简介"));
     }
 
     #[tokio::test]

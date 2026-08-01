@@ -1,4 +1,10 @@
-use std::{collections::HashMap, io::SeekFrom, sync::Arc};
+use std::{
+    collections::HashMap,
+    io::SeekFrom,
+    process::Stdio,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json,
@@ -12,6 +18,9 @@ use serde_json::json;
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt},
+    process::Command,
+    sync::RwLock,
+    time::timeout,
 };
 use tokio_util::io::ReaderStream;
 
@@ -263,46 +272,86 @@ pub async fn stream_audio_head(
 pub async fn stream_subtitle(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, index, _format)): Path<(String, i64, String)>,
+    Path((item_id, index, format)): Path<(String, i64, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(state, item_id, index, headers, query, Method::GET).await
+    stream_subtitle_item(
+        state,
+        item_id,
+        index,
+        format,
+        None,
+        headers,
+        query,
+        Method::GET,
+    )
+    .await
 }
 
 pub async fn stream_subtitle_head(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, index, _format)): Path<(String, i64, String)>,
+    Path((item_id, index, format)): Path<(String, i64, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(state, item_id, index, headers, query, Method::HEAD).await
+    stream_subtitle_item(
+        state,
+        item_id,
+        index,
+        format,
+        None,
+        headers,
+        query,
+        Method::HEAD,
+    )
+    .await
 }
 
 /// Subtitle streaming with mediaSourceId path segment for Emby client compatibility.
 pub async fn stream_subtitle_with_source(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, _media_source_id, index, _format)): Path<(String, String, i64, String)>,
+    Path((item_id, _media_source_id, index, format)): Path<(String, String, i64, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     // media_source_id is ignored; route to the same handler
-    stream_subtitle_item(state, item_id, index, headers, query, Method::GET).await
+    stream_subtitle_item(
+        state,
+        item_id,
+        index,
+        format,
+        None,
+        headers,
+        query,
+        Method::GET,
+    )
+    .await
 }
 
 pub async fn stream_subtitle_with_source_head(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, _media_source_id, index, _format)): Path<(String, String, i64, String)>,
+    Path((item_id, _media_source_id, index, format)): Path<(String, String, i64, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(state, item_id, index, headers, query, Method::HEAD).await
+    stream_subtitle_item(
+        state,
+        item_id,
+        index,
+        format,
+        None,
+        headers,
+        query,
+        Method::HEAD,
+    )
+    .await
 }
 
 /// Subtitle streaming with mediaSourceId and start position ticks (Emby compatibility).
 pub async fn stream_subtitle_with_ticks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, _media_source_id, index, _start_ticks, _format)): Path<(
+    Path((item_id, _media_source_id, index, start_ticks, format)): Path<(
         String,
         String,
         i64,
@@ -311,13 +360,23 @@ pub async fn stream_subtitle_with_ticks(
     )>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(state, item_id, index, headers, query, Method::GET).await
+    stream_subtitle_item(
+        state,
+        item_id,
+        index,
+        format,
+        Some(start_ticks),
+        headers,
+        query,
+        Method::GET,
+    )
+    .await
 }
 
 pub async fn stream_subtitle_with_ticks_head(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, _media_source_id, index, _start_ticks, _format)): Path<(
+    Path((item_id, _media_source_id, index, start_ticks, format)): Path<(
         String,
         String,
         i64,
@@ -326,13 +385,25 @@ pub async fn stream_subtitle_with_ticks_head(
     )>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    stream_subtitle_item(state, item_id, index, headers, query, Method::HEAD).await
+    stream_subtitle_item(
+        state,
+        item_id,
+        index,
+        format,
+        Some(start_ticks),
+        headers,
+        query,
+        Method::HEAD,
+    )
+    .await
 }
 
 async fn stream_subtitle_item(
     state: Arc<AppState>,
     item_id: String,
     index: i64,
+    format: String,
+    start_ticks: Option<i64>,
     request_headers: HeaderMap,
     query: HashMap<String, String>,
     method: Method,
@@ -344,39 +415,52 @@ async fn stream_subtitle_item(
     } else {
         find_media_item(&state.db, &user_id, &item_id).await
     };
-    match item {
-        Ok(Some(_)) => {}
+    let item = match item {
+        Ok(Some(item)) => item,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return internal_error(error),
-    }
-    if wants_json_response(&request_headers) {
-        return ok_response();
-    }
-
+    };
     let path = match crate::jellyfin::routes::subtitle_stream_path(&state.db, &item_id, index).await
     {
-        Ok(Some(path)) => path,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(path) => path,
         Err(error) => return internal_error(error),
     };
-    if !readable_media_path(&state.db, &path).await {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "Error": format!("failed to read subtitle file: {error}") })),
-            )
-                .into_response();
+    let bytes = match path {
+        Some(path) => {
+            if !readable_media_path(&state.db, &path).await {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "Error": format!("failed to read subtitle file: {error}") })),
+                    )
+                        .into_response();
+                }
+            }
         }
+        None => match cached_embedded_subtitle(&state, &item, index, start_ticks).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(item_id = %item_id, index, "embedded subtitle extraction failed: {error:#}");
+                return StatusCode::NOT_FOUND.into_response();
+            }
+        },
+    };
+    let (content_type, bytes) = if format.eq_ignore_ascii_case("js") {
+        (
+            "application/json; charset=utf-8",
+            vtt_to_track_events(&bytes),
+        )
+    } else if format.eq_ignore_ascii_case("vtt") {
+        ("text/vtt; charset=utf-8", bytes)
+    } else {
+        return StatusCode::NOT_FOUND.into_response();
     };
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(
         header::CONTENT_LENGTH,
         HeaderValue::from_str(&bytes.len().to_string())
@@ -387,6 +471,193 @@ async fn stream_subtitle_item(
     } else {
         (StatusCode::OK, headers, Body::from(bytes)).into_response()
     }
+}
+
+const EMBEDDED_SUBTITLE_TIMEOUT: Duration = Duration::from_secs(30);
+const EMBEDDED_SUBTITLE_WINDOW_SECONDS: u64 = 30;
+const MAX_EMBEDDED_SUBTITLE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EMBEDDED_SUBTITLE_CACHE_ENTRIES: usize = 32;
+
+type EmbeddedSubtitleCacheKey = (String, i64, i64, i64);
+static EMBEDDED_SUBTITLE_CACHE: OnceLock<RwLock<HashMap<EmbeddedSubtitleCacheKey, Vec<u8>>>> =
+    OnceLock::new();
+
+fn embedded_subtitle_cache() -> &'static RwLock<HashMap<EmbeddedSubtitleCacheKey, Vec<u8>>> {
+    EMBEDDED_SUBTITLE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+async fn cached_embedded_subtitle(
+    state: &Arc<AppState>,
+    item: &MediaItem,
+    index: i64,
+    start_ticks: Option<i64>,
+) -> anyhow::Result<Vec<u8>> {
+    let start_ticks = start_ticks.unwrap_or_default().max(0);
+    let key = (item.id.clone(), item.modified_at, index, start_ticks);
+    if let Some(bytes) = embedded_subtitle_cache().read().await.get(&key).cloned() {
+        return Ok(bytes);
+    }
+    let bytes = extract_embedded_subtitle(state, item, index, start_ticks).await?;
+    let mut cache = embedded_subtitle_cache().write().await;
+    if cache.len() >= MAX_EMBEDDED_SUBTITLE_CACHE_ENTRIES {
+        if let Some(oldest) = cache.keys().next().cloned() {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(key, bytes.clone());
+    Ok(bytes)
+}
+
+async fn extract_embedded_subtitle(
+    state: &Arc<AppState>,
+    item: &MediaItem,
+    index: i64,
+    start_ticks: i64,
+) -> anyhow::Result<Vec<u8>> {
+    let source = match playback_target_for_item(item)? {
+        PlaybackTarget::RemoteUrl(url) => url,
+        PlaybackTarget::LocalPath(path) => path.to_string_lossy().into_owned(),
+    };
+    let mut command = Command::new(&state.sa_config.ffmpeg_path);
+    command
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin")
+        .arg("-ss")
+        .arg(format!("{:.3}", start_ticks as f64 / 10_000_000.0))
+        .arg("-i")
+        .arg(source)
+        .arg("-t")
+        .arg(EMBEDDED_SUBTITLE_WINDOW_SECONDS.to_string())
+        .arg("-map")
+        .arg(format!("0:{index}"))
+        .arg("-c:s")
+        .arg("webvtt")
+        .arg("-f")
+        .arg("webvtt")
+        .arg("pipe:1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = timeout(EMBEDDED_SUBTITLE_TIMEOUT, command.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("embedded subtitle extraction timed out"))??;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ffmpeg exited with {}: {}", output.status, stderr.trim());
+    }
+    if output.stdout.len() > MAX_EMBEDDED_SUBTITLE_BYTES {
+        anyhow::bail!("embedded subtitle output is too large");
+    }
+    if output.stdout.is_empty() {
+        anyhow::bail!("ffmpeg returned an empty subtitle stream");
+    }
+    Ok(shift_vtt_timestamps(&output.stdout, start_ticks))
+}
+
+fn shift_vtt_timestamps(bytes: &[u8], start_ticks: i64) -> Vec<u8> {
+    if start_ticks <= 0 {
+        return bytes.to_vec();
+    }
+    let offset_seconds = start_ticks as f64 / 10_000_000.0;
+    let text = String::from_utf8_lossy(bytes).replace('\r', "");
+    let mut shifted = String::with_capacity(text.len());
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            shifted.push('\n');
+        }
+        let Some((start, end_and_settings)) = line.split_once("-->") else {
+            shifted.push_str(line);
+            continue;
+        };
+        let Some(end_token) = end_and_settings.split_whitespace().next() else {
+            shifted.push_str(line);
+            continue;
+        };
+        let Some(start_seconds) = vtt_timestamp_seconds(start.trim()) else {
+            shifted.push_str(line);
+            continue;
+        };
+        let Some(end_seconds) = vtt_timestamp_seconds(end_token) else {
+            shifted.push_str(line);
+            continue;
+        };
+        let settings = &end_and_settings[end_token.len()..];
+        shifted.push_str(&format!(
+            "{} --> {}{}",
+            format_vtt_timestamp(start_seconds + offset_seconds),
+            format_vtt_timestamp(end_seconds + offset_seconds),
+            settings
+        ));
+    }
+    shifted.into_bytes()
+}
+
+fn vtt_to_track_events(bytes: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(bytes).replace('\r', "");
+    let lines: Vec<&str> = text.lines().collect();
+    let mut events = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if !lines[index].contains("-->") {
+            index += 1;
+            continue;
+        }
+        let Some((start, end)) = parse_vtt_timing(lines[index]) else {
+            index += 1;
+            continue;
+        };
+        index += 1;
+        let text_start = index;
+        while index < lines.len() && !lines[index].trim().is_empty() {
+            index += 1;
+        }
+        let cue_text = lines[text_start..index].join("\n");
+        if !cue_text.is_empty() {
+            events.push(json!({
+                "Text": cue_text,
+                "StartPositionTicks": start,
+                "EndPositionTicks": end,
+            }));
+        }
+        index += 1;
+    }
+    serde_json::to_vec(&json!({ "TrackEvents": events }))
+        .unwrap_or_else(|_| br#"{"TrackEvents":[]}"#.to_vec())
+}
+
+fn parse_vtt_timing(line: &str) -> Option<(i64, i64)> {
+    let (start, end) = line.split_once("-->")?;
+    let start = vtt_timestamp_ticks(start.trim().split_whitespace().next()?)?;
+    let end = vtt_timestamp_ticks(end.trim().split_whitespace().next()?)?;
+    (end > start).then_some((start, end))
+}
+
+fn vtt_timestamp_ticks(value: &str) -> Option<i64> {
+    Some((vtt_timestamp_seconds(value)? * 10_000_000.0).round() as i64)
+}
+
+fn vtt_timestamp_seconds(value: &str) -> Option<f64> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [minutes, seconds] => (0.0, minutes.parse::<f64>().ok()?, *seconds),
+        [hours, minutes, seconds] => (
+            hours.parse::<f64>().ok()?,
+            minutes.parse::<f64>().ok()?,
+            *seconds,
+        ),
+        _ => return None,
+    };
+    let seconds = seconds.parse::<f64>().ok()?;
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+fn format_vtt_timestamp(seconds: f64) -> String {
+    let seconds = seconds.max(0.0);
+    let hours = (seconds / 3600.0).floor() as u64;
+    let minutes = ((seconds - hours as f64 * 3600.0) / 60.0).floor() as u64;
+    let remainder = seconds - hours as f64 * 3600.0 - minutes as f64 * 60.0;
+    format!("{hours:02}:{minutes:02}:{remainder:06.3}")
 }
 
 async fn stream_media_item(
@@ -680,11 +951,47 @@ pub(crate) async fn readable_media_path(db: &sea_orm::DatabaseConnection, path: 
 }
 
 async fn library_roots(db: &sea_orm::DatabaseConnection) -> anyhow::Result<Vec<String>> {
+    {
+        let cache = library_roots_cache().read().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.loaded_at.elapsed() <= LIBRARY_ROOTS_CACHE_TTL
+        {
+            return Ok(cached.roots.clone());
+        }
+    }
+
+    // Recheck while holding the write lock so concurrent HEAD/GET/seek
+    // requests perform at most one database refresh per short TTL window.
+    let mut cache = library_roots_cache().write().await;
+    if let Some(cached) = cache.as_ref()
+        && cached.loaded_at.elapsed() <= LIBRARY_ROOTS_CACHE_TTL
+    {
+        return Ok(cached.roots.clone());
+    }
+
     let paths = LibraryPaths::find()
         .order_by_asc(library_paths::Column::Path)
         .all(db)
         .await?;
-    Ok(paths.into_iter().map(|path| path.path).collect())
+    let roots: Vec<String> = paths.into_iter().map(|path| path.path).collect();
+    *cache = Some(CachedLibraryRoots {
+        loaded_at: Instant::now(),
+        roots: roots.clone(),
+    });
+    Ok(roots)
+}
+
+const LIBRARY_ROOTS_CACHE_TTL: Duration = Duration::from_secs(3);
+
+struct CachedLibraryRoots {
+    loaded_at: Instant,
+    roots: Vec<String>,
+}
+
+static LIBRARY_ROOTS_CACHE: OnceLock<RwLock<Option<CachedLibraryRoots>>> = OnceLock::new();
+
+fn library_roots_cache() -> &'static RwLock<Option<CachedLibraryRoots>> {
+    LIBRARY_ROOTS_CACHE.get_or_init(|| RwLock::new(None))
 }
 
 /// GET /Audio/{id}/stream — alias for stream_audio
@@ -729,8 +1036,12 @@ pub async fn stream_audio_container_head(
 
 #[cfg(test)]
 mod tests {
-    use super::{PlaybackTarget, playback_target_for_item};
+    use super::{
+        PlaybackTarget, parse_range_header, playback_target_for_item, remote_stream_redirect,
+        shift_vtt_timestamps, vtt_to_track_events,
+    };
     use crate::library::models::MediaItem;
+    use axum::http::{StatusCode, header};
 
     #[test]
     fn playback_target_resolves_remote_strm_url() {
@@ -766,6 +1077,51 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_strm_playback_is_a_redirect_without_body_buffering() {
+        let response = remote_stream_redirect("https://smartstrm.example/movie.mkv?sign=x");
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "https://smartstrm.example/movie.mkv?sign=x"
+        );
+    }
+
+    #[test]
+    fn range_parser_covers_browser_seek_shapes() {
+        assert_eq!(parse_range_header("bytes=0-99", 1_000).unwrap().len(), 100);
+        assert_eq!(parse_range_header("bytes=900-", 1_000).unwrap().start, 900);
+        assert_eq!(parse_range_header("bytes=-100", 1_000).unwrap().start, 900);
+        assert!(parse_range_header("bytes=1000-", 1_000).is_none());
+        assert!(parse_range_header("bytes=0-1,2-3", 1_000).is_none());
+    }
+
+    #[test]
+    fn embedded_vtt_is_exposed_as_jellyfin_track_events() {
+        let body = vtt_to_track_events(
+            b"WEBVTT\n\n00:00.400 --> 00:03.900\n<b>hello</b>\n\n00:10.240 --> 00:12.910\nworld\n",
+        );
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let events = value["TrackEvents"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["StartPositionTicks"], 4_000_000);
+        assert_eq!(events[0]["EndPositionTicks"], 39_000_000);
+        assert_eq!(events[0]["Text"], "<b>hello</b>");
+        assert_eq!(events[1]["StartPositionTicks"], 102_400_000);
+    }
+
+    #[test]
+    fn embedded_vtt_window_is_shifted_back_to_absolute_time() {
+        let shifted = shift_vtt_timestamps(
+            b"WEBVTT\n\n00:00.400 --> 00:03.900\nhello\n",
+            180 * 10_000_000,
+        );
+        let text = String::from_utf8(shifted).unwrap();
+        assert!(text.contains("00:03:00.400 --> 00:03:03.900"));
+        assert!(text.contains("hello"));
     }
 
     fn media_item(path: &str) -> MediaItem {

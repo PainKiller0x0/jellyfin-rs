@@ -2033,7 +2033,11 @@ mod tests {
             return;
         };
         insert_library(&db, "movies-paged", "Movies paged", "movies").await;
-        for (id, title) in [("movie-c", "Charlie"), ("movie-a", "Alpha"), ("movie-b", "Bravo")] {
+        for (id, title) in [
+            ("movie-c", "Charlie"),
+            ("movie-a", "Alpha"),
+            ("movie-b", "Bravo"),
+        ] {
             insert_item(
                 &db,
                 id,
@@ -2058,7 +2062,13 @@ mod tests {
         query.insert("Limit".to_string(), "1".to_string());
         let (items, total) = super::list_media_items(&db, "u1", &query).await.unwrap();
         assert_eq!(total, 3);
-        assert_eq!(items.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["movie-b"]);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["movie-b"]
+        );
     }
 
     #[tokio::test]

@@ -1049,10 +1049,8 @@ fn is_bd_source_range_folder_name(name: &str) -> bool {
     static REGEX: OnceLock<regex::Regex> = OnceLock::new();
     REGEX
         .get_or_init(|| {
-            regex::Regex::new(
-                r"(?i)^bd(?:\s*版)?\s*[0-9]{1,4}\s*[-~至]\s*[0-9]{1,4}(?:\s+.*)?$",
-            )
-            .expect("BD source range folder regex must compile")
+            regex::Regex::new(r"(?i)^bd(?:\s*版)?\s*[0-9]{1,4}\s*[-~至]\s*[0-9]{1,4}(?:\s+.*)?$")
+                .expect("BD source range folder regex must compile")
         })
         .is_match(name.trim())
 }
@@ -1067,13 +1065,14 @@ fn season_suffix_regex() -> &'static regex::Regex {
 
 fn is_multi_season_range_name(name: &str) -> bool {
     static REGEX: OnceLock<regex::Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:se|s)\d{1,4}\s*[-~至]\s*(?:se|s)?\d{1,4}(?:[^0-9]|$)"#,
-        )
-        .expect("multi-season range regex must compile")
-    })
-    .is_match(name)
+    REGEX
+        .get_or_init(|| {
+            regex::Regex::new(
+                r#"(?i)(?:^|[^a-z0-9])(?:se|s)\d{1,4}\s*[-~至]\s*(?:se|s)?\d{1,4}(?:[^0-9]|$)"#,
+            )
+            .expect("multi-season range regex must compile")
+        })
+        .is_match(name)
 }
 
 fn parse_keyword_season_number(clean_name: &str) -> Option<i64> {
@@ -1692,14 +1691,8 @@ mod tests {
 
         assert_eq!(tv_folder_type(&domestic, &root, "tvshows"), "Folder");
         assert_eq!(tv_folder_type(&foreign, &root, "tvshows"), "Folder");
-        assert_eq!(
-            tv_folder_type(&domestic_series, &root, "tvshows"),
-            "Series"
-        );
-        assert_eq!(
-            tv_folder_type(&foreign_series, &root, "tvshows"),
-            "Series"
-        );
+        assert_eq!(tv_folder_type(&domestic_series, &root, "tvshows"), "Series");
+        assert_eq!(tv_folder_type(&foreign_series, &root, "tvshows"), "Series");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1850,14 +1843,8 @@ mod tests {
             tv_folder_type(&root.join("外剧"), root, "tvshows"),
             "Folder"
         );
-        assert_eq!(
-            season_number_from_folder_name("黑镜S01", None),
-            Some(1)
-        );
-        assert_eq!(
-            season_number_from_folder_name("SE10", None),
-            Some(10)
-        );
+        assert_eq!(season_number_from_folder_name("黑镜S01", None), Some(1));
+        assert_eq!(season_number_from_folder_name("SE10", None), Some(10));
         assert_eq!(
             season_number_from_folder_name("绝命毒师 S01-S05 4K", None),
             None

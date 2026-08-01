@@ -1764,10 +1764,7 @@ mod tests {
             "https://other.example.test/movie.mkv"
         );
         assert_eq!(
-            rewrite_public_strm_target_with_base(
-                "http://127.0.0.1:8024/movie.mkv",
-                None,
-            ),
+            rewrite_public_strm_target_with_base("http://127.0.0.1:8024/movie.mkv", None,),
             "http://127.0.0.1:8024/movie.mkv"
         );
     }

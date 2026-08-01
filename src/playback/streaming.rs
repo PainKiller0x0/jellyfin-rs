@@ -1,11 +1,11 @@
 use std::{collections::HashMap, io::SeekFrom, process::Stdio, sync::Arc};
 
 use axum::{
+    Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
-    Json,
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use serde_json::json;
@@ -13,6 +13,7 @@ use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt},
     process::Command,
+    time::{Duration, timeout},
 };
 use tokio_util::io::ReaderStream;
 
@@ -29,7 +30,7 @@ use crate::{
         routes::{find_media_item, find_media_item_for_admin, internal_error, not_found},
     },
     library::{
-        models::{rewrite_public_strm_target, MediaItem},
+        models::{MediaItem, rewrite_public_strm_target},
         path_utils,
     },
 };
@@ -525,46 +526,131 @@ async fn stream_embedded_subtitle(
         Ok(input) => input,
         Err(error) => return internal_error(error),
     };
+    let start_ticks = start_ticks.unwrap_or_default().max(0);
     let mut command = Command::new(&state.sa_config.ffmpeg_path);
-    command.args(["-nostdin", "-v", "error"]);
-    if let Some(start_ticks) = start_ticks.filter(|value| *value > 0) {
-        command
-            .args(["-copyts", "-ss"])
-            .arg(format!("{:.3}", start_ticks as f64 / 10_000_000.0));
-    }
+    command
+        .args(["-hide_banner", "-nostdin", "-v", "error", "-ss"])
+        .arg(format!("{:.3}", start_ticks as f64 / 10_000_000.0));
     command
         .arg("-i")
         .arg(input)
-        .args(["-map", &format!("0:{index}"), "-f", "webvtt", "pipe:1"])
+        .args([
+            "-t",
+            EMBEDDED_SUBTITLE_WINDOW_SECONDS,
+            "-map",
+            &format!("0:{index}"),
+            "-c:s",
+            "webvtt",
+            "-f",
+            "webvtt",
+            "pipe:1",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
+    let output = match timeout(EMBEDDED_SUBTITLE_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
             return internal_error(
                 anyhow::anyhow!(error).context("failed to start embedded subtitle extraction"),
             );
         }
-    };
-    let Some(mut stdout) = child.stdout.take() else {
-        return internal_error(anyhow::anyhow!("ffmpeg subtitle stdout was not available"));
-    };
-    let (mut writer, reader) = tokio::io::duplex(64 * 1024);
-    tokio::spawn(async move {
-        if tokio::io::copy(&mut stdout, &mut writer).await.is_err() {
-            let _ = child.kill().await;
+        Err(_) => {
+            return internal_error(anyhow::anyhow!(
+                "embedded subtitle extraction timed out after {} seconds",
+                EMBEDDED_SUBTITLE_TIMEOUT.as_secs()
+            ));
         }
-        drop(writer);
-        let _ = child.wait().await;
-    });
-    (
-        StatusCode::OK,
-        headers,
-        Body::from_stream(ReaderStream::new(reader)),
-    )
-        .into_response()
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return internal_error(anyhow::anyhow!(
+            "ffmpeg exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    if output.stdout.is_empty() {
+        return internal_error(anyhow::anyhow!("ffmpeg returned an empty subtitle stream"));
+    }
+    if output.stdout.len() > MAX_EMBEDDED_SUBTITLE_BYTES {
+        return internal_error(anyhow::anyhow!("embedded subtitle output is too large"));
+    }
+
+    let bytes = shift_vtt_timestamps(&output.stdout, start_ticks);
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    (StatusCode::OK, headers, Body::from(bytes)).into_response()
+}
+
+const EMBEDDED_SUBTITLE_TIMEOUT: Duration = Duration::from_secs(30);
+const EMBEDDED_SUBTITLE_WINDOW_SECONDS: &str = "30";
+const MAX_EMBEDDED_SUBTITLE_BYTES: usize = 16 * 1024 * 1024;
+
+fn shift_vtt_timestamps(bytes: &[u8], start_ticks: i64) -> Vec<u8> {
+    if start_ticks <= 0 {
+        return bytes.to_vec();
+    }
+    let offset_seconds = start_ticks as f64 / 10_000_000.0;
+    let text = String::from_utf8_lossy(bytes).replace('\r', "");
+    let mut shifted = String::with_capacity(text.len());
+    for (line_index, line) in text.split('\n').enumerate() {
+        if line_index > 0 {
+            shifted.push('\n');
+        }
+        let Some((start, end_and_settings)) = line.split_once("-->") else {
+            shifted.push_str(line);
+            continue;
+        };
+        let end_and_settings = end_and_settings.trim_start();
+        let Some(end_token) = end_and_settings.split_whitespace().next() else {
+            shifted.push_str(line);
+            continue;
+        };
+        let Some(start_seconds) = vtt_timestamp_seconds(start.trim()) else {
+            shifted.push_str(line);
+            continue;
+        };
+        let Some(end_seconds) = vtt_timestamp_seconds(end_token) else {
+            shifted.push_str(line);
+            continue;
+        };
+        let settings = &end_and_settings[end_token.len()..];
+        shifted.push_str(&format!(
+            "{} --> {}{}",
+            format_vtt_timestamp(start_seconds + offset_seconds),
+            format_vtt_timestamp(end_seconds + offset_seconds),
+            settings
+        ));
+    }
+    shifted.into_bytes()
+}
+
+fn vtt_timestamp_seconds(value: &str) -> Option<f64> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [minutes, seconds] => (0.0, minutes.parse::<f64>().ok()?, *seconds),
+        [hours, minutes, seconds] => (
+            hours.parse::<f64>().ok()?,
+            minutes.parse::<f64>().ok()?,
+            *seconds,
+        ),
+        _ => return None,
+    };
+    let seconds = seconds.parse::<f64>().ok()?;
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+fn format_vtt_timestamp(seconds: f64) -> String {
+    let seconds = seconds.max(0.0);
+    let hours = (seconds / 3600.0).floor() as u64;
+    let minutes = ((seconds - hours as f64 * 3600.0) / 60.0).floor() as u64;
+    let remainder = seconds - hours as f64 * 3600.0 - minutes as f64 * 60.0;
+    format!("{hours:02}:{minutes:02}:{remainder:06.3}")
 }
 
 fn embedded_subtitle_input(item: &MediaItem) -> anyhow::Result<String> {
@@ -934,7 +1020,7 @@ pub async fn stream_audio_container_head(
 
 #[cfg(test)]
 mod tests {
-    use super::{playback_target_for_item, PlaybackTarget};
+    use super::{PlaybackTarget, playback_target_for_item, shift_vtt_timestamps};
     use crate::library::models::MediaItem;
 
     #[test]
@@ -971,6 +1057,15 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn embedded_subtitle_window_timestamps_are_shifted() {
+        let input = b"WEBVTT\n\n00:00:01.250 --> 00:00:03.500 align:start\nHello\n";
+        let shifted = shift_vtt_timestamps(input, 180 * 10_000_000);
+        let shifted = String::from_utf8(shifted).unwrap();
+        assert!(shifted.contains("00:03:01.250 --> 00:03:03.500 align:start"));
+        assert!(shifted.contains("Hello"));
     }
 
     fn media_item(path: &str) -> MediaItem {

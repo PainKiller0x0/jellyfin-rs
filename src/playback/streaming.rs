@@ -588,7 +588,7 @@ async fn stream_embedded_subtitle(
 }
 
 const EMBEDDED_SUBTITLE_TIMEOUT: Duration = Duration::from_secs(30);
-const EMBEDDED_SUBTITLE_WINDOW_SECONDS: &str = "30";
+const EMBEDDED_SUBTITLE_WINDOW_SECONDS: &str = "20";
 const MAX_EMBEDDED_SUBTITLE_BYTES: usize = 16 * 1024 * 1024;
 
 fn shift_vtt_timestamps(bytes: &[u8], start_ticks: i64) -> Vec<u8> {

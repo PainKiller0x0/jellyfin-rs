@@ -106,7 +106,7 @@ async function submit() {
   background:
     linear-gradient(135deg, rgb(15 118 110 / 12%), transparent 34%),
     linear-gradient(315deg, rgb(180 83 9 / 14%), transparent 30%),
-    #f6f8fb;
+    var(--admin-bg);
 }
 
 .login-page__panel {
@@ -114,7 +114,7 @@ async function submit() {
   padding: 28px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
   box-shadow: 0 20px 55px rgb(15 23 42 / 10%);
 }
 

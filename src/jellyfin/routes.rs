@@ -15,10 +15,11 @@ use crate::{
         stream_audio, stream_audio_container, stream_audio_container_head, stream_audio_head,
         stream_audio_simple, stream_audio_simple_head, stream_subtitle, stream_subtitle_head,
         stream_subtitle_with_source, stream_subtitle_with_source_head, stream_subtitle_with_ticks,
-        stream_subtitle_with_ticks_head, stream_video, stream_video_head, stream_video_original,
-        stream_video_original_container, stream_video_original_container_head,
-        stream_video_original_head, stream_video_original_with_source,
-        stream_video_original_with_source_container,
+        stream_subtitle_with_ticks_head, stream_subtitle_with_ticks_no_source,
+        stream_subtitle_with_ticks_no_source_head, stream_video, stream_video_head,
+        stream_video_original, stream_video_original_container,
+        stream_video_original_container_head, stream_video_original_head,
+        stream_video_original_with_source, stream_video_original_with_source_container,
         stream_video_original_with_source_container_head, stream_video_original_with_source_head,
         stream_video_simple, stream_video_simple_head, stream_video_with_source,
         stream_video_with_source_head, stream_video_with_source_simple,
@@ -986,6 +987,11 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route(
             "/Videos/{item_id}/Subtitles/{index}/Stream.{format}",
             get(stream_subtitle).head(stream_subtitle_head),
+        )
+        .route(
+            "/Videos/{item_id}/Subtitles/{index}/{start_ticks}/Stream.{format}",
+            get(stream_subtitle_with_ticks_no_source)
+                .head(stream_subtitle_with_ticks_no_source_head),
         )
         .route(
             "/Videos/{item_id}/{media_source_id}/Subtitles/{index}/Stream.{format}",

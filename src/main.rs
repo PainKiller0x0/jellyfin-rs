@@ -106,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
 
     db::seed_default_data(&state).await?;
     jellyfin::system::start_scheduled_task_scheduler(state.clone()).await;
+    playback::streaming::start_embedded_subtitle_cache_scheduler(state.clone());
     if app::state::should_scan_on_startup() {
         let scan_state = state.clone();
         tokio::spawn(async move {

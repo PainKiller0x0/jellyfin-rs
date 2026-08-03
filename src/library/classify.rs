@@ -665,7 +665,17 @@ pub fn tv_folder_type(path: &Path, root: &Path, collection_type: &str) -> &'stat
         .parent()
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str());
-    if path_depth(path, root) > 1 && season_number_from_folder_name(name, parent_name).is_some() {
+    if is_bd_source_range_folder_name(name) {
+        "Folder"
+    } else if path_depth(path, root) == 1 && is_grouping_folder_name(name) {
+        "Folder"
+    } else if path_depth(path, root) > 1
+        && season_number_from_folder_name(name, parent_name).is_some()
+        // A decorated series folder can itself contain a real season folder,
+        // e.g. `Show.S01.2160p/S01`. In that shape the outer folder is the
+        // Series item; only a leaf season directory should become Season.
+        && !directory_has_season_folder(path)
+    {
         "Season"
     } else if is_quality_or_range_folder_name(name)
         || (is_grouping_folder_name(name) && !directory_has_direct_tv_episode_file(path))
@@ -956,12 +966,14 @@ fn is_grouping_folder_name(name: &str) -> bool {
         || matches!(
             folded.as_str(),
             "国产"
+                | "国产剧"
                 | "大陆"
                 | "内地"
                 | "港台"
                 | "港剧"
                 | "台剧"
                 | "欧美"
+                | "外剧"
                 | "美剧"
                 | "英剧"
                 | "韩剧"
@@ -973,7 +985,21 @@ fn is_grouping_folder_name(name: &str) -> bool {
 }
 
 fn season_number_from_folder_name(name: &str, parent_name: Option<&str>) -> Option<i64> {
+    // A bundle such as "S01-S05" contains multiple seasons and is the
+    // series/grouping folder, not one individual Season item.
+    if is_multi_season_range_name(name) {
+        return None;
+    }
+
     if let Some(number) = season_prefix_regex()
+        .captures(name)
+        .and_then(|captures| captures.name("number"))
+        .and_then(|number| number.as_str().parse::<i64>().ok())
+    {
+        return Some(number);
+    }
+
+    if let Some(number) = season_suffix_regex()
         .captures(name)
         .and_then(|captures| captures.name("number"))
         .and_then(|number| number.as_str().parse::<i64>().ok())
@@ -1017,6 +1043,36 @@ fn season_prefix_regex() -> &'static regex::Regex {
         regex::Regex::new(r#"(?i)(^|[ ._\-\[\]])s(?P<number>\d{1,4})($|[ ._\-\[\]].*)"#)
             .expect("season prefix regex must compile")
     })
+}
+
+fn is_bd_source_range_folder_name(name: &str) -> bool {
+    static REGEX: OnceLock<regex::Regex> = OnceLock::new();
+    REGEX
+        .get_or_init(|| {
+            regex::Regex::new(r"(?i)^bd(?:\s*版)?\s*[0-9]{1,4}\s*[-~至]\s*[0-9]{1,4}(?:\s+.*)?$")
+                .expect("BD source range folder regex must compile")
+        })
+        .is_match(name.trim())
+}
+
+fn season_suffix_regex() -> &'static regex::Regex {
+    static REGEX: OnceLock<regex::Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        regex::Regex::new(r#"(?i)(^|.)(?:se|s)(?P<number>\d{1,4})($|[ ._\-\[\]].*)"#)
+            .expect("season suffix regex must compile")
+    })
+}
+
+fn is_multi_season_range_name(name: &str) -> bool {
+    static REGEX: OnceLock<regex::Regex> = OnceLock::new();
+    REGEX
+        .get_or_init(|| {
+            regex::Regex::new(
+                r#"(?i)(?:^|[^a-z0-9])(?:se|s)\d{1,4}\s*[-~至]\s*(?:se|s)?\d{1,4}(?:[^0-9]|$)"#,
+            )
+            .expect("multi-season range regex must compile")
+        })
+        .is_match(name)
 }
 
 fn parse_keyword_season_number(clean_name: &str) -> Option<i64> {
@@ -1365,7 +1421,7 @@ fn is_ignored_video_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_media_path, tv_folder_type};
+    use super::{classify_media_path, season_number_from_folder_name, tv_folder_type};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -1622,6 +1678,26 @@ mod tests {
     }
 
     #[test]
+    fn top_level_tv_grouping_folders_stay_folders() {
+        let root = test_dir("top_level_tv_grouping_folders_stay_folders");
+        let domestic = root.join("国产剧");
+        let foreign = root.join("外剧");
+        let domestic_series = domestic.join("Spy.Game.S01.2023.2160p");
+        let foreign_series = foreign.join("Ted Lasso");
+        fs::create_dir_all(domestic_series.join("S01")).unwrap();
+        fs::create_dir_all(foreign_series.join("Season1")).unwrap();
+        fs::write(domestic_series.join("S01/Spy.Game.S01E01.mkv"), []).unwrap();
+        fs::write(foreign_series.join("Season1/Ted.Lasso.S01E01.mkv"), []).unwrap();
+
+        assert_eq!(tv_folder_type(&domestic, &root, "tvshows"), "Folder");
+        assert_eq!(tv_folder_type(&foreign, &root, "tvshows"), "Folder");
+        assert_eq!(tv_folder_type(&domestic_series, &root, "tvshows"), "Series");
+        assert_eq!(tv_folder_type(&foreign_series, &root, "tvshows"), "Series");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn tv_quality_and_range_folders_stay_folders() {
         let root = test_dir("tv_quality_and_range_folders_stay_folders");
         let series = root.join("剧名 (2025){tmdb-123}");
@@ -1753,6 +1829,36 @@ mod tests {
         assert_eq!(tv_folder_type(&series, &root, "tvshows"), "Series");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tv_category_and_decorated_season_folders_are_classified_correctly() {
+        let root = Path::new("/media/电视剧");
+
+        assert_eq!(
+            tv_folder_type(&root.join("国产剧"), root, "tvshows"),
+            "Folder"
+        );
+        assert_eq!(
+            tv_folder_type(&root.join("外剧"), root, "tvshows"),
+            "Folder"
+        );
+        assert_eq!(season_number_from_folder_name("黑镜S01", None), Some(1));
+        assert_eq!(season_number_from_folder_name("SE10", None), Some(10));
+        assert_eq!(
+            season_number_from_folder_name("绝命毒师 S01-S05 4K", None),
+            None
+        );
+
+        let bd_root = Path::new("/media/特摄/假面骑士ZZZ（2025）");
+        assert_eq!(
+            tv_folder_type(&bd_root.join("BD版 01-16"), bd_root, "tvshows"),
+            "Folder"
+        );
+        assert_eq!(
+            tv_folder_type(&bd_root.join("bd01-16"), bd_root, "tvshows"),
+            "Folder"
+        );
     }
 
     #[test]

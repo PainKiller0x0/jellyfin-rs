@@ -1207,7 +1207,7 @@ async fn resolve_named_values(
         .iter()
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
-        .filter(|value| seen.insert((*value).to_string()))
+        .filter(|value| seen.insert(value.to_ascii_lowercase()))
         .map(|value| {
             (
                 stable_text_id(&format!("{table}:{}", value.to_ascii_lowercase())),
@@ -1220,41 +1220,41 @@ async fn resolve_named_values(
     }
 
     upsert_named_values(db, kind, &candidates).await?;
-    let names = candidates
+    let ids = candidates
         .iter()
-        .map(|(_, name)| name.clone())
+        .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
     let existing = match kind {
         NamedRelationKind::Genre => Genres::find()
-            .filter(genres::Column::Name.is_in(names))
+            .filter(genres::Column::Id.is_in(ids.clone()))
             .all(db)
             .await?
             .into_iter()
-            .map(|value| (value.name, value.id))
+            .map(|value| (value.id, value.name))
             .collect::<HashMap<_, _>>(),
         NamedRelationKind::Tag => Tags::find()
-            .filter(tags::Column::Name.is_in(names))
+            .filter(tags::Column::Id.is_in(ids.clone()))
             .all(db)
             .await?
             .into_iter()
-            .map(|value| (value.name, value.id))
+            .map(|value| (value.id, value.name))
             .collect::<HashMap<_, _>>(),
         NamedRelationKind::Studio => Studios::find()
-            .filter(studios::Column::Name.is_in(names))
+            .filter(studios::Column::Id.is_in(ids))
             .all(db)
             .await?
             .into_iter()
-            .map(|value| (value.name, value.id))
+            .map(|value| (value.id, value.name))
             .collect::<HashMap<_, _>>(),
     };
 
     candidates
         .into_iter()
-        .map(|(_, name)| {
+        .map(|(id, name)| {
             existing
-                .get(&name)
+                .get(&id)
                 .cloned()
-                .map(|id| (id, name.clone()))
+                .map(|_| (id, name.clone()))
                 .ok_or_else(|| {
                     anyhow::anyhow!("failed to resolve {table} row after upsert: {name}")
                 })
@@ -1375,23 +1375,31 @@ async fn upsert_people(
     if metadata.people.is_empty() && !replace_empty {
         return Ok(());
     }
-    let people = metadata
-        .people
-        .iter()
-        .enumerate()
-        .map(|(sort_order, person)| DesiredPerson {
-            relation: PersonRelation {
-                person_id: stable_text_id(&format!(
-                    "people:{}",
-                    person.name.trim().to_ascii_lowercase()
-                )),
-                role: person.role.clone(),
-                person_type: person.person_type.clone(),
-                sort_order: i64::try_from(sort_order).unwrap_or(i64::MAX),
-            },
+    let mut people = Vec::new();
+    for (sort_order, person) in metadata.people.iter().enumerate() {
+        let relation = PersonRelation {
+            person_id: stable_text_id(&format!(
+                "people:{}",
+                person.name.trim().to_ascii_lowercase()
+            )),
+            role: person.role.clone(),
+            person_type: person.person_type.clone(),
+            sort_order: i64::try_from(sort_order).unwrap_or(i64::MAX),
+        };
+        // TMDb can return the same person more than once with the same type.
+        // De-duplicate before the batch upsert; PostgreSQL rejects a single
+        // INSERT that would update the same unique key twice.
+        if people.iter().any(|existing: &DesiredPerson| {
+            existing.relation.person_id == relation.person_id
+                && existing.relation.person_type == relation.person_type
+        }) {
+            continue;
+        }
+        people.push(DesiredPerson {
+            relation,
             name: person.name.trim().to_string(),
-        })
-        .collect::<Vec<_>>();
+        });
+    }
     if people_match(db, item_id, &people).await? {
         return Ok(());
     }

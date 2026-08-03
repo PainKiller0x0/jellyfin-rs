@@ -790,7 +790,7 @@ onBeforeUnmount(stopPolling);
   background:
     linear-gradient(rgba(31, 35, 40, 0.08) 1px, transparent 1px),
     linear-gradient(90deg, rgba(31, 35, 40, 0.08) 1px, transparent 1px),
-    #ffffff;
+    var(--admin-surface);
   background-size:
     100% 74px,
     150px 100%,
@@ -815,8 +815,8 @@ onBeforeUnmount(stopPolling);
 }
 
 .dashboard-page__china-province {
-  fill: #ebedf0;
-  stroke: #ffffff;
+  fill: var(--admin-surface-soft);
+  stroke: var(--admin-border);
   stroke-linejoin: round;
   stroke-width: 1;
   vector-effect: non-scaling-stroke;
@@ -834,7 +834,7 @@ onBeforeUnmount(stopPolling);
 .dashboard-page__china-province--active:focus-visible {
   outline: 0;
   filter: brightness(0.96);
-  stroke: #1f2328;
+  stroke: var(--admin-text);
   stroke-width: 1.5;
 }
 
@@ -878,8 +878,8 @@ onBeforeUnmount(stopPolling);
   padding: 7px 8px;
   border: 1px solid rgba(31, 35, 40, 0.12);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.84);
-  color: #57606a;
+  background: var(--admin-surface-soft);
+  color: var(--admin-muted);
   font-size: 11px;
   box-shadow: 0 10px 26px rgba(15, 23, 42, 0.08);
   backdrop-filter: blur(8px);
@@ -905,8 +905,8 @@ onBeforeUnmount(stopPolling);
   padding: 7px 12px;
   border: 1px solid rgba(100, 116, 139, 0.16);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.72);
-  color: #64748b;
+  background: var(--admin-surface-soft);
+  color: var(--admin-muted);
   font-size: 13px;
   transform: translate(-50%, -50%);
   pointer-events: none;
@@ -926,7 +926,7 @@ onBeforeUnmount(stopPolling);
   padding: 10px 12px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
 }
 
 .dashboard-page__region-swatch {

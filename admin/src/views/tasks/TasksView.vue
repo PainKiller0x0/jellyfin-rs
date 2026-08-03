@@ -259,7 +259,7 @@ onMounted(loadTasks);
   padding: 12px 14px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
 
   span {
     min-width: 0;
@@ -301,7 +301,7 @@ onMounted(loadTasks);
   padding: 16px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
   box-shadow: 0 10px 26px rgba(15, 23, 42, 0.04);
 }
 
@@ -348,7 +348,7 @@ onMounted(loadTasks);
 
   h2 {
     overflow: hidden;
-    color: #0f172a;
+    color: var(--admin-text);
     font-size: 17px;
     line-height: 1.25;
     text-overflow: ellipsis;
@@ -378,10 +378,10 @@ onMounted(loadTasks);
   span {
     min-height: 30px;
     padding: 7px 10px;
-    border: 1px solid #e2e8f0;
+    border: 1px solid var(--admin-border);
     border-radius: 8px;
-    color: #475569;
-    background: #f8fafc;
+    color: var(--admin-muted);
+    background: var(--admin-surface-soft);
     font-size: 13px;
     line-height: 1.15;
   }

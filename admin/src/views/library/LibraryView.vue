@@ -657,7 +657,7 @@ onMounted(loadFolders);
   padding: 12px 14px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
 
   span {
     min-width: 0;
@@ -699,7 +699,7 @@ onMounted(loadFolders);
   padding: 16px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
   box-shadow: 0 10px 26px rgba(15, 23, 42, 0.04);
 }
 
@@ -732,7 +732,7 @@ onMounted(loadFolders);
   h2 {
     margin: 0;
     overflow: hidden;
-    color: #0f172a;
+    color: var(--admin-text);
     font-size: 17px;
     line-height: 1.25;
     text-overflow: ellipsis;
@@ -884,7 +884,7 @@ onMounted(loadFolders);
 
   h2 {
     margin: 0;
-    color: #0f172a;
+    color: var(--admin-text);
     font-size: 20px;
     line-height: 1.25;
   }
@@ -907,7 +907,7 @@ onMounted(loadFolders);
 
 .library-page__create-form :deep(.el-form-item__label) {
   padding-bottom: 7px;
-  color: #334155;
+  color: var(--admin-text);
   font-weight: 700;
 }
 
@@ -927,7 +927,7 @@ onMounted(loadFolders);
   border: 1px solid var(--admin-border);
   border-radius: 8px;
   color: var(--admin-text);
-  background: #ffffff;
+  background: var(--admin-surface);
   cursor: pointer;
   text-align: left;
   transition:

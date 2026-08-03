@@ -2283,11 +2283,11 @@ fn scan_root_concurrency() -> usize {
 }
 
 fn ingest_concurrency() -> usize {
-    (crate::db::cpu_parallelism() / 4).clamp(1, 2)
+    crate::db::cpu_parallelism().clamp(1, 2)
 }
 
 fn metadata_fetch_concurrency() -> usize {
-    (crate::db::cpu_parallelism() / 4).clamp(1, 2)
+    crate::db::cpu_parallelism().clamp(1, 2)
 }
 
 fn ingest_queue_capacity() -> usize {

@@ -205,7 +205,7 @@ watch(
   padding: 10px 12px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #f8fafc;
+  background: var(--admin-surface-soft);
 
   span {
     overflow: hidden;

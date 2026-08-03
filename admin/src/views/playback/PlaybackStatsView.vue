@@ -350,7 +350,7 @@ onMounted(loadStats);
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(37, 99, 235, 0.06), rgba(255, 255, 255, 0) 45%),
-    #ffffff;
+    var(--admin-surface);
 }
 
 .playback-stats-page__chart-day {
@@ -407,7 +407,7 @@ onMounted(loadStats);
   padding: 10px 12px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
 }
 
 .playback-stats-page__rank-row div {

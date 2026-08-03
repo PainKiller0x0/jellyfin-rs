@@ -75,6 +75,22 @@ jobs:
       - name: Build admin
         run: pnpm build
 
+  smartstrm-contract:
+    name: SmartStrm contract fixture
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run local SmartStrm protocol fixture
+        run: python -m unittest discover -s tests/smartstrm_contract -p "test_*.py"
+
   dockerhub:
     name: Docker Hub
     runs-on: ubuntu-latest

@@ -895,7 +895,7 @@ onMounted(loadUsers);
   padding: 12px 14px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
 
   span {
     min-width: 0;
@@ -937,11 +937,11 @@ onMounted(loadUsers);
   padding: 16px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
   box-shadow: 0 10px 26px rgba(15, 23, 42, 0.04);
 
   &.is-disabled {
-    background: #fffafa;
+    background: var(--admin-surface-soft);
   }
 }
 
@@ -982,7 +982,7 @@ onMounted(loadUsers);
   h2 {
     margin: 0;
     overflow: hidden;
-    color: #0f172a;
+    color: var(--admin-text);
     font-size: 17px;
     line-height: 1.25;
     text-overflow: ellipsis;
@@ -1018,10 +1018,10 @@ onMounted(loadUsers);
     min-height: 30px;
     gap: 6px;
     padding: 0 10px;
-    border: 1px solid #e2e8f0;
+    border: 1px solid var(--admin-border);
     border-radius: 8px;
-    color: #475569;
-    background: #f8fafc;
+    color: var(--admin-muted);
+    background: var(--admin-surface-soft);
     font-size: 13px;
     line-height: 1;
   }
@@ -1047,7 +1047,7 @@ onMounted(loadUsers);
 
 :deep(.users-page__policy-drawer .el-drawer__body) {
   padding: 0;
-  background: #f8fafc;
+  background: var(--admin-bg);
 }
 
 :deep(.users-page__policy-drawer .el-drawer__footer) {
@@ -1064,7 +1064,7 @@ onMounted(loadUsers);
   h2 {
     margin: 0;
     overflow: hidden;
-    color: #0f172a;
+    color: var(--admin-text);
     font-size: 18px;
     line-height: 1.25;
     text-overflow: ellipsis;
@@ -1095,7 +1095,7 @@ onMounted(loadUsers);
   padding: 14px;
   border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--admin-surface);
 }
 
 .users-page__policy-group-heading {
@@ -1108,7 +1108,7 @@ onMounted(loadUsers);
   }
 
   h3 {
-    color: #0f172a;
+    color: var(--admin-text);
     font-size: 15px;
     line-height: 1.25;
   }
@@ -1132,9 +1132,9 @@ onMounted(loadUsers);
   align-items: center;
   min-height: 54px;
   padding: 10px 12px;
-  border: 1px solid #edf2f7;
+  border: 1px solid var(--admin-border);
   border-radius: 8px;
-  background: #fbfdff;
+  background: var(--admin-surface-soft);
 
   span {
     display: grid;
@@ -1149,7 +1149,7 @@ onMounted(loadUsers);
   }
 
   strong {
-    color: #1f2937;
+    color: var(--admin-text);
     font-size: 13px;
     line-height: 1.25;
     white-space: nowrap;
@@ -1174,7 +1174,7 @@ onMounted(loadUsers);
   }
 
   span {
-    color: #334155;
+    color: var(--admin-text);
     font-size: 13px;
     font-weight: 700;
   }

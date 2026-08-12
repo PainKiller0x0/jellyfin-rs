@@ -567,7 +567,18 @@ async fn upsert_library_path(
     let path = path_utils::validate_library_path(&normalize_library_path_text(path)?)?;
 
     let library_id = library_id_for_name(&name);
-    let collection_type = normalize_collection_type(collection_type, &name)?;
+    let existing_collection_type = if collection_type.is_none() {
+        Libraries::find_by_id(&library_id)
+            .one(db)
+            .await?
+            .map(|library| library.collection_type)
+    } else {
+        None
+    };
+    let collection_type = normalize_collection_type(
+        collection_type.or(existing_collection_type.as_deref()),
+        &name,
+    )?;
     let now = now_unix();
 
     upsert_library(db, &library_id, &name, &collection_type, now).await?;
@@ -980,11 +991,11 @@ mod tests {
     use super::{
         MAX_LIBRARY_NAME_LEN, MAX_LIBRARY_OPTIONS_JSON_BYTES, MAX_LIBRARY_PATHS_PER_REQUEST,
         VirtualFolderQuery, delete_virtual_folder_inner, delete_virtual_folder_path_inner,
-        library_options_result, library_path_request, normalize_collection_type,
-        normalize_library_name, normalize_library_path_text, query_result, query_string,
-        rename_virtual_folder_inner, rename_virtual_folder_request, split_library_paths,
-        update_library_options_inner, update_virtual_folder_path_inner,
-        update_virtual_folder_path_request, virtual_folder_request,
+        library_id_for_name, library_options_result, library_path_request,
+        normalize_collection_type, normalize_library_name, normalize_library_path_text,
+        query_result, query_string, rename_virtual_folder_inner, rename_virtual_folder_request,
+        split_library_paths, update_library_options_inner, update_virtual_folder_path_inner,
+        update_virtual_folder_path_request, upsert_library_path, virtual_folder_request,
     };
     use crate::entities::{
         libraries::{self, Entity as Libraries},
@@ -1180,6 +1191,40 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn adding_path_preserves_existing_library_collection_type() {
+        let Some(db) = test_db().await else {
+            return;
+        };
+        let name = "电视剧";
+        let library_id = library_id_for_name(name);
+        let dir = temp_media_dir("preserve-tvshows-type");
+        std::fs::create_dir_all(&dir).unwrap();
+        Libraries::insert(libraries::ActiveModel {
+            id: Set(library_id.clone()),
+            name: Set(name.to_string()),
+            collection_type: Set("tvshows".to_string()),
+            created_at: Set(1),
+            updated_at: Set(1),
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+
+        upsert_library_path(&db, name, &dir.to_string_lossy(), None)
+            .await
+            .unwrap();
+
+        let library = Libraries::find_by_id(library_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(library.collection_type, "tvshows");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

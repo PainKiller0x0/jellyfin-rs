@@ -309,6 +309,12 @@ fn episode_patterns() -> &'static [(Regex, EpisodeStyle)] {
     PATTERNS.get_or_init(|| {
         [
         (
+            // Season marker and episode marker separated by a translated/localized title,
+            // e.g. `Home Temptation S02 回家的欲望 EP01`.
+            r#"(?i).*(?:/)(?P<title>.*?)[._ -]s(?P<season>[0-9]{1,4})\b[^/]*?[._ -]ep_?(?P<episode>[0-9]{1,4})(?:[._ -]+(?P<name>[^/]+))?$"#,
+            EpisodeStyle::Named,
+        ),
+        (
             // Jellyfin/Kodi standard: foo.s01.e01, foo.s01_e01, S01E02 foo, S01 - E02.
             r#"(?i).*(?:/)(?P<title>.*?)[s](?P<season>[0-9]{1,4})[\]\[ ._-]*[e](?P<episode>[0-9]{1,4})(?:[\]\[ ._-]*(?:[ex]|-[ex]?)(?P<ending>[0-9]{1,4}))?[^/]*$"#,
             EpisodeStyle::Named,
@@ -822,6 +828,13 @@ mod tests {
         assert_eq!(parsed.season_number, Some(1));
         assert_eq!(parsed.episode_number, Some(1));
         assert_eq!(parsed.title, "Pilot");
+
+        let parsed = parse_media_name(
+            Path::new("Home Temptation S02 回家的欲望 EP01.1080P.WEB-DL.(mp4).strm"),
+            "tvshows",
+        );
+        assert_eq!(parsed.season_number, Some(2));
+        assert_eq!(parsed.episode_number, Some(1));
     }
 
     #[test]

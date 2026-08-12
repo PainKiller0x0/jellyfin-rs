@@ -274,6 +274,9 @@ fn probed_stream_from_disc(index: i64, stream: crate::library::disc::DiscStream)
 }
 
 fn remote_probe_preferred_redirect(url: &reqwest::Url) -> Option<reqwest::Url> {
+    if !remote_probe_uses_ipv4_proxy(url) {
+        return None;
+    }
     let redirected_url = resolve_remote_probe_redirect(url)?;
     (redirected_url.as_str() != url.as_str()).then_some(redirected_url)
 }
@@ -288,9 +291,11 @@ fn probe_media_once(
         if !remote_probe_endpoint_available(url) {
             return Err(ProbeFailure::EndpointUnavailable);
         }
-        let ipv4_proxy = Ipv4ProbeProxy::start().ok_or(ProbeFailure::EndpointUnavailable)?;
-        http_proxy = Some(ipv4_proxy.url.clone());
-        proxy = Some(ipv4_proxy);
+        if remote_probe_uses_ipv4_proxy(url) {
+            let ipv4_proxy = Ipv4ProbeProxy::start().ok_or(ProbeFailure::EndpointUnavailable)?;
+            http_proxy = Some(ipv4_proxy.url.clone());
+            proxy = Some(ipv4_proxy);
+        }
     }
     let output = run_ffprobe(path, remote_url.is_some(), http_proxy.as_deref())
         .ok_or(ProbeFailure::Failed)?;
@@ -440,6 +445,11 @@ fn ffprobe_timeout(is_remote: bool) -> Duration {
     } else {
         LOCAL_FFPROBE_TIMEOUT
     }
+}
+
+fn remote_probe_uses_ipv4_proxy(url: &reqwest::Url) -> bool {
+    url.host_str()
+        .is_none_or(|host| host.parse::<Ipv4Addr>().is_err())
 }
 
 fn ffprobe_scans_frames(is_remote: bool) -> bool {
@@ -1994,6 +2004,15 @@ mod tests {
     #[test]
     fn remote_probe_uses_shorter_ffprobe_timeout() {
         assert!(ffprobe_timeout(true) < ffprobe_timeout(false));
+    }
+
+    #[test]
+    fn ipv4_literal_remote_probe_connects_directly() {
+        let local = reqwest::Url::parse("http://127.0.0.1:8024/media").unwrap();
+        let hostname = reqwest::Url::parse("https://media.example.com/video").unwrap();
+
+        assert!(!remote_probe_uses_ipv4_proxy(&local));
+        assert!(remote_probe_uses_ipv4_proxy(&hostname));
     }
 
     #[test]

@@ -16,6 +16,10 @@ use serde::{Deserialize, Deserializer};
 
 const LOCAL_FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_FFPROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCAL_FFPROBE_ANALYZE_DURATION_MICROS: &str = "30000000";
+const LOCAL_FFPROBE_PROBE_SIZE_BYTES: &str = "100000000";
+const REMOTE_FFPROBE_ANALYZE_DURATION_MICROS: &str = "5000000";
+const REMOTE_FFPROBE_PROBE_SIZE_BYTES: &str = "10000000";
 const REMOTE_FFPROBE_RW_TIMEOUT_MICROS: &str = "5000000";
 const REMOTE_FFPROBE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -326,11 +330,11 @@ fn run_ffprobe(path: &Path, is_remote: bool, http_proxy: Option<&str>) -> Option
     let analyze_duration = std::env::var("JELLYFIN_RS_FFPROBE_ANALYZE_DURATION")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "30000000".to_string());
+        .unwrap_or_else(|| ffprobe_default_analyze_duration(is_remote).to_string());
     let probe_size = std::env::var("JELLYFIN_RS_FFPROBE_PROBE_SIZE")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "100000000".to_string());
+        .unwrap_or_else(|| ffprobe_default_probe_size(is_remote).to_string());
 
     let mut command = Command::new(ffprobe);
     command
@@ -454,6 +458,22 @@ fn remote_probe_uses_ipv4_proxy(url: &reqwest::Url) -> bool {
 
 fn ffprobe_scans_frames(is_remote: bool) -> bool {
     !is_remote
+}
+
+fn ffprobe_default_analyze_duration(is_remote: bool) -> &'static str {
+    if is_remote {
+        REMOTE_FFPROBE_ANALYZE_DURATION_MICROS
+    } else {
+        LOCAL_FFPROBE_ANALYZE_DURATION_MICROS
+    }
+}
+
+fn ffprobe_default_probe_size(is_remote: bool) -> &'static str {
+    if is_remote {
+        REMOTE_FFPROBE_PROBE_SIZE_BYTES
+    } else {
+        LOCAL_FFPROBE_PROBE_SIZE_BYTES
+    }
 }
 
 fn remote_probe_url(path: &Path) -> Option<reqwest::Url> {
@@ -2019,6 +2039,14 @@ mod tests {
     fn remote_probe_avoids_expensive_frame_scan() {
         assert!(!ffprobe_scans_frames(true));
         assert!(ffprobe_scans_frames(false));
+    }
+
+    #[test]
+    fn remote_probe_uses_bounded_analysis_defaults() {
+        assert_eq!(ffprobe_default_analyze_duration(true), "5000000");
+        assert_eq!(ffprobe_default_probe_size(true), "10000000");
+        assert_eq!(ffprobe_default_analyze_duration(false), "30000000");
+        assert_eq!(ffprobe_default_probe_size(false), "100000000");
     }
 
     #[test]

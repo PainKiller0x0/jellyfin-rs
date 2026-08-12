@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -46,16 +47,21 @@ async fn watch_loop(state: Arc<AppState>) -> anyhow::Result<()> {
 
     loop {
         let mut changed = false;
+        let mut changed_paths = Vec::new();
         // Drain pending events
         while let Ok(Ok(event)) = rx.try_recv() {
             if is_relevant(&event) {
                 changed = true;
+                changed_paths.extend(event.paths);
             }
         }
         // If no immediate events, wait for the next one
         if !changed {
             match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
-                Ok(Some(Ok(event))) if is_relevant(&event) => changed = true,
+                Ok(Some(Ok(event))) if is_relevant(&event) => {
+                    changed = true;
+                    changed_paths.extend(event.paths);
+                }
                 Ok(Some(Ok(_))) => {} // non-relevant event, continue
                 Ok(Some(Err(e))) => warn!("file watch error: {e}"),
                 Ok(None) => break,
@@ -71,9 +77,15 @@ async fn watch_loop(state: Arc<AppState>) -> anyhow::Result<()> {
                 info!("file change detected, scheduling scan after debounce...");
                 let state = state.clone();
                 let flag = scan_triggered.clone();
+                let changed_roots = library_roots_for_changed_paths(&paths, &changed_paths);
                 tokio::spawn(async move {
                     tokio::time::sleep(debounce).await;
-                    run_scheduled_scan_when_idle(&state, "file watcher trigger").await;
+                    run_scheduled_scan_when_idle(
+                        &state,
+                        "file watcher trigger",
+                        Some(&changed_roots),
+                    )
+                    .await;
                     let mut triggered = flag.lock().await;
                     *triggered = false;
                 });
@@ -125,8 +137,12 @@ async fn poll_loop(state: Arc<AppState>) {
                 match media_tree_snapshot(paths).await {
                     Ok(settled_snapshot) => {
                         if settled_snapshot == current_snapshot {
-                            if run_scheduled_scan_when_idle(&state, "file watcher polling fallback")
-                                .await
+                            if run_scheduled_scan_when_idle(
+                                &state,
+                                "file watcher polling fallback",
+                                None,
+                            )
+                            .await
                             {
                                 previous_snapshot = Some(settled_snapshot);
                             }
@@ -149,9 +165,25 @@ async fn poll_loop(state: Arc<AppState>) {
     }
 }
 
-async fn run_scheduled_scan_when_idle(state: &AppState, reason: &str) -> bool {
+pub fn schedule_paths_scan(state: Arc<AppState>, paths: Vec<String>, reason: &'static str) {
+    tokio::spawn(async move {
+        run_scheduled_scan_when_idle(&state, reason, Some(&paths)).await;
+    });
+}
+
+async fn run_scheduled_scan_when_idle(
+    state: &AppState,
+    reason: &str,
+    paths: Option<&[String]>,
+) -> bool {
     loop {
-        match crate::library::scanner::scan_media_library_if_idle(state).await {
+        let result = match paths {
+            Some(paths) if !paths.is_empty() => {
+                crate::library::scanner::scan_media_library_paths_if_idle(state, paths).await
+            }
+            _ => crate::library::scanner::scan_media_library_if_idle(state).await,
+        };
+        match result {
             Ok(Some(_)) => {
                 info!("scheduled scan completed ({reason})");
                 return true;
@@ -166,6 +198,23 @@ async fn run_scheduled_scan_when_idle(state: &AppState, reason: &str) -> bool {
             }
         }
     }
+}
+
+fn library_roots_for_changed_paths(
+    library_paths: &[String],
+    changed_paths: &[PathBuf],
+) -> Vec<String> {
+    let mut roots = HashSet::new();
+    for changed_path in changed_paths {
+        for library_path in library_paths {
+            if changed_path.starts_with(Path::new(library_path)) {
+                roots.insert(library_path.clone());
+            }
+        }
+    }
+    let mut roots = roots.into_iter().collect::<Vec<_>>();
+    roots.sort();
+    roots
 }
 
 fn is_relevant(event: &Event) -> bool {
@@ -350,5 +399,21 @@ mod tests {
         assert!(snapshot.files.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changed_file_is_mapped_to_its_library_root() {
+        let library_paths = vec![
+            "/media/tv-domestic".to_string(),
+            "/media/tv-xunlei".to_string(),
+        ];
+        let changed_paths = vec![PathBuf::from(
+            "/media/tv-xunlei/Home Temptation/episode-01.strm",
+        )];
+
+        assert_eq!(
+            library_roots_for_changed_paths(&library_paths, &changed_paths),
+            vec!["/media/tv-xunlei".to_string()]
+        );
     }
 }

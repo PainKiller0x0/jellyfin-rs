@@ -282,6 +282,38 @@ async fn force_refresh_media_probe(
 
 pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Option<usize>> {
     let roots = media_roots(state).await?;
+    scan_media_roots_if_idle(state, roots, true).await
+}
+
+pub async fn scan_media_library_paths_if_idle(
+    state: &AppState,
+    requested_paths: &[String],
+) -> anyhow::Result<Option<usize>> {
+    let roots = select_media_roots(media_roots(state).await?, requested_paths);
+    scan_media_roots_if_idle(state, roots, false).await
+}
+
+fn select_media_roots(
+    roots: Vec<(PathBuf, String, String, bool)>,
+    requested_paths: &[String],
+) -> Vec<(PathBuf, String, String, bool)> {
+    let requested_paths = requested_paths
+        .iter()
+        .map(|path| path_utils::normalize_path(path))
+        .collect::<std::collections::HashSet<_>>();
+    roots
+        .into_iter()
+        .filter(|(root, _, _, _)| {
+            requested_paths.contains(&path_utils::normalize_path(&root.to_string_lossy()))
+        })
+        .collect()
+}
+
+async fn scan_media_roots_if_idle(
+    state: &AppState,
+    roots: Vec<(PathBuf, String, String, bool)>,
+    remove_missing: bool,
+) -> anyhow::Result<Option<usize>> {
     if roots.is_empty() {
         tracing::info!("media scan skipped because no media library paths are configured");
         return Ok(Some(0));
@@ -372,26 +404,12 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
             IngestWorkerStats::default()
         }
     };
-    drop(probe_pipeline.tx);
-    drop(metadata_pipeline.tx);
-    let (probe_result, metadata_result) =
-        tokio::join!(probe_pipeline.handle, metadata_pipeline.handle);
-    match probe_result {
-        Ok(stats) => tracing::info!(
-            "media probe completed {} item(s); stream_probe_succeeded={} failed={}",
-            stats.completed,
-            stats.stream_probe_succeeded,
-            stats.failed
-        ),
-        Err(error) => tracing::warn!("media probe pipeline task panicked: {error}"),
-    }
-    if let Err(error) = metadata_result {
-        tracing::warn!("metadata fetch pipeline task panicked: {error}");
-    }
 
     scanned_library_ids.sort();
     scanned_library_ids.dedup();
-    remove_missing_media_items(&scan_db, &scanned_library_ids, &all_seen).await?;
+    if remove_missing {
+        remove_missing_media_items(&scan_db, &scanned_library_ids, &all_seen).await?;
+    }
     tracing::info!(
         "media scan discovered {total} file item(s) across all libraries; queued {ingest_queued} ingest job(s)"
     );
@@ -410,6 +428,28 @@ pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Opti
             total
         );
     }
+
+    // Catalog discovery and ingestion are complete. Metadata and probing can involve slow remote
+    // calls, so they must not block a follow-up scan from discovering newly arrived files.
+    drop(_scan_guard);
+    drop(probe_pipeline.tx);
+    drop(metadata_pipeline.tx);
+    tokio::spawn(async move {
+        let (probe_result, metadata_result) =
+            tokio::join!(probe_pipeline.handle, metadata_pipeline.handle);
+        match probe_result {
+            Ok(stats) => tracing::info!(
+                "media probe completed {} item(s); stream_probe_succeeded={} failed={}",
+                stats.completed,
+                stats.stream_probe_succeeded,
+                stats.failed
+            ),
+            Err(error) => tracing::warn!("media probe pipeline task panicked: {error}"),
+        }
+        if let Err(error) = metadata_result {
+            tracing::warn!("metadata fetch pipeline task panicked: {error}");
+        }
+    });
 
     Ok(Some(total))
 }
@@ -2544,6 +2584,29 @@ mod tests {
     #[test]
     fn scan_root_concurrency_defaults_to_positive_value() {
         assert!(scan_root_concurrency() > 0);
+    }
+
+    #[test]
+    fn targeted_scan_selects_only_requested_library_roots() {
+        let roots = vec![
+            (
+                PathBuf::from("/media/tv-domestic"),
+                "tv".to_string(),
+                "tvshows".to_string(),
+                true,
+            ),
+            (
+                PathBuf::from("/media/tv-xunlei"),
+                "tv".to_string(),
+                "tvshows".to_string(),
+                true,
+            ),
+        ];
+
+        let selected = select_media_roots(roots, &["/media/tv-xunlei".to_string()]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].0, PathBuf::from("/media/tv-xunlei"));
     }
 
     #[test]

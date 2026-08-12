@@ -373,7 +373,14 @@ pub async fn add_virtual_folder_path(
         Err(response) => return *response,
     };
     match upsert_library_path(&state.db, &query.name, &query.path, None).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            crate::library::watcher::schedule_paths_scan(
+                state,
+                vec![query.path],
+                "library path added",
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error) => library_write_error(error),
     }
 }
@@ -891,7 +898,14 @@ pub async fn update_virtual_folder_path(
         }
     };
     match update_virtual_folder_path_inner(&state.db, &name, &path, &target_path).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            crate::library::watcher::schedule_paths_scan(
+                state,
+                vec![target_path],
+                "library path updated",
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => library_write_error(error),
     }

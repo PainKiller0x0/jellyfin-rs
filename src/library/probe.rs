@@ -335,10 +335,13 @@ fn run_ffprobe(path: &Path, is_remote: bool, http_proxy: Option<&str>) -> Option
         .arg("json")
         .arg("-show_format")
         .arg("-show_streams")
-        .arg("-show_chapters")
-        .arg("-show_frames")
-        .arg("-read_intervals")
-        .arg("%+#1");
+        .arg("-show_chapters");
+    if ffprobe_scans_frames(is_remote) {
+        command
+            .arg("-show_frames")
+            .arg("-read_intervals")
+            .arg("%+#1");
+    }
     if analyze_duration != "0" {
         command.arg("-analyzeduration").arg(analyze_duration);
     }
@@ -437,6 +440,10 @@ fn ffprobe_timeout(is_remote: bool) -> Duration {
     } else {
         LOCAL_FFPROBE_TIMEOUT
     }
+}
+
+fn ffprobe_scans_frames(is_remote: bool) -> bool {
+    !is_remote
 }
 
 fn remote_probe_url(path: &Path) -> Option<reqwest::Url> {
@@ -1987,6 +1994,12 @@ mod tests {
     #[test]
     fn remote_probe_uses_shorter_ffprobe_timeout() {
         assert!(ffprobe_timeout(true) < ffprobe_timeout(false));
+    }
+
+    #[test]
+    fn remote_probe_avoids_expensive_frame_scan() {
+        assert!(!ffprobe_scans_frames(true));
+        assert!(ffprobe_scans_frames(false));
     }
 
     #[test]

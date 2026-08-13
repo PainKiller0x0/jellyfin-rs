@@ -6,7 +6,12 @@ import { computed, onMounted, reactive, ref } from 'vue';
 import * as serverApi from '@/services/server';
 import * as settingsApi from '@/services/settings';
 import { useAuthStore } from '@/stores/auth';
-import type { ApiKey, DoubanClientConfiguration, TmdbClientConfiguration } from '@/types/settings';
+import type {
+  ApiKey,
+  DoubanClientConfiguration,
+  TmdbClientConfiguration,
+  TmdbLlmConfiguration
+} from '@/types/settings';
 
 type ApiKeyForm = {
   appName: string;
@@ -17,14 +22,21 @@ const loading = ref(false);
 const savingServerName = ref(false);
 const savingTmdb = ref(false);
 const savingTmdbProxy = ref(false);
+const savingTmdbLlm = ref(false);
+const runningTmdbLlmAudit = ref(false);
 const savingDouban = ref(false);
 const savingApiKey = ref(false);
 const apiKeyDialogVisible = ref(false);
 const serverName = ref('');
 const tmdbApiKey = ref('');
 const tmdbProxyUrl = ref('');
+const tmdbLlmEnabled = ref(false);
+const tmdbLlmApiKey = ref('');
+const tmdbLlmBaseUrl = ref('');
+const tmdbLlmModel = ref('');
 const doubanCookie = ref('');
 const tmdbConfig = ref<TmdbClientConfiguration | null>(null);
+const tmdbLlmConfig = ref<TmdbLlmConfiguration | null>(null);
 const doubanConfig = ref<DoubanClientConfiguration | null>(null);
 const keys = ref<ApiKey[]>([]);
 const apiKeyFormRef = ref<FormInstance>();
@@ -39,6 +51,19 @@ const apiKeyRules: FormRules<ApiKeyForm> = {
 
 const tmdbEnabled = computed(() => Boolean(tmdbConfig.value?.HasApiKey || tmdbConfig.value?.IsTmdbEnabled));
 const tmdbHasProxy = computed(() => Boolean(tmdbConfig.value?.HasProxy));
+const tmdbLlmConfigured = computed(() => Boolean(tmdbLlmConfig.value?.Configured));
+const tmdbLlmAuditLabel = computed(() => {
+  switch (tmdbLlmConfig.value?.AuditStatus) {
+    case 'running':
+      return '复查中';
+    case 'completed':
+      return '已完成';
+    case 'failed':
+      return '上次有失败';
+    default:
+      return tmdbLlmConfig.value?.AuditCompleted ? '已完成' : '未复查';
+  }
+});
 const doubanHasCookie = computed(() => Boolean(doubanConfig.value?.HasCookie));
 const settingsStats = computed(() => [
   {
@@ -50,6 +75,11 @@ const settingsStats = computed(() => [
     label: 'TMDb',
     value: tmdbEnabled.value ? '已启用' : '未配置',
     hint: tmdbHasProxy.value ? '代理' : '元数据'
+  },
+  {
+    label: 'LLM',
+    value: tmdbLlmConfigured.value ? (tmdbLlmEnabled.value ? '已启用' : '已配置') : '未配置',
+    hint: '智能纠错'
   },
   {
     label: '豆瓣',
@@ -70,21 +100,66 @@ async function loadSettings() {
 
   loading.value = true;
   try {
-    const [system, tmdb, douban, apiKeys] = await Promise.all([
+    const [system, tmdb, tmdbLlm, douban, apiKeys] = await Promise.all([
       serverApi.systemInfo(authStore.token),
       settingsApi.tmdbClientConfiguration(authStore.token),
+      settingsApi.tmdbLlmConfiguration(authStore.token),
       settingsApi.doubanClientConfiguration(authStore.token),
       settingsApi.apiKeys(authStore.token)
     ]);
     serverName.value = system.ServerName;
     tmdbConfig.value = tmdb;
     tmdbProxyUrl.value = tmdb.ProxyUrl ?? tmdb.TmdbProxyUrl ?? '';
+    tmdbLlmConfig.value = tmdbLlm;
+    tmdbLlmEnabled.value = tmdbLlm.Enabled;
+    tmdbLlmBaseUrl.value = tmdbLlm.BaseUrl;
+    tmdbLlmModel.value = tmdbLlm.Model;
     doubanConfig.value = douban;
     keys.value = apiKeys.Items;
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '加载配置失败');
   } finally {
     loading.value = false;
+  }
+}
+
+async function saveTmdbLlm() {
+  if (!authStore.token) {
+    return;
+  }
+
+  savingTmdbLlm.value = true;
+  try {
+    await settingsApi.updateTmdbLlmConfiguration(authStore.token, {
+      enabled: tmdbLlmEnabled.value,
+      apiKey: tmdbLlmApiKey.value.trim() || null,
+      baseUrl: tmdbLlmBaseUrl.value.trim(),
+      model: tmdbLlmModel.value.trim()
+    });
+    tmdbLlmApiKey.value = '';
+    ElMessage.success('LLM 刮削配置已保存');
+    await loadSettings();
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存 LLM 刮削配置失败');
+  } finally {
+    savingTmdbLlm.value = false;
+  }
+}
+
+async function runTmdbLlmAudit() {
+  if (!authStore.token) {
+    return;
+  }
+
+  runningTmdbLlmAudit.value = true;
+  try {
+    await settingsApi.startTmdbLlmAudit(authStore.token);
+    ElMessage.success('已开始复查现有媒体，后台会继续运行');
+    await loadSettings();
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '启动 LLM 复查失败');
+  } finally {
+    runningTmdbLlmAudit.value = false;
   }
 }
 
@@ -340,6 +415,61 @@ onMounted(loadSettings);
             />
             <div class="settings-page__form-actions">
               <ElButton :loading="savingDouban" type="primary" @click="saveDoubanCookie">保存 Cookie</ElButton>
+            </div>
+          </section>
+
+          <section class="settings-page__source">
+            <div class="settings-page__source-head">
+              <div>
+                <h3>LLM 智能刮削</h3>
+                <span>只用于清理文件名和候选消歧，不会让模型凭空生成 TMDb ID。</span>
+              </div>
+              <div class="settings-page__tag-group">
+                <ElTag :type="tmdbLlmConfigured ? 'success' : 'info'" effect="plain">
+                  {{ tmdbLlmConfigured ? '已配置' : '未配置' }}
+                </ElTag>
+                <ElTag :type="tmdbLlmConfig?.AuditStatus === 'failed' ? 'danger' : 'info'" effect="plain">
+                  {{ tmdbLlmAuditLabel }}
+                </ElTag>
+              </div>
+            </div>
+
+            <div class="settings-page__inline-control">
+              <span class="settings-page__field-label">启用 LLM 纠错</span>
+              <ElSwitch v-model="tmdbLlmEnabled" active-text="启用" inactive-text="关闭" />
+            </div>
+            <ElInput
+              v-model.trim="tmdbLlmBaseUrl"
+              clearable
+              maxlength="2048"
+              placeholder="https://api.example.com/v1"
+            />
+            <ElInput
+              v-model.trim="tmdbLlmModel"
+              class="settings-page__stacked-input"
+              maxlength="256"
+              placeholder="模型名称，例如 agnes-2.5"
+            />
+            <ElInput
+              v-model.trim="tmdbLlmApiKey"
+              class="settings-page__stacked-input"
+              placeholder="API Key（留空则保留当前密钥）"
+              show-password
+              type="password"
+            />
+            <div class="settings-page__source-note">
+              <span v-if="tmdbLlmConfig?.HasApiKey">当前密钥：{{ tmdbLlmConfig.ApiKeyHint }}</span>
+              <span v-else>当前没有可用的 LLM API Key。</span>
+            </div>
+            <div class="settings-page__form-actions">
+              <ElButton :loading="savingTmdbLlm" type="primary" @click="saveTmdbLlm">保存 LLM 配置</ElButton>
+              <ElButton
+                :disabled="!tmdbLlmConfigured"
+                :loading="runningTmdbLlmAudit"
+                @click="runTmdbLlmAudit"
+              >
+                立即复查现有媒体
+              </ElButton>
             </div>
           </section>
         </div>
@@ -620,6 +750,22 @@ onMounted(loadSettings);
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
+}
+
+.settings-page__field-label {
+  align-self: center;
+  color: var(--admin-text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.settings-page__stacked-input {
+  margin-top: 2px;
+}
+
+.settings-page__source-note {
+  color: var(--admin-muted);
+  font-size: 12px;
 }
 
 .settings-page__key-list {

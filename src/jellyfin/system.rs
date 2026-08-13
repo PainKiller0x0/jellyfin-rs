@@ -56,6 +56,9 @@ const MAX_PLUGIN_REPOSITORIES: usize = 32;
 const MAX_PLUGIN_REPOSITORY_NAME_LEN: usize = 128;
 const MAX_PLUGIN_REPOSITORY_URL_LEN: usize = 2048;
 const MAX_DOUBAN_COOKIE_LEN: usize = 16 * 1024;
+const MAX_TMDB_LLM_API_KEY_LEN: usize = 16 * 1024;
+const MAX_TMDB_LLM_BASE_URL_LEN: usize = 2048;
+const MAX_TMDB_LLM_MODEL_LEN: usize = 256;
 const MAX_SCHEDULED_TASK_TRIGGERS: usize = 32;
 const MAX_SCHEDULED_TASK_TRIGGERS_JSON_BYTES: usize = 32 * 1024;
 const MAX_NOTIFICATION_NAME_LEN: usize = 256;
@@ -884,6 +887,171 @@ pub async fn tmdb_client_configuration(State(state): State<Arc<AppState>>) -> im
         enabled,
         proxy_url.as_deref(),
     ))
+}
+
+pub async fn tmdb_llm_configuration(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(crate::library::tmdb_metadata::tmdb_llm_configuration_value(&state.db).await)
+}
+
+#[derive(Deserialize)]
+pub struct TmdbLlmConfigurationRequest {
+    #[serde(rename = "Enabled", alias = "enabled")]
+    enabled: bool,
+    #[serde(rename = "ApiKey", alias = "apiKey", alias = "api_key")]
+    api_key: Option<String>,
+    #[serde(rename = "BaseUrl", alias = "baseUrl", alias = "base_url")]
+    base_url: String,
+    #[serde(rename = "Model", alias = "model")]
+    model: String,
+}
+
+fn invalid_tmdb_llm_text(value: &str, max_len: usize) -> bool {
+    value.len() > max_len || value.contains('\0') || value.chars().any(char::is_control)
+}
+
+pub async fn update_tmdb_llm_configuration(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TmdbLlmConfigurationRequest>,
+) -> Response {
+    let base_url = request.base_url.trim();
+    let model = request.model.trim();
+    if invalid_tmdb_llm_text(base_url, MAX_TMDB_LLM_BASE_URL_LEN)
+        || invalid_tmdb_llm_text(model, MAX_TMDB_LLM_MODEL_LEN)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "Invalid LLM base URL or model" })),
+        )
+            .into_response();
+    }
+    let api_key = request.api_key.as_deref().map(str::trim);
+    if api_key.is_some_and(|value| invalid_tmdb_llm_text(value, MAX_TMDB_LLM_API_KEY_LEN)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "Invalid LLM API key" })),
+        )
+            .into_response();
+    }
+
+    let settings = &state.db;
+    let result = async {
+        crate::db::settings::set(
+            settings,
+            crate::library::tmdb_metadata::TMDB_LLM_ENABLED_KEY,
+            if request.enabled { "true" } else { "false" },
+        )
+        .await?;
+        if base_url.is_empty() {
+            crate::db::settings::delete(
+                settings,
+                crate::library::tmdb_metadata::TMDB_LLM_BASE_URL_KEY,
+            )
+            .await?;
+        } else {
+            crate::db::settings::set(
+                settings,
+                crate::library::tmdb_metadata::TMDB_LLM_BASE_URL_KEY,
+                base_url,
+            )
+            .await?;
+        }
+        if model.is_empty() {
+            crate::db::settings::delete(
+                settings,
+                crate::library::tmdb_metadata::TMDB_LLM_MODEL_KEY,
+            )
+            .await?;
+        } else {
+            crate::db::settings::set(
+                settings,
+                crate::library::tmdb_metadata::TMDB_LLM_MODEL_KEY,
+                model,
+            )
+            .await?;
+        }
+        if let Some(api_key) = api_key {
+            if api_key.is_empty() {
+                crate::db::settings::delete(
+                    settings,
+                    crate::library::tmdb_metadata::TMDB_LLM_API_KEY_KEY,
+                )
+                .await?;
+            } else {
+                crate::db::settings::set(
+                    settings,
+                    crate::library::tmdb_metadata::TMDB_LLM_API_KEY_KEY,
+                    api_key,
+                )
+                .await?;
+            }
+        }
+        crate::library::tmdb_metadata::mark_tmdb_llm_audit_pending(settings).await
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            Json(crate::library::tmdb_metadata::tmdb_llm_configuration_value(&state.db).await)
+                .into_response()
+        }
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn start_tmdb_llm_audit(State(state): State<Arc<AppState>>) -> Response {
+    let config = crate::library::tmdb_metadata::load_tmdb_llm_config(&state.db).await;
+    if !config.configured() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "LLM 刮削尚未配置完成" })),
+        )
+            .into_response();
+    }
+    let Some(tmdb_api_key) = state
+        .tmdb_api_key
+        .read()
+        .await
+        .clone()
+        .filter(|key| !key.trim().is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "TMDb API key is not configured" })),
+        )
+            .into_response();
+    };
+    if let Err(error) = crate::library::tmdb_metadata::mark_tmdb_llm_audit_pending(&state.db).await
+    {
+        return internal_error(error);
+    }
+
+    let database_url = crate::db::database_url_from_env();
+    let http_client = state.http_client.clone();
+    let tmdb_proxy_url = state.tmdb_proxy_url.read().await.clone();
+    tokio::spawn(async move {
+        let db = match crate::db::background_connection(&database_url).await {
+            Ok(db) => db,
+            Err(error) => {
+                tracing::error!("manual TMDb LLM audit could not connect to database: {error:#}");
+                return;
+            }
+        };
+        match crate::library::tmdb_metadata::audit_existing_tmdb(
+            &db,
+            &tmdb_api_key,
+            &http_client,
+            tmdb_proxy_url.as_deref(),
+        )
+        .await
+        {
+            Ok(repaired) => tracing::info!(
+                "manual TMDb LLM audit completed: repaired/refreshed {repaired} item(s)"
+            ),
+            Err(error) => tracing::error!("manual TMDb LLM audit failed: {error:#}"),
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(json!({ "Status": "Started" }))).into_response()
 }
 
 fn tmdb_client_configuration_value(enabled: bool, proxy_url: Option<&str>) -> JsonValue {

@@ -1,5 +1,10 @@
 import { request } from '@/services/http';
-import type { ApiKeyQueryResult, DoubanClientConfiguration, TmdbClientConfiguration } from '@/types/settings';
+import type {
+  ApiKeyQueryResult,
+  DoubanClientConfiguration,
+  TmdbClientConfiguration,
+  TmdbLlmConfiguration
+} from '@/types/settings';
 
 export function tmdbClientConfiguration(token: string) {
   return request<TmdbClientConfiguration>('/Tmdb/ClientConfiguration', { token });
@@ -22,6 +27,33 @@ export function updateTmdbProxyUrl(token: string, proxyUrl: string) {
     body: {
       TmdbProxyUrl: proxyUrl
     }
+  });
+}
+
+export function tmdbLlmConfiguration(token: string) {
+  return request<TmdbLlmConfiguration>('/Tmdb/LlmConfiguration', { token });
+}
+
+export function updateTmdbLlmConfiguration(
+  token: string,
+  payload: { enabled: boolean; apiKey?: string | null; baseUrl: string; model: string }
+) {
+  return request<TmdbLlmConfiguration>('/System/Configuration/TmdbLlm', {
+    method: 'POST',
+    token,
+    body: {
+      Enabled: payload.enabled,
+      ApiKey: payload.apiKey ?? null,
+      BaseUrl: payload.baseUrl,
+      Model: payload.model
+    }
+  });
+}
+
+export function startTmdbLlmAudit(token: string) {
+  return request<{ Status: string }>('/System/Configuration/TmdbLlm/Audit', {
+    method: 'POST',
+    token
   });
 }
 

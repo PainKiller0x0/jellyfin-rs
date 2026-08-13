@@ -233,6 +233,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(system::tmdb_client_configuration),
         )
         .route(
+            "/Tmdb/LlmConfiguration",
+            get(system::tmdb_llm_configuration),
+        )
+        .route(
             "/Douban/ClientConfiguration",
             get(system::douban_client_configuration),
         )
@@ -243,6 +247,14 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route(
             "/System/Configuration/TmdbProxyUrl",
             post(system::update_tmdb_proxy_url),
+        )
+        .route(
+            "/System/Configuration/TmdbLlm",
+            post(system::update_tmdb_llm_configuration),
+        )
+        .route(
+            "/System/Configuration/TmdbLlm/Audit",
+            post(system::start_tmdb_llm_audit),
         )
         .route(
             "/System/Configuration/DoubanCookie",

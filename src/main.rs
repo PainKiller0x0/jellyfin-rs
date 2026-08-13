@@ -156,6 +156,28 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Repair existing wrong matches as well as missing matches. This
+            // is conservative: the resolver only selects IDs returned by
+            // TMDb, and locked/manual items are skipped.
+            match library::tmdb_metadata::audit_existing_tmdb(
+                &metadata_db,
+                &api_key,
+                &tmdb_client,
+                tmdb_base_url.as_deref(),
+            )
+            .await
+            {
+                Ok(0) => {
+                    tracing::info!("No existing TMDb matches needed LLM audit");
+                }
+                Ok(n) => {
+                    tracing::info!("Audited and repaired/refreshed {n} existing TMDb item(s)");
+                }
+                Err(e) => {
+                    tracing::warn!("audit_existing_tmdb failed: {e:#}");
+                }
+            }
+
             match library::tmdb_metadata::refresh_existing_tmdb_titles(
                 &metadata_db,
                 &api_key,

@@ -10,6 +10,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
     Set, sea_query::OnConflict,
 };
+use serde_json::{Value as JsonValue, json};
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::{
@@ -30,16 +31,107 @@ use crate::{
 };
 
 static EPISODE_TMDB_BATCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TMDB_LLM_AUDIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 type EpisodeGroupCacheCell = Arc<OnceCell<Option<Arc<TmdbEpisodeGroupCollection>>>>;
 static EPISODE_GROUP_CACHE: OnceLock<Mutex<HashMap<String, EpisodeGroupCacheCell>>> =
     OnceLock::new();
 const MAX_EPISODE_GROUP_CACHE_ENTRIES: usize = 512;
 const TMDB_API_KEY_QUERY: &str = "api_key=";
 const TMDB_TITLE_BACKFILL_KEY: &str = "tmdb_title_backfill_v1_completed";
+pub(crate) const TMDB_LLM_AUDIT_KEY: &str = "tmdb_llm_audit_v1_completed";
+pub(crate) const TMDB_LLM_ENABLED_KEY: &str = "tmdb_llm_enabled";
+pub(crate) const TMDB_LLM_API_KEY_KEY: &str = "tmdb_llm_api_key";
+pub(crate) const TMDB_LLM_BASE_URL_KEY: &str = "tmdb_llm_base_url";
+pub(crate) const TMDB_LLM_MODEL_KEY: &str = "tmdb_llm_model";
+pub(crate) const TMDB_LLM_AUDIT_STATUS_KEY: &str = "tmdb_llm_audit_status";
+const TMDB_LLM_DEFAULT_MODEL: &str = "agnes-2.5-flash";
 const MAX_METADATA_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const TMDB_DEFAULT_MAX_CAST_MEMBERS: usize = 15;
 const TMDB_DEFAULT_MAX_CREW_MEMBERS: usize = 15;
 pub(crate) const TMDB_METADATA_VERSION: i64 = 4;
+
+#[derive(Clone, Debug)]
+pub(crate) struct TmdbLlmConfig {
+    pub enabled: bool,
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+}
+
+impl TmdbLlmConfig {
+    pub(crate) fn configured(&self) -> bool {
+        self.enabled && !self.api_key.trim().is_empty() && !self.base_url.trim().is_empty()
+    }
+}
+
+pub(crate) async fn load_tmdb_llm_config(db: &DatabaseConnection) -> TmdbLlmConfig {
+    let env_api_key = std::env::var("JELLYFIN_RS_LLM_API_KEY").unwrap_or_default();
+    let env_base_url = std::env::var("JELLYFIN_RS_LLM_BASE_URL").unwrap_or_default();
+    let env_model = std::env::var("JELLYFIN_RS_LLM_MODEL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| TMDB_LLM_DEFAULT_MODEL.to_string());
+    let enabled_default = env_flag("JELLYFIN_RS_LLM_ENABLED")
+        || (!env_api_key.trim().is_empty() && !env_base_url.trim().is_empty());
+
+    TmdbLlmConfig {
+        enabled: crate::db::settings::get_bool(db, TMDB_LLM_ENABLED_KEY, enabled_default).await,
+        api_key: crate::db::settings::get_non_empty_or_default(
+            db,
+            TMDB_LLM_API_KEY_KEY,
+            &env_api_key,
+        )
+        .await,
+        base_url: crate::db::settings::get_non_empty_or_default(
+            db,
+            TMDB_LLM_BASE_URL_KEY,
+            &env_base_url,
+        )
+        .await,
+        model: crate::db::settings::get_non_empty_or_default(db, TMDB_LLM_MODEL_KEY, &env_model)
+            .await,
+    }
+}
+
+pub(crate) async fn tmdb_llm_configuration_value(db: &DatabaseConnection) -> JsonValue {
+    let config = load_tmdb_llm_config(db).await;
+    let audit_status =
+        crate::db::settings::get_non_empty_or_default(db, TMDB_LLM_AUDIT_STATUS_KEY, "idle").await;
+    let audit_completed = crate::db::settings::is_true(db, TMDB_LLM_AUDIT_KEY)
+        .await
+        .unwrap_or(false);
+    json!({
+        "Enabled": config.enabled,
+        "Configured": config.configured(),
+        "HasApiKey": !config.api_key.trim().is_empty(),
+        "ApiKeyHint": mask_tmdb_llm_secret(&config.api_key),
+        "BaseUrl": config.base_url,
+        "Model": config.model,
+        "AuditCompleted": audit_completed,
+        "AuditStatus": audit_status,
+    })
+}
+
+fn mask_tmdb_llm_secret(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= 8 {
+        return Some("已配置".to_string());
+    }
+    Some(format!(
+        "{}***{}",
+        chars[..4].iter().collect::<String>(),
+        chars[chars.len() - 4..].iter().collect::<String>()
+    ))
+}
+
+pub(crate) async fn mark_tmdb_llm_audit_pending(db: &DatabaseConnection) -> anyhow::Result<()> {
+    crate::db::settings::set(db, TMDB_LLM_AUDIT_KEY, "false").await?;
+    crate::db::settings::set(db, TMDB_LLM_AUDIT_STATUS_KEY, "idle").await
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetadataRefreshPolicy {
@@ -2457,6 +2549,7 @@ async fn lookup_tmdb_id_by_name(
     year: Option<i64>,
     is_tv: bool,
     language: &str,
+    llm_config: Option<&TmdbLlmConfig>,
 ) -> anyhow::Result<Option<String>> {
     let url = tmdb::api_url(
         tmdb_base_url,
@@ -2479,15 +2572,392 @@ async fn lookup_tmdb_id_by_name(
         .error_for_status()?
         .json::<serde_json::Value>()
         .await?;
-    if let Some(results) = response.get("results").and_then(|v| v.as_array()) {
-        if let Some(first) = results.first() {
-            return Ok(first
-                .get("id")
-                .and_then(|v| v.as_i64())
-                .map(|id| id.to_string()));
-        }
+    let Some(results) = response.get("results").and_then(|v| v.as_array()) else {
+        return Ok(None);
+    };
+
+    // TMDb's result order is popularity-oriented, not filename-oriented. Taking
+    // results[0] is therefore unsafe for localized titles, remakes, specials and
+    // similarly named entries. Score the title and year first, and reject weak
+    // candidates instead of silently storing a wrong provider id.
+    let mut candidates = results
+        .iter()
+        .filter_map(|result| {
+            let id = result.get("id").and_then(serde_json::Value::as_i64)?;
+            let candidate_title = result
+                .get(if is_tv { "name" } else { "title" })
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let original_title = result
+                .get(if is_tv {
+                    "original_name"
+                } else {
+                    "original_title"
+                })
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let candidate_year = result
+                .get(if is_tv {
+                    "first_air_date"
+                } else {
+                    "release_date"
+                })
+                .and_then(serde_json::Value::as_str)
+                .and_then(|date| date.get(..4))
+                .and_then(|year| year.parse::<i64>().ok());
+            let title_score = tmdb_title_match_score(name, candidate_title)
+                .max(tmdb_title_match_score(name, original_title));
+            let score = tmdb_candidate_score(title_score, year, candidate_year);
+            (title_score > 0).then_some(TmdbSearchCandidate {
+                id,
+                title: candidate_title.to_string(),
+                original_title: original_title.to_string(),
+                title_score,
+                score,
+                candidate_year,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| right.title_score.cmp(&left.title_score))
+            .then_with(|| right.candidate_year.cmp(&left.candidate_year))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let Some(best) = candidates.first() else {
+        return Ok(None);
+    };
+    let close_second = candidates
+        .get(1)
+        .is_some_and(|second| best.score - second.score < 12);
+    if llm_config.is_some_and(TmdbLlmConfig::configured)
+        && (best.title_score < 100 || close_second)
+        && let Some(id) = llm_select_tmdb_candidate(
+            client,
+            llm_config.expect("checked above"),
+            name,
+            year,
+            is_tv,
+            &candidates,
+        )
+        .await
+    {
+        tracing::info!(
+            "TMDb LLM disambiguation selected tmdb-{id} for '{name}' (top_score={}, close_second={close_second})",
+            best.score
+        );
+        return Ok(Some(id.to_string()));
     }
-    Ok(None)
+    // A weak title match is more dangerous than an unmatched item. In
+    // particular, do not turn a generic folder into a popular unrelated title.
+    if best.title_score < 55 || best.score < 45 {
+        tracing::info!(
+            "TMDb name search rejected low-confidence candidate for '{name}' (title_score={}, score={}, requested_year={year:?}, candidate_year={:?})",
+            best.title_score,
+            best.score,
+            best.candidate_year
+        );
+        return Ok(None);
+    }
+    tracing::debug!(
+        "TMDb name search selected tmdb-{} for '{name}' (title_score={}, score={}, requested_year={year:?}, candidate_year={:?})",
+        best.id,
+        best.title_score,
+        best.score,
+        best.candidate_year
+    );
+    Ok(Some(best.id.to_string()))
+}
+
+/// Retry a failed name lookup after asking the configured LLM to remove
+/// release-group/codec/subtitle noise from the filename. The normalized title
+/// is still sent through the normal TMDb search and confidence checks.
+async fn lookup_tmdb_id_by_name_with_llm_cleanup(
+    client: &reqwest::Client,
+    api_key: &str,
+    tmdb_base_url: Option<&str>,
+    raw_name: &str,
+    year: Option<i64>,
+    is_tv: bool,
+    language: &str,
+    llm_config: Option<&TmdbLlmConfig>,
+) -> anyhow::Result<Option<String>> {
+    let initial = lookup_tmdb_id_by_name(
+        client,
+        api_key,
+        tmdb_base_url,
+        raw_name,
+        year,
+        is_tv,
+        language,
+        llm_config,
+    )
+    .await?;
+    if initial.is_some() || !llm_config.is_some_and(TmdbLlmConfig::configured) {
+        return Ok(initial);
+    }
+
+    let Some((normalized_name, normalized_year)) = llm_normalize_tmdb_lookup_name(
+        client,
+        llm_config.expect("checked above"),
+        raw_name,
+        year,
+        is_tv,
+    )
+    .await
+    else {
+        return Ok(None);
+    };
+    if normalized_name.eq_ignore_ascii_case(raw_name.trim()) {
+        return Ok(None);
+    }
+    let search_year = normalized_year.or(year);
+    tracing::info!("TMDb LLM filename cleanup normalized {raw_name:?} -> {normalized_name:?}");
+    lookup_tmdb_id_by_name(
+        client,
+        api_key,
+        tmdb_base_url,
+        &normalized_name,
+        search_year,
+        is_tv,
+        language,
+        llm_config,
+    )
+    .await
+}
+
+#[derive(Clone, Debug)]
+struct TmdbSearchCandidate {
+    id: i64,
+    title: String,
+    original_title: String,
+    title_score: i64,
+    score: i64,
+    candidate_year: Option<i64>,
+}
+
+async fn llm_select_tmdb_candidate(
+    client: &reqwest::Client,
+    config: &TmdbLlmConfig,
+    name: &str,
+    year: Option<i64>,
+    is_tv: bool,
+    candidates: &[TmdbSearchCandidate],
+) -> Option<i64> {
+    let endpoint = llm_chat_completions_url(&config.base_url)?;
+    let candidate_payload = candidates
+        .iter()
+        .take(8)
+        .map(|candidate| {
+            serde_json::json!({
+                "tmdb_id": candidate.id,
+                "title": candidate.title,
+                "original_title": candidate.original_title,
+                "year": candidate.candidate_year,
+                "heuristic_score": candidate.score,
+            })
+        })
+        .collect::<Vec<_>>();
+    let media_type = if is_tv { "tv series" } else { "movie" };
+    let candidate_json = serde_json::to_string(&candidate_payload).ok()?;
+    let messages = serde_json::json!([
+        {
+            "role": "system",
+            "content": "You are a conservative TMDB metadata disambiguator. Choose only a tmdb_id from the supplied candidates. Never invent an id. Return JSON only: {\"tmdb_id\": number|null, \"confidence\": \"high\"|\"medium\"|\"low\", \"reason\": \"short\"}. Return null when the title/year is ambiguous."
+        },
+        {
+            "role": "user",
+            "content": format!("media_type={media_type}; title={name:?}; year={year:?}; candidates={candidate_json}")
+        }
+    ]);
+    let response = client
+        .post(endpoint)
+        .bearer_auth(&config.api_key)
+        .timeout(std::time::Duration::from_secs(20))
+        .json(&serde_json::json!({
+            "model": config.model,
+            "messages": messages,
+            "temperature": 0,
+            "max_tokens": 160,
+        }))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    let content = response
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)?;
+    let json_start = content.find('{')?;
+    let json_end = content.rfind('}')?;
+    let parsed = serde_json::from_str::<serde_json::Value>(&content[json_start..=json_end]).ok()?;
+    let confidence = parsed
+        .get("confidence")
+        .and_then(serde_json::Value::as_str)?;
+    if confidence.eq_ignore_ascii_case("low") {
+        return None;
+    }
+    let selected = parsed.get("tmdb_id").and_then(serde_json::Value::as_i64)?;
+    candidates
+        .iter()
+        .any(|candidate| candidate.id == selected)
+        .then_some(selected)
+}
+
+async fn llm_normalize_tmdb_lookup_name(
+    client: &reqwest::Client,
+    config: &TmdbLlmConfig,
+    raw_name: &str,
+    year: Option<i64>,
+    is_tv: bool,
+) -> Option<(String, Option<i64>)> {
+    let endpoint = llm_chat_completions_url(&config.base_url)?;
+    let media_type = if is_tv { "TV series" } else { "movie" };
+    let prompt =
+        format!("media_type={media_type}; raw_filename={raw_name:?}; detected_year={year:?}");
+    let messages = serde_json::json!([
+        {
+            "role": "system",
+            "content": "Extract a clean official title for TMDB search from a noisy media filename. Remove release groups, codecs, resolution, subtitles, source/edition words, season ranges, and file noise. Keep the original language title when present; do not translate or invent a title. Return JSON only: {\"title\": string|null, \"year\": number|null}. Return null when the title cannot be determined."
+        },
+        {
+            "role": "user",
+            "content": prompt
+        }
+    ]);
+    let response = client
+        .post(endpoint)
+        .bearer_auth(&config.api_key)
+        .timeout(std::time::Duration::from_secs(20))
+        .json(&serde_json::json!({
+            "model": config.model,
+            "messages": messages,
+            "temperature": 0,
+            "max_tokens": 120,
+        }))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    let content = response
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)?;
+    let json_start = content.find('{')?;
+    let json_end = content.rfind('}')?;
+    let parsed = serde_json::from_str::<serde_json::Value>(&content[json_start..=json_end]).ok()?;
+    let title = parsed
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty() && title.len() <= 160)
+        .map(ToString::to_string)?;
+    let normalized_year = parsed
+        .get("year")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|year| (1880..=2100).contains(year));
+    Some((title, normalized_year))
+}
+
+fn llm_chat_completions_url(base_url: &str) -> Option<String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() || base.contains('\n') || base.contains('\r') {
+        return None;
+    }
+    Some(if base.ends_with("/v1") {
+        format!("{base}/chat/completions")
+    } else {
+        format!("{base}/v1/chat/completions")
+    })
+}
+
+fn tmdb_candidate_score(
+    title_score: i64,
+    requested_year: Option<i64>,
+    candidate_year: Option<i64>,
+) -> i64 {
+    let year_score = match (requested_year, candidate_year) {
+        (Some(requested), Some(candidate)) if requested == candidate => 35,
+        (Some(requested), Some(candidate)) if (requested - candidate).abs() == 1 => 12,
+        (Some(requested), Some(candidate)) if (requested - candidate).abs() >= 4 => -30,
+        (Some(_), None) => -4,
+        _ => 0,
+    };
+    title_score + year_score
+}
+
+fn tmdb_title_match_score(query: &str, candidate: &str) -> i64 {
+    let query = normalize_tmdb_match_title(query);
+    let candidate = normalize_tmdb_match_title(candidate);
+    if query.is_empty() || candidate.is_empty() {
+        return 0;
+    }
+    if query == candidate {
+        return 100;
+    }
+
+    let query_compact = query.replace(' ', "");
+    let candidate_compact = candidate.replace(' ', "");
+    if query_compact == candidate_compact {
+        return 96;
+    }
+    if query_compact.len() >= 3
+        && (candidate_compact.contains(&query_compact)
+            || query_compact.contains(&candidate_compact))
+    {
+        return 72;
+    }
+
+    let query_tokens = query
+        .split_whitespace()
+        .collect::<std::collections::HashSet<_>>();
+    let candidate_tokens = candidate
+        .split_whitespace()
+        .collect::<std::collections::HashSet<_>>();
+    if query_tokens.is_empty() || candidate_tokens.is_empty() {
+        return 0;
+    }
+    let overlap = query_tokens.intersection(&candidate_tokens).count();
+    let denominator = query_tokens.len().max(candidate_tokens.len());
+    if overlap > 0 && overlap * 2 >= denominator {
+        55
+    } else {
+        0
+    }
+}
+
+fn normalize_tmdb_match_title(value: &str) -> String {
+    clean_provider_tags(value)
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch == ' ' {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Fill in missing TMDb metadata for existing Movie/Series items by searching by name
@@ -2508,6 +2978,7 @@ pub async fn fill_missing_tmdb(
 
     let total = rows.len();
     tracing::info!("fill_missing_tmdb: {total} items need name-based TMDb lookup");
+    let llm_config = load_tmdb_llm_config(db).await;
 
     let mut count = 0usize;
 
@@ -2529,7 +3000,7 @@ pub async fn fill_missing_tmdb(
         }
 
         let metadata_language = preferred_metadata_language_for_item(db, &item_id).await;
-        match lookup_tmdb_id_by_name(
+        match lookup_tmdb_id_by_name_with_llm_cleanup(
             client,
             api_key,
             tmdb_base_url,
@@ -2537,6 +3008,7 @@ pub async fn fill_missing_tmdb(
             year,
             is_tv,
             &metadata_language,
+            Some(&llm_config),
         )
         .await
         {
@@ -2572,6 +3044,189 @@ pub async fn fill_missing_tmdb(
 
     tracing::info!("fill_missing_tmdb: filled {count}/{total} items");
     Ok(count)
+}
+
+/// Audit existing Movie/Series matches against their path names and repair
+/// high-confidence mismatches. The LLM is only allowed to choose from TMDb's
+/// returned candidates; it never receives permission to invent provider IDs.
+///
+/// This is deliberately a one-time startup pass. Set
+/// `JELLYFIN_RS_TMDB_LLM_AUDIT_FORCE=true` to run it again after changing
+/// naming or metadata-provider configuration.
+pub async fn audit_existing_tmdb(
+    db: &sea_orm::DatabaseConnection,
+    api_key: &str,
+    client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
+) -> anyhow::Result<usize> {
+    let audit_lock = TMDB_LLM_AUDIT_LOCK.get_or_init(|| Mutex::new(()));
+    let _audit_guard = audit_lock.lock().await;
+    if !env_flag("JELLYFIN_RS_TMDB_LLM_AUDIT_FORCE")
+        && app_setting_is_true(db, TMDB_LLM_AUDIT_KEY).await?
+    {
+        return Ok(0);
+    }
+    crate::db::settings::set(db, TMDB_LLM_AUDIT_STATUS_KEY, "running").await?;
+
+    let limit = std::env::var("JELLYFIN_RS_TMDB_LLM_AUDIT_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(500);
+    let rows = db
+        .query_all_raw(crate::db::helpers::pg_statement(
+            r#"SELECT mi.id, mi.title, mi.path, mi.item_type, mi.locked_fields,
+                      mi.tmdb_metadata_version,
+                      p.provider_item_id AS tmdb_id,
+                      CASE WHEN EXISTS (
+                          SELECT 1 FROM image_assets ia
+                          WHERE ia.item_id = mi.id AND ia.image_type = 'Primary'
+                      ) THEN 1 ELSE 0 END AS has_primary_image
+               FROM media_items mi
+               LEFT JOIN provider_ids p
+                 ON p.item_id = mi.id AND p.provider = 'Tmdb'
+               WHERE mi.item_type IN ('Movie', 'Series')
+                 AND mi.lock_data = 0
+               ORDER BY mi.path
+               LIMIT ?"#,
+            vec![i64::try_from(limit).unwrap_or(i64::MAX).into()],
+        ))
+        .await?;
+
+    if rows.is_empty() {
+        set_app_setting(db, TMDB_LLM_AUDIT_KEY, "true").await?;
+        crate::db::settings::set(db, TMDB_LLM_AUDIT_STATUS_KEY, "completed").await?;
+        return Ok(0);
+    }
+
+    let total = rows.len();
+    let llm_config = load_tmdb_llm_config(db).await;
+    tracing::info!(
+        "audit_existing_tmdb: checking {total} Movie/Series item(s) (llm_configured={})",
+        llm_config.configured()
+    );
+    let mut repaired = 0usize;
+    let mut failed = 0usize;
+
+    for row in &rows {
+        let Ok(item_id) = row.get_str("id") else {
+            continue;
+        };
+        let item_type = row.get_str("item_type").unwrap_or_default();
+        let title = row.get_str("title").unwrap_or_default();
+        let path_str = row.get_str("path").unwrap_or_default();
+        let locked_fields = row.get_opt_str("locked_fields").ok().flatten();
+        if metadata_field_locked_storage(locked_fields.as_deref(), "Name")
+            || metadata_field_locked_storage(locked_fields.as_deref(), "ProviderIds")
+        {
+            tracing::debug!("audit_existing_tmdb: skipped locked item {item_id} ({title})");
+            continue;
+        }
+
+        let (name, year) = match parse_lookup_title_year(Path::new(&path_str)) {
+            Some((name, year)) if !should_skip_name_based_tmdb_lookup(&name) => (name, year),
+            _ if !should_skip_name_based_tmdb_lookup(&title) => (title.clone(), None),
+            _ => continue,
+        };
+        let metadata_language = preferred_metadata_language_for_item(db, &item_id).await;
+        let is_tv = item_type == "Series";
+        let candidate = match lookup_tmdb_id_by_name_with_llm_cleanup(
+            client,
+            api_key,
+            tmdb_base_url,
+            &name,
+            year,
+            is_tv,
+            &metadata_language,
+            Some(&llm_config),
+        )
+        .await
+        {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    "audit_existing_tmdb: search failed for '{name}': {}",
+                    redact_tmdb_error(&error)
+                );
+                continue;
+            }
+        };
+        let Some(candidate_id) = candidate else {
+            continue;
+        };
+        let current_id = row.get_opt_str("tmdb_id").ok().flatten();
+        let metadata_version = row.get_opt_i64("tmdb_metadata_version").ok().flatten();
+        let has_primary_image = row.get_bool_from_i64("has_primary_image").unwrap_or(false);
+        let changed_id = current_id.as_deref() != Some(candidate_id.as_str());
+        let needs_metadata = changed_id
+            || !has_primary_image
+            || metadata_version.unwrap_or(0) < TMDB_METADATA_VERSION;
+        if !needs_metadata {
+            continue;
+        }
+
+        if let Err(error) =
+            crate::db::provider_ids::upsert(db, &item_id, "Tmdb", &candidate_id).await
+        {
+            failed += 1;
+            tracing::warn!(
+                "audit_existing_tmdb: failed to store tmdb-{candidate_id} for {item_id}: {error:#}"
+            );
+            continue;
+        }
+
+        match fetch_and_apply_tmdb_metadata(
+            db,
+            &item_id,
+            &item_type,
+            Path::new(&path_str),
+            api_key,
+            client,
+            tmdb_base_url,
+            MetadataRefreshPolicy::automatic(false),
+        )
+        .await
+        {
+            Ok(()) => {
+                repaired += 1;
+                tracing::info!(
+                    "audit_existing_tmdb: {} '{}' -> tmdb-{candidate_id}{}",
+                    if changed_id { "repaired" } else { "refreshed" },
+                    name,
+                    current_id
+                        .as_deref()
+                        .map(|id| format!(" (was tmdb-{id})"))
+                        .unwrap_or_default()
+                );
+            }
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    "audit_existing_tmdb: metadata refresh failed for '{name}' tmdb-{candidate_id}: {error:#}"
+                );
+            }
+        }
+    }
+
+    if failed == 0 {
+        set_app_setting(db, TMDB_LLM_AUDIT_KEY, "true").await?;
+        crate::db::settings::set(db, TMDB_LLM_AUDIT_STATUS_KEY, "completed").await?;
+    } else {
+        crate::db::settings::set(db, TMDB_LLM_AUDIT_STATUS_KEY, "failed").await?;
+        tracing::warn!("audit_existing_tmdb: {failed} item(s) failed; will retry on next startup");
+    }
+    tracing::info!("audit_existing_tmdb: repaired/refreshed {repaired}/{total} item(s)");
+    Ok(repaired)
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// One-time backfill for libraries created before TMDb scraping updated item titles.
@@ -2670,6 +3325,7 @@ pub async fn fetch_and_apply_tmdb_metadata(
     }
     let preserve_existing_metadata = policy.preserves_metadata();
     let is_tv = item_type == "Series" || item_type == "Season" || item_type == "Episode";
+    let llm_config = load_tmdb_llm_config(db).await;
     let metadata_language = preferred_metadata_language_for_item(db, item_id).await;
     let metadata_country_code = preferred_metadata_country_code_for_item(db, item_id).await;
 
@@ -2719,7 +3375,7 @@ pub async fn fetch_and_apply_tmdb_metadata(
                 tracing::debug!("TMDb name search skipped generic folder name '{name}'");
                 return Ok(());
             }
-            match lookup_tmdb_id_by_name(
+            match lookup_tmdb_id_by_name_with_llm_cleanup(
                 client,
                 api_key,
                 tmdb_base_url,
@@ -2727,6 +3383,7 @@ pub async fn fetch_and_apply_tmdb_metadata(
                 year,
                 is_tv,
                 &metadata_language,
+                Some(&llm_config),
             )
             .await
             {
@@ -3594,6 +4251,12 @@ fn is_season_lookup_name(name: &str, folded: &str) -> bool {
 }
 
 fn is_generic_container_name(name: &str) -> bool {
+    if name.len() == 4
+        && name.starts_with(['1', '2'])
+        && name.chars().all(|value| value.is_ascii_digit())
+    {
+        return true;
+    }
     matches!(
         name,
         "media"
@@ -3823,8 +4486,9 @@ mod tests {
         local_episode_title_from_path, merge_metadata_string_list, merge_remote_trailers,
         metadata_field_locked_storage, normalize_tmdb_overview, parse_lookup_title_year,
         parse_season_number, redact_tmdb_api_key, resolve_tmdb_episode_group_mapping,
-        should_skip_name_based_tmdb_lookup, tmdb_credit_people, tmdb_episode_group_type,
-        tmdb_episode_response_for_target, tmdb_find_result_id, upsert_tmdb_people,
+        should_skip_name_based_tmdb_lookup, tmdb_candidate_score, tmdb_credit_people,
+        tmdb_episode_group_type, tmdb_episode_response_for_target, tmdb_find_result_id,
+        tmdb_title_match_score, upsert_tmdb_people,
     };
     use crate::{
         entities::{
@@ -4239,6 +4903,7 @@ mod tests {
         for name in ["Season 1", "S01", "第1季", "CloudDrive", "儿童"] {
             assert!(should_skip_name_based_tmdb_lookup(name), "{name}");
         }
+        assert!(should_skip_name_based_tmdb_lookup("2025"));
         assert!(!should_skip_name_based_tmdb_lookup("Movie Name"));
     }
 
@@ -4252,6 +4917,17 @@ mod tests {
             parse_lookup_title_year(Path::new("Movie.Name (2024) {tmdb-123}")),
             Some(("Movie Name".to_string(), Some(2024)))
         );
+    }
+
+    #[test]
+    fn tmdb_name_matching_prefers_exact_title_and_year() {
+        assert_eq!(
+            tmdb_title_match_score("阿凡达：水之道", "阿凡达 水之道"),
+            100
+        );
+        assert_eq!(tmdb_title_match_score("Black Mirror", "Black Mirror"), 100);
+        assert_eq!(tmdb_candidate_score(100, Some(2022), Some(2022)), 135);
+        assert_eq!(tmdb_candidate_score(100, Some(2022), Some(1950)), 70);
     }
 
     #[test]

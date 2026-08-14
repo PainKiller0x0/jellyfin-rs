@@ -1145,7 +1145,19 @@ async fn stream_media_item(
     }
 
     let playback_target = match playback_target_for_item(&item) {
-        Ok(PlaybackTarget::RemoteUrl(url)) => return remote_stream_redirect(&url),
+        Ok(PlaybackTarget::RemoteUrl(url)) => {
+            if remote_stream_proxy_requested(&query) {
+                return remote_stream_proxy(
+                    &url,
+                    &request_headers,
+                    method,
+                    media_content_type(&item),
+                    item.runtime_ticks,
+                )
+                .await;
+            }
+            return remote_stream_redirect(&url);
+        }
         Ok(PlaybackTarget::LocalPath(path)) => path,
         Err(error) => {
             tracing::warn!(
@@ -1340,6 +1352,177 @@ fn remote_stream_redirect(url: &str) -> Response {
     }
 }
 
+/// Proxy a remote STRM target through the server when a client cannot follow
+/// the cloud-drive redirect itself.  The default remains a redirect so
+/// clients such as VidHub keep the existing direct-link performance.  Jellium
+/// opts in with `JellyfinRsProxy=1`, which keeps the signed cloud-drive URL and
+/// any IP-bound session on the VPS instead of exposing it to the desktop.
+async fn remote_stream_proxy(
+    url: &str,
+    request_headers: &HeaderMap,
+    method: Method,
+    content_type: &'static str,
+    runtime_ticks: Option<i64>,
+) -> Response {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            // Follow redirects below so the cloud-drive Referer can be
+            // re-applied after SmartStrm crosses from its local endpoint to
+            // the CDN host.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build remote stream proxy client")
+    });
+
+    let reqwest_method =
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
+    let has_client_range = request_headers.contains_key(header::RANGE);
+    let mut current_url = url.to_string();
+    let mut upstream = None;
+    for _ in 0..8 {
+        let mut request = client.request(reqwest_method.clone(), &current_url);
+        for name in [
+            header::RANGE,
+            header::IF_RANGE,
+            header::IF_NONE_MATCH,
+            header::IF_MODIFIED_SINCE,
+            header::ACCEPT,
+            header::USER_AGENT,
+        ] {
+            if let Some(value) = request_headers.get(&name) {
+                request = request.header(name.as_str(), value.as_bytes());
+            }
+        }
+        // Xunlei's preview endpoint returns an unbounded 200 response when the
+        // client omits Range. Desktop players then classify it as a live stream
+        // and report a one-second duration. Seed the first GET with an open
+        // range so the upstream returns 206 plus the complete Content-Range.
+        if method == Method::GET && !has_client_range {
+            request = request.header(header::RANGE, "bytes=0-");
+        }
+        // Re-apply the provider Referer on every redirect. reqwest strips or
+        // does not synthesize it when the redirect crosses hosts.
+        if let Some(referer) =
+            remote_stream_referer(&current_url).or_else(|| remote_stream_referer(url))
+        {
+            request = request.header(header::REFERER, referer);
+        }
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(url = %redacted_remote_stream_url(url), "remote STRM proxy request failed: {error}");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "Error": "remote media proxy request failed" })),
+                )
+                    .into_response();
+            }
+        };
+        if !response.status().is_redirection() {
+            upstream = Some(response);
+            break;
+        }
+        let Some(location) = response.headers().get(header::LOCATION) else {
+            upstream = Some(response);
+            break;
+        };
+        let Ok(location) = location.to_str() else {
+            upstream = Some(response);
+            break;
+        };
+        let Some(next_url) = response.url().join(location).ok() else {
+            upstream = Some(response);
+            break;
+        };
+        current_url = next_url.to_string();
+    }
+    let Some(upstream) = upstream else {
+        tracing::warn!(url = %redacted_remote_stream_url(url), "remote STRM proxy redirect limit exceeded");
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "Error": "remote media proxy redirect limit exceeded" })),
+        )
+            .into_response();
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut headers = HeaderMap::new();
+    for name in [
+        header::ACCEPT_RANGES,
+        header::CACHE_CONTROL,
+        header::CONTENT_DISPOSITION,
+        header::CONTENT_LENGTH,
+        header::CONTENT_RANGE,
+        header::CONTENT_TYPE,
+        header::ETAG,
+        header::LAST_MODIFIED,
+    ] {
+        if name == header::CONTENT_TYPE {
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+        } else if let Some(value) = upstream.headers().get(name.as_str())
+            && let Ok(value) = HeaderValue::from_bytes(value.as_bytes())
+        {
+            headers.insert(name, value);
+        }
+    }
+    if let Some(runtime_ticks) = runtime_ticks.filter(|value| *value > 0) {
+        let duration_seconds = runtime_ticks as f64 / 10_000_000.0;
+        if let Ok(value) = HeaderValue::from_str(&format!("{duration_seconds:.3}")) {
+            // The upstream is an MPEG-TS preview stream and does not carry a
+            // fixed duration in its initial packets.  Jellyfin already knows
+            // the duration from its media metadata, so expose it using the
+            // standard HTTP hint understood by some desktop players.
+            headers.insert(
+                header::HeaderName::from_static("content-duration"),
+                value.clone(),
+            );
+            headers.insert(header::HeaderName::from_static("x-content-duration"), value);
+        }
+    }
+
+    if method == Method::HEAD {
+        return (status, headers, Body::empty()).into_response();
+    }
+
+    (status, headers, Body::from_stream(upstream.bytes_stream())).into_response()
+}
+
+fn remote_stream_proxy_requested(query: &HashMap<String, String>) -> bool {
+    query.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("JellyfinRsProxy")
+            && matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+    })
+}
+
+fn remote_stream_referer(url: &str) -> Option<&'static str> {
+    let folded = url.to_ascii_lowercase();
+    if folded.contains("xunlei") || folded.contains("thunder") {
+        Some("http://pan.xunlei.com/")
+    } else if folded.contains("quark") || folded.contains("myquark") {
+        Some("http://pan.quark.cn/")
+    } else {
+        None
+    }
+}
+
+fn redacted_remote_stream_url(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .map(|mut parsed| {
+            if parsed.query().is_some() {
+                parsed.set_query(Some("<redacted>"));
+            }
+            parsed.to_string()
+        })
+        .unwrap_or_else(|_| "<invalid-url>".to_string())
+}
+
 #[derive(Clone, Copy)]
 struct ByteRange {
     start: u64,
@@ -1487,10 +1670,12 @@ pub async fn stream_audio_container_head(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
         PlaybackTarget, normalize_embedded_subtitle_window_start_ticks, parse_range_header,
-        playback_target_for_item, remote_stream_redirect, shift_vtt_timestamps,
-        vtt_to_track_events,
+        playback_target_for_item, remote_stream_proxy_requested, remote_stream_redirect,
+        remote_stream_referer, shift_vtt_timestamps, vtt_to_track_events,
     };
     use crate::library::models::MediaItem;
     use axum::http::{StatusCode, header};
@@ -1540,6 +1725,31 @@ mod tests {
             response.headers().get(header::LOCATION).unwrap(),
             "https://smartstrm.example/movie.mkv?sign=x"
         );
+    }
+
+    #[test]
+    fn remote_strm_proxy_requires_explicit_opt_in() {
+        let mut query = HashMap::new();
+        assert!(!remote_stream_proxy_requested(&query));
+        query.insert("JellyfinRsProxy".to_string(), "1".to_string());
+        assert!(remote_stream_proxy_requested(&query));
+        query.insert("jellyfinrsproxy".to_string(), "true".to_string());
+        assert!(remote_stream_proxy_requested(&query));
+        query.insert("JellyfinRsProxy".to_string(), "0".to_string());
+        assert!(remote_stream_proxy_requested(&query));
+    }
+
+    #[test]
+    fn remote_strm_proxy_selects_cloud_drive_referer() {
+        assert_eq!(
+            remote_stream_referer("http://127.0.0.1:8024/smartstrm_fid/myquark/file"),
+            Some("http://pan.quark.cn/")
+        );
+        assert_eq!(
+            remote_stream_referer("http://127.0.0.1:8024/smartstrm_fid/xunlei_123/file"),
+            Some("http://pan.xunlei.com/")
+        );
+        assert_eq!(remote_stream_referer("https://example.test/file"), None);
     }
 
     #[test]

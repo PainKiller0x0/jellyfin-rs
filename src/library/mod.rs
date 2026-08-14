@@ -9,6 +9,7 @@ pub mod naming;
 pub mod path_utils;
 pub mod photo;
 pub mod probe;
+pub mod reconcile;
 pub mod scanner;
 pub mod storage;
 pub mod subtitles;

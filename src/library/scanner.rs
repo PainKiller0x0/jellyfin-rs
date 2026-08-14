@@ -61,6 +61,21 @@ struct ScanRootResult {
     ingest_queued: usize,
 }
 
+struct ScanRootRequest {
+    root: PathBuf,
+    library_id: String,
+    collection_type: String,
+    enable_photos: bool,
+    scope_paths: Option<Vec<PathBuf>>,
+}
+
+#[derive(Clone)]
+struct ExistingMediaState {
+    item_type: String,
+    modified_at: i64,
+    size_bytes: Option<i64>,
+}
+
 struct IngestPipeline {
     tx: mpsc::Sender<IngestJob>,
     handle: tokio::task::JoinHandle<IngestWorkerStats>,
@@ -282,6 +297,18 @@ async fn force_refresh_media_probe(
 
 pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Option<usize>> {
     let roots = media_roots(state).await?;
+    let roots = roots
+        .into_iter()
+        .map(
+            |(root, library_id, collection_type, enable_photos)| ScanRootRequest {
+                root,
+                library_id,
+                collection_type,
+                enable_photos,
+                scope_paths: None,
+            },
+        )
+        .collect();
     scan_media_roots_if_idle(state, roots, true).await
 }
 
@@ -296,22 +323,42 @@ pub async fn scan_media_library_paths_if_idle(
 fn select_media_roots(
     roots: Vec<(PathBuf, String, String, bool)>,
     requested_paths: &[String],
-) -> Vec<(PathBuf, String, String, bool)> {
+) -> Vec<ScanRootRequest> {
     let requested_paths = requested_paths
         .iter()
-        .map(|path| path_utils::normalize_path(path))
+        .map(|path| PathBuf::from(path_utils::normalize_path(path)))
         .collect::<std::collections::HashSet<_>>();
     roots
         .into_iter()
-        .filter(|(root, _, _, _)| {
-            requested_paths.contains(&path_utils::normalize_path(&root.to_string_lossy()))
+        .filter_map(|(root, library_id, collection_type, enable_photos)| {
+            let normalized_root =
+                PathBuf::from(path_utils::normalize_path(&root.to_string_lossy()));
+            let matching_paths = requested_paths
+                .iter()
+                .filter(|path| *path == &normalized_root || path.starts_with(&normalized_root))
+                .cloned()
+                .collect::<Vec<_>>();
+            if matching_paths.is_empty() {
+                return None;
+            }
+            let scope_paths = matching_paths
+                .into_iter()
+                .filter(|path| path != &normalized_root)
+                .collect::<Vec<_>>();
+            Some(ScanRootRequest {
+                root,
+                library_id,
+                collection_type,
+                enable_photos,
+                scope_paths: (!scope_paths.is_empty()).then_some(scope_paths),
+            })
         })
         .collect()
 }
 
 async fn scan_media_roots_if_idle(
     state: &AppState,
-    roots: Vec<(PathBuf, String, String, bool)>,
+    roots: Vec<ScanRootRequest>,
     remove_missing: bool,
 ) -> anyhow::Result<Option<usize>> {
     if roots.is_empty() {
@@ -329,6 +376,7 @@ async fn scan_media_roots_if_idle(
 
     let scan_database_url = crate::db::database_url_from_env();
     let scan_db = crate::db::background_connection(&scan_database_url).await?;
+    let existing_media = load_existing_media_state(&scan_db, &roots).await?;
 
     let force_probe = !media_probe_cache_is_current(&scan_db).await?;
     if force_probe {
@@ -367,18 +415,34 @@ async fn scan_media_roots_if_idle(
     let mut pending_roots = roots.into_iter();
     loop {
         while tasks.len() < root_concurrency {
-            let Some((root, library_id, collection_type, enable_photos)) = pending_roots.next()
-            else {
+            let Some(request) = pending_roots.next() else {
                 break;
             };
+            let ScanRootRequest {
+                root,
+                library_id,
+                collection_type,
+                enable_photos,
+                scope_paths,
+            } = request;
             if !root.exists() {
                 tracing::warn!("media directory does not exist: {}", root.display());
                 continue;
             }
             scanned_library_ids.push(library_id.clone());
             let ingest_tx = ingest_pipeline.tx.clone();
+            let existing_media = existing_media.clone();
             tasks.spawn(async move {
-                scan_root(root, library_id, collection_type, enable_photos, ingest_tx).await
+                scan_root(
+                    root,
+                    library_id,
+                    collection_type,
+                    enable_photos,
+                    scope_paths,
+                    existing_media,
+                    ingest_tx,
+                )
+                .await
             });
         }
 
@@ -459,417 +523,442 @@ async fn scan_root(
     library_id: String,
     collection_type: String,
     enable_photos: bool,
+    scope_paths: Option<Vec<PathBuf>>,
+    existing_media: HashMap<String, ExistingMediaState>,
     ingest_tx: mpsc::Sender<IngestJob>,
 ) -> anyhow::Result<ScanRootResult> {
     let mut scanned = 0usize;
     let mut seen_paths = Vec::new();
     let mut ingest_queued = 0usize;
-    let stack_part_owners = movie_stack_part_owners(&root, &collection_type);
-    let episode_version_owners = episode_version_owners(&root, &library_id, &collection_type);
+    let stack_part_owners =
+        movie_stack_part_owners(&root, &collection_type, scope_paths.as_deref());
+    let episode_version_owners =
+        episode_version_owners(&root, &library_id, &collection_type, scope_paths.as_deref());
 
-    for entry in WalkDir::new(&root).follow_links(false).into_iter() {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracing::warn!("failed to read media path: {error}");
+    let walk_roots = scope_paths.clone().unwrap_or_else(|| vec![root.clone()]);
+    for walk_root in walk_roots {
+        for entry in WalkDir::new(walk_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !is_ignored_scan_path(entry.path()))
+        {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!("failed to read media path: {error}");
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if path == root {
                 continue;
             }
-        };
-        let path = entry.path();
-        if path == root {
-            continue;
-        }
-        if should_skip_disc_structure_entry(path, &root) {
-            continue;
-        }
-
-        let resolved = match path_utils::resolve_path_info(path) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                tracing::warn!("failed to resolve media path {}: {error:#}", path.display());
+            if is_ignored_scan_path(path) || !path_is_in_scan_scope(path, scope_paths.as_deref()) {
                 continue;
             }
-        };
-
-        let path_string = resolved.path.clone();
-        let mut parent_id = parent_id_for_path(path, &root, &library_id);
-
-        if resolved.is_directory {
-            // Jellyfin's BookResolver collapses a directory containing exactly one supported
-            // book into that file-backed Book item. The file is handled below by WalkDir.
-            if collection_type == "books"
-                && (book_file_for_directory(path).is_some()
-                    || audiobook_file_for_directory(path).is_some())
-            {
+            if should_skip_disc_structure_entry(path, &root) {
                 continue;
             }
-            if collection_type == "music"
-                && is_music_multi_part_folder(path)
-                && path.parent().is_some_and(|parent| {
-                    tv_folder_type(parent, &root, &collection_type) == "MusicAlbum"
-                })
-            {
+
+            let resolved = match path_utils::resolve_path_info(path) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    tracing::warn!("failed to resolve media path {}: {error:#}", path.display());
+                    continue;
+                }
+            };
+
+            let path_string = resolved.path.clone();
+            let mut parent_id = parent_id_for_path(path, &root, &library_id);
+
+            if resolved.is_directory {
+                // Jellyfin's BookResolver collapses a directory containing exactly one supported
+                // book into that file-backed Book item. The file is handled below by WalkDir.
+                if collection_type == "books"
+                    && (book_file_for_directory(path).is_some()
+                        || audiobook_file_for_directory(path).is_some())
+                {
+                    continue;
+                }
+                if collection_type == "music"
+                    && is_music_multi_part_folder(path)
+                    && path.parent().is_some_and(|parent| {
+                        tv_folder_type(parent, &root, &collection_type) == "MusicAlbum"
+                    })
+                {
+                    continue;
+                }
+                seen_paths.push(path_string.clone());
+                let mut folder_type = tv_folder_type(path, &root, &collection_type);
+                if collection_type == "homevideos" && !enable_photos && folder_type == "PhotoAlbum"
+                {
+                    folder_type = "Folder";
+                }
+                let (folder_title, year) =
+                    crate::library::tmdb_metadata::clean_title_with_year(&resolved.name);
+                let mut item = ScannedMediaItem::folder_with_type(
+                    resolved.id,
+                    library_id.clone(),
+                    parent_id,
+                    path_string,
+                    folder_title,
+                    folder_type,
+                    resolved.modified_at,
+                    resolved.created_at,
+                    year,
+                );
+                if folder_type == "Season" {
+                    item.season_number =
+                        crate::library::tmdb_metadata::parse_season_number(&resolved.name);
+                }
+                item.video_type = folder_video_type(path).map(ToString::to_string);
+                // Jellyfin resolves DVD and Blu-ray directory structures as Video
+                // items whose Path happens to be a directory, not as folders.
+                item.is_folder = item
+                    .video_type
+                    .as_deref()
+                    .is_none_or(|video_type| !matches!(video_type, "Dvd" | "BluRay"));
+                item.iso_type = item
+                    .video_type
+                    .as_deref()
+                    .filter(|video_type| *video_type == "Iso")
+                    .and_then(|_| iso_type_for_path(path).map(ToString::to_string));
+                item.video_3d_format = crate::library::naming::parse_video_3d_format(&item.path);
+                let parsed_metadata = parse_sidecar_metadata_for_item(path, folder_type).await;
+                if parsed_metadata.has_nfo {
+                    if let Some(title) = parsed_metadata.title.clone() {
+                        item.title = title;
+                    }
+                    item.overview = parsed_metadata.overview.clone();
+                    item.official_rating = parsed_metadata.official_rating.clone();
+                    item.custom_rating = parsed_metadata.custom_rating.clone();
+                    item.video_3d_format = parsed_metadata
+                        .video_3d_format
+                        .clone()
+                        .or(item.video_3d_format);
+                    item.original_title = parsed_metadata.original_title.clone();
+                    item.sort_name = parsed_metadata.sort_name.clone();
+                    item.forced_sort_name = parsed_metadata.forced_sort_name.clone();
+                    item.lock_data = parsed_metadata.lock_data;
+                    item.locked_fields = parsed_metadata.locked_fields.clone();
+                    item.tagline = parsed_metadata.tagline.clone();
+                    item.collection_name = parsed_metadata.collection_name.clone();
+                    item.original_language = parsed_metadata.original_language.clone();
+                    item.preferred_metadata_language =
+                        parsed_metadata.preferred_metadata_language.clone();
+                    item.preferred_metadata_country_code =
+                        parsed_metadata.preferred_metadata_country_code.clone();
+                    item.series_status = parsed_metadata.series_status.clone();
+                    item.air_days = parsed_metadata.air_days.clone();
+                    item.air_time = parsed_metadata.air_time.clone();
+                    item.home_page_url = parsed_metadata.home_page_url.clone();
+                    item.remote_trailers = parsed_metadata.remote_trailers.clone();
+                    item.production_locations = parsed_metadata.production_locations.clone();
+                    item.production_year = parsed_metadata.production_year.or(item.production_year);
+                    item.premiere_date = parsed_metadata.premiere_date.clone();
+                    item.end_date = parsed_metadata.end_date.clone();
+                    item.runtime_ticks = parsed_metadata.runtime_ticks;
+                    item.aspect_ratio = parsed_metadata.aspect_ratio.clone();
+                    item.width = parsed_metadata.width;
+                    item.height = parsed_metadata.height;
+                    item.has_subtitles = parsed_metadata.has_subtitles.unwrap_or(false);
+                    item.display_order = parsed_metadata.display_order.clone();
+                    item.community_rating = parsed_metadata.community_rating;
+                    item.critic_rating = parsed_metadata.critic_rating;
+                    item.created_at = parsed_metadata.created_at.unwrap_or(item.created_at);
+                    if folder_type == "Season" {
+                        item.season_number = parsed_metadata.season_number.or(item.season_number);
+                    }
+                }
+                let media_probe = item
+                    .video_type
+                    .as_deref()
+                    .filter(|video_type| matches!(*video_type, "Dvd" | "BluRay"))
+                    .map(|_| PendingMediaProbe {
+                        media_path: path.to_path_buf(),
+                        probe_path: path.to_path_buf(),
+                        allow_size_mismatch: true,
+                    });
+                let job = IngestJob {
+                    item,
+                    source_path: path.to_path_buf(),
+                    parsed_metadata,
+                    clear_folder_metadata: folder_type == "Folder",
+                    media_probe,
+                };
+                if scope_paths.is_some() || item_requires_ingest(&job.item, &existing_media) {
+                    if queue_ingest(&ingest_tx, job).await {
+                        ingest_queued += 1;
+                    }
+                }
                 continue;
             }
-            seen_paths.push(path_string.clone());
-            let mut folder_type = tv_folder_type(path, &root, &collection_type);
-            if collection_type == "homevideos" && !enable_photos && folder_type == "PhotoAlbum" {
-                folder_type = "Folder";
+
+            // Handle STRM files: classify based on the resolved target's extension
+            let is_strm_file = strm::is_strm_path(path);
+            let (classify_path, probe_path) = if is_strm_file {
+                match strm::resolve_strm_path(path) {
+                    Ok(resolved_target) => {
+                        let ext_path = strm::classification_path_for_target(&resolved_target, path);
+                        (ext_path, Some(resolved_target))
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to resolve STRM {}: {e}", path.display());
+                        continue;
+                    }
+                }
+            } else {
+                (path.to_path_buf(), None)
+            };
+
+            let Some(item_type) = classify_media_path(&classify_path, &collection_type) else {
+                continue;
+            };
+            if collection_type == "homevideos" && !enable_photos && item_type == "Photo" {
+                continue;
             }
-            let (folder_title, year) =
-                crate::library::tmdb_metadata::clean_title_with_year(&resolved.name);
-            let mut item = ScannedMediaItem::folder_with_type(
-                resolved.id,
-                library_id.clone(),
-                parent_id,
-                path_string,
-                folder_title,
-                folder_type,
-                resolved.modified_at,
-                resolved.created_at,
-                year,
-            );
-            if folder_type == "Season" {
-                item.season_number =
-                    crate::library::tmdb_metadata::parse_season_number(&resolved.name);
-            }
-            item.video_type = folder_video_type(path).map(ToString::to_string);
-            // Jellyfin resolves DVD and Blu-ray directory structures as Video
-            // items whose Path happens to be a directory, not as folders.
-            item.is_folder = item
-                .video_type
-                .as_deref()
-                .is_none_or(|video_type| !matches!(video_type, "Dvd" | "BluRay"));
-            item.iso_type = item
-                .video_type
+            let extra_type =
+                video_extra_type(path, matches!(item_type.as_str(), "Audio" | "AudioBook"))
+                    .map(|extra_type| extra_type.as_jellyfin_str().to_string());
+            let video_type = file_video_type(path).map(ToString::to_string);
+            let iso_type = video_type
                 .as_deref()
                 .filter(|video_type| *video_type == "Iso")
                 .and_then(|_| iso_type_for_path(path).map(ToString::to_string));
-            item.video_3d_format = crate::library::naming::parse_video_3d_format(&item.path);
-            let parsed_metadata = parse_sidecar_metadata_for_item(path, folder_type).await;
-            if parsed_metadata.has_nfo {
-                if let Some(title) = parsed_metadata.title.clone() {
-                    item.title = title;
-                }
-                item.overview = parsed_metadata.overview.clone();
-                item.official_rating = parsed_metadata.official_rating.clone();
-                item.custom_rating = parsed_metadata.custom_rating.clone();
-                item.video_3d_format = parsed_metadata
+            let mut item_type = normalize_scanned_file_type(
+                &item_type,
+                &collection_type,
+                &parent_id,
+                &library_id,
+                path,
+                &root,
+                extra_type.is_some(),
+            );
+            parent_id = parent_id_for_scanned_file(
+                path,
+                &root,
+                &library_id,
+                &collection_type,
+                &item_type,
+                extra_type.is_some(),
+            );
+            if item_type == "Movie"
+                && let Some(primary_path) = stack_part_owners.get(path)
+            {
+                item_type = "Video".to_string();
+                parent_id = crate::util::stable_item_id(primary_path);
+            } else if item_type == "Episode"
+                && let Some(primary_path) = episode_version_owners.get(path)
+            {
+                item_type = "Video".to_string();
+                parent_id = crate::util::stable_item_id(primary_path);
+            }
+            let container = if is_strm_file {
+                probe_path
+                    .as_ref()
+                    .and_then(|target| strm::target_extension(&target.to_string_lossy()))
+            } else {
+                classify_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| extension.to_ascii_lowercase())
+            };
+
+            seen_paths.push(path_string.clone());
+            let parsed_metadata = parse_sidecar_metadata_for_item(path, &item_type).await;
+            let parsed_name = parse_media_name(path, &collection_type);
+            let collapsed_book_directory = (item_type == "Book")
+                .then(|| path.parent())
+                .flatten()
+                .filter(|parent| {
+                    book_file_for_directory(parent)
+                        .as_deref()
+                        .is_some_and(|book| same_normalized_path(book, path))
+                });
+            let collapsed_audiobook_directory = (item_type == "AudioBook")
+                .then(|| path.parent())
+                .flatten()
+                .filter(|parent| {
+                    audiobook_file_for_directory(parent)
+                        .as_deref()
+                        .is_some_and(|audiobook| same_normalized_path(audiobook, path))
+                });
+            let parsed_book = (item_type == "Book").then(|| {
+                let source = collapsed_book_directory
+                    .and_then(|parent| parent.file_name())
+                    .or_else(|| path.file_stem())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                crate::library::naming::parse_book_name(source)
+            });
+            if let Some(parent) = collapsed_book_directory.or(collapsed_audiobook_directory) {
+                parent_id = parent_id_for_path(parent, &root, &library_id);
+            }
+            let (audiobook_title, audiobook_year) = collapsed_audiobook_directory
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .map(crate::library::tmdb_metadata::clean_title_with_year)
+                .unzip();
+            let mut season_number = parsed_metadata
+                .season_number
+                .or(parsed_name.season_number)
+                .or_else(|| episode_season_number_from_path(path, &root, &collection_type));
+            let episode_number = parsed_metadata
+                .episode_number
+                .or(parsed_name.episode_number);
+            if item_type == "Episode"
+                && season_number.is_none()
+                && (episode_number.is_some()
+                    || parsed_metadata.premiere_date.is_some()
+                    || parsed_name.premiere_date.is_some())
+            {
+                season_number = Some(1);
+            }
+            let episode_number_end = parsed_metadata
+                .ending_episode_number
+                .or(parsed_name.ending_episode_number);
+            let title = if parsed_metadata.has_nfo {
+                parsed_metadata
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| resolved.name.clone())
+            } else if let Some(book) = parsed_book.as_ref() {
+                book.title.clone()
+            } else if let Some(title) = audiobook_title {
+                title
+            } else if parsed_name.title.is_empty() {
+                resolved.name.clone()
+            } else {
+                parsed_name.title.clone()
+            };
+            let probe_target_path = probe_path.as_deref().unwrap_or(path);
+            let standalone_book_series_name = (item_type == "Book"
+                && collapsed_book_directory.is_none())
+            .then(|| {
+                path.parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    .map(ToString::to_string)
+            })
+            .flatten();
+            let item = ScannedMediaItem {
+                id: resolved.id,
+                title,
+                path: path_string,
+                library_id: library_id.clone(),
+                parent_id,
+                item_type,
+                extra_type,
+                video_type,
+                iso_type,
+                video_3d_format: parsed_metadata
                     .video_3d_format
                     .clone()
-                    .or(item.video_3d_format);
-                item.original_title = parsed_metadata.original_title.clone();
-                item.sort_name = parsed_metadata.sort_name.clone();
-                item.forced_sort_name = parsed_metadata.forced_sort_name.clone();
-                item.lock_data = parsed_metadata.lock_data;
-                item.locked_fields = parsed_metadata.locked_fields.clone();
-                item.tagline = parsed_metadata.tagline.clone();
-                item.collection_name = parsed_metadata.collection_name.clone();
-                item.original_language = parsed_metadata.original_language.clone();
-                item.preferred_metadata_language =
-                    parsed_metadata.preferred_metadata_language.clone();
-                item.preferred_metadata_country_code =
-                    parsed_metadata.preferred_metadata_country_code.clone();
-                item.series_status = parsed_metadata.series_status.clone();
-                item.air_days = parsed_metadata.air_days.clone();
-                item.air_time = parsed_metadata.air_time.clone();
-                item.home_page_url = parsed_metadata.home_page_url.clone();
-                item.remote_trailers = parsed_metadata.remote_trailers.clone();
-                item.production_locations = parsed_metadata.production_locations.clone();
-                item.production_year = parsed_metadata.production_year.or(item.production_year);
-                item.premiere_date = parsed_metadata.premiere_date.clone();
-                item.end_date = parsed_metadata.end_date.clone();
-                item.runtime_ticks = parsed_metadata.runtime_ticks;
-                item.aspect_ratio = parsed_metadata.aspect_ratio.clone();
-                item.width = parsed_metadata.width;
-                item.height = parsed_metadata.height;
-                item.has_subtitles = parsed_metadata.has_subtitles.unwrap_or(false);
-                item.display_order = parsed_metadata.display_order.clone();
-                item.community_rating = parsed_metadata.community_rating;
-                item.critic_rating = parsed_metadata.critic_rating;
-                item.created_at = parsed_metadata.created_at.unwrap_or(item.created_at);
-                if folder_type == "Season" {
-                    item.season_number = parsed_metadata.season_number.or(item.season_number);
-                }
-            }
-            let media_probe = item
-                .video_type
-                .as_deref()
-                .filter(|video_type| matches!(*video_type, "Dvd" | "BluRay"))
-                .map(|_| PendingMediaProbe {
-                    media_path: path.to_path_buf(),
-                    probe_path: path.to_path_buf(),
-                    allow_size_mismatch: true,
-                });
+                    .or(parsed_name.video_3d_format),
+                is_folder: false,
+                container,
+                overview: parsed_metadata.overview.clone(),
+                official_rating: parsed_metadata.official_rating.clone(),
+                custom_rating: parsed_metadata.custom_rating.clone(),
+                extended_video_type: (!parsed_name.extended_video_types.is_empty())
+                    .then(|| parsed_name.extended_video_types.join(",")),
+                original_title: parsed_metadata.original_title.clone(),
+                sort_name: parsed_metadata.sort_name.clone(),
+                forced_sort_name: parsed_metadata.forced_sort_name.clone(),
+                lock_data: parsed_metadata.lock_data,
+                locked_fields: parsed_metadata.locked_fields.clone(),
+                tagline: parsed_metadata.tagline.clone(),
+                collection_name: parsed_metadata.collection_name.clone(),
+                original_language: parsed_metadata.original_language.clone(),
+                preferred_metadata_language: parsed_metadata.preferred_metadata_language.clone(),
+                preferred_metadata_country_code: parsed_metadata
+                    .preferred_metadata_country_code
+                    .clone(),
+                series_status: parsed_metadata.series_status.clone(),
+                air_days: parsed_metadata.air_days.clone(),
+                air_time: parsed_metadata.air_time.clone(),
+                home_page_url: parsed_metadata.home_page_url.clone(),
+                remote_trailers: parsed_metadata.remote_trailers.clone(),
+                production_locations: parsed_metadata.production_locations.clone(),
+                production_year: parsed_metadata
+                    .production_year
+                    .or_else(|| {
+                        parsed_name
+                            .premiere_date
+                            .as_deref()
+                            .and_then(crate::util::year_from_yyyy_mm_dd)
+                    })
+                    .or_else(|| parsed_book.as_ref().and_then(|book| book.production_year))
+                    .or(audiobook_year.flatten()),
+                premiere_date: parsed_metadata
+                    .premiere_date
+                    .clone()
+                    .or_else(|| parsed_name.premiere_date.clone()),
+                end_date: parsed_metadata.end_date.clone(),
+                runtime_ticks: parsed_metadata.runtime_ticks,
+                aspect_ratio: parsed_metadata.aspect_ratio.clone(),
+                width: parsed_metadata.width,
+                height: parsed_metadata.height,
+                has_subtitles: parsed_metadata.has_subtitles.unwrap_or(false),
+                photo_metadata: None,
+                display_order: parsed_metadata.display_order.clone(),
+                size_bytes: resolved.size_bytes,
+                season_number: parsed_book
+                    .as_ref()
+                    .and_then(|book| book.parent_index_number)
+                    .or(season_number),
+                episode_number: parsed_book
+                    .as_ref()
+                    .and_then(|book| book.index_number)
+                    .or(episode_number),
+                episode_number_end,
+                airs_before_episode_number: parsed_metadata.airs_before_episode_number,
+                airs_after_season_number: parsed_metadata.airs_after_season_number,
+                airs_before_season_number: parsed_metadata.airs_before_season_number,
+                series_name: parsed_metadata
+                    .series_name
+                    .clone()
+                    .or_else(|| {
+                        parsed_book
+                            .as_ref()
+                            .and_then(|book| book.series_name.clone())
+                    })
+                    .or(standalone_book_series_name),
+                community_rating: parsed_metadata.community_rating,
+                critic_rating: parsed_metadata.critic_rating,
+                modified_at: resolved.modified_at,
+                created_at: parsed_metadata.created_at.unwrap_or(resolved.created_at),
+            };
+
+            let media_probe = (!is_video_stub(path)
+                && matches!(
+                    item.item_type.as_str(),
+                    "Audio"
+                        | "AudioBook"
+                        | "Movie"
+                        | "Episode"
+                        | "Video"
+                        | "Trailer"
+                        | "MusicVideo"
+                ))
+            .then(|| PendingMediaProbe {
+                media_path: path.to_path_buf(),
+                probe_path: probe_target_path.to_path_buf(),
+                allow_size_mismatch: is_strm_file,
+            });
             let job = IngestJob {
                 item,
                 source_path: path.to_path_buf(),
                 parsed_metadata,
-                clear_folder_metadata: folder_type == "Folder",
+                clear_folder_metadata: false,
                 media_probe,
             };
-            if queue_ingest(&ingest_tx, job).await {
-                ingest_queued += 1;
-            }
-            continue;
-        }
-
-        // Handle STRM files: classify based on the resolved target's extension
-        let is_strm_file = strm::is_strm_path(path);
-        let (classify_path, probe_path) = if is_strm_file {
-            match strm::resolve_strm_path(path) {
-                Ok(resolved_target) => {
-                    let ext_path = strm::classification_path_for_target(&resolved_target, path);
-                    (ext_path, Some(resolved_target))
-                }
-                Err(e) => {
-                    tracing::warn!("failed to resolve STRM {}: {e}", path.display());
-                    continue;
+            if scope_paths.is_some() || item_requires_ingest(&job.item, &existing_media) {
+                if queue_ingest(&ingest_tx, job).await {
+                    ingest_queued += 1;
+                    scanned += 1;
                 }
             }
-        } else {
-            (path.to_path_buf(), None)
-        };
-
-        let Some(item_type) = classify_media_path(&classify_path, &collection_type) else {
-            continue;
-        };
-        if collection_type == "homevideos" && !enable_photos && item_type == "Photo" {
-            continue;
-        }
-        let extra_type =
-            video_extra_type(path, matches!(item_type.as_str(), "Audio" | "AudioBook"))
-                .map(|extra_type| extra_type.as_jellyfin_str().to_string());
-        let video_type = file_video_type(path).map(ToString::to_string);
-        let iso_type = video_type
-            .as_deref()
-            .filter(|video_type| *video_type == "Iso")
-            .and_then(|_| iso_type_for_path(path).map(ToString::to_string));
-        let mut item_type = normalize_scanned_file_type(
-            &item_type,
-            &collection_type,
-            &parent_id,
-            &library_id,
-            path,
-            &root,
-            extra_type.is_some(),
-        );
-        parent_id = parent_id_for_scanned_file(
-            path,
-            &root,
-            &library_id,
-            &collection_type,
-            &item_type,
-            extra_type.is_some(),
-        );
-        if item_type == "Movie"
-            && let Some(primary_path) = stack_part_owners.get(path)
-        {
-            item_type = "Video".to_string();
-            parent_id = crate::util::stable_item_id(primary_path);
-        } else if item_type == "Episode"
-            && let Some(primary_path) = episode_version_owners.get(path)
-        {
-            item_type = "Video".to_string();
-            parent_id = crate::util::stable_item_id(primary_path);
-        }
-        let container = if is_strm_file {
-            probe_path
-                .as_ref()
-                .and_then(|target| strm::target_extension(&target.to_string_lossy()))
-        } else {
-            classify_path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .map(|extension| extension.to_ascii_lowercase())
-        };
-
-        seen_paths.push(path_string.clone());
-        let parsed_metadata = parse_sidecar_metadata_for_item(path, &item_type).await;
-        let parsed_name = parse_media_name(path, &collection_type);
-        let collapsed_book_directory = (item_type == "Book")
-            .then(|| path.parent())
-            .flatten()
-            .filter(|parent| {
-                book_file_for_directory(parent)
-                    .as_deref()
-                    .is_some_and(|book| same_normalized_path(book, path))
-            });
-        let collapsed_audiobook_directory = (item_type == "AudioBook")
-            .then(|| path.parent())
-            .flatten()
-            .filter(|parent| {
-                audiobook_file_for_directory(parent)
-                    .as_deref()
-                    .is_some_and(|audiobook| same_normalized_path(audiobook, path))
-            });
-        let parsed_book = (item_type == "Book").then(|| {
-            let source = collapsed_book_directory
-                .and_then(|parent| parent.file_name())
-                .or_else(|| path.file_stem())
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            crate::library::naming::parse_book_name(source)
-        });
-        if let Some(parent) = collapsed_book_directory.or(collapsed_audiobook_directory) {
-            parent_id = parent_id_for_path(parent, &root, &library_id);
-        }
-        let (audiobook_title, audiobook_year) = collapsed_audiobook_directory
-            .and_then(|parent| parent.file_name())
-            .and_then(|name| name.to_str())
-            .map(crate::library::tmdb_metadata::clean_title_with_year)
-            .unzip();
-        let mut season_number = parsed_metadata
-            .season_number
-            .or(parsed_name.season_number)
-            .or_else(|| episode_season_number_from_path(path, &root, &collection_type));
-        let episode_number = parsed_metadata
-            .episode_number
-            .or(parsed_name.episode_number);
-        if item_type == "Episode"
-            && season_number.is_none()
-            && (episode_number.is_some()
-                || parsed_metadata.premiere_date.is_some()
-                || parsed_name.premiere_date.is_some())
-        {
-            season_number = Some(1);
-        }
-        let episode_number_end = parsed_metadata
-            .ending_episode_number
-            .or(parsed_name.ending_episode_number);
-        let title = if parsed_metadata.has_nfo {
-            parsed_metadata
-                .title
-                .clone()
-                .unwrap_or_else(|| resolved.name.clone())
-        } else if let Some(book) = parsed_book.as_ref() {
-            book.title.clone()
-        } else if let Some(title) = audiobook_title {
-            title
-        } else if parsed_name.title.is_empty() {
-            resolved.name.clone()
-        } else {
-            parsed_name.title.clone()
-        };
-        let probe_target_path = probe_path.as_deref().unwrap_or(path);
-        let standalone_book_series_name = (item_type == "Book"
-            && collapsed_book_directory.is_none())
-        .then(|| {
-            path.parent()
-                .and_then(|parent| parent.file_name())
-                .and_then(|name| name.to_str())
-                .map(ToString::to_string)
-        })
-        .flatten();
-        let item = ScannedMediaItem {
-            id: resolved.id,
-            title,
-            path: path_string,
-            library_id: library_id.clone(),
-            parent_id,
-            item_type,
-            extra_type,
-            video_type,
-            iso_type,
-            video_3d_format: parsed_metadata
-                .video_3d_format
-                .clone()
-                .or(parsed_name.video_3d_format),
-            is_folder: false,
-            container,
-            overview: parsed_metadata.overview.clone(),
-            official_rating: parsed_metadata.official_rating.clone(),
-            custom_rating: parsed_metadata.custom_rating.clone(),
-            extended_video_type: (!parsed_name.extended_video_types.is_empty())
-                .then(|| parsed_name.extended_video_types.join(",")),
-            original_title: parsed_metadata.original_title.clone(),
-            sort_name: parsed_metadata.sort_name.clone(),
-            forced_sort_name: parsed_metadata.forced_sort_name.clone(),
-            lock_data: parsed_metadata.lock_data,
-            locked_fields: parsed_metadata.locked_fields.clone(),
-            tagline: parsed_metadata.tagline.clone(),
-            collection_name: parsed_metadata.collection_name.clone(),
-            original_language: parsed_metadata.original_language.clone(),
-            preferred_metadata_language: parsed_metadata.preferred_metadata_language.clone(),
-            preferred_metadata_country_code: parsed_metadata
-                .preferred_metadata_country_code
-                .clone(),
-            series_status: parsed_metadata.series_status.clone(),
-            air_days: parsed_metadata.air_days.clone(),
-            air_time: parsed_metadata.air_time.clone(),
-            home_page_url: parsed_metadata.home_page_url.clone(),
-            remote_trailers: parsed_metadata.remote_trailers.clone(),
-            production_locations: parsed_metadata.production_locations.clone(),
-            production_year: parsed_metadata
-                .production_year
-                .or_else(|| {
-                    parsed_name
-                        .premiere_date
-                        .as_deref()
-                        .and_then(crate::util::year_from_yyyy_mm_dd)
-                })
-                .or_else(|| parsed_book.as_ref().and_then(|book| book.production_year))
-                .or(audiobook_year.flatten()),
-            premiere_date: parsed_metadata
-                .premiere_date
-                .clone()
-                .or_else(|| parsed_name.premiere_date.clone()),
-            end_date: parsed_metadata.end_date.clone(),
-            runtime_ticks: parsed_metadata.runtime_ticks,
-            aspect_ratio: parsed_metadata.aspect_ratio.clone(),
-            width: parsed_metadata.width,
-            height: parsed_metadata.height,
-            has_subtitles: parsed_metadata.has_subtitles.unwrap_or(false),
-            photo_metadata: None,
-            display_order: parsed_metadata.display_order.clone(),
-            size_bytes: resolved.size_bytes,
-            season_number: parsed_book
-                .as_ref()
-                .and_then(|book| book.parent_index_number)
-                .or(season_number),
-            episode_number: parsed_book
-                .as_ref()
-                .and_then(|book| book.index_number)
-                .or(episode_number),
-            episode_number_end,
-            airs_before_episode_number: parsed_metadata.airs_before_episode_number,
-            airs_after_season_number: parsed_metadata.airs_after_season_number,
-            airs_before_season_number: parsed_metadata.airs_before_season_number,
-            series_name: parsed_metadata
-                .series_name
-                .clone()
-                .or_else(|| {
-                    parsed_book
-                        .as_ref()
-                        .and_then(|book| book.series_name.clone())
-                })
-                .or(standalone_book_series_name),
-            community_rating: parsed_metadata.community_rating,
-            critic_rating: parsed_metadata.critic_rating,
-            modified_at: resolved.modified_at,
-            created_at: parsed_metadata.created_at.unwrap_or(resolved.created_at),
-        };
-
-        let media_probe = (!is_video_stub(path)
-            && matches!(
-                item.item_type.as_str(),
-                "Audio" | "AudioBook" | "Movie" | "Episode" | "Video" | "Trailer" | "MusicVideo"
-            ))
-        .then(|| PendingMediaProbe {
-            media_path: path.to_path_buf(),
-            probe_path: probe_target_path.to_path_buf(),
-            allow_size_mismatch: is_strm_file,
-        });
-        let job = IngestJob {
-            item,
-            source_path: path.to_path_buf(),
-            parsed_metadata,
-            clear_folder_metadata: false,
-            media_probe,
-        };
-        if queue_ingest(&ingest_tx, job).await {
-            ingest_queued += 1;
-            scanned += 1;
         }
     }
 
@@ -883,6 +972,7 @@ async fn scan_root(
 fn movie_stack_part_owners(
     root: &std::path::Path,
     collection_type: &str,
+    scope_paths: Option<&[PathBuf]>,
 ) -> HashMap<PathBuf, PathBuf> {
     if collection_type != "movies" {
         return HashMap::new();
@@ -892,11 +982,14 @@ fn movie_stack_part_owners(
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|entry| !is_ignored_scan_path(entry.path()))
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
     {
         let path = entry.path();
-        if should_skip_disc_structure_entry(path, root)
+        if is_ignored_scan_path(path)
+            || !path_is_in_scan_scope(path, scope_paths)
+            || should_skip_disc_structure_entry(path, root)
             || classify_media_path(path, collection_type).as_deref() != Some("Video")
             || video_extra_type(path, false).is_some()
         {
@@ -936,6 +1029,7 @@ fn episode_version_owners(
     root: &std::path::Path,
     library_id: &str,
     collection_type: &str,
+    scope_paths: Option<&[PathBuf]>,
 ) -> HashMap<PathBuf, PathBuf> {
     if !matches!(collection_type, "tvshows" | "tv") {
         return HashMap::new();
@@ -947,11 +1041,14 @@ fn episode_version_owners(
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|entry| !is_ignored_scan_path(entry.path()))
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
     {
         let path = entry.path();
-        if classify_media_path(path, collection_type).as_deref() != Some("Episode")
+        if is_ignored_scan_path(path)
+            || !path_is_in_scan_scope(path, scope_paths)
+            || classify_media_path(path, collection_type).as_deref() != Some("Episode")
             || video_extra_type(path, false).is_some()
         {
             continue;
@@ -1036,6 +1133,32 @@ fn video_version_rank(version: Option<&str>) -> i64 {
         }
     }
     0
+}
+
+pub(crate) fn is_ignored_scan_path(path: &std::path::Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == std::ffi::OsStr::new(".oani-download-tmp"))
+}
+
+fn item_requires_ingest(
+    item: &ScannedMediaItem,
+    existing_media: &HashMap<String, ExistingMediaState>,
+) -> bool {
+    existing_media.get(&item.path).is_none_or(|existing| {
+        // STRM ingestion replaces the source-file size with the resolved media size after
+        // probing. Comparing that value with the tiny STRM text file would make every
+        // unchanged STRM look modified on the next full scan. Its mtime is the stable source
+        // fingerprint; a changed STRM gets a new mtime and is still re-ingested.
+        let source_size_changed = !item.path.to_ascii_lowercase().ends_with(".strm")
+            && existing.size_bytes != item.size_bytes;
+        existing.item_type != item.item_type
+            || existing.modified_at != item.modified_at
+            || source_size_changed
+    })
+}
+
+fn path_is_in_scan_scope(path: &std::path::Path, scope_paths: Option<&[PathBuf]>) -> bool {
+    scope_paths.is_none_or(|scopes| scopes.iter().any(|scope| path.starts_with(scope)))
 }
 
 async fn queue_ingest(ingest_tx: &mpsc::Sender<IngestJob>, job: IngestJob) -> bool {
@@ -1608,6 +1731,30 @@ async fn run_post_scan_metadata_tasks(
     if !api_key.is_empty() {
         let tmdb_base_url = tmdb_proxy_url.read().await.clone();
         let tmdb_client = tmdb_http_client.read().await.clone();
+        // Incremental scans (for example, a new folder appearing in a watched
+        // cloud root) do not go through the one-time startup backfill in
+        // `main.rs`.  Resolve newly-created Movie/Series rows before provider
+        // reconciliation; otherwise a matching item with a missing TMDb ID is
+        // invisible to the duplicate grouping pass and remains as a second
+        // top-level entry.
+        match crate::library::tmdb_metadata::fill_missing_tmdb(
+            db,
+            api_key,
+            &tmdb_client,
+            tmdb_base_url.as_deref(),
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                "post-scan TMDb backfill matched {n} newly discovered Movie/Series item(s)"
+            ),
+            Err(error) => tracing::warn!(
+                "post-scan TMDb backfill failed: {}",
+                crate::library::tmdb_metadata::redact_tmdb_error(&error)
+            ),
+        }
+
         match crate::library::tmdb_metadata::batch_fetch_episode_tmdb(
             db,
             api_key,
@@ -1629,6 +1776,17 @@ async fn run_post_scan_metadata_tasks(
         crate::library::douban_metadata::fill_missing_douban(db, douban_cookie).await
     {
         tracing::warn!("Douban metadata fetch failed: {error:#}");
+    }
+
+    match crate::library::reconcile::reconcile_provider_duplicates(db).await {
+        Ok(stats) if stats.changed() => tracing::info!(
+            "provider reconciliation merged {} series and {} movie version(s); normalized {} series date range(s)",
+            stats.merged_series,
+            stats.merged_versions,
+            stats.normalized_series_dates,
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!("provider reconciliation failed: {error:#}"),
     }
 }
 
@@ -2314,20 +2472,80 @@ async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String, S
         .collect())
 }
 
+async fn load_existing_media_state(
+    db: &sea_orm::DatabaseConnection,
+    roots: &[ScanRootRequest],
+) -> anyhow::Result<HashMap<String, ExistingMediaState>> {
+    let mut library_ids = roots
+        .iter()
+        .map(|root| root.library_id.clone())
+        .collect::<Vec<_>>();
+    library_ids.sort();
+    library_ids.dedup();
+    if library_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let items = MediaItems::find()
+        .filter(media_items::Column::LibraryId.is_in(library_ids))
+        .all(db)
+        .await
+        .context("failed to load existing media index")?;
+    Ok(items
+        .into_iter()
+        .map(|item| {
+            (
+                item.path,
+                ExistingMediaState {
+                    item_type: item.item_type,
+                    modified_at: item.modified_at,
+                    size_bytes: item.size_bytes,
+                },
+            )
+        })
+        .collect())
+}
+
 fn media_probe_concurrency() -> usize {
-    (crate::db::cpu_parallelism() / 4).clamp(1, 3)
+    configured_concurrency(
+        "JELLYFIN_RS_MEDIA_PROBE_CONCURRENCY",
+        (crate::db::cpu_parallelism() / 4).clamp(1, 3),
+        1,
+        4,
+    )
 }
 
 fn scan_root_concurrency() -> usize {
-    (crate::db::cpu_parallelism() / 4).clamp(1, 2)
+    configured_concurrency(
+        "JELLYFIN_RS_SCAN_ROOT_CONCURRENCY",
+        (crate::db::cpu_parallelism() / 4).clamp(1, 2),
+        1,
+        4,
+    )
 }
 
 fn ingest_concurrency() -> usize {
-    crate::db::cpu_parallelism().clamp(1, 2)
+    configured_concurrency(
+        "JELLYFIN_RS_INGEST_CONCURRENCY",
+        crate::db::cpu_parallelism().clamp(1, 2),
+        1,
+        4,
+    )
 }
 
 fn metadata_fetch_concurrency() -> usize {
-    crate::db::cpu_parallelism().clamp(1, 2)
+    configured_concurrency(
+        "JELLYFIN_RS_METADATA_CONCURRENCY",
+        crate::db::cpu_parallelism().clamp(1, 2),
+        1,
+        4,
+    )
+}
+
+fn configured_concurrency(key: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map_or(default, |value| value.clamp(min, max))
 }
 
 fn ingest_queue_capacity() -> usize {
@@ -2391,7 +2609,7 @@ mod tests {
         fs::write(&cd1, []).unwrap();
         fs::write(&cd2, []).unwrap();
 
-        let owners = movie_stack_part_owners(&root, "movies");
+        let owners = movie_stack_part_owners(&root, "movies", None);
         assert_eq!(owners.get(&cd2), Some(&cd1));
         assert!(!owners.contains_key(&cd1));
 
@@ -2606,7 +2824,55 @@ mod tests {
         let selected = select_media_roots(roots, &["/media/tv-xunlei".to_string()]);
 
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].0, PathBuf::from("/media/tv-xunlei"));
+        assert_eq!(selected[0].root, PathBuf::from("/media/tv-xunlei"));
+        assert!(selected[0].scope_paths.is_none());
+
+        let roots = vec![(
+            PathBuf::from("/media/tv-xunlei"),
+            "tv".to_string(),
+            "tvshows".to_string(),
+            true,
+        )];
+        let selected = select_media_roots(roots, &["/media/tv-xunlei/Show".to_string()]);
+        assert_eq!(
+            selected[0].scope_paths,
+            Some(vec![PathBuf::from("/media/tv-xunlei/Show")])
+        );
+    }
+
+    #[test]
+    fn temporary_download_tree_is_ignored() {
+        assert!(is_ignored_scan_path(
+            PathBuf::from("/media/tv/.oani-download-tmp/job/movie.mkv",).as_path()
+        ));
+        assert!(!is_ignored_scan_path(
+            PathBuf::from("/media/tv/Show/Season 1/movie.strm",).as_path()
+        ));
+    }
+
+    #[test]
+    fn unchanged_strm_ignores_resolved_media_size() {
+        let item = ScannedMediaItem {
+            path: "/media/tv/Show/Season 1/E01.strm".to_string(),
+            item_type: "Episode".to_string(),
+            modified_at: 42,
+            size_bytes: Some(128),
+            ..Default::default()
+        };
+        let existing = HashMap::from([(
+            item.path.clone(),
+            ExistingMediaState {
+                item_type: "Episode".to_string(),
+                modified_at: 42,
+                size_bytes: Some(700_000_000),
+            },
+        )]);
+
+        assert!(!item_requires_ingest(&item, &existing));
+
+        let mut changed = item;
+        changed.modified_at = 43;
+        assert!(item_requires_ingest(&changed, &existing));
     }
 
     #[test]
@@ -2703,6 +2969,8 @@ mod tests {
             "tv".to_string(),
             "tvshows".to_string(),
             true,
+            None,
+            HashMap::new(),
             tx,
         )
         .await
@@ -2737,6 +3005,8 @@ mod tests {
             "tv".to_string(),
             "tvshows".to_string(),
             true,
+            None,
+            HashMap::new(),
             tx,
         )
         .await
@@ -2793,6 +3063,8 @@ mod tests {
             "movies".to_string(),
             "movies".to_string(),
             true,
+            None,
+            HashMap::new(),
             tx,
         )
         .await
@@ -2858,6 +3130,8 @@ mod tests {
             "movies".to_string(),
             "movies".to_string(),
             true,
+            None,
+            HashMap::new(),
             tx,
         )
         .await
@@ -3123,6 +3397,8 @@ mod tests {
             library_id.to_string(),
             collection.to_string(),
             enable_photos,
+            None,
+            HashMap::new(),
             tx,
         )
         .await

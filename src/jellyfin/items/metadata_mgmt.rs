@@ -1286,17 +1286,16 @@ async fn merge_versions_inner(
     }
 
     let first = &items[0];
-    let target_parent = if first.parent_id.is_empty() || first.parent_id == first.id {
-        first.id.clone()
-    } else {
-        first.parent_id.clone()
-    };
-
     let now = now_unix();
     for id in &item_ids[1..] {
         if let Some(item) = MediaItems::find_by_id(id.clone()).one(db).await? {
             let mut active: media_items::ActiveModel = item.into();
-            active.parent_id = Set(target_parent.clone());
+            // A merged version is a child of the selected primary item.  The
+            // old code used the primary item's folder, which made both files
+            // appear as separate movies/episodes to clients.
+            active.parent_id = Set(first.id.clone());
+            active.item_type = Set("Video".to_string());
+            active.is_folder = Set(0);
             active.updated_at = Set(now);
             active
                 .update(db)
@@ -2282,7 +2281,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(item.parent_id, "movie");
+        assert_eq!(item.parent_id, "v1");
+        assert_eq!(item.item_type, "Video");
         assert_eq!(
             merge_versions_inner(&state.db, &["v1".to_string(), "missing".to_string()])
                 .await

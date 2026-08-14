@@ -77,13 +77,17 @@ async fn watch_loop(state: Arc<AppState>) -> anyhow::Result<()> {
                 info!("file change detected, scheduling scan after debounce...");
                 let state = state.clone();
                 let flag = scan_triggered.clone();
-                let changed_roots = library_roots_for_changed_paths(&paths, &changed_paths);
+                let changed_scopes = scan_scopes_for_changed_paths(&paths, &changed_paths);
+                if changed_scopes.is_empty() {
+                    *flag.lock().await = false;
+                    continue;
+                }
                 tokio::spawn(async move {
                     tokio::time::sleep(debounce).await;
                     run_scheduled_scan_when_idle(
                         &state,
                         "file watcher trigger",
-                        Some(&changed_roots),
+                        Some(&changed_scopes),
                     )
                     .await;
                     let mut triggered = flag.lock().await;
@@ -134,16 +138,20 @@ async fn poll_loop(state: Arc<AppState>) {
             if *previous != current_snapshot {
                 info!("media directory change detected by polling; waiting for changes to settle");
                 tokio::time::sleep(debounce).await;
-                match media_tree_snapshot(paths).await {
+                match media_tree_snapshot(paths.clone()).await {
                     Ok(settled_snapshot) => {
                         if settled_snapshot == current_snapshot {
-                            if run_scheduled_scan_when_idle(
-                                &state,
-                                "file watcher polling fallback",
-                                None,
-                            )
-                            .await
-                            {
+                            let changed_paths = changed_snapshot_paths(previous, &settled_snapshot);
+                            let changed_scopes =
+                                scan_scopes_for_changed_paths(&paths, &changed_paths);
+                            let scan_succeeded = !changed_scopes.is_empty()
+                                && run_scheduled_scan_when_idle(
+                                    &state,
+                                    "file watcher polling fallback",
+                                    Some(&changed_scopes),
+                                )
+                                .await;
+                            if changed_scopes.is_empty() || scan_succeeded {
                                 previous_snapshot = Some(settled_snapshot);
                             }
                         } else {
@@ -200,21 +208,62 @@ async fn run_scheduled_scan_when_idle(
     }
 }
 
-fn library_roots_for_changed_paths(
+fn scan_scopes_for_changed_paths(
     library_paths: &[String],
     changed_paths: &[PathBuf],
 ) -> Vec<String> {
     let mut roots = HashSet::new();
     for changed_path in changed_paths {
+        if crate::library::scanner::is_ignored_scan_path(changed_path) {
+            continue;
+        }
         for library_path in library_paths {
-            if changed_path.starts_with(Path::new(library_path)) {
-                roots.insert(library_path.clone());
+            let library_root = Path::new(library_path);
+            if !changed_path.starts_with(library_root) {
+                continue;
             }
+            let scope = top_level_scan_scope(library_root, changed_path);
+            roots.insert(scope.to_string_lossy().to_string());
         }
     }
     let mut roots = roots.into_iter().collect::<Vec<_>>();
     roots.sort();
     roots
+}
+
+fn top_level_scan_scope(library_root: &Path, changed_path: &Path) -> PathBuf {
+    let Ok(relative) = changed_path.strip_prefix(library_root) else {
+        return library_root.to_path_buf();
+    };
+    let Some(first) = relative.components().next() else {
+        return library_root.to_path_buf();
+    };
+    library_root.join(first.as_os_str())
+}
+
+fn changed_snapshot_paths(
+    previous: &MediaTreeSnapshot,
+    current: &MediaTreeSnapshot,
+) -> Vec<PathBuf> {
+    let previous = previous
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), (file.len, file.modified_at_nanos)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let current = current
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), (file.len, file.modified_at_nanos)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut changed = previous
+        .keys()
+        .chain(current.keys())
+        .filter(|path| previous.get(*path) != current.get(*path))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed.dedup();
+    changed
 }
 
 fn is_relevant(event: &Event) -> bool {
@@ -282,7 +331,10 @@ fn media_tree_snapshot_blocking(paths: &[String]) -> anyhow::Result<MediaTreeSna
                     continue;
                 }
             };
-            if !entry.file_type().is_file() || !is_snapshot_relevant(entry.path()) {
+            if !entry.file_type().is_file()
+                || crate::library::scanner::is_ignored_scan_path(entry.path())
+                || !is_snapshot_relevant(entry.path())
+            {
                 continue;
             }
             let metadata = match entry.metadata() {
@@ -402,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_file_is_mapped_to_its_library_root() {
+    fn changed_file_is_mapped_to_its_scan_scope() {
         let library_paths = vec![
             "/media/tv-domestic".to_string(),
             "/media/tv-xunlei".to_string(),
@@ -412,8 +464,18 @@ mod tests {
         )];
 
         assert_eq!(
-            library_roots_for_changed_paths(&library_paths, &changed_paths),
-            vec!["/media/tv-xunlei".to_string()]
+            scan_scopes_for_changed_paths(&library_paths, &changed_paths),
+            vec!["/media/tv-xunlei/Home Temptation".to_string()]
+        );
+    }
+
+    #[test]
+    fn nested_episode_change_scans_the_series_directory() {
+        let root = Path::new("/media/tv-xunlei");
+        let changed = Path::new("/media/tv-xunlei/Home Temptation/Season 1/E01.strm");
+        assert_eq!(
+            top_level_scan_scope(root, changed),
+            PathBuf::from("/media/tv-xunlei/Home Temptation")
         );
     }
 }

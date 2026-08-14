@@ -448,7 +448,9 @@ async fn serve_item_image(
     }
 
     let path = model.path.unwrap_or_default();
-    if !image_storage_path_allowed(&path) {
+    if !image_storage_path_allowed(&path)
+        && !crate::playback::streaming::readable_media_path(db, &path).await
+    {
         return StatusCode::NOT_FOUND.into_response();
     }
     if image_format_from_query(query).is_none()
@@ -697,7 +699,9 @@ async fn collage_source_images(
         let Some(path) = row.get_opt_str("path")? else {
             continue;
         };
-        if image_storage_path_allowed(&path) {
+        if image_storage_path_allowed(&path)
+            || crate::playback::streaming::readable_media_path(db, &path).await
+        {
             if let Ok(bytes) = tokio::fs::read(&path).await {
                 images.push(bytes);
             }

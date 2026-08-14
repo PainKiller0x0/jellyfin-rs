@@ -156,6 +156,25 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Name-based backfill can make a previously ungroupable item
+            // identifiable (for example, a new Xunlei copy whose folder name
+            // differs from the existing Quark copy). Reconcile immediately so
+            // startup does not leave two top-level entries until the next scan.
+            match library::reconcile::reconcile_provider_duplicates(&metadata_db).await {
+                Ok(stats) if stats.changed() => {
+                    tracing::info!(
+                        "startup provider reconciliation merged {} series, {} movies, and {} versions",
+                        stats.merged_series,
+                        stats.merged_movies,
+                        stats.merged_versions
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("startup provider reconciliation failed: {e:#}");
+                }
+            }
+
             // Repair existing wrong matches as well as missing matches. This
             // is conservative: the resolver only selects IDs returned by
             // TMDb, and locked/manual items are skipped.

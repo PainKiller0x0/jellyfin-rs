@@ -124,6 +124,9 @@ pub async fn playback_info(
             if let Some(max_streaming_bitrate) = max_streaming_bitrate {
                 apply_max_streaming_bitrate_to_sources(&mut media_sources, max_streaming_bitrate);
             }
+            if query_flag(&query, "JellyfinRsProxy") {
+                rewrite_media_sources_for_server_proxy(&mut media_sources, &item.id);
+            }
             if let Err(error) = super::apply_user_stream_preferences_to_sources(
                 &state.db,
                 &user_id,
@@ -145,6 +148,52 @@ pub async fn playback_info(
         )
         .into_response(),
         Err(error) => internal_error(error),
+    }
+}
+
+fn query_flag(query: &HashMap<String, String>, key: &str) -> bool {
+    query.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case(key)
+            && matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+    })
+}
+
+fn rewrite_media_sources_for_server_proxy(media_sources: &mut [JsonValue], item_id: &str) {
+    for source in media_sources {
+        let Some(object) = source.as_object_mut() else {
+            continue;
+        };
+        let source_id = object
+            .get("Id")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(item_id);
+        let container = object
+            .get("Container")
+            .and_then(JsonValue::as_str)
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 12
+                    && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .unwrap_or("mp4");
+        let stream_path = if source_id == item_id {
+            format!("/Videos/{item_id}/stream.{container}")
+        } else {
+            format!("/Videos/{item_id}/{source_id}/stream.{container}")
+        };
+        object.insert(
+            "DirectStreamUrl".to_string(),
+            JsonValue::String(format!("{stream_path}?JellyfinRsProxy=1")),
+        );
+        object.insert(
+            "Protocol".to_string(),
+            JsonValue::String("Http".to_string()),
+        );
+        object.insert("IsRemote".to_string(), JsonValue::Bool(false));
     }
 }
 
@@ -1530,8 +1579,8 @@ mod tests {
     use super::{
         PlaybackEvent, PlaybackSessionUpdateError, append_access_token_to_media_sources,
         apply_max_streaming_bitrate_to_sources, current_user_playing_item_start,
-        playback_max_streaming_bitrate, update_playback_session, watch_delta_seconds,
-        watch_segment_day_slices,
+        playback_max_streaming_bitrate, query_flag, rewrite_media_sources_for_server_proxy,
+        update_playback_session, watch_delta_seconds, watch_segment_day_slices,
     };
     use crate::app::state::{AppState, PlaybackSession};
     use crate::entities::{
@@ -1570,6 +1619,31 @@ mod tests {
             sources[0]["MediaAttachments"][0]["DeliveryUrl"],
             "/Videos/video/video/Attachments/5?api_key=token%201"
         );
+    }
+
+    #[test]
+    fn server_proxy_rewrites_remote_media_sources_to_stream_route() {
+        let mut sources = vec![serde_json::json!({
+            "Id": "version-2",
+            "DirectStreamUrl": "https://smartstrm.example/video.mp4",
+            "Protocol": "Http",
+            "IsRemote": true
+        })];
+        rewrite_media_sources_for_server_proxy(&mut sources, "episode-1");
+        assert_eq!(
+            sources[0]["DirectStreamUrl"],
+            "/Videos/episode-1/version-2/stream.mp4?JellyfinRsProxy=1"
+        );
+        assert_eq!(sources[0]["Protocol"], "Http");
+        assert_eq!(sources[0]["IsRemote"], false);
+    }
+
+    #[test]
+    fn server_proxy_flag_accepts_case_insensitive_boolean_values() {
+        let mut query = HashMap::from([(String::from("jellyfinrsproxy"), String::from("YES"))]);
+        assert!(query_flag(&query, "JellyfinRsProxy"));
+        query.insert("jellyfinrsproxy".into(), "0".into());
+        assert!(!query_flag(&query, "JellyfinRsProxy"));
     }
 
     #[test]

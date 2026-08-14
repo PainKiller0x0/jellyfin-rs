@@ -2555,26 +2555,50 @@ async fn lookup_tmdb_id_by_name(
         tmdb_base_url,
         if is_tv { "search/tv" } else { "search/movie" },
     );
-    let mut request = client.get(&url).query(&[
-        ("api_key", api_key),
-        ("query", name),
-        ("language", language),
-    ]);
-    let year_param: String;
-    if let Some(year) = year {
-        year_param = year.to_string();
-        let key = if is_tv { "first_air_date_year" } else { "year" };
-        request = request.query(&[(key, year_param.as_str())]);
+    let year_param = year.map(|value| value.to_string());
+    let year_key = if is_tv { "first_air_date_year" } else { "year" };
+    let mut results = Vec::new();
+    for query in tmdb_search_query_variants(name) {
+        // When a bilingual filename falls back to an ASCII/Latin title, ask
+        // TMDb for an English response as well. Otherwise a zh-CN response can
+        // contain only the localized title, leaving no shared tokens with the
+        // Latin part of the original folder name.
+        let query_language = if query != name && query.is_ascii() {
+            "en-US"
+        } else {
+            language
+        };
+        let mut request = client.get(&url).query(&[
+            ("api_key", api_key),
+            ("query", query.as_str()),
+            ("language", query_language),
+        ]);
+        if let Some(year_param) = year_param.as_deref() {
+            request = request.query(&[(year_key, year_param)]);
+        }
+        let response = request
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<serde_json::Value>()
+            .await?;
+        let Some(query_results) = response.get("results").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if query_results.is_empty() {
+            continue;
+        }
+        if query != name {
+            tracing::debug!(
+                "TMDb name search fell back from '{name}' to the shorter query '{query}'"
+            );
+        }
+        results.extend(query_results.iter().cloned());
+        break;
     }
-    let response = request
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<serde_json::Value>()
-        .await?;
-    let Some(results) = response.get("results").and_then(|v| v.as_array()) else {
+    if results.is_empty() {
         return Ok(None);
-    };
+    }
 
     // TMDb's result order is popularity-oriented, not filename-oriented. Taking
     // results[0] is therefore unsafe for localized titles, remakes, specials and
@@ -2671,6 +2695,43 @@ async fn lookup_tmdb_id_by_name(
         best.candidate_year
     );
     Ok(Some(best.id.to_string()))
+}
+
+/// Return conservative fallback queries for noisy or bilingual folder names.
+///
+/// TMDb can return no results for a filename-style title such as
+/// `Clevatess II-魔兽之王与虚假的勇者传承`, while the actual searchable title
+/// is simply `Clevatess`. Keep the full title first, then try the parts before
+/// common subtitle separators and meaningful Latin tokens. The caller still
+/// scores the returned candidates against the original title and year, so this
+/// only broadens discovery; it does not weaken the confidence check.
+fn tmdb_search_query_variants(name: &str) -> Vec<String> {
+    let mut variants = Vec::new();
+    let mut push_unique = |value: &str| {
+        let value = value.trim();
+        if value.chars().count() >= 3
+            && !variants
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(value))
+        {
+            variants.push(value.to_string());
+        }
+    };
+
+    push_unique(name);
+    for segment in name.split(['-', '–', '—', ':', '：', '/', '|']) {
+        push_unique(segment);
+        for token in segment.split_whitespace() {
+            let latin_len = token
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric())
+                .count();
+            if latin_len >= 4 && token.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+                push_unique(token);
+            }
+        }
+    }
+    variants
 }
 
 /// Retry a failed name lookup after asking the configured LLM to remove
@@ -4488,7 +4549,7 @@ mod tests {
         parse_season_number, redact_tmdb_api_key, resolve_tmdb_episode_group_mapping,
         should_skip_name_based_tmdb_lookup, tmdb_candidate_score, tmdb_credit_people,
         tmdb_episode_group_type, tmdb_episode_response_for_target, tmdb_find_result_id,
-        tmdb_title_match_score, upsert_tmdb_people,
+        tmdb_search_query_variants, tmdb_title_match_score, upsert_tmdb_people,
     };
     use crate::{
         entities::{
@@ -4928,6 +4989,27 @@ mod tests {
         assert_eq!(tmdb_title_match_score("Black Mirror", "Black Mirror"), 100);
         assert_eq!(tmdb_candidate_score(100, Some(2022), Some(2022)), 135);
         assert_eq!(tmdb_candidate_score(100, Some(2022), Some(1950)), 70);
+    }
+
+    #[test]
+    fn tmdb_search_variants_strip_bilingual_subtitles() {
+        assert_eq!(
+            tmdb_search_query_variants("Clevatess II-魔兽之王与虚假的勇者传承"),
+            vec![
+                "Clevatess II-魔兽之王与虚假的勇者传承",
+                "Clevatess II",
+                "Clevatess",
+                "魔兽之王与虚假的勇者传承",
+            ]
+        );
+        assert_eq!(
+            tmdb_search_query_variants("克雷瓦提斯-魔兽之王与婴儿与尸之勇者"),
+            vec![
+                "克雷瓦提斯-魔兽之王与婴儿与尸之勇者",
+                "克雷瓦提斯",
+                "魔兽之王与婴儿与尸之勇者",
+            ]
+        );
     }
 
     #[test]

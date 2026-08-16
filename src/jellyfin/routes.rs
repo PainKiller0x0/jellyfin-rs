@@ -245,6 +245,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(system::update_tmdb_api_key),
         )
         .route(
+            "/System/Configuration/TmdbEnabled",
+            post(system::update_tmdb_provider_enabled),
+        )
+        .route(
             "/System/Configuration/TmdbProxyUrl",
             post(system::update_tmdb_proxy_url),
         )
@@ -259,6 +263,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route(
             "/System/Configuration/DoubanCookie",
             post(system::update_douban_cookie),
+        )
+        .route(
+            "/System/Configuration/DoubanEnabled",
+            post(system::update_douban_provider_enabled),
         )
         .route("/Devices/Info", get(system::device_info))
         .route("/Auth/Providers", get(auth::auth_providers))

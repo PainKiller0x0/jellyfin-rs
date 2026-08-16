@@ -30,6 +30,14 @@ export function updateTmdbProxyUrl(token: string, proxyUrl: string) {
   });
 }
 
+export function updateTmdbProviderEnabled(token: string, enabled: boolean) {
+  return request<void>('/System/Configuration/TmdbEnabled', {
+    method: 'POST',
+    token,
+    body: { Enabled: enabled }
+  });
+}
+
 export function tmdbLlmConfiguration(token: string) {
   return request<TmdbLlmConfiguration>('/Tmdb/LlmConfiguration', { token });
 }
@@ -68,6 +76,14 @@ export function updateDoubanCookie(token: string, cookie: string) {
     body: {
       DoubanCookie: cookie
     }
+  });
+}
+
+export function updateDoubanProviderEnabled(token: string, enabled: boolean) {
+  return request<void>('/System/Configuration/DoubanEnabled', {
+    method: 'POST',
+    token,
+    body: { Enabled: enabled }
   });
 }
 

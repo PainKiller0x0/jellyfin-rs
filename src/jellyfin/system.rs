@@ -876,15 +876,17 @@ pub async fn utc_time() -> impl IntoResponse {
 }
 
 pub async fn tmdb_client_configuration(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let enabled = state
+    let has_api_key = state
         .tmdb_api_key
         .read()
         .await
         .as_deref()
         .is_some_and(|key| !key.is_empty());
+    let provider_enabled = crate::library::tmdb_metadata::tmdb_provider_enabled(&state.db).await;
     let proxy_url = state.tmdb_proxy_url.read().await.clone();
     Json(tmdb_client_configuration_value(
-        enabled,
+        provider_enabled,
+        has_api_key,
         proxy_url.as_deref(),
     ))
 }
@@ -1054,14 +1056,21 @@ pub async fn start_tmdb_llm_audit(State(state): State<Arc<AppState>>) -> Respons
     (StatusCode::ACCEPTED, Json(json!({ "Status": "Started" }))).into_response()
 }
 
-fn tmdb_client_configuration_value(enabled: bool, proxy_url: Option<&str>) -> JsonValue {
+fn tmdb_client_configuration_value(
+    provider_enabled: bool,
+    has_api_key: bool,
+    proxy_url: Option<&str>,
+) -> JsonValue {
     let proxy_url = proxy_url.unwrap_or_default().trim();
     let has_proxy = !proxy_url.is_empty();
+    let configured = provider_enabled && has_api_key;
     json!({
-        "IsTmdbEnabled": enabled,
-        "IsEnabled": enabled,
-        "Enabled": enabled,
-        "HasApiKey": enabled,
+        "ProviderEnabled": provider_enabled,
+        "Configured": configured,
+        "IsTmdbEnabled": configured,
+        "IsEnabled": configured,
+        "Enabled": configured,
+        "HasApiKey": has_api_key,
         "HasProxy": has_proxy,
         "ProxyUrl": proxy_url,
         "TmdbProxyUrl": proxy_url
@@ -1084,6 +1093,28 @@ pub async fn update_tmdb_api_key(
     Json(request): Json<TmdbApiKeyRequest>,
 ) -> Response {
     match state.set_tmdb_api_key(request.tmdb_api_key.trim()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MetadataProviderEnabledRequest {
+    #[serde(rename = "Enabled", alias = "enabled")]
+    enabled: bool,
+}
+
+pub async fn update_tmdb_provider_enabled(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<MetadataProviderEnabledRequest>,
+) -> Response {
+    match crate::db::settings::set(
+        &state.db,
+        crate::library::tmdb_metadata::TMDB_ENABLED_KEY,
+        if request.enabled { "true" } else { "false" },
+    )
+    .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error),
     }
@@ -1124,16 +1155,40 @@ pub async fn douban_client_configuration(State(state): State<Arc<AppState>>) -> 
         .await
         .as_deref()
         .is_some_and(|cookie| !cookie.is_empty());
-    Json(douban_client_configuration_value(has_cookie))
+    let provider_enabled =
+        crate::library::douban_metadata::douban_provider_enabled(&state.db).await;
+    Json(douban_client_configuration_value(
+        provider_enabled,
+        has_cookie,
+    ))
 }
 
-fn douban_client_configuration_value(has_cookie: bool) -> JsonValue {
+fn douban_client_configuration_value(provider_enabled: bool, has_cookie: bool) -> JsonValue {
+    let configured = provider_enabled && has_cookie;
     json!({
-        "IsDoubanEnabled": true,
-        "IsEnabled": true,
-        "Enabled": true,
+        "ProviderEnabled": provider_enabled,
+        "Configured": configured,
+        "IsDoubanEnabled": configured,
+        "IsEnabled": configured,
+        "Enabled": configured,
         "HasCookie": has_cookie
     })
+}
+
+pub async fn update_douban_provider_enabled(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<MetadataProviderEnabledRequest>,
+) -> Response {
+    match crate::db::settings::set(
+        &state.db,
+        crate::library::douban_metadata::DOUBAN_ENABLED_KEY,
+        if request.enabled { "true" } else { "false" },
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
 }
 
 #[derive(Deserialize)]
@@ -6530,7 +6585,9 @@ mod tests {
 
     #[test]
     fn tmdb_client_configuration_reports_compatible_enabled_fields() {
-        let enabled = tmdb_client_configuration_value(true, Some("https://tmdb.qb.edu.kg"));
+        let enabled = tmdb_client_configuration_value(true, true, Some("https://tmdb.qb.edu.kg"));
+        assert_eq!(enabled["ProviderEnabled"], true);
+        assert_eq!(enabled["Configured"], true);
         assert_eq!(enabled["IsTmdbEnabled"], true);
         assert_eq!(enabled["IsEnabled"], true);
         assert_eq!(enabled["Enabled"], true);
@@ -6539,13 +6596,34 @@ mod tests {
         assert_eq!(enabled["ProxyUrl"], "https://tmdb.qb.edu.kg");
         assert_eq!(enabled["TmdbProxyUrl"], "https://tmdb.qb.edu.kg");
 
-        let disabled = tmdb_client_configuration_value(false, None);
+        let disabled = tmdb_client_configuration_value(false, true, None);
+        assert_eq!(disabled["ProviderEnabled"], false);
+        assert_eq!(disabled["Configured"], false);
         assert_eq!(disabled["IsTmdbEnabled"], false);
         assert_eq!(disabled["IsEnabled"], false);
         assert_eq!(disabled["Enabled"], false);
-        assert_eq!(disabled["HasApiKey"], false);
+        assert_eq!(disabled["HasApiKey"], true);
         assert_eq!(disabled["HasProxy"], false);
         assert_eq!(disabled["ProxyUrl"], "");
+
+        let unconfigured = tmdb_client_configuration_value(true, false, None);
+        assert_eq!(unconfigured["ProviderEnabled"], true);
+        assert_eq!(unconfigured["Configured"], false);
+        assert_eq!(unconfigured["HasApiKey"], false);
+    }
+
+    #[test]
+    fn douban_client_configuration_respects_provider_switch() {
+        let enabled = super::douban_client_configuration_value(true, true);
+        assert_eq!(enabled["ProviderEnabled"], true);
+        assert_eq!(enabled["Configured"], true);
+        assert_eq!(enabled["IsDoubanEnabled"], true);
+
+        let disabled = super::douban_client_configuration_value(false, true);
+        assert_eq!(disabled["ProviderEnabled"], false);
+        assert_eq!(disabled["Configured"], false);
+        assert_eq!(disabled["HasCookie"], true);
+        assert_eq!(disabled["IsDoubanEnabled"], false);
     }
 
     #[test]

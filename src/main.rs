@@ -79,9 +79,11 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let tmdb_api_key = app::state::load_tmdb_api_key(&db).await;
+    let tmdb_provider_enabled = library::tmdb_metadata::tmdb_provider_enabled(&db).await;
     let tmdb_proxy_url = app::state::load_tmdb_proxy_url(&db).await;
     let tmdb_http_client = util::http_client().context("failed to build TMDb HTTP client")?;
     let douban_cookie = app::state::load_douban_cookie(&db).await;
+    let douban_provider_enabled = library::douban_metadata::douban_provider_enabled(&db).await;
 
     let state = Arc::new(AppState {
         user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, default_username.as_bytes()),
@@ -132,7 +134,9 @@ async fn main() -> anyhow::Result<()> {
         });
     let run_startup_metadata_backfill = !startup_backfill_completed || startup_backfill_forced;
     if run_startup_metadata_backfill {
-        if let Some(api_key) = state
+        if !tmdb_provider_enabled {
+            tracing::info!("startup TMDb metadata backfill skipped: TMDb provider is disabled");
+        } else if let Some(api_key) = state
             .tmdb_api_key
             .read()
             .await
@@ -191,26 +195,35 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Repair existing wrong matches as well as missing matches. This
-                // is conservative: the resolver only selects IDs returned by
-                // TMDb, and locked/manual items are skipped.
-                match library::tmdb_metadata::audit_existing_tmdb(
-                    &metadata_db,
-                    &api_key,
-                    &tmdb_client,
-                    tmdb_base_url.as_deref(),
-                )
-                .await
-                {
-                    Ok(0) => {
-                        tracing::info!("No existing TMDb matches needed LLM audit");
+                let llm_config = library::tmdb_metadata::load_tmdb_llm_config(&metadata_db).await;
+                if llm_config.configured() {
+                    // Repair existing wrong matches as well as missing matches. This
+                    // is conservative: the resolver only selects IDs returned by
+                    // TMDb, and locked/manual items are skipped.
+                    match library::tmdb_metadata::audit_existing_tmdb(
+                        &metadata_db,
+                        &api_key,
+                        &tmdb_client,
+                        tmdb_base_url.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(0) => {
+                            tracing::info!("No existing TMDb matches needed LLM audit");
+                        }
+                        Ok(n) => {
+                            tracing::info!(
+                                "Audited and repaired/refreshed {n} existing TMDb item(s)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("audit_existing_tmdb failed: {e:#}");
+                        }
                     }
-                    Ok(n) => {
-                        tracing::info!("Audited and repaired/refreshed {n} existing TMDb item(s)");
-                    }
-                    Err(e) => {
-                        tracing::warn!("audit_existing_tmdb failed: {e:#}");
-                    }
+                } else {
+                    tracing::info!(
+                        "startup TMDb LLM audit skipped: LLM API key/base URL is not configured"
+                    );
                 }
 
                 match library::tmdb_metadata::refresh_existing_tmdb_titles(
@@ -283,12 +296,14 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             });
+        } else {
+            tracing::info!("startup TMDb metadata backfill skipped: no TMDb API key configured");
         }
     } else {
         tracing::info!("startup metadata backfill skipped; library is already initialized");
     }
 
-    if run_startup_metadata_backfill {
+    if run_startup_metadata_backfill && douban_provider_enabled {
         let douban_state = state.clone();
         let douban_database_url = database_url.clone();
         tokio::spawn(async move {
@@ -301,13 +316,20 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             let cookie = douban_state.douban_cookie.read().await.clone();
-            match library::douban_metadata::fill_missing_douban(&douban_db, cookie.as_deref()).await
-            {
+            let Some(cookie) = cookie.filter(|value| !value.trim().is_empty()) else {
+                tracing::info!(
+                    "background Douban metadata task skipped: no Douban cookie configured"
+                );
+                return;
+            };
+            match library::douban_metadata::fill_missing_douban(&douban_db, Some(&cookie)).await {
                 Ok(0) => tracing::info!("No missing Douban metadata to fill"),
                 Ok(n) => tracing::info!("Filled Douban metadata for {n} items via name search"),
                 Err(e) => tracing::warn!("fill_missing_douban failed: {e:#}"),
             }
         });
+    } else if run_startup_metadata_backfill {
+        tracing::info!("startup Douban metadata backfill skipped: Douban provider is disabled");
     }
 
     let api_routes = jellyfin::routes::api_routes().route_layer(

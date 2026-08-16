@@ -37,6 +37,7 @@ static EPISODE_GROUP_CACHE: OnceLock<Mutex<HashMap<String, EpisodeGroupCacheCell
     OnceLock::new();
 const MAX_EPISODE_GROUP_CACHE_ENTRIES: usize = 512;
 const TMDB_API_KEY_QUERY: &str = "api_key=";
+pub(crate) const TMDB_ENABLED_KEY: &str = "tmdb_enabled";
 const TMDB_TITLE_BACKFILL_KEY: &str = "tmdb_title_backfill_v1_completed";
 pub(crate) const TMDB_LLM_AUDIT_KEY: &str = "tmdb_llm_audit_v1_completed";
 pub(crate) const TMDB_LLM_ENABLED_KEY: &str = "tmdb_llm_enabled";
@@ -91,6 +92,10 @@ pub(crate) async fn load_tmdb_llm_config(db: &DatabaseConnection) -> TmdbLlmConf
         model: crate::db::settings::get_non_empty_or_default(db, TMDB_LLM_MODEL_KEY, &env_model)
             .await,
     }
+}
+
+pub(crate) async fn tmdb_provider_enabled(db: &DatabaseConnection) -> bool {
+    crate::db::settings::get_bool(db, TMDB_ENABLED_KEY, true).await
 }
 
 pub(crate) async fn tmdb_llm_configuration_value(db: &DatabaseConnection) -> JsonValue {
@@ -1716,6 +1721,11 @@ pub async fn batch_fetch_episode_tmdb(
     client: &reqwest::Client,
     tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<usize> {
+    if api_key.trim().is_empty() {
+        tracing::info!("episode TMDb batch skipped: no TMDb API key configured");
+        return Ok(0);
+    }
+
     let lock = EPISODE_TMDB_BATCH_LOCK.get_or_init(|| Mutex::new(()));
     let Ok(_guard) = lock.try_lock() else {
         tracing::info!("Episode TMDb batch already running; skipping overlapping request");
@@ -3028,6 +3038,11 @@ pub async fn fill_missing_tmdb(
     client: &reqwest::Client,
     tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<usize> {
+    if api_key.trim().is_empty() {
+        tracing::info!("missing TMDb backfill skipped: no TMDb API key configured");
+        return Ok(0);
+    }
+
     let rows = db.query_all_raw(crate::db::helpers::pg_statement(
         r#"SELECT mi.id, mi.title, mi.path, mi.item_type FROM media_items mi WHERE mi.item_type IN ('Movie', 'Series') AND mi.lock_data = 0 AND NOT EXISTS (SELECT 1 FROM provider_ids p WHERE p.item_id = mi.id AND p.provider = 'Tmdb')"#,
         vec![],
@@ -3120,6 +3135,16 @@ pub async fn audit_existing_tmdb(
     client: &reqwest::Client,
     tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<usize> {
+    if api_key.trim().is_empty() {
+        tracing::info!("TMDb LLM audit skipped: no TMDb API key configured");
+        return Ok(0);
+    }
+    let llm_config = load_tmdb_llm_config(db).await;
+    if !llm_config.configured() {
+        tracing::info!("TMDb LLM audit skipped: LLM is not configured");
+        return Ok(0);
+    }
+
     let audit_lock = TMDB_LLM_AUDIT_LOCK.get_or_init(|| Mutex::new(()));
     let _audit_guard = audit_lock.lock().await;
     if !env_flag("JELLYFIN_RS_TMDB_LLM_AUDIT_FORCE")
@@ -3161,7 +3186,6 @@ pub async fn audit_existing_tmdb(
     }
 
     let total = rows.len();
-    let llm_config = load_tmdb_llm_config(db).await;
     tracing::info!(
         "audit_existing_tmdb: checking {total} Movie/Series item(s) (llm_configured={})",
         llm_config.configured()
@@ -3297,6 +3321,11 @@ pub async fn refresh_existing_tmdb_titles(
     client: &reqwest::Client,
     tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<usize> {
+    if api_key.trim().is_empty() {
+        tracing::info!("TMDb title backfill skipped: no TMDb API key configured");
+        return Ok(0);
+    }
+
     if app_setting_is_true(db, TMDB_TITLE_BACKFILL_KEY).await? {
         return Ok(0);
     }
@@ -4516,6 +4545,11 @@ pub async fn batch_fetch_person_tmdb(
     client: &reqwest::Client,
     tmdb_base_url: Option<&str>,
 ) -> anyhow::Result<usize> {
+    if api_key.trim().is_empty() {
+        tracing::info!("TMDb person backfill skipped: no TMDb API key configured");
+        return Ok(0);
+    }
+
     let people = People::find()
         .all(db)
         .await

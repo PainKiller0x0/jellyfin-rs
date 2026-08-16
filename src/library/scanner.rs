@@ -396,8 +396,20 @@ async fn scan_media_roots_if_idle(
     );
     let mut tasks = tokio::task::JoinSet::new();
     let root_concurrency = scan_root_concurrency();
-    let api_key = state.tmdb_api_key.read().await.clone().unwrap_or_default();
-    let douban_cookie = state.douban_cookie.read().await.clone();
+    let tmdb_enabled = crate::library::tmdb_metadata::tmdb_provider_enabled(&scan_db).await;
+    let api_key = if tmdb_enabled {
+        state.tmdb_api_key.read().await.clone().unwrap_or_default()
+    } else {
+        tracing::info!("TMDb metadata disabled by provider setting for this scan");
+        String::new()
+    };
+    let douban_enabled = crate::library::douban_metadata::douban_provider_enabled(&scan_db).await;
+    let douban_cookie = if douban_enabled {
+        state.douban_cookie.read().await.clone()
+    } else {
+        tracing::info!("Douban metadata disabled by provider setting for this scan");
+        None
+    };
     let tmdb_library_options =
         crate::library::tmdb_metadata::load_tmdb_library_provider_options(&scan_db).await?;
     let metadata_pipeline = start_metadata_fetch_pipeline(

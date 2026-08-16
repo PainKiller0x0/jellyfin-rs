@@ -21,20 +21,24 @@ const authStore = useAuthStore();
 const loading = ref(false);
 const savingServerName = ref(false);
 const savingTmdb = ref(false);
+const savingTmdbProvider = ref(false);
 const savingTmdbProxy = ref(false);
 const savingTmdbLlm = ref(false);
 const runningTmdbLlmAudit = ref(false);
 const savingDouban = ref(false);
+const savingDoubanProvider = ref(false);
 const savingApiKey = ref(false);
 const apiKeyDialogVisible = ref(false);
 const serverName = ref('');
 const tmdbApiKey = ref('');
 const tmdbProxyUrl = ref('');
+const tmdbProviderEnabled = ref(true);
 const tmdbLlmEnabled = ref(false);
 const tmdbLlmApiKey = ref('');
 const tmdbLlmBaseUrl = ref('');
 const tmdbLlmModel = ref('');
 const doubanCookie = ref('');
+const doubanProviderEnabled = ref(true);
 const tmdbConfig = ref<TmdbClientConfiguration | null>(null);
 const tmdbLlmConfig = ref<TmdbLlmConfiguration | null>(null);
 const doubanConfig = ref<DoubanClientConfiguration | null>(null);
@@ -49,7 +53,8 @@ const apiKeyRules: FormRules<ApiKeyForm> = {
   appName: [{ required: true, message: '请输入应用名称', trigger: 'blur' }]
 };
 
-const tmdbEnabled = computed(() => Boolean(tmdbConfig.value?.HasApiKey || tmdbConfig.value?.IsTmdbEnabled));
+const tmdbHasApiKey = computed(() => Boolean(tmdbConfig.value?.HasApiKey));
+const tmdbEnabled = computed(() => Boolean(tmdbConfig.value?.Configured ?? (tmdbProviderEnabled.value && tmdbHasApiKey.value)));
 const tmdbHasProxy = computed(() => Boolean(tmdbConfig.value?.HasProxy));
 const tmdbLlmConfigured = computed(() => Boolean(tmdbLlmConfig.value?.Configured));
 const tmdbLlmAuditLabel = computed(() => {
@@ -65,6 +70,7 @@ const tmdbLlmAuditLabel = computed(() => {
   }
 });
 const doubanHasCookie = computed(() => Boolean(doubanConfig.value?.HasCookie));
+const doubanEnabled = computed(() => Boolean(doubanConfig.value?.Configured ?? (doubanProviderEnabled.value && doubanHasCookie.value)));
 const settingsStats = computed(() => [
   {
     label: '服务器',
@@ -73,7 +79,7 @@ const settingsStats = computed(() => [
   },
   {
     label: 'TMDb',
-    value: tmdbEnabled.value ? '已启用' : '未配置',
+    value: tmdbEnabled.value ? '已启用' : tmdbProviderEnabled.value ? '待配置' : '已关闭',
     hint: tmdbHasProxy.value ? '代理' : '元数据'
   },
   {
@@ -83,7 +89,7 @@ const settingsStats = computed(() => [
   },
   {
     label: '豆瓣',
-    value: doubanHasCookie.value ? '已配置' : '匿名',
+    value: doubanEnabled.value ? '已启用' : doubanProviderEnabled.value ? '待配置' : '已关闭',
     hint: '刮削'
   },
   {
@@ -109,12 +115,14 @@ async function loadSettings() {
     ]);
     serverName.value = system.ServerName;
     tmdbConfig.value = tmdb;
+    tmdbProviderEnabled.value = tmdb.ProviderEnabled ?? Boolean(tmdb.Enabled);
     tmdbProxyUrl.value = tmdb.ProxyUrl ?? tmdb.TmdbProxyUrl ?? '';
     tmdbLlmConfig.value = tmdbLlm;
     tmdbLlmEnabled.value = tmdbLlm.Enabled;
     tmdbLlmBaseUrl.value = tmdbLlm.BaseUrl;
     tmdbLlmModel.value = tmdbLlm.Model;
     doubanConfig.value = douban;
+    doubanProviderEnabled.value = douban.ProviderEnabled ?? Boolean(douban.Enabled);
     keys.value = apiKeys.Items;
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '加载配置失败');
@@ -198,6 +206,25 @@ async function saveTmdbApiKey() {
   }
 }
 
+async function saveTmdbProviderEnabled(enabled: boolean) {
+  if (!authStore.token) {
+    return;
+  }
+
+  const previous = tmdbProviderEnabled.value;
+  savingTmdbProvider.value = true;
+  try {
+    await settingsApi.updateTmdbProviderEnabled(authStore.token, enabled);
+    ElMessage.success(enabled ? 'TMDb 自动刮削已启用' : 'TMDb 自动刮削已关闭');
+    await loadSettings();
+  } catch (error) {
+    tmdbProviderEnabled.value = previous;
+    ElMessage.error(error instanceof Error ? error.message : '保存 TMDb 开关失败');
+  } finally {
+    savingTmdbProvider.value = false;
+  }
+}
+
 async function saveTmdbProxyUrl() {
   if (!authStore.token) {
     return;
@@ -230,6 +257,25 @@ async function saveDoubanCookie() {
     ElMessage.error(error instanceof Error ? error.message : '保存豆瓣 Cookie 失败');
   } finally {
     savingDouban.value = false;
+  }
+}
+
+async function saveDoubanProviderEnabled(enabled: boolean) {
+  if (!authStore.token) {
+    return;
+  }
+
+  const previous = doubanProviderEnabled.value;
+  savingDoubanProvider.value = true;
+  try {
+    await settingsApi.updateDoubanProviderEnabled(authStore.token, enabled);
+    ElMessage.success(enabled ? '豆瓣自动刮削已启用' : '豆瓣自动刮削已关闭');
+    await loadSettings();
+  } catch (error) {
+    doubanProviderEnabled.value = previous;
+    ElMessage.error(error instanceof Error ? error.message : '保存豆瓣开关失败');
+  } finally {
+    savingDoubanProvider.value = false;
   }
 }
 
@@ -376,12 +422,23 @@ onMounted(loadSettings);
               </div>
               <div class="settings-page__tag-group">
                 <ElTag :type="tmdbEnabled ? 'success' : 'info'" effect="plain">
-                  {{ tmdbEnabled ? '已启用' : '未配置' }}
+                  {{ tmdbEnabled ? '已启用' : tmdbProviderEnabled ? '待配置' : '已关闭' }}
                 </ElTag>
                 <ElTag :type="tmdbHasProxy ? 'success' : 'info'" effect="plain">
                   {{ tmdbHasProxy ? '反代已配置' : '直连' }}
                 </ElTag>
               </div>
+            </div>
+
+            <div class="settings-page__inline-control">
+              <span class="settings-page__field-label">启用 TMDb 自动刮削</span>
+              <ElSwitch
+                v-model="tmdbProviderEnabled"
+                :loading="savingTmdbProvider"
+                active-text="启用"
+                inactive-text="关闭"
+                @change="saveTmdbProviderEnabled"
+              />
             </div>
 
             <div class="settings-page__inline-control">
@@ -400,8 +457,8 @@ onMounted(loadSettings);
                 <h3>豆瓣</h3>
                 <span>中文资料与评分补充。</span>
               </div>
-              <ElTag :type="doubanHasCookie ? 'success' : 'info'" effect="plain">
-                {{ doubanHasCookie ? '已配置 Cookie' : '匿名模式' }}
+              <ElTag :type="doubanEnabled ? 'success' : 'info'" effect="plain">
+                {{ doubanEnabled ? '已启用' : doubanProviderEnabled ? '待配置' : '已关闭' }}
               </ElTag>
             </div>
 
@@ -438,6 +495,17 @@ onMounted(loadSettings);
               <span class="settings-page__field-label">启用 LLM 纠错</span>
               <ElSwitch v-model="tmdbLlmEnabled" active-text="启用" inactive-text="关闭" />
             </div>
+            <div class="settings-page__inline-control">
+              <span class="settings-page__field-label">启用豆瓣自动刮削</span>
+              <ElSwitch
+                v-model="doubanProviderEnabled"
+                :loading="savingDoubanProvider"
+                active-text="启用"
+                inactive-text="关闭"
+                @change="saveDoubanProviderEnabled"
+              />
+            </div>
+
             <ElInput
               v-model.trim="tmdbLlmBaseUrl"
               clearable

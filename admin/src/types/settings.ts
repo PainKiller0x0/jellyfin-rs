@@ -1,6 +1,8 @@
 import type { QueryResult } from '@/types/server';
 
 export type TmdbClientConfiguration = {
+  ProviderEnabled: boolean;
+  Configured?: boolean;
   IsTmdbEnabled: boolean;
   IsEnabled: boolean;
   Enabled: boolean;
@@ -22,6 +24,8 @@ export type TmdbLlmConfiguration = {
 };
 
 export type DoubanClientConfiguration = {
+  ProviderEnabled: boolean;
+  Configured?: boolean;
   IsDoubanEnabled: boolean;
   IsEnabled: boolean;
   Enabled: boolean;

@@ -34,7 +34,8 @@ use crate::{
         probe::{ProbedAudioMetadata, probe_video_media},
         storage::{
             CachedMediaProbe, ScannedMediaItem, cached_media_probe_if_current,
-            refresh_external_lyric_stream, remove_missing_media_items, upsert_default_media_stream,
+            refresh_external_lyric_stream, remove_missing_media_items,
+            remove_missing_media_items_in_scopes, upsert_default_media_stream,
             upsert_failed_media_probe, upsert_media_item, upsert_media_metadata,
             upsert_probed_audio_metadata, upsert_probed_media_streams,
         },
@@ -412,6 +413,11 @@ async fn scan_media_roots_if_idle(
     let mut total = 0usize;
     let mut all_seen = Vec::new();
     let mut ingest_queued = 0usize;
+    let scoped_cleanup_paths = roots
+        .iter()
+        .flat_map(|request| request.scope_paths.iter().flatten())
+        .map(|path| path_utils::normalize_path(&path.to_string_lossy()))
+        .collect::<Vec<_>>();
     let mut pending_roots = roots.into_iter();
     loop {
         while tasks.len() < root_concurrency {
@@ -473,6 +479,14 @@ async fn scan_media_roots_if_idle(
     scanned_library_ids.dedup();
     if remove_missing {
         remove_missing_media_items(&scan_db, &scanned_library_ids, &all_seen).await?;
+    } else if !scoped_cleanup_paths.is_empty() {
+        remove_missing_media_items_in_scopes(
+            &scan_db,
+            &scanned_library_ids,
+            &scoped_cleanup_paths,
+            &all_seen,
+        )
+        .await?;
     }
     tracing::info!(
         "media scan discovered {total} file item(s) across all libraries; queued {ingest_queued} ingest job(s)"

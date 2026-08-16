@@ -1923,6 +1923,24 @@ pub async fn remove_missing_media_items(
     library_ids: &[String],
     seen_paths: &[String],
 ) -> anyhow::Result<()> {
+    remove_missing_media_items_internal(db, library_ids, &[], seen_paths).await
+}
+
+pub async fn remove_missing_media_items_in_scopes(
+    db: &DatabaseConnection,
+    library_ids: &[String],
+    scopes: &[String],
+    seen_paths: &[String],
+) -> anyhow::Result<()> {
+    remove_missing_media_items_internal(db, library_ids, scopes, seen_paths).await
+}
+
+async fn remove_missing_media_items_internal(
+    db: &DatabaseConnection,
+    library_ids: &[String],
+    scopes: &[String],
+    seen_paths: &[String],
+) -> anyhow::Result<()> {
     if library_ids.is_empty() {
         return Ok(());
     }
@@ -1962,6 +1980,9 @@ pub async fn remove_missing_media_items(
         for item in items {
             let id = item.id.clone();
             let path = item.path.clone();
+            if !scopes.is_empty() && !scopes.iter().any(|scope| path_is_in_scope(&path, scope)) {
+                continue;
+            }
             if seen_paths.contains(path.as_str()) || cleanup_path_exists(&path).await {
                 continue;
             }
@@ -1975,6 +1996,13 @@ pub async fn remove_missing_media_items(
         tokio::time::sleep(MISSING_CLEANUP_PAUSE).await;
     }
     Ok(())
+}
+
+fn path_is_in_scope(path: &str, scope: &str) -> bool {
+    path == scope
+        || path
+            .strip_prefix(scope)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 async fn cleanup_path_exists(path: &str) -> bool {
@@ -2008,6 +2036,19 @@ mod tests {
     use crate::library::metadata::{ParsedMetadata, ParsedPerson};
     use crate::library::probe::{MediaProbe, ProbedStream};
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
+
+    #[test]
+    fn missing_media_scope_matches_the_scope_and_descendants_only() {
+        assert!(super::path_is_in_scope(
+            "/media/番/示例/Season 1/E01.strm",
+            "/media/番/示例"
+        ));
+        assert!(super::path_is_in_scope("/media/番/示例", "/media/番/示例"));
+        assert!(!super::path_is_in_scope(
+            "/media/番/示例2/E01.strm",
+            "/media/番/示例"
+        ));
+    }
 
     #[tokio::test]
     async fn media_item_upsert_skips_unchanged_conflict_update() {

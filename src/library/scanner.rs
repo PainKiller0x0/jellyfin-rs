@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use anyhow::Context;
 use chrono::Datelike;
@@ -544,12 +549,29 @@ async fn scan_root(
     let mut scanned = 0usize;
     let mut seen_paths = Vec::new();
     let mut ingest_queued = 0usize;
-    let stack_part_owners =
-        movie_stack_part_owners(&root, &collection_type, scope_paths.as_deref());
-    let episode_version_owners =
-        episode_version_owners(&root, &library_id, &collection_type, scope_paths.as_deref());
+    // Building version ownership requires a second full directory walk and name parse.  A
+    // global scan commonly has no changed files, so defer that work until the first file that
+    // actually needs ingestion.  Scoped scans still build it on demand, preserving the version
+    // grouping behavior for watcher-triggered updates.
+    let stack_owners_cache = OnceLock::new();
+    let episode_owners_cache = OnceLock::new();
 
     let walk_roots = scope_paths.clone().unwrap_or_else(|| vec![root.clone()]);
+    if scope_paths.is_none() {
+        let preflight = scan_root_preflight(&root, &collection_type, &existing_media)?;
+        if !preflight.has_changes {
+            tracing::info!(
+                "global scan skipped unchanged root {} after lightweight preflight",
+                root.display()
+            );
+            return Ok(ScanRootResult {
+                scanned: 0,
+                seen_paths: preflight.seen_paths,
+                ingest_queued: 0,
+            });
+        }
+    }
+
     for walk_root in walk_roots {
         for entry in WalkDir::new(walk_root)
             .follow_links(false)
@@ -756,13 +778,33 @@ async fn scan_root(
                 &item_type,
                 extra_type.is_some(),
             );
+            let primary_path = if item_type == "Movie" {
+                stack_owners_cache
+                    .get_or_init(|| {
+                        movie_stack_part_owners(&root, &collection_type, scope_paths.as_deref())
+                    })
+                    .get(path)
+            } else if item_type == "Episode" {
+                episode_owners_cache
+                    .get_or_init(|| {
+                        episode_version_owners(
+                            &root,
+                            &library_id,
+                            &collection_type,
+                            scope_paths.as_deref(),
+                        )
+                    })
+                    .get(path)
+            } else {
+                None
+            };
             if item_type == "Movie"
-                && let Some(primary_path) = stack_part_owners.get(path)
+                && let Some(primary_path) = primary_path
             {
                 item_type = "Video".to_string();
                 parent_id = crate::util::stable_item_id(primary_path);
             } else if item_type == "Episode"
-                && let Some(primary_path) = episode_version_owners.get(path)
+                && let Some(primary_path) = primary_path
             {
                 item_type = "Video".to_string();
                 parent_id = crate::util::stable_item_id(primary_path);
@@ -1168,6 +1210,93 @@ fn item_requires_ingest(
         existing.item_type != item.item_type
             || existing.modified_at != item.modified_at
             || source_size_changed
+    })
+}
+
+fn source_fingerprint_is_unchanged(
+    path: &str,
+    resolved: &path_utils::ResolvedPathInfo,
+    existing: &ExistingMediaState,
+) -> bool {
+    existing.modified_at == resolved.modified_at
+        && (path.to_ascii_lowercase().ends_with(".strm")
+            || existing.size_bytes == resolved.size_bytes)
+}
+
+struct ScanPreflight {
+    has_changes: bool,
+    seen_paths: Vec<String>,
+}
+
+fn scan_root_preflight(
+    root: &std::path::Path,
+    collection_type: &str,
+    existing_media: &HashMap<String, ExistingMediaState>,
+) -> anyhow::Result<ScanPreflight> {
+    let normalized_root = path_utils::normalize_path(&root.to_string_lossy());
+    let mut has_changes = false;
+    let mut seen_paths = Vec::new();
+    let mut seen_set = std::collections::HashSet::new();
+    seen_set.insert(normalized_root);
+
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_ignored_scan_path(entry.path()))
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!("failed to read media path during preflight: {error}");
+                has_changes = true;
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path == root || should_skip_disc_structure_entry(path, root) {
+            continue;
+        }
+
+        // Match the main scanner's notion of a media item. Sidecars, artwork and
+        // unrelated files must not force an expensive full scan every time.
+        if !entry.file_type().is_dir()
+            && !strm::is_strm_path(path)
+            && classify_media_path(path, collection_type).is_none()
+        {
+            continue;
+        }
+
+        let resolved = match path_utils::resolve_path_info(path) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to resolve media path during preflight {}: {error:#}",
+                    path.display()
+                );
+                has_changes = true;
+                continue;
+            }
+        };
+        let path_string = resolved.path.clone();
+        seen_set.insert(path_string.clone());
+        seen_paths.push(path_string.clone());
+        match existing_media.get(&path_string) {
+            Some(existing)
+                if source_fingerprint_is_unchanged(&path_string, &resolved, existing) => {}
+            _ => has_changes = true,
+        }
+    }
+
+    if existing_media
+        .keys()
+        .any(|path| PathBuf::from(path).starts_with(root) && !seen_set.contains(path))
+    {
+        has_changes = true;
+    }
+
+    Ok(ScanPreflight {
+        has_changes,
+        seen_paths,
     })
 }
 
@@ -1596,14 +1725,20 @@ fn start_metadata_fetch_pipeline(
             }
         }
 
-        run_post_scan_metadata_tasks(
-            &db,
-            &api_key,
-            tmdb_proxy_url,
-            tmdb_http_client,
-            douban_cookie.as_deref(),
-        )
-        .await;
+        if queued > 0 {
+            run_post_scan_metadata_tasks(
+                &db,
+                &api_key,
+                tmdb_proxy_url,
+                tmdb_http_client,
+                douban_cookie.as_deref(),
+            )
+            .await;
+        } else {
+            tracing::info!(
+                "metadata fetch pipeline skipped post-scan backfill because no metadata jobs were queued"
+            );
+        }
         tracing::info!(
             "metadata fetch pipeline completed {completed}/{queued} item(s); failed={failed}"
         );
@@ -1742,6 +1877,14 @@ async fn run_post_scan_metadata_tasks(
     tmdb_http_client: Arc<RwLock<reqwest::Client>>,
     douban_cookie: Option<&str>,
 ) {
+    let run_global_backfill = std::env::var("JELLYFIN_RS_POST_SCAN_METADATA_BACKFILL")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        });
     if !api_key.is_empty() {
         let tmdb_base_url = tmdb_proxy_url.read().await.clone();
         let tmdb_client = tmdb_http_client.read().await.clone();
@@ -1769,27 +1912,39 @@ async fn run_post_scan_metadata_tasks(
             ),
         }
 
-        match crate::library::tmdb_metadata::batch_fetch_episode_tmdb(
-            db,
-            api_key,
-            &tmdb_client,
-            tmdb_base_url.as_deref(),
-        )
-        .await
-        {
-            Ok(0) => {}
-            Ok(n) => tracing::info!("post-scan episode TMDb batch fetched {n} title(s)"),
-            Err(error) => tracing::warn!(
-                "post-scan episode TMDb batch failed: {}",
-                crate::library::tmdb_metadata::redact_tmdb_error(&error)
-            ),
+        if run_global_backfill {
+            match crate::library::tmdb_metadata::batch_fetch_episode_tmdb(
+                db,
+                api_key,
+                &tmdb_client,
+                tmdb_base_url.as_deref(),
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("post-scan episode TMDb batch fetched {n} title(s)"),
+                Err(error) => tracing::warn!(
+                    "post-scan episode TMDb batch failed: {}",
+                    crate::library::tmdb_metadata::redact_tmdb_error(&error)
+                ),
+            }
+        } else {
+            tracing::info!(
+                "post-scan episode TMDb backfill skipped; set JELLYFIN_RS_POST_SCAN_METADATA_BACKFILL=true for a full backfill"
+            );
         }
     }
 
-    if let Err(error) =
-        crate::library::douban_metadata::fill_missing_douban(db, douban_cookie).await
-    {
-        tracing::warn!("Douban metadata fetch failed: {error:#}");
+    if run_global_backfill {
+        if let Err(error) =
+            crate::library::douban_metadata::fill_missing_douban(db, douban_cookie).await
+        {
+            tracing::warn!("Douban metadata fetch failed: {error:#}");
+        }
+    } else {
+        tracing::info!(
+            "post-scan Douban backfill skipped; set JELLYFIN_RS_POST_SCAN_METADATA_BACKFILL=true for a full backfill"
+        );
     }
 
     match crate::library::reconcile::reconcile_provider_duplicates(db).await {
@@ -2887,6 +3042,94 @@ mod tests {
         let mut changed = item;
         changed.modified_at = 43;
         assert!(item_requires_ingest(&changed, &existing));
+    }
+
+    #[test]
+    fn unchanged_source_fingerprint_skips_expensive_file_parsing() {
+        let existing = ExistingMediaState {
+            item_type: "Episode".to_string(),
+            modified_at: 42,
+            size_bytes: Some(700_000_000),
+        };
+        let strm = path_utils::ResolvedPathInfo {
+            id: "strm".to_string(),
+            name: "E01.strm".to_string(),
+            path: "/media/tv/Show/Season 1/E01.strm".to_string(),
+            is_directory: false,
+            size_bytes: Some(128),
+            created_at: 1,
+            modified_at: 42,
+        };
+        assert!(source_fingerprint_is_unchanged(
+            &strm.path, &strm, &existing
+        ));
+
+        let video = path_utils::ResolvedPathInfo {
+            path: "/media/movies/Movie.mkv".to_string(),
+            size_bytes: Some(700_000_000),
+            ..strm.clone()
+        };
+        assert!(source_fingerprint_is_unchanged(
+            &video.path,
+            &video,
+            &existing
+        ));
+
+        let mut changed = video;
+        changed.size_bytes = Some(700_000_001);
+        assert!(!source_fingerprint_is_unchanged(
+            &changed.path,
+            &changed,
+            &existing
+        ));
+    }
+
+    #[test]
+    fn unchanged_global_preflight_ignores_sidecars_and_detects_new_media() {
+        let root = test_dir("unchanged_global_preflight_ignores_sidecars");
+        let movie_dir = root.join("Movie");
+        fs::create_dir_all(&movie_dir).unwrap();
+        let movie = movie_dir.join("Movie.mkv");
+        fs::write(&movie, []).unwrap();
+        fs::write(movie_dir.join("poster.jpg"), []).unwrap();
+
+        let folder_info = path_utils::resolve_path_info(&movie_dir).unwrap();
+        let movie_info = path_utils::resolve_path_info(&movie).unwrap();
+        let existing = HashMap::from([
+            (
+                folder_info.path.clone(),
+                ExistingMediaState {
+                    item_type: "Folder".to_string(),
+                    modified_at: folder_info.modified_at,
+                    size_bytes: folder_info.size_bytes,
+                },
+            ),
+            (
+                movie_info.path.clone(),
+                ExistingMediaState {
+                    item_type: "Movie".to_string(),
+                    modified_at: movie_info.modified_at,
+                    size_bytes: movie_info.size_bytes,
+                },
+            ),
+        ]);
+
+        let unchanged = scan_root_preflight(&root, "movies", &existing).unwrap();
+        assert!(!unchanged.has_changes);
+        assert!(unchanged.seen_paths.contains(&folder_info.path));
+        assert!(unchanged.seen_paths.contains(&movie_info.path));
+        assert!(
+            !unchanged
+                .seen_paths
+                .iter()
+                .any(|path| path.ends_with("poster.jpg"))
+        );
+
+        fs::write(movie_dir.join("Movie 2.mkv"), []).unwrap();
+        let changed = scan_root_preflight(&root, "movies", &existing).unwrap();
+        assert!(changed.has_changes);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

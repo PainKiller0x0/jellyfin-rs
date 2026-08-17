@@ -1345,21 +1345,11 @@ impl MediaStreamRow {
         let is_subtitle = self.stream_type == "Subtitle";
         let is_text_subtitle = is_subtitle && is_text_subtitle_codec(codec);
         let is_pgs_subtitle = is_subtitle && is_pgs_subtitle_codec(codec);
-        let delivery_url = if is_subtitle {
-            // Jellyfin Web resolves the subtitle request from DeliveryUrl.
-            // Text subtitles are fetched as Stream.js by the custom renderer,
-            // so their advertised URL must be the canonical Stream.vtt URL;
-            // getTextTrackUrl() then replaces .vtt with .js. Keep ASS/PGS on
-            // their native formats because those renderers consume the raw
-            // subtitle stream directly.
-            let format = subtitle_delivery_format(codec);
-            Some(format!(
-                "/Videos/{item_id}/{item_id}/Subtitles/{}/Stream.{format}",
-                self.stream_index
-            ))
-        } else if is_text_subtitle {
-            // Browser clients cannot consume an embedded subtitle stream directly.
-            // Expose text-based embedded tracks through the extraction endpoint as WebVTT.
+        let delivery_url = if is_text_subtitle {
+            // Browser clients cannot consume an embedded subtitle stream
+            // directly. Expose text-based tracks through the extraction
+            // endpoint as WebVTT; the client may derive the Stream.js form
+            // from this canonical URL.
             Some(format!(
                 "/Videos/{item_id}/{item_id}/Subtitles/{}/Stream.vtt",
                 self.stream_index
@@ -1505,16 +1495,6 @@ fn is_text_subtitle_codec(codec: &str) -> bool {
 fn is_pgs_subtitle_codec(codec: &str) -> bool {
     let codec = codec.to_ascii_lowercase();
     codec == "pgs" || codec == "hdmv_pgs_subtitle" || codec.contains("pgs")
-}
-
-fn subtitle_delivery_format(codec: &str) -> &'static str {
-    if matches!(codec.to_ascii_lowercase().as_str(), "ass" | "ssa") {
-        return "ass";
-    }
-    if is_pgs_subtitle_codec(codec) {
-        return "sup";
-    }
-    "vtt"
 }
 
 fn compute_stream_display_title(stream: &MediaStreamRow) -> String {
@@ -2204,18 +2184,6 @@ mod tests {
         assert_eq!(
             external["DeliveryUrl"],
             "/Videos/movie/movie/Subtitles/2/Stream.vtt"
-        );
-
-        let ass = subtitle_stream("ass", false).to_jellyfin_json("movie");
-        assert_eq!(
-            ass["DeliveryUrl"],
-            "/Videos/movie/movie/Subtitles/2/Stream.ass"
-        );
-
-        let pgs = subtitle_stream("hdmv_pgs_subtitle", false).to_jellyfin_json("movie");
-        assert_eq!(
-            pgs["DeliveryUrl"],
-            "/Videos/movie/movie/Subtitles/2/Stream.sup"
         );
     }
 

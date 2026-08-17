@@ -342,6 +342,12 @@ fn episode_patterns() -> &'static [(Regex, EpisodeStyle)] {
             EpisodeStyle::Named,
         ),
         (
+            // SmartStrm may wrap a bare E01/EP01 filename as E01.(mkv).strm.
+            // The wrapper is normalized to E01.mkv before this parser runs.
+            r#"(?i).*/(?:ep_?|e)(?P<episode>[0-9]{1,4})(?:[._ -]*(?:\([0-9]+\)|\[[0-9]+\]))?(?:[._ -]+(?P<name>[^/]+))?$"#,
+            EpisodeStyle::TrailingTitle,
+        ),
+        (
             // Kodi standard: foo.ep01, foo.EP_01.
             r#"(?i).*(?:/)(?P<title>.*?)[._ -]ep_?(?P<episode>[0-9]{1,4})(?:[._ -]+(?P<name>[^/]+))?$"#,
             EpisodeStyle::TrailingTitle,

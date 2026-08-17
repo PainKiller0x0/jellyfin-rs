@@ -97,7 +97,12 @@ jobs:
     needs:
       - backend
       - frontend
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    # Docker publishing is opt-in. Set the repository variable
+    # DOCKERHUB_PUBLISH=true after configuring the Docker Hub secrets.
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/master' &&
+      vars.DOCKERHUB_PUBLISH == 'true'
 
     concurrency:
       group: dockerhub-${{ github.ref }}

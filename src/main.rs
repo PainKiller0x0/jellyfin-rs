@@ -303,6 +303,34 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("startup metadata backfill skipped; library is already initialized");
     }
 
+    // Provider reconciliation is a local database consistency pass and must
+    // not depend on the optional, slow metadata backfill.  Run it on every
+    // normal restart so duplicate cross-cloud Series/Movie roots are repaired
+    // even when a full library scan is still running or has no metadata jobs.
+    if !run_startup_metadata_backfill {
+        let reconcile_database_url = database_url.clone();
+        tokio::spawn(async move {
+            let reconcile_db = match crate::db::background_connection(&reconcile_database_url).await
+            {
+                Ok(db) => db,
+                Err(error) => {
+                    tracing::warn!("startup provider reconciliation skipped: {error:#}");
+                    return;
+                }
+            };
+            match library::reconcile::reconcile_provider_duplicates(&reconcile_db).await {
+                Ok(stats) if stats.changed() => tracing::info!(
+                    "startup provider reconciliation merged {} series, {} movies, and {} versions",
+                    stats.merged_series,
+                    stats.merged_movies,
+                    stats.merged_versions
+                ),
+                Ok(_) => tracing::info!("startup provider reconciliation found no duplicates"),
+                Err(error) => tracing::warn!("startup provider reconciliation failed: {error:#}"),
+            }
+        });
+    }
+
     if run_startup_metadata_backfill && douban_provider_enabled {
         let douban_state = state.clone();
         let douban_database_url = database_url.clone();

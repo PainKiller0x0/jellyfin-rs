@@ -1748,8 +1748,13 @@ fn start_metadata_fetch_pipeline(
             .await;
         } else {
             tracing::info!(
-                "metadata fetch pipeline skipped post-scan backfill because no metadata jobs were queued"
+                "metadata fetch pipeline skipped metadata backfill because no metadata jobs were queued"
             );
+            // Provider reconciliation is a database consistency pass, not a
+            // metadata fetch.  It must still run when every scanned item is
+            // unchanged; otherwise the same TMDb title from Quark and
+            // Xunlei can remain exposed as two top-level Series forever.
+            run_provider_reconciliation(&db).await;
         }
         tracing::info!(
             "metadata fetch pipeline completed {completed}/{queued} item(s); failed={failed}"
@@ -1959,6 +1964,10 @@ async fn run_post_scan_metadata_tasks(
         );
     }
 
+    run_provider_reconciliation(db).await;
+}
+
+async fn run_provider_reconciliation(db: &sea_orm::DatabaseConnection) {
     match crate::library::reconcile::reconcile_provider_duplicates(db).await {
         Ok(stats) if stats.changed() => tracing::info!(
             "provider reconciliation merged {} series and {} movie version(s); normalized {} series date range(s)",

@@ -1297,8 +1297,8 @@ mod tests {
     use super::{
         MAX_IMAGE_BYTES, add_art_tag_fallback, canonical_image_type, collage_source_images,
         decode_image_body, image_asset_path_allowed, image_format_from_path,
-        image_storage_path_allowed,
-        image_type_and_index, is_image_too_large, item_images_inner, with_tagged_image_cache,
+        image_storage_path_allowed, image_type_and_index, is_image_too_large, item_images_inner,
+        with_tagged_image_cache,
     };
     use crate::entities::{
         image_assets::{self, Entity as ImageAssets},
@@ -1336,7 +1336,8 @@ mod tests {
         let Some(db) = crate::db::test_db().await else {
             return;
         };
-        let root = std::env::temp_dir().join(format!("jellyfin-rs-images-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("jellyfin-rs-images-{}", uuid::Uuid::new_v4()));
         let sibling =
             std::env::temp_dir().join(format!("jellyfin-rs-images-other-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();

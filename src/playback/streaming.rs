@@ -286,6 +286,7 @@ pub async fn stream_subtitle(
     stream_subtitle_item(
         state,
         item_id,
+        None,
         index,
         format,
         None,
@@ -305,6 +306,7 @@ pub async fn stream_subtitle_head(
     stream_subtitle_item(
         state,
         item_id,
+        None,
         index,
         format,
         None,
@@ -319,13 +321,13 @@ pub async fn stream_subtitle_head(
 pub async fn stream_subtitle_with_source(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, _media_source_id, index, format)): Path<(String, String, i64, String)>,
+    Path((item_id, media_source_id, index, format)): Path<(String, String, i64, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    // media_source_id is ignored; route to the same handler
     stream_subtitle_item(
         state,
         item_id,
+        Some(media_source_id),
         index,
         format,
         None,
@@ -339,12 +341,13 @@ pub async fn stream_subtitle_with_source(
 pub async fn stream_subtitle_with_source_head(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, _media_source_id, index, format)): Path<(String, String, i64, String)>,
+    Path((item_id, media_source_id, index, format)): Path<(String, String, i64, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     stream_subtitle_item(
         state,
         item_id,
+        Some(media_source_id),
         index,
         format,
         None,
@@ -369,6 +372,7 @@ pub async fn stream_subtitle_with_ticks_no_source(
     stream_subtitle_item(
         state,
         item_id,
+        None,
         index,
         format,
         Some(start_ticks),
@@ -388,6 +392,7 @@ pub async fn stream_subtitle_with_ticks_no_source_head(
     stream_subtitle_item(
         state,
         item_id,
+        None,
         index,
         format,
         Some(start_ticks),
@@ -402,7 +407,7 @@ pub async fn stream_subtitle_with_ticks_no_source_head(
 pub async fn stream_subtitle_with_ticks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, _media_source_id, index, start_ticks, format)): Path<(
+    Path((item_id, media_source_id, index, start_ticks, format)): Path<(
         String,
         String,
         i64,
@@ -414,6 +419,7 @@ pub async fn stream_subtitle_with_ticks(
     stream_subtitle_item(
         state,
         item_id,
+        Some(media_source_id),
         index,
         format,
         Some(start_ticks),
@@ -427,7 +433,7 @@ pub async fn stream_subtitle_with_ticks(
 pub async fn stream_subtitle_with_ticks_head(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, _media_source_id, index, start_ticks, format)): Path<(
+    Path((item_id, media_source_id, index, start_ticks, format)): Path<(
         String,
         String,
         i64,
@@ -439,6 +445,7 @@ pub async fn stream_subtitle_with_ticks_head(
     stream_subtitle_item(
         state,
         item_id,
+        Some(media_source_id),
         index,
         format,
         Some(start_ticks),
@@ -452,7 +459,7 @@ pub async fn stream_subtitle_with_ticks_head(
 async fn stream_subtitle_item(
     state: Arc<AppState>,
     item_id: String,
-    media_source_id: Option<String>,
+    _media_source_id: Option<String>,
     index: i64,
     format: String,
     start_ticks: Option<i64>,
@@ -558,9 +565,9 @@ const EMBEDDED_SUBTITLE_TIMEOUT: Duration = Duration::from_secs(30);
 // A remote STRM can service byte ranges quickly, but FFmpeg still has to walk
 // the selected subtitle stream until the requested output window is complete.
 // A 120-second window made a seek wait tens of seconds on Quark-backed media.
-// Thirty seconds is small enough to return promptly and the WebView client
+// Twenty seconds is small enough to return promptly and the WebView client
 // requests the next window ahead of the playback position.
-const EMBEDDED_SUBTITLE_WINDOW_SECONDS: u64 = 30;
+const EMBEDDED_SUBTITLE_WINDOW_SECONDS: u64 = 20;
 const EMBEDDED_SUBTITLE_WINDOW_BUCKET_TICKS: i64 = 5 * 10_000_000;
 const MAX_EMBEDDED_SUBTITLE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EMBEDDED_SUBTITLE_CACHE_ENTRIES: usize = 32;

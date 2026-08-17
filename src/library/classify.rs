@@ -991,10 +991,8 @@ fn has_year_tag(name: &str) -> bool {
     static YEAR_TAG: OnceLock<regex::Regex> = OnceLock::new();
     YEAR_TAG
         .get_or_init(|| {
-            regex::Regex::new(
-                r#"[\{\[\(（【]\s*(?P<year>(?:18|19|20)\d{2}|2100)\s*[\}\]\)）】]"#,
-            )
-            .expect("year tag regex must compile")
+            regex::Regex::new(r#"[\{\[\(（【]\s*(?P<year>(?:18|19|20)\d{2}|2100)\s*[\}\]\)）】]"#)
+                .expect("year tag regex must compile")
         })
         .captures_iter(name)
         .filter_map(|captures| captures.name("year"))
@@ -1003,13 +1001,19 @@ fn has_year_tag(name: &str) -> bool {
 }
 
 fn bracket_tags(name: &str) -> impl Iterator<Item = &str> {
-    [('{', '}'), ('[', ']'), ('(', ')'), ('（', '）'), ('【', '】')]
-        .into_iter()
-        .filter_map(move |(open, close)| {
-            let (_, after_open) = name.rsplit_once(open)?;
-            let (tag, _) = after_open.split_once(close)?;
-            Some(tag)
-        })
+    [
+        ('{', '}'),
+        ('[', ']'),
+        ('(', ')'),
+        ('（', '）'),
+        ('【', '】'),
+    ]
+    .into_iter()
+    .filter_map(move |(open, close)| {
+        let (_, after_open) = name.rsplit_once(open)?;
+        let (tag, _) = after_open.split_once(close)?;
+        Some(tag)
+    })
 }
 
 fn is_grouping_folder_name(name: &str) -> bool {

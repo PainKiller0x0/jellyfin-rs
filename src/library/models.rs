@@ -827,7 +827,7 @@ fn remote_strm_target(path: &str) -> Option<String> {
 
 static STRM_PUBLIC_BASE: OnceLock<Option<String>> = OnceLock::new();
 
-fn rewrite_public_strm_target(target: &str) -> String {
+pub(crate) fn rewrite_public_strm_target(target: &str) -> String {
     let public_base = STRM_PUBLIC_BASE.get_or_init(|| {
         std::env::var("JELLYFIN_RS_STRM_PUBLIC_BASE_URL")
             .ok()

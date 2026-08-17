@@ -865,8 +865,7 @@ mod tests {
         assert_eq!(parsed.season_number, None);
         assert_eq!(parsed.episode_number, Some(1));
 
-        let parsed =
-            parse_media_name(Path::new("知否知否应是绿肥红瘦/EP64.(mp4).strm"), "tvshows");
+        let parsed = parse_media_name(Path::new("知否知否应是绿肥红瘦/EP64.(mp4).strm"), "tvshows");
         assert_eq!(parsed.season_number, None);
         assert_eq!(parsed.episode_number, Some(64));
         assert_ne!(parsed.title, "mp4");
@@ -883,8 +882,10 @@ mod tests {
         assert_eq!(parsed.episode_number, Some(27));
         assert_ne!(parsed.title, "mkv");
 
-        let parsed =
-            parse_media_name(Path::new("知否知否应是绿肥红瘦/EP62(1).(mp4).strm"), "tvshows");
+        let parsed = parse_media_name(
+            Path::new("知否知否应是绿肥红瘦/EP62(1).(mp4).strm"),
+            "tvshows",
+        );
         assert_eq!(parsed.season_number, None);
         assert_eq!(parsed.episode_number, Some(62));
         assert_ne!(parsed.title, "mp4");

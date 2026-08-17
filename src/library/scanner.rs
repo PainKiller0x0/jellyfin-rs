@@ -1972,10 +1972,11 @@ async fn run_post_scan_metadata_tasks(
 async fn run_provider_reconciliation(db: &sea_orm::DatabaseConnection) {
     match crate::library::reconcile::reconcile_provider_duplicates(db).await {
         Ok(stats) if stats.changed() => tracing::info!(
-            "provider reconciliation merged {} series and {} movie version(s); normalized {} series date range(s)",
+            "provider reconciliation merged {} series and {} movie version(s); normalized {} series date range(s) and {} episode metadata row(s)",
             stats.merged_series,
             stats.merged_versions,
             stats.normalized_series_dates,
+            stats.normalized_episode_metadata,
         ),
         Ok(_) => {}
         Err(error) => tracing::warn!("provider reconciliation failed: {error:#}"),

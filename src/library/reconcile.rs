@@ -5,8 +5,8 @@ use std::{
 
 use anyhow::Context;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
 };
 
 use crate::{
@@ -23,11 +23,15 @@ pub struct ProviderReconcileStats {
     pub merged_movies: usize,
     pub merged_versions: usize,
     pub normalized_series_dates: usize,
+    pub normalized_episode_metadata: usize,
 }
 
 impl ProviderReconcileStats {
     pub fn changed(self) -> bool {
-        self.merged_series > 0 || self.merged_movies > 0 || self.normalized_series_dates > 0
+        self.merged_series > 0
+            || self.merged_movies > 0
+            || self.normalized_series_dates > 0
+            || self.normalized_episode_metadata > 0
     }
 }
 
@@ -170,10 +174,183 @@ pub async fn reconcile_provider_duplicates(
 
     stats.normalized_series_dates =
         normalize_series_date_ranges(&txn, &all_items, &children_by_parent).await?;
+    stats.normalized_episode_metadata = normalize_episode_metadata(&txn).await?;
     txn.commit()
         .await
         .context("failed to commit provider reconciliation transaction")?;
     Ok(stats)
+}
+
+/// Repairs episode rows that were ingested before metadata was available or
+/// before duplicate cloud roots were merged.  A cloud STRM filename can leave
+/// the preferred episode represented as the literal container name (`mp4`,
+/// `mkv`, ...), while an alternate version already has the real episode title.
+/// Keep the preferred file for playback, but borrow safe descriptive metadata
+/// from the alternate version when the preferred row is incomplete.
+async fn normalize_episode_metadata(db: &DatabaseTransaction) -> anyhow::Result<usize> {
+    let items = MediaItems::find()
+        .all(db)
+        .await
+        .context("failed to load media items for episode metadata normalization")?;
+    if items.is_empty() {
+        return Ok(0);
+    }
+
+    let by_id: HashMap<&str, &media_items::Model> =
+        items.iter().map(|item| (item.id.as_str(), item)).collect();
+    let mut children_by_parent: HashMap<&str, Vec<&media_items::Model>> = HashMap::new();
+    for item in &items {
+        if !item.parent_id.is_empty() {
+            children_by_parent
+                .entry(item.parent_id.as_str())
+                .or_default()
+                .push(item);
+        }
+    }
+
+    let provider_rows = ProviderIds::find()
+        .all(db)
+        .await
+        .context("failed to load provider IDs for episode metadata normalization")?;
+    let mut provider_ids_by_item: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for row in provider_rows {
+        provider_ids_by_item
+            .entry(row.item_id)
+            .or_default()
+            .push((row.provider, row.provider_item_id));
+    }
+
+    let mut changed = 0usize;
+    for episode in items.iter().filter(|item| item.item_type == "Episode") {
+        let Some(series) = ancestor_series(episode, &by_id) else {
+            continue;
+        };
+        let alternate = children_by_parent
+            .get(episode.id.as_str())
+            .into_iter()
+            .flatten()
+            .filter(|item| item.item_type == "Video")
+            .filter(|item| !is_generic_episode_title(&item.title))
+            .max_by_key(|item| {
+                (
+                    item.overview.is_some(),
+                    provider_ids_by_item.contains_key(item.id.as_str()),
+                    item.title.chars().count(),
+                )
+            });
+
+        let needs_series_name = episode
+            .series_name
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty());
+        let needs_title = is_generic_episode_title(&episode.title);
+        let mut active: media_items::ActiveModel = episode.clone().into();
+        let mut item_changed = false;
+
+        if needs_series_name {
+            active.series_name = Set(Some(series.title.clone()));
+            item_changed = true;
+        }
+
+        if needs_title {
+            if let Some(alternate) = alternate {
+                active.title = Set(alternate.title.clone());
+                item_changed = true;
+                if episode.overview.is_none() && alternate.overview.is_some() {
+                    active.overview = Set(alternate.overview.clone());
+                }
+                if episode.original_title.is_none() && alternate.original_title.is_some() {
+                    active.original_title = Set(alternate.original_title.clone());
+                }
+                if episode.production_year.is_none() && alternate.production_year.is_some() {
+                    active.production_year = Set(alternate.production_year);
+                }
+                if episode.premiere_date.is_none() && alternate.premiere_date.is_some() {
+                    active.premiere_date = Set(alternate.premiere_date.clone());
+                }
+                if episode.photo_metadata.is_none() && alternate.photo_metadata.is_some() {
+                    active.photo_metadata = Set(alternate.photo_metadata.clone());
+                }
+            }
+        } else if episode.overview.is_none() {
+            if let Some(alternate) = alternate {
+                if alternate.overview.is_some() {
+                    active.overview = Set(alternate.overview.clone());
+                    item_changed = true;
+                }
+            }
+        }
+
+        if item_changed {
+            active.updated_at = Set(now_unix());
+            active
+                .update(db)
+                .await
+                .with_context(|| format!("failed to normalize episode metadata: {}", episode.id))?;
+            changed += 1;
+        }
+
+        if let Some(alternate) = alternate {
+            if let Some(provider_ids) = provider_ids_by_item.get(alternate.id.as_str()) {
+                let missing: Vec<_> = provider_ids
+                    .iter()
+                    .filter(|(provider, _)| {
+                        !provider_ids_by_item
+                            .get(episode.id.as_str())
+                            .is_some_and(|existing| {
+                                existing.iter().any(|(name, _)| name == provider)
+                            })
+                    })
+                    .cloned()
+                    .collect();
+                if !missing.is_empty() {
+                    ProviderIds::insert_many(missing.iter().map(|(provider, provider_item_id)| {
+                        provider_ids::ActiveModel {
+                            item_id: Set(episode.id.clone()),
+                            provider: Set(provider.clone()),
+                            provider_item_id: Set(provider_item_id.clone()),
+                        }
+                    }))
+                    .exec_without_returning(db)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to copy alternate episode provider IDs: {}",
+                            episode.id
+                        )
+                    })?;
+                    changed += 1;
+                }
+            }
+        }
+    }
+
+    Ok(changed)
+}
+
+fn ancestor_series<'a>(
+    item: &'a media_items::Model,
+    by_id: &HashMap<&str, &'a media_items::Model>,
+) -> Option<&'a media_items::Model> {
+    let mut parent_id = item.parent_id.as_str();
+    let mut visited = HashSet::new();
+    while !parent_id.is_empty() && visited.insert(parent_id) {
+        let parent = by_id.get(parent_id).copied()?;
+        if parent.item_type == "Series" {
+            return Some(parent);
+        }
+        parent_id = parent.parent_id.as_str();
+    }
+    None
+}
+
+fn is_generic_episode_title(title: &str) -> bool {
+    let normalized = title.trim().trim_start_matches('.').to_ascii_lowercase();
+    normalized.is_empty()
+        || matches!(
+            normalized.as_str(),
+            "mp4" | "mkv" | "avi" | "mov" | "flv" | "m4v" | "ts" | "webm" | "strm"
+        )
 }
 
 fn contains_xunlei_marker(path: &str) -> bool {

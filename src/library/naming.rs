@@ -889,6 +889,16 @@ mod tests {
         assert_ne!(parsed.title, "mkv");
 
         let parsed = parse_media_name(
+            Path::new(
+                "花织即使是转生也想打架 (2026)/Season 1/花织即使是转生也想打架 (2026) - S01E01 -.(mp4).strm",
+            ),
+            "tvshows",
+        );
+        assert_eq!(parsed.season_number, Some(1));
+        assert_eq!(parsed.episode_number, Some(1));
+        assert_eq!(parsed.title, "花织即使是转生也想打架");
+
+        let parsed = parse_media_name(
             Path::new("知否知否应是绿肥红瘦/EP62(1).(mp4).strm"),
             "tvshows",
         );

@@ -52,9 +52,9 @@ const identifyForm = reactive<IdentifyForm>({
   doubanId: ''
 });
 
-const tmdbEnabled = computed(() => Boolean(tmdbConfig.value?.HasApiKey || tmdbConfig.value?.IsTmdbEnabled));
+const tmdbEnabled = computed(() => Boolean(tmdbConfig.value?.Configured ?? (tmdbConfig.value?.ProviderEnabled && tmdbConfig.value?.HasApiKey)));
 const tmdbHasProxy = computed(() => Boolean(tmdbConfig.value?.HasProxy));
-const doubanHasCookie = computed(() => Boolean(doubanConfig.value?.HasCookie));
+const doubanEnabled = computed(() => Boolean(doubanConfig.value?.Configured ?? (doubanConfig.value?.ProviderEnabled && doubanConfig.value?.HasCookie)));
 const manualResetIds = computed(() => parseItemIds(resetIdsText.value));
 const resetIds = computed(() => (resetMode.value === 'selected' ? selectedIds.value : manualResetIds.value));
 const selectedCount = computed(() => selectedIds.value.length);
@@ -67,7 +67,7 @@ const sourceStats = computed(() => [
   },
   {
     label: '豆瓣',
-    value: doubanHasCookie.value ? '已配置' : '匿名',
+    value: doubanEnabled.value ? '已启用' : doubanConfig.value?.ProviderEnabled === false ? '已关闭' : '未配置',
     hint: '中文资料'
   },
   {

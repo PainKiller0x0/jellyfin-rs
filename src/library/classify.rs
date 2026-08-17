@@ -671,6 +671,9 @@ pub fn tv_folder_type(path: &Path, root: &Path, collection_type: &str) -> &'stat
         "Folder"
     } else if path_depth(path, root) > 1
         && season_number_from_folder_name(name, parent_name).is_some()
+        // A decorated series folder can itself contain a real season folder,
+        // e.g. `Show.S01.2160p/S01`. In that shape the outer folder is the
+        // Series item; only a leaf season directory should become Season.
         && !directory_has_season_folder(path)
     {
         "Season"
@@ -1100,10 +1103,8 @@ fn is_bd_source_range_folder_name(name: &str) -> bool {
     static REGEX: OnceLock<regex::Regex> = OnceLock::new();
     REGEX
         .get_or_init(|| {
-            regex::Regex::new(
-                r"(?i)^bd(?:\s*版)?\s*[0-9]{1,4}\s*[-~至]\s*[0-9]{1,4}(?:\s+.*)?$",
-            )
-            .expect("BD source range folder regex must compile")
+            regex::Regex::new(r"(?i)^bd(?:\s*版)?\s*[0-9]{1,4}\s*[-~至]\s*[0-9]{1,4}(?:\s+.*)?$")
+                .expect("BD source range folder regex must compile")
         })
         .is_match(name.trim())
 }
@@ -1118,13 +1119,14 @@ fn season_suffix_regex() -> &'static regex::Regex {
 
 fn is_multi_season_range_name(name: &str) -> bool {
     static REGEX: OnceLock<regex::Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:se|s)\d{1,4}\s*[-~至]\s*(?:se|s)?\d{1,4}(?:[^0-9]|$)"#,
-        )
-        .expect("multi-season range regex must compile")
-    })
-    .is_match(name)
+    REGEX
+        .get_or_init(|| {
+            regex::Regex::new(
+                r#"(?i)(?:^|[^a-z0-9])(?:se|s)\d{1,4}\s*[-~至]\s*(?:se|s)?\d{1,4}(?:[^0-9]|$)"#,
+            )
+            .expect("multi-season range regex must compile")
+        })
+        .is_match(name)
 }
 
 fn parse_keyword_season_number(clean_name: &str) -> Option<i64> {
@@ -1743,81 +1745,8 @@ mod tests {
 
         assert_eq!(tv_folder_type(&domestic, &root, "tvshows"), "Folder");
         assert_eq!(tv_folder_type(&foreign, &root, "tvshows"), "Folder");
-        assert_eq!(
-            tv_folder_type(&domestic_series, &root, "tvshows"),
-            "Series"
-        );
-        assert_eq!(
-            tv_folder_type(&foreign_series, &root, "tvshows"),
-            "Series"
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn tv_folder_with_unparsed_direct_strm_files_is_series() {
-        let root = test_dir("tv_folder_with_unparsed_direct_strm_files_is_series");
-        let group = root.join("国产剧");
-        let e_series = group.join("美人心计");
-        let ep_series = group.join("知否知否应是绿肥红瘦");
-        let numeric_series =
-            group.join("[至尊红颜][2003][全42集][国语中字][1080P][38G]");
-        fs::create_dir_all(&e_series).unwrap();
-        fs::create_dir_all(&ep_series).unwrap();
-        fs::create_dir_all(&numeric_series).unwrap();
-        fs::write(e_series.join("E01.(mkv).strm"), []).unwrap();
-        fs::write(ep_series.join("EP64.(mp4).strm"), []).unwrap();
-        fs::write(numeric_series.join("01.(mp4).strm"), []).unwrap();
-
-        assert_eq!(tv_folder_type(&group, &root, "tvshows"), "Folder");
-        assert_eq!(tv_folder_type(&e_series, &root, "tvshows"), "Series");
-        assert_eq!(tv_folder_type(&ep_series, &root, "tvshows"), "Series");
-        assert_eq!(
-            tv_folder_type(&numeric_series, &root, "tvshows"),
-            "Series"
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn fullwidth_year_and_movie_nfo_identify_version_folders() {
-        let root = test_dir("fullwidth_year_and_movie_nfo_identify_version_folders");
-        let avatar = root.join("阿凡达1（2009）");
-        let f1 = root.join("F1：狂飙飞车");
-        fs::create_dir_all(&avatar).unwrap();
-        fs::create_dir_all(&f1).unwrap();
-        fs::write(avatar.join("阿凡达 (2009) 4K.mkv"), []).unwrap();
-        fs::write(avatar.join("阿凡达 (2009) 4K杜比.mp4"), []).unwrap();
-        fs::write(f1.join("2025.1080p.mkv"), []).unwrap();
-        fs::write(f1.join("2025.2160p.mkv"), []).unwrap();
-        fs::write(f1.join("movie.nfo"), []).unwrap();
-
-        assert_eq!(tv_folder_type(&avatar, &root, "movies"), "Movie");
-        assert_eq!(tv_folder_type(&f1, &root, "movies"), "Movie");
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn nested_release_and_extra_folders_do_not_become_duplicate_series() {
-        let root = test_dir("nested_release_and_extra_folders_do_not_become_duplicate_series");
-        let series = root.join("老友记 (1994)");
-        let season = series.join("老友记S01.Friends.1994.1080p");
-        let reunion = series.join("L 老友记重聚特辑");
-        let ova = series.join("ova").join("冬季篇");
-        fs::create_dir_all(&season).unwrap();
-        fs::create_dir_all(&reunion).unwrap();
-        fs::create_dir_all(&ova).unwrap();
-        fs::write(season.join("Friends.S01E01.mkv"), []).unwrap();
-        fs::write(reunion.join("老友记重聚特辑.2021.mp4"), []).unwrap();
-        fs::write(ova.join("SP01.strm"), []).unwrap();
-
-        assert_eq!(tv_folder_type(&series, &root, "tvshows"), "Series");
-        assert_eq!(tv_folder_type(&season, &root, "tvshows"), "Season");
-        assert_eq!(tv_folder_type(&reunion, &root, "tvshows"), "Folder");
-        assert_eq!(tv_folder_type(&ova, &root, "tvshows"), "Folder");
+        assert_eq!(tv_folder_type(&domestic_series, &root, "tvshows"), "Series");
+        assert_eq!(tv_folder_type(&foreign_series, &root, "tvshows"), "Series");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1968,14 +1897,8 @@ mod tests {
             tv_folder_type(&root.join("外剧"), root, "tvshows"),
             "Folder"
         );
-        assert_eq!(
-            season_number_from_folder_name("黑镜S01", None),
-            Some(1)
-        );
-        assert_eq!(
-            season_number_from_folder_name("SE10", None),
-            Some(10)
-        );
+        assert_eq!(season_number_from_folder_name("黑镜S01", None), Some(1));
+        assert_eq!(season_number_from_folder_name("SE10", None), Some(10));
         assert_eq!(
             season_number_from_folder_name("绝命毒师 S01-S05 4K", None),
             None

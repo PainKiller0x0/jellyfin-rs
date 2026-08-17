@@ -1,4 +1,4 @@
-use std::cmp::Reverse;
+use std::{cmp::Reverse, sync::OnceLock};
 
 use serde_json::{Map, Value as JsonValue, json};
 
@@ -726,14 +726,16 @@ pub fn media_source_json_with_streams(
     let (default_audio_stream_index, default_subtitle_stream_index) =
         default_media_stream_indexes(&media_streams);
     let bitrate = media_source_bitrate(item.size_bytes, item.runtime_ticks, &media_streams);
-    let direct_stream_url = match remote_strm_target(&item.path) {
+    let remote_target = remote_strm_target(&item.path);
+    let direct_stream_url = match remote_target.clone() {
         Some(target) => target,
         None => match item.item_type.as_str() {
             "Audio" => format!("/Audio/{}/universal", item.id),
             _ => format!("/Videos/{}/stream", item.id),
         },
     };
-    let (protocol, path, is_remote) = media_source_protocol_path(&item.path);
+    let (protocol, path, is_remote) =
+        media_source_protocol_path_with_target(&item.path, remote_target.as_deref());
     let video_type = opt_str(&resolved_video_type(item));
     let iso_type = opt_str(&resolved_iso_type(item));
 
@@ -804,9 +806,12 @@ pub fn media_source_json_with_streams(
     JsonValue::Object(map)
 }
 
-fn media_source_protocol_path(path: &str) -> (String, String, bool) {
-    match remote_strm_target(path) {
-        Some(target) => ("Http".to_string(), target, true),
+fn media_source_protocol_path_with_target(
+    path: &str,
+    remote_target: Option<&str>,
+) -> (String, String, bool) {
+    match remote_target {
+        Some(target) => ("Http".to_string(), target.to_string(), true),
         None => ("File".to_string(), path.to_string(), false),
     }
 }
@@ -820,11 +825,15 @@ fn remote_strm_target(path: &str) -> Option<String> {
         .map(|target| rewrite_public_strm_target(&target))
 }
 
-pub(crate) fn rewrite_public_strm_target(target: &str) -> String {
-    let public_base = std::env::var("JELLYFIN_RS_STRM_PUBLIC_BASE_URL")
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| value.starts_with("http://") || value.starts_with("https://"));
+static STRM_PUBLIC_BASE: OnceLock<Option<String>> = OnceLock::new();
+
+fn rewrite_public_strm_target(target: &str) -> String {
+    let public_base = STRM_PUBLIC_BASE.get_or_init(|| {
+        std::env::var("JELLYFIN_RS_STRM_PUBLIC_BASE_URL")
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+    });
     rewrite_public_strm_target_with_base(target, public_base.as_deref())
 }
 
@@ -1336,11 +1345,17 @@ impl MediaStreamRow {
         let is_subtitle = self.stream_type == "Subtitle";
         let is_text_subtitle = is_subtitle && is_text_subtitle_codec(codec);
         let is_pgs_subtitle = is_subtitle && is_pgs_subtitle_codec(codec);
-        let delivery_url = if self.stream_type == "Subtitle" && self.is_external {
+        let delivery_url = if is_subtitle {
+            // Jellyfin Web resolves the subtitle request from DeliveryUrl.
+            // Text subtitles are fetched as Stream.js by the custom renderer,
+            // so their advertised URL must be the canonical Stream.vtt URL;
+            // getTextTrackUrl() then replaces .vtt with .js. Keep ASS/PGS on
+            // their native formats because those renderers consume the raw
+            // subtitle stream directly.
+            let format = subtitle_delivery_format(codec);
             Some(format!(
-                "/Videos/{item_id}/{item_id}/Subtitles/{}/Stream.{}",
-                self.stream_index,
-                if codec.is_empty() { "srt" } else { codec }
+                "/Videos/{item_id}/{item_id}/Subtitles/{}/Stream.{format}",
+                self.stream_index
             ))
         } else if is_text_subtitle {
             // Browser clients cannot consume an embedded subtitle stream directly.
@@ -1490,6 +1505,16 @@ fn is_text_subtitle_codec(codec: &str) -> bool {
 fn is_pgs_subtitle_codec(codec: &str) -> bool {
     let codec = codec.to_ascii_lowercase();
     codec == "pgs" || codec == "hdmv_pgs_subtitle" || codec.contains("pgs")
+}
+
+fn subtitle_delivery_format(codec: &str) -> &'static str {
+    if matches!(codec.to_ascii_lowercase().as_str(), "ass" | "ssa") {
+        return "ass";
+    }
+    if is_pgs_subtitle_codec(codec) {
+        return "sup";
+    }
+    "vtt"
 }
 
 fn compute_stream_display_title(stream: &MediaStreamRow) -> String {
@@ -1662,9 +1687,12 @@ pub fn child_video_source_json_for_item(
     let (default_audio_stream_index, default_subtitle_stream_index) =
         default_media_stream_indexes(&media_streams);
     let bitrate = media_source_bitrate(size, runtime_ticks, &media_streams);
-    let direct_stream_url = remote_strm_target(path)
+    let remote_target = remote_strm_target(path);
+    let direct_stream_url = remote_target
+        .clone()
         .unwrap_or_else(|| format!("/Videos/{item_id}/{media_source_id}/stream"));
-    let (protocol, path, is_remote) = media_source_protocol_path(path);
+    let (protocol, path, is_remote) =
+        media_source_protocol_path_with_target(path, remote_target.as_deref());
     let video_type = crate::library::classify::file_video_type(std::path::Path::new(&path))
         .unwrap_or("VideoFile")
         .to_string();
@@ -1767,10 +1795,7 @@ mod tests {
             "https://other.example.test/movie.mkv"
         );
         assert_eq!(
-            rewrite_public_strm_target_with_base(
-                "http://127.0.0.1:8024/movie.mkv",
-                None,
-            ),
+            rewrite_public_strm_target_with_base("http://127.0.0.1:8024/movie.mkv", None,),
             "http://127.0.0.1:8024/movie.mkv"
         );
     }
@@ -2160,7 +2185,6 @@ mod tests {
         assert_eq!(text["IsExtractableSubtitleStream"], true);
         assert_eq!(text["DisplayLanguage"], "eng");
         assert_eq!(text["Extradata"], "");
-        assert_eq!(text["DeliveryMethod"], "External");
         assert_eq!(
             text["DeliveryUrl"],
             "/Videos/movie/movie/Subtitles/2/Stream.vtt"
@@ -2177,6 +2201,22 @@ mod tests {
         assert_eq!(external["DeliveryMethod"], "External");
         assert_eq!(external["IsTextSubtitleStream"], true);
         assert_eq!(external["IsExtractableSubtitleStream"], false);
+        assert_eq!(
+            external["DeliveryUrl"],
+            "/Videos/movie/movie/Subtitles/2/Stream.vtt"
+        );
+
+        let ass = subtitle_stream("ass", false).to_jellyfin_json("movie");
+        assert_eq!(
+            ass["DeliveryUrl"],
+            "/Videos/movie/movie/Subtitles/2/Stream.ass"
+        );
+
+        let pgs = subtitle_stream("hdmv_pgs_subtitle", false).to_jellyfin_json("movie");
+        assert_eq!(
+            pgs["DeliveryUrl"],
+            "/Videos/movie/movie/Subtitles/2/Stream.sup"
+        );
     }
 
     fn sample_streams() -> Vec<serde_json::Value> {

@@ -23,6 +23,7 @@ use crate::{
 };
 
 const DOUBAN_PROVIDER: &str = "Douban";
+pub(crate) const DOUBAN_ENABLED_KEY: &str = "douban_enabled";
 const SEARCH_URL: &str = "https://movie.douban.com/subject_search";
 const SUGGEST_URL: &str = "https://movie.douban.com/j/subject_suggest";
 const DESKTOP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
@@ -172,6 +173,11 @@ pub async fn fill_missing_douban(
     db: &DatabaseConnection,
     cookie: Option<&str>,
 ) -> anyhow::Result<usize> {
+    if cookie.is_none_or(|value| value.trim().is_empty()) {
+        tracing::info!("fill_missing_douban skipped: no Douban cookie configured");
+        return Ok(0);
+    }
+
     let candidates = db
         .query_all_raw(crate::db::helpers::pg_statement(
             r#"SELECT mi.id,
@@ -288,6 +294,10 @@ pub async fn fill_missing_douban(
 
     tracing::info!("fill_missing_douban: filled {filled}/{total} items");
     Ok(filled)
+}
+
+pub(crate) async fn douban_provider_enabled(db: &DatabaseConnection) -> bool {
+    crate::db::settings::get_bool(db, DOUBAN_ENABLED_KEY, true).await
 }
 
 struct DoubanFillTarget {

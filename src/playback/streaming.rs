@@ -1,4 +1,10 @@
-use std::{collections::HashMap, io::SeekFrom, process::Stdio, sync::Arc};
+use std::{
+    collections::HashMap,
+    io::SeekFrom,
+    process::Stdio,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json,
@@ -7,13 +13,15 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde_json::json;
 use tokio::{
-    fs::File,
+    fs::{self, File},
     io::{AsyncReadExt, AsyncSeekExt},
     process::Command,
-    time::{Duration, timeout},
+    sync::{Mutex, OnceCell, RwLock},
+    time::timeout,
 };
 use tokio_util::io::ReaderStream;
 
@@ -278,7 +286,6 @@ pub async fn stream_subtitle(
     stream_subtitle_item(
         state,
         item_id,
-        None,
         index,
         format,
         None,
@@ -298,7 +305,6 @@ pub async fn stream_subtitle_head(
     stream_subtitle_item(
         state,
         item_id,
-        None,
         index,
         format,
         None,
@@ -313,13 +319,13 @@ pub async fn stream_subtitle_head(
 pub async fn stream_subtitle_with_source(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, media_source_id, index, format)): Path<(String, String, i64, String)>,
+    Path((item_id, _media_source_id, index, format)): Path<(String, String, i64, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    // media_source_id is ignored; route to the same handler
     stream_subtitle_item(
         state,
         item_id,
-        Some(media_source_id),
         index,
         format,
         None,
@@ -333,16 +339,58 @@ pub async fn stream_subtitle_with_source(
 pub async fn stream_subtitle_with_source_head(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, media_source_id, index, format)): Path<(String, String, i64, String)>,
+    Path((item_id, _media_source_id, index, format)): Path<(String, String, i64, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     stream_subtitle_item(
         state,
         item_id,
-        Some(media_source_id),
         index,
         format,
         None,
+        headers,
+        query,
+        Method::HEAD,
+    )
+    .await
+}
+
+/// Subtitle streaming with a start position but without mediaSourceId.
+///
+/// Jellyfin Web can emit this compact form while progressively loading
+/// embedded subtitles. Keep it equivalent to the mediaSourceId variant so
+/// lightweight clients do not need to query and retain a media source id.
+pub async fn stream_subtitle_with_ticks_no_source(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((item_id, index, start_ticks, format)): Path<(String, i64, i64, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    stream_subtitle_item(
+        state,
+        item_id,
+        index,
+        format,
+        Some(start_ticks),
+        headers,
+        query,
+        Method::GET,
+    )
+    .await
+}
+
+pub async fn stream_subtitle_with_ticks_no_source_head(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((item_id, index, start_ticks, format)): Path<(String, i64, i64, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    stream_subtitle_item(
+        state,
+        item_id,
+        index,
+        format,
+        Some(start_ticks),
         headers,
         query,
         Method::HEAD,
@@ -354,7 +402,7 @@ pub async fn stream_subtitle_with_source_head(
 pub async fn stream_subtitle_with_ticks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, media_source_id, index, start_ticks, format)): Path<(
+    Path((item_id, _media_source_id, index, start_ticks, format)): Path<(
         String,
         String,
         i64,
@@ -366,7 +414,6 @@ pub async fn stream_subtitle_with_ticks(
     stream_subtitle_item(
         state,
         item_id,
-        Some(media_source_id),
         index,
         format,
         Some(start_ticks),
@@ -380,7 +427,7 @@ pub async fn stream_subtitle_with_ticks(
 pub async fn stream_subtitle_with_ticks_head(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((item_id, media_source_id, index, start_ticks, format)): Path<(
+    Path((item_id, _media_source_id, index, start_ticks, format)): Path<(
         String,
         String,
         i64,
@@ -392,7 +439,6 @@ pub async fn stream_subtitle_with_ticks_head(
     stream_subtitle_item(
         state,
         item_id,
-        Some(media_source_id),
         index,
         format,
         Some(start_ticks),
@@ -421,70 +467,81 @@ async fn stream_subtitle_item(
     } else {
         find_media_item(&state.db, &user_id, &item_id).await
     };
-    match item {
-        Ok(Some(_)) => {}
+    let item = match item {
+        Ok(Some(item)) => item,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return internal_error(error),
-    }
-    if wants_json_response(&request_headers) {
-        return ok_response();
-    }
-
-    let source_item =
-        match find_stream_media_item(&state.db, &user_id, &item_id, media_source_id.as_deref())
-            .await
-        {
-            Ok(Some(item)) => item,
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-            Err(error) => return internal_error(error),
-        };
-    let stream = match MediaStreams::find()
-        .filter(media_streams::Column::ItemId.eq(&source_item.id))
-        .filter(media_streams::Column::StreamIndex.eq(index))
-        .filter(media_streams::Column::StreamType.eq("Subtitle"))
-        .one(&state.db)
-        .await
-    {
-        Ok(Some(stream)) => stream,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return internal_error(error.into()),
     };
-
-    if stream.is_external != 0 {
-        let Some(path) = stream.path else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        return stream_external_subtitle(&state, &path, &format, method).await;
-    }
-
-    let codec = stream.codec.as_deref().unwrap_or_default();
-    if !is_extractable_text_subtitle(codec) {
-        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
-    }
-    stream_embedded_subtitle(&state, &source_item, index, &format, start_ticks, method).await
-}
-
-async fn stream_external_subtitle(
-    state: &AppState,
-    path: &str,
-    format: &str,
-    method: Method,
-) -> Response {
-    if !readable_media_path(&state.db, path).await {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "Error": format!("failed to read subtitle file: {error}") })),
-            )
-                .into_response();
+    let path = match crate::jellyfin::routes::subtitle_stream_path(&state.db, &item_id, index).await
+    {
+        Ok(path) => path,
+        Err(error) => return internal_error(error),
+    };
+    let bytes = match path {
+        Some(path) => {
+            if !readable_media_path(&state.db, &path).await {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "Error": format!("failed to read subtitle file: {error}") })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        None => {
+            // Jellyfin Web may request Stream.js through a native track/XHR
+            // path that the Jellium fetch shim cannot intercept. For remote
+            // STRM sources, return only the requested bounded window. Do not
+            // start a full-track background extraction: it competes with video
+            // playback for the same remote source and can outlive a seek.
+            let bytes = if format.eq_ignore_ascii_case("js") {
+                let window_start_ticks = start_ticks.unwrap_or(0).max(0);
+                match cached_embedded_subtitle_window(
+                    &state,
+                    &item,
+                    index,
+                    window_start_ticks,
+                    EMBEDDED_SUBTITLE_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(item_id = %item_id, index, "embedded subtitle extraction failed: {error:#}");
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                }
+            } else {
+                match cached_embedded_subtitle(&state, &item, index, EMBEDDED_SUBTITLE_TIMEOUT)
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(item_id = %item_id, index, "embedded subtitle extraction failed: {error:#}");
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                }
+            };
+            bytes
         }
     };
+    let (content_type, bytes) = if format.eq_ignore_ascii_case("js") {
+        (
+            "application/json; charset=utf-8",
+            vtt_to_track_events(&bytes),
+        )
+    } else if format.eq_ignore_ascii_case("vtt") {
+        ("text/vtt; charset=utf-8", bytes)
+    } else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, subtitle_content_type(format));
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(
         header::CONTENT_LENGTH,
         HeaderValue::from_str(&bytes.len().to_string())
@@ -497,99 +554,431 @@ async fn stream_external_subtitle(
     }
 }
 
-async fn stream_embedded_subtitle(
-    state: &AppState,
-    item: &MediaItem,
-    index: i64,
-    format: &str,
-    start_ticks: Option<i64>,
-    method: Method,
-) -> Response {
-    if !readable_media_path(&state.db, &item.path).await {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    if !format.eq_ignore_ascii_case("vtt") && !format.eq_ignore_ascii_case("webvtt") {
-        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
-    }
+const EMBEDDED_SUBTITLE_TIMEOUT: Duration = Duration::from_secs(30);
+// A remote STRM can service byte ranges quickly, but FFmpeg still has to walk
+// the selected subtitle stream until the requested output window is complete.
+// A 120-second window made a seek wait tens of seconds on Quark-backed media.
+// Thirty seconds is small enough to return promptly and the WebView client
+// requests the next window ahead of the playback position.
+const EMBEDDED_SUBTITLE_WINDOW_SECONDS: u64 = 30;
+const EMBEDDED_SUBTITLE_WINDOW_BUCKET_TICKS: i64 = 5 * 10_000_000;
+const MAX_EMBEDDED_SUBTITLE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EMBEDDED_SUBTITLE_CACHE_ENTRIES: usize = 32;
+const DEFAULT_SUBTITLE_CACHE_DIR: &str = "/data/subtitle-cache";
+const DEFAULT_SUBTITLE_PREWARM_INTERVAL_SECONDS: u64 = 6 * 60 * 60;
+const DEFAULT_SUBTITLE_PREWARM_INITIAL_DELAY_SECONDS: u64 = 30;
+const DEFAULT_SUBTITLE_PREWARM_MAX_ITEMS: usize = 32;
+const DEFAULT_SUBTITLE_PREWARM_TIMEOUT_SECONDS: u64 = 15;
+const DEFAULT_SUBTITLE_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, subtitle_content_type("vtt"));
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=86400"),
-    );
-    if method == Method::HEAD {
-        return (StatusCode::OK, headers, Body::empty()).into_response();
-    }
+type EmbeddedSubtitleCacheKey = (String, i64, i64, i64);
+static EMBEDDED_SUBTITLE_CACHE: OnceLock<RwLock<HashMap<EmbeddedSubtitleCacheKey, Vec<u8>>>> =
+    OnceLock::new();
+static EMBEDDED_SUBTITLE_INFLIGHT: OnceLock<
+    Mutex<HashMap<EmbeddedSubtitleCacheKey, Arc<OnceCell<Result<Vec<u8>, String>>>>>,
+> = OnceLock::new();
 
-    let input = match embedded_subtitle_input(item) {
-        Ok(input) => input,
-        Err(error) => return internal_error(error),
-    };
-    let start_ticks = start_ticks.unwrap_or_default().max(0);
-    let mut command = Command::new(&state.sa_config.ffmpeg_path);
-    command
-        .args(["-hide_banner", "-nostdin", "-v", "error", "-ss"])
-        .arg(format!("{:.3}", start_ticks as f64 / 10_000_000.0));
-    command
-        .arg("-i")
-        .arg(input)
-        .args([
-            "-t",
-            EMBEDDED_SUBTITLE_WINDOW_SECONDS,
-            "-map",
-            &format!("0:{index}"),
-            "-c:s",
-            "webvtt",
-            "-f",
-            "webvtt",
-            "pipe:1",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let output = match timeout(EMBEDDED_SUBTITLE_TIMEOUT, command.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            return internal_error(
-                anyhow::anyhow!(error).context("failed to start embedded subtitle extraction"),
-            );
-        }
-        Err(_) => {
-            return internal_error(anyhow::anyhow!(
-                "embedded subtitle extraction timed out after {} seconds",
-                EMBEDDED_SUBTITLE_TIMEOUT.as_secs()
-            ));
-        }
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return internal_error(anyhow::anyhow!(
-            "ffmpeg exited with {}: {}",
-            output.status,
-            stderr.trim()
-        ));
-    }
-    if output.stdout.is_empty() {
-        return internal_error(anyhow::anyhow!("ffmpeg returned an empty subtitle stream"));
-    }
-    if output.stdout.len() > MAX_EMBEDDED_SUBTITLE_BYTES {
-        return internal_error(anyhow::anyhow!("embedded subtitle output is too large"));
-    }
-
-    let bytes = shift_vtt_timestamps(&output.stdout, start_ticks);
-    headers.insert(
-        header::CONTENT_LENGTH,
-        HeaderValue::from_str(&bytes.len().to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("0")),
-    );
-    (StatusCode::OK, headers, Body::from(bytes)).into_response()
+fn embedded_subtitle_cache() -> &'static RwLock<HashMap<EmbeddedSubtitleCacheKey, Vec<u8>>> {
+    EMBEDDED_SUBTITLE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-const EMBEDDED_SUBTITLE_TIMEOUT: Duration = Duration::from_secs(30);
-const EMBEDDED_SUBTITLE_WINDOW_SECONDS: &str = "20";
-const MAX_EMBEDDED_SUBTITLE_BYTES: usize = 16 * 1024 * 1024;
+fn embedded_subtitle_inflight()
+-> &'static Mutex<HashMap<EmbeddedSubtitleCacheKey, Arc<OnceCell<Result<Vec<u8>, String>>>>> {
+    EMBEDDED_SUBTITLE_INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn cached_embedded_subtitle(
+    state: &Arc<AppState>,
+    item: &MediaItem,
+    index: i64,
+    extraction_timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    cached_embedded_subtitle_range(state, item, index, None, extraction_timeout).await
+}
+
+async fn cached_embedded_subtitle_window(
+    state: &Arc<AppState>,
+    item: &MediaItem,
+    index: i64,
+    start_ticks: i64,
+    extraction_timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    // Browsers report a seek position with sub-second precision. Treat nearby
+    // requests as the same five-second subtitle window so the `seeking` and
+    // `seeked` events cannot launch duplicate FFmpeg processes.
+    let start_ticks = normalize_embedded_subtitle_window_start_ticks(start_ticks);
+    if let Some(bytes) = read_persistent_subtitle_cache(item, index).await? {
+        return Ok(bytes);
+    }
+    let full_key = (item.id.clone(), item.modified_at, index, -1);
+    if let Some(bytes) = embedded_subtitle_cache()
+        .read()
+        .await
+        .get(&full_key)
+        .cloned()
+    {
+        return Ok(bytes);
+    }
+    cached_embedded_subtitle_range(state, item, index, Some(start_ticks), extraction_timeout).await
+}
+
+fn normalize_embedded_subtitle_window_start_ticks(start_ticks: i64) -> i64 {
+    start_ticks
+        .max(0)
+        .div_euclid(EMBEDDED_SUBTITLE_WINDOW_BUCKET_TICKS)
+        * EMBEDDED_SUBTITLE_WINDOW_BUCKET_TICKS
+}
+
+async fn cached_embedded_subtitle_range(
+    state: &Arc<AppState>,
+    item: &MediaItem,
+    index: i64,
+    start_ticks: Option<i64>,
+    extraction_timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let cache_start_ticks = start_ticks.unwrap_or(-1);
+    let key = (item.id.clone(), item.modified_at, index, cache_start_ticks);
+    let cache_path = persistent_subtitle_cache_path_for(item, index, start_ticks);
+    loop {
+        if let Some(bytes) = read_persistent_subtitle_cache_path(&cache_path).await? {
+            return Ok(bytes);
+        }
+        if let Some(bytes) = embedded_subtitle_cache().read().await.get(&key).cloned() {
+            return Ok(bytes);
+        }
+
+        // WebView2 can issue multiple subtitle requests at the same time. Only
+        // one FFmpeg process should inspect the remote STRM source for a key.
+        let cell = {
+            let mut inflight = embedded_subtitle_inflight().lock().await;
+            inflight
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+
+        let result = cell
+            .get_or_init(|| async {
+                let _permit = state
+                    .queue_manager
+                    .tier2_semaphore
+                    .acquire()
+                    .await
+                    .map_err(|error| format!("subtitle extraction queue closed: {error}"))?;
+                extract_embedded_subtitle(state, item, index, start_ticks, extraction_timeout)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .await
+            .clone()
+            .map_err(|error| anyhow::anyhow!(error));
+        if let Ok(bytes) = &result {
+            let mut cache = embedded_subtitle_cache().write().await;
+            if cache.len() >= MAX_EMBEDDED_SUBTITLE_CACHE_ENTRIES {
+                if let Some(oldest) = cache.keys().next().cloned() {
+                    cache.remove(&oldest);
+                }
+            }
+            cache.insert(key.clone(), bytes.clone());
+            if let Err(error) = write_persistent_subtitle_cache_path(&cache_path, bytes).await {
+                tracing::warn!(
+                    item_id = %item.id,
+                    index,
+                    "failed to persist embedded subtitle cache: {error:#}"
+                );
+            }
+        }
+        let mut inflight = embedded_subtitle_inflight().lock().await;
+        if inflight
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &cell))
+        {
+            inflight.remove(&key);
+        }
+        return result;
+    }
+}
+
+fn subtitle_cache_dir() -> std::path::PathBuf {
+    std::env::var_os("JELLYFIN_RS_SUBTITLE_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_SUBTITLE_CACHE_DIR))
+}
+
+fn persistent_subtitle_cache_path_for(
+    item: &MediaItem,
+    index: i64,
+    start_ticks: Option<i64>,
+) -> std::path::PathBuf {
+    let key = format!(
+        "{}:{}:{}:{}",
+        item.id,
+        item.modified_at,
+        index,
+        start_ticks.unwrap_or(-1).max(-1)
+    );
+    let encoded = URL_SAFE_NO_PAD.encode(key.as_bytes());
+    subtitle_cache_dir().join(format!("{encoded}.vtt"))
+}
+
+fn persistent_subtitle_cache_path(item: &MediaItem, index: i64) -> std::path::PathBuf {
+    persistent_subtitle_cache_path_for(item, index, None)
+}
+
+async fn read_persistent_subtitle_cache(
+    item: &MediaItem,
+    index: i64,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    read_persistent_subtitle_cache_path(&persistent_subtitle_cache_path(item, index)).await
+}
+
+async fn read_persistent_subtitle_cache_path(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    match fs::read(&path).await {
+        Ok(bytes) if !bytes.is_empty() => Ok(Some(bytes)),
+        Ok(_) => {
+            let _ = fs::remove_file(path).await;
+            Ok(None)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn write_persistent_subtitle_cache_path(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    // The cache key is already part of `path`, so the temporary file is also
+    // unique per item/track. This avoids collisions when two tracks finish
+    // extraction during the same process.
+    let temp_path = path.with_extension("vtt.tmp");
+    fs::write(&temp_path, bytes).await?;
+    if let Err(error) = fs::rename(&temp_path, &path).await {
+        let _ = fs::remove_file(&temp_path).await;
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn subtitle_prewarm_interval() -> Duration {
+    let seconds = std::env::var("JELLYFIN_RS_SUBTITLE_PREWARM_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SUBTITLE_PREWARM_INTERVAL_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+fn subtitle_prewarm_initial_delay() -> Duration {
+    let seconds = std::env::var("JELLYFIN_RS_SUBTITLE_PREWARM_INITIAL_DELAY_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SUBTITLE_PREWARM_INITIAL_DELAY_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+fn subtitle_prewarm_max_items() -> usize {
+    std::env::var("JELLYFIN_RS_SUBTITLE_PREWARM_MAX_ITEMS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SUBTITLE_PREWARM_MAX_ITEMS)
+}
+
+fn subtitle_prewarm_timeout() -> Duration {
+    let seconds = std::env::var("JELLYFIN_RS_SUBTITLE_PREWARM_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SUBTITLE_PREWARM_TIMEOUT_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+fn subtitle_cache_max_bytes() -> u64 {
+    std::env::var("JELLYFIN_RS_SUBTITLE_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SUBTITLE_CACHE_MAX_BYTES)
+}
+
+async fn prune_persistent_subtitle_cache() -> anyhow::Result<()> {
+    let mut directory = match fs::read_dir(subtitle_cache_dir()).await {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut entries = Vec::new();
+    while let Some(entry) = directory.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("vtt") {
+            continue;
+        }
+        let metadata = entry.metadata().await?;
+        entries.push((
+            metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+            metadata.len(),
+            path,
+        ));
+    }
+    let mut total_bytes = entries.iter().map(|(_, size, _)| *size).sum::<u64>();
+    if total_bytes <= subtitle_cache_max_bytes() {
+        return Ok(());
+    }
+    entries.sort_by_key(|(modified, _, _)| *modified);
+    for (_, size, path) in entries {
+        if total_bytes <= subtitle_cache_max_bytes() {
+            break;
+        }
+        if fs::remove_file(path).await.is_ok() {
+            total_bytes = total_bytes.saturating_sub(size);
+        }
+    }
+    Ok(())
+}
+
+/// Start the persistent embedded-subtitle prewarm loop.
+///
+/// The loop is intentionally incremental: it only extracts tracks whose
+/// versioned cache file is missing, and the shared tier-2 semaphore keeps it
+/// from competing with other light media operations.
+pub fn start_embedded_subtitle_cache_scheduler(state: Arc<AppState>) {
+    let interval = subtitle_prewarm_interval();
+    if interval.is_zero() {
+        tracing::info!("embedded subtitle cache prewarm disabled");
+        return;
+    }
+
+    tokio::spawn(async move {
+        tokio::time::sleep(subtitle_prewarm_initial_delay()).await;
+        loop {
+            match prewarm_embedded_subtitle_cache(&state, subtitle_prewarm_max_items()).await {
+                Ok(0) => tracing::debug!("embedded subtitle cache prewarm found no missing tracks"),
+                Ok(count) => tracing::info!(count, "embedded subtitle cache prewarm completed"),
+                Err(error) => tracing::warn!("embedded subtitle cache prewarm failed: {error:#}"),
+            }
+            if let Err(error) = prune_persistent_subtitle_cache().await {
+                tracing::warn!("embedded subtitle cache cleanup failed: {error:#}");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+async fn prewarm_embedded_subtitle_cache(
+    state: &Arc<AppState>,
+    max_items: usize,
+) -> anyhow::Result<usize> {
+    // `media_items.has_subtitles` is a metadata hint and can be stale for
+    // existing libraries. The stream table is authoritative for embedded
+    // subtitle tracks, so use it as the prewarm source.
+    let candidates = MediaStreams::find()
+        .filter(media_streams::Column::StreamType.eq("Subtitle"))
+        .filter(media_streams::Column::IsExternal.eq(0_i64))
+        .order_by_desc(media_streams::Column::CreatedAt)
+        .limit((max_items.saturating_mul(8).max(64)) as u64)
+        .all(&state.db)
+        .await?;
+    let user_id = state.user_id.to_string();
+    let mut warmed = 0;
+
+    for stream in candidates {
+        if warmed >= max_items {
+            break;
+        }
+        let Some(item) = find_media_item_for_admin(&state.db, &user_id, &stream.item_id).await?
+        else {
+            continue;
+        };
+        if !item.is_public || item.is_folder {
+            continue;
+        }
+        let result = cached_embedded_subtitle_window(
+            state,
+            &item,
+            stream.stream_index,
+            0,
+            subtitle_prewarm_timeout(),
+        )
+        .await;
+        match result {
+            Ok(_) => warmed += 1,
+            Err(error) => {
+                tracing::warn!(
+                    item_id = %item.id,
+                    index = stream.stream_index,
+                    "embedded subtitle prewarm failed: {error:#}"
+                );
+            }
+        }
+    }
+    Ok(warmed)
+}
+
+async fn extract_embedded_subtitle(
+    state: &Arc<AppState>,
+    item: &MediaItem,
+    index: i64,
+    start_ticks: Option<i64>,
+    extraction_timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let source = match playback_target_for_item(item)? {
+        PlaybackTarget::RemoteUrl(url) => url,
+        PlaybackTarget::LocalPath(path) => path.to_string_lossy().into_owned(),
+    };
+    let mut command = Command::new(&state.sa_config.ffmpeg_path);
+    // An HTTP client cancels a seek as soon as it moves again. Ensure its
+    // remote FFmpeg extraction is terminated with that request instead of
+    // continuing to consume the SmartStrm/Quark connection in the background.
+    command.kill_on_drop(true);
+    command
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin");
+    if let Some(start_ticks) = start_ticks {
+        command
+            .arg("-ss")
+            .arg(format!("{:.3}", start_ticks as f64 / 10_000_000.0));
+    }
+    command.arg("-i").arg(source);
+    if start_ticks.is_some() {
+        command
+            .arg("-t")
+            .arg(EMBEDDED_SUBTITLE_WINDOW_SECONDS.to_string());
+    }
+    command
+        .arg("-map")
+        .arg(format!("0:{index}"))
+        .arg("-c:s")
+        .arg("webvtt")
+        .arg("-f")
+        .arg("webvtt")
+        .arg("pipe:1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = timeout(extraction_timeout, command.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("embedded subtitle extraction timed out"))??;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ffmpeg exited with {}: {}", output.status, stderr.trim());
+    }
+    if output.stdout.len() > MAX_EMBEDDED_SUBTITLE_BYTES {
+        anyhow::bail!("embedded subtitle output is too large");
+    }
+    if output.stdout.is_empty() {
+        anyhow::bail!("ffmpeg returned an empty subtitle stream");
+    }
+    Ok(match start_ticks {
+        Some(start_ticks) => shift_vtt_timestamps(&output.stdout, start_ticks),
+        None => output.stdout,
+    })
+}
 
 fn shift_vtt_timestamps(bytes: &[u8], start_ticks: i64) -> Vec<u8> {
     if start_ticks <= 0 {
@@ -598,15 +987,14 @@ fn shift_vtt_timestamps(bytes: &[u8], start_ticks: i64) -> Vec<u8> {
     let offset_seconds = start_ticks as f64 / 10_000_000.0;
     let text = String::from_utf8_lossy(bytes).replace('\r', "");
     let mut shifted = String::with_capacity(text.len());
-    for (line_index, line) in text.split('\n').enumerate() {
-        if line_index > 0 {
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
             shifted.push('\n');
         }
         let Some((start, end_and_settings)) = line.split_once("-->") else {
             shifted.push_str(line);
             continue;
         };
-        let end_and_settings = end_and_settings.trim_start();
         let Some(end_token) = end_and_settings.split_whitespace().next() else {
             shifted.push_str(line);
             continue;
@@ -630,6 +1018,80 @@ fn shift_vtt_timestamps(bytes: &[u8], start_ticks: i64) -> Vec<u8> {
     shifted.into_bytes()
 }
 
+fn vtt_to_track_events(bytes: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(bytes).replace('\r', "");
+    let lines: Vec<&str> = text.lines().collect();
+    let mut events = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if !lines[index].contains("-->") {
+            index += 1;
+            continue;
+        }
+        let Some((start, end)) = parse_vtt_timing(lines[index]) else {
+            index += 1;
+            continue;
+        };
+        index += 1;
+        let text_start = index;
+        while index < lines.len() && !lines[index].trim().is_empty() {
+            index += 1;
+        }
+        let cue_text = strip_subtitle_markup(&lines[text_start..index].join("\n"));
+        if !cue_text.is_empty() {
+            events.push(json!({
+                "Text": cue_text,
+                "StartPositionTicks": start,
+                "EndPositionTicks": end,
+            }));
+        }
+        index += 1;
+    }
+    serde_json::to_vec(&json!({ "TrackEvents": events }))
+        .unwrap_or_else(|_| br#"{"TrackEvents":[]}"#.to_vec())
+}
+
+fn strip_subtitle_markup(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut in_tag = false;
+    let mut tag = String::new();
+    for ch in value.chars() {
+        match ch {
+            '<' if !in_tag => {
+                in_tag = true;
+                tag.clear();
+            }
+            '>' if in_tag => {
+                in_tag = false;
+                if tag.trim_start().to_ascii_lowercase().starts_with("br") {
+                    output.push('\n');
+                }
+            }
+            _ if in_tag => tag.push(ch),
+            _ => output.push(ch),
+        }
+    }
+    output
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
+}
+
+fn parse_vtt_timing(line: &str) -> Option<(i64, i64)> {
+    let (start, end) = line.split_once("-->")?;
+    let start = vtt_timestamp_ticks(start.trim().split_whitespace().next()?)?;
+    let end = vtt_timestamp_ticks(end.trim().split_whitespace().next()?)?;
+    (end > start).then_some((start, end))
+}
+
+fn vtt_timestamp_ticks(value: &str) -> Option<i64> {
+    Some((vtt_timestamp_seconds(value)? * 10_000_000.0).round() as i64)
+}
+
 fn vtt_timestamp_seconds(value: &str) -> Option<f64> {
     let parts: Vec<&str> = value.split(':').collect();
     let (hours, minutes, seconds) = match parts.as_slice() {
@@ -651,31 +1113,6 @@ fn format_vtt_timestamp(seconds: f64) -> String {
     let minutes = ((seconds - hours as f64 * 3600.0) / 60.0).floor() as u64;
     let remainder = seconds - hours as f64 * 3600.0 - minutes as f64 * 60.0;
     format!("{hours:02}:{minutes:02}:{remainder:06.3}")
-}
-
-fn embedded_subtitle_input(item: &MediaItem) -> anyhow::Result<String> {
-    let path = std::path::Path::new(&item.path);
-    if crate::strm::is_strm_path(path) {
-        return Ok(crate::strm::resolve_strm_path(path)?
-            .to_string_lossy()
-            .to_string());
-    }
-    Ok(item.path.clone())
-}
-
-fn is_extractable_text_subtitle(codec: &str) -> bool {
-    matches!(
-        codec.to_ascii_lowercase().as_str(),
-        "srt" | "subrip" | "ass" | "ssa" | "webvtt" | "vtt" | "mov_text" | "text" | "ttml" | "dfxp"
-    )
-}
-
-fn subtitle_content_type(format: &str) -> HeaderValue {
-    if matches!(format.to_ascii_lowercase().as_str(), "vtt" | "webvtt") {
-        HeaderValue::from_static("text/vtt; charset=utf-8")
-    } else {
-        HeaderValue::from_static("text/plain; charset=utf-8")
-    }
 }
 
 async fn stream_media_item(
@@ -712,7 +1149,19 @@ async fn stream_media_item(
     }
 
     let playback_target = match playback_target_for_item(&item) {
-        Ok(PlaybackTarget::RemoteUrl(url)) => return remote_stream_redirect(&url),
+        Ok(PlaybackTarget::RemoteUrl(url)) => {
+            if remote_stream_proxy_requested(&query) {
+                return remote_stream_proxy(
+                    &url,
+                    &request_headers,
+                    method,
+                    media_content_type(&item),
+                    item.runtime_ticks,
+                )
+                .await;
+            }
+            return remote_stream_redirect(&url);
+        }
         Ok(PlaybackTarget::LocalPath(path)) => path,
         Err(error) => {
             tracing::warn!(
@@ -909,6 +1358,177 @@ fn remote_stream_redirect(url: &str) -> Response {
     }
 }
 
+/// Proxy a remote STRM target through the server when a client cannot follow
+/// the cloud-drive redirect itself.  The default remains a redirect so
+/// clients such as VidHub keep the existing direct-link performance.  Jellium
+/// opts in with `JellyfinRsProxy=1`, which keeps the signed cloud-drive URL and
+/// any IP-bound session on the VPS instead of exposing it to the desktop.
+async fn remote_stream_proxy(
+    url: &str,
+    request_headers: &HeaderMap,
+    method: Method,
+    content_type: &'static str,
+    runtime_ticks: Option<i64>,
+) -> Response {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            // Follow redirects below so the cloud-drive Referer can be
+            // re-applied after SmartStrm crosses from its local endpoint to
+            // the CDN host.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build remote stream proxy client")
+    });
+
+    let reqwest_method =
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
+    let has_client_range = request_headers.contains_key(header::RANGE);
+    let mut current_url = url.to_string();
+    let mut upstream = None;
+    for _ in 0..8 {
+        let mut request = client.request(reqwest_method.clone(), &current_url);
+        for name in [
+            header::RANGE,
+            header::IF_RANGE,
+            header::IF_NONE_MATCH,
+            header::IF_MODIFIED_SINCE,
+            header::ACCEPT,
+            header::USER_AGENT,
+        ] {
+            if let Some(value) = request_headers.get(&name) {
+                request = request.header(name.as_str(), value.as_bytes());
+            }
+        }
+        // Xunlei's preview endpoint returns an unbounded 200 response when the
+        // client omits Range. Desktop players then classify it as a live stream
+        // and report a one-second duration. Seed the first GET with an open
+        // range so the upstream returns 206 plus the complete Content-Range.
+        if method == Method::GET && !has_client_range {
+            request = request.header(header::RANGE, "bytes=0-");
+        }
+        // Re-apply the provider Referer on every redirect. reqwest strips or
+        // does not synthesize it when the redirect crosses hosts.
+        if let Some(referer) =
+            remote_stream_referer(&current_url).or_else(|| remote_stream_referer(url))
+        {
+            request = request.header(header::REFERER, referer);
+        }
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(url = %redacted_remote_stream_url(url), "remote STRM proxy request failed: {error}");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "Error": "remote media proxy request failed" })),
+                )
+                    .into_response();
+            }
+        };
+        if !response.status().is_redirection() {
+            upstream = Some(response);
+            break;
+        }
+        let Some(location) = response.headers().get(header::LOCATION) else {
+            upstream = Some(response);
+            break;
+        };
+        let Ok(location) = location.to_str() else {
+            upstream = Some(response);
+            break;
+        };
+        let Some(next_url) = response.url().join(location).ok() else {
+            upstream = Some(response);
+            break;
+        };
+        current_url = next_url.to_string();
+    }
+    let Some(upstream) = upstream else {
+        tracing::warn!(url = %redacted_remote_stream_url(url), "remote STRM proxy redirect limit exceeded");
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "Error": "remote media proxy redirect limit exceeded" })),
+        )
+            .into_response();
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut headers = HeaderMap::new();
+    for name in [
+        header::ACCEPT_RANGES,
+        header::CACHE_CONTROL,
+        header::CONTENT_DISPOSITION,
+        header::CONTENT_LENGTH,
+        header::CONTENT_RANGE,
+        header::CONTENT_TYPE,
+        header::ETAG,
+        header::LAST_MODIFIED,
+    ] {
+        if name == header::CONTENT_TYPE {
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+        } else if let Some(value) = upstream.headers().get(name.as_str())
+            && let Ok(value) = HeaderValue::from_bytes(value.as_bytes())
+        {
+            headers.insert(name, value);
+        }
+    }
+    if let Some(runtime_ticks) = runtime_ticks.filter(|value| *value > 0) {
+        let duration_seconds = runtime_ticks as f64 / 10_000_000.0;
+        if let Ok(value) = HeaderValue::from_str(&format!("{duration_seconds:.3}")) {
+            // The upstream is an MPEG-TS preview stream and does not carry a
+            // fixed duration in its initial packets.  Jellyfin already knows
+            // the duration from its media metadata, so expose it using the
+            // standard HTTP hint understood by some desktop players.
+            headers.insert(
+                header::HeaderName::from_static("content-duration"),
+                value.clone(),
+            );
+            headers.insert(header::HeaderName::from_static("x-content-duration"), value);
+        }
+    }
+
+    if method == Method::HEAD {
+        return (status, headers, Body::empty()).into_response();
+    }
+
+    (status, headers, Body::from_stream(upstream.bytes_stream())).into_response()
+}
+
+fn remote_stream_proxy_requested(query: &HashMap<String, String>) -> bool {
+    query.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("JellyfinRsProxy")
+            && matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+    })
+}
+
+fn remote_stream_referer(url: &str) -> Option<&'static str> {
+    let folded = url.to_ascii_lowercase();
+    if folded.contains("xunlei") || folded.contains("thunder") {
+        Some("http://pan.xunlei.com/")
+    } else if folded.contains("quark") || folded.contains("myquark") {
+        Some("http://pan.quark.cn/")
+    } else {
+        None
+    }
+}
+
+fn redacted_remote_stream_url(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .map(|mut parsed| {
+            if parsed.query().is_some() {
+                parsed.set_query(Some("<redacted>"));
+            }
+            parsed.to_string()
+        })
+        .unwrap_or_else(|_| "<invalid-url>".to_string())
+}
+
 #[derive(Clone, Copy)]
 struct ByteRange {
     start: u64,
@@ -971,11 +1591,47 @@ pub(crate) async fn readable_media_path(db: &sea_orm::DatabaseConnection, path: 
 }
 
 async fn library_roots(db: &sea_orm::DatabaseConnection) -> anyhow::Result<Vec<String>> {
+    {
+        let cache = library_roots_cache().read().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.loaded_at.elapsed() <= LIBRARY_ROOTS_CACHE_TTL
+        {
+            return Ok(cached.roots.clone());
+        }
+    }
+
+    // Recheck while holding the write lock so concurrent HEAD/GET/seek
+    // requests perform at most one database refresh per short TTL window.
+    let mut cache = library_roots_cache().write().await;
+    if let Some(cached) = cache.as_ref()
+        && cached.loaded_at.elapsed() <= LIBRARY_ROOTS_CACHE_TTL
+    {
+        return Ok(cached.roots.clone());
+    }
+
     let paths = LibraryPaths::find()
         .order_by_asc(library_paths::Column::Path)
         .all(db)
         .await?;
-    Ok(paths.into_iter().map(|path| path.path).collect())
+    let roots: Vec<String> = paths.into_iter().map(|path| path.path).collect();
+    *cache = Some(CachedLibraryRoots {
+        loaded_at: Instant::now(),
+        roots: roots.clone(),
+    });
+    Ok(roots)
+}
+
+const LIBRARY_ROOTS_CACHE_TTL: Duration = Duration::from_secs(3);
+
+struct CachedLibraryRoots {
+    loaded_at: Instant,
+    roots: Vec<String>,
+}
+
+static LIBRARY_ROOTS_CACHE: OnceLock<RwLock<Option<CachedLibraryRoots>>> = OnceLock::new();
+
+fn library_roots_cache() -> &'static RwLock<Option<CachedLibraryRoots>> {
+    LIBRARY_ROOTS_CACHE.get_or_init(|| RwLock::new(None))
 }
 
 /// GET /Audio/{id}/stream — alias for stream_audio
@@ -1020,8 +1676,15 @@ pub async fn stream_audio_container_head(
 
 #[cfg(test)]
 mod tests {
-    use super::{PlaybackTarget, playback_target_for_item, shift_vtt_timestamps};
+    use std::collections::HashMap;
+
+    use super::{
+        PlaybackTarget, normalize_embedded_subtitle_window_start_ticks, parse_range_header,
+        playback_target_for_item, remote_stream_proxy_requested, remote_stream_redirect,
+        remote_stream_referer, shift_vtt_timestamps, vtt_to_track_events,
+    };
     use crate::library::models::MediaItem;
+    use axum::http::{StatusCode, header};
 
     #[test]
     fn playback_target_resolves_remote_strm_url() {
@@ -1060,12 +1723,90 @@ mod tests {
     }
 
     #[test]
-    fn embedded_subtitle_window_timestamps_are_shifted() {
-        let input = b"WEBVTT\n\n00:00:01.250 --> 00:00:03.500 align:start\nHello\n";
-        let shifted = shift_vtt_timestamps(input, 180 * 10_000_000);
-        let shifted = String::from_utf8(shifted).unwrap();
-        assert!(shifted.contains("00:03:01.250 --> 00:03:03.500 align:start"));
-        assert!(shifted.contains("Hello"));
+    fn remote_strm_playback_is_a_redirect_without_body_buffering() {
+        let response = remote_stream_redirect("https://smartstrm.example/movie.mkv?sign=x");
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "https://smartstrm.example/movie.mkv?sign=x"
+        );
+    }
+
+    #[test]
+    fn remote_strm_proxy_requires_explicit_opt_in() {
+        let mut query = HashMap::new();
+        assert!(!remote_stream_proxy_requested(&query));
+        query.insert("JellyfinRsProxy".to_string(), "1".to_string());
+        assert!(remote_stream_proxy_requested(&query));
+        query.insert("jellyfinrsproxy".to_string(), "true".to_string());
+        assert!(remote_stream_proxy_requested(&query));
+        query.insert("JellyfinRsProxy".to_string(), "0".to_string());
+        assert!(remote_stream_proxy_requested(&query));
+    }
+
+    #[test]
+    fn remote_strm_proxy_selects_cloud_drive_referer() {
+        assert_eq!(
+            remote_stream_referer("http://127.0.0.1:8024/smartstrm_fid/myquark/file"),
+            Some("http://pan.quark.cn/")
+        );
+        assert_eq!(
+            remote_stream_referer("http://127.0.0.1:8024/smartstrm_fid/xunlei_123/file"),
+            Some("http://pan.xunlei.com/")
+        );
+        assert_eq!(remote_stream_referer("https://example.test/file"), None);
+    }
+
+    #[test]
+    fn range_parser_covers_browser_seek_shapes() {
+        assert_eq!(parse_range_header("bytes=0-99", 1_000).unwrap().len(), 100);
+        assert_eq!(parse_range_header("bytes=900-", 1_000).unwrap().start, 900);
+        assert_eq!(parse_range_header("bytes=-100", 1_000).unwrap().start, 900);
+        assert!(parse_range_header("bytes=1000-", 1_000).is_none());
+        assert!(parse_range_header("bytes=0-1,2-3", 1_000).is_none());
+    }
+
+    #[test]
+    fn embedded_vtt_is_exposed_as_jellyfin_track_events() {
+        let body = vtt_to_track_events(
+            b"WEBVTT\n\n00:00.400 --> 00:03.900\n<b>hello</b>\n\n00:10.240 --> 00:12.910\nworld\n",
+        );
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let events = value["TrackEvents"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["StartPositionTicks"], 4_000_000);
+        assert_eq!(events[0]["EndPositionTicks"], 39_000_000);
+        assert_eq!(events[0]["Text"], "hello");
+        assert_eq!(events[1]["StartPositionTicks"], 102_400_000);
+    }
+
+    #[test]
+    fn embedded_vtt_window_is_shifted_back_to_absolute_time() {
+        let shifted = shift_vtt_timestamps(
+            b"WEBVTT\n\n00:00.400 --> 00:03.900\nhello\n",
+            180 * 10_000_000,
+        );
+        let text = String::from_utf8(shifted).unwrap();
+        assert!(text.contains("00:03:00.400 --> 00:03:03.900"));
+        assert!(text.contains("hello"));
+    }
+
+    #[test]
+    fn embedded_subtitle_window_uses_a_shared_five_second_bucket() {
+        assert_eq!(normalize_embedded_subtitle_window_start_ticks(0), 0);
+        assert_eq!(
+            normalize_embedded_subtitle_window_start_ticks(49_999_999),
+            0
+        );
+        assert_eq!(
+            normalize_embedded_subtitle_window_start_ticks(50_000_000),
+            50_000_000
+        );
+        assert_eq!(
+            normalize_embedded_subtitle_window_start_ticks(5_733_660_000),
+            5_700_000_000
+        );
     }
 
     fn media_item(path: &str) -> MediaItem {

@@ -26,4 +26,6 @@ scripts/
 /tests/openapi_contract/.pytest_cache/
 /tests/openapi_contract/.venv/
 /tests/openapi_contract/__pycache__/
+/tests/smartstrm_contract/__pycache__/
+*.pyc
 /tests/openapi_contract/contract-report.jsonl

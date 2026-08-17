@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
-    jellyfin::{auth::query_user_id_or_request, common::internal_error, item_queries},
+    jellyfin::{auth::query_user_id_or_request, common::internal_error},
 };
 
 fn visible_media_item_sql(alias: &str) -> String {
@@ -395,8 +395,6 @@ pub async fn home_section_items(
             }
             all_items.sort_by_key(|i| std::cmp::Reverse(i.modified_at));
             all_items.truncate(limit);
-
-            let _ = item_queries::attach_item_image_tags(&state.db, &mut all_items).await;
 
             let json_items =
                 crate::jellyfin::items::enrich_episode_list(&state.db, &user_id, all_items).await;

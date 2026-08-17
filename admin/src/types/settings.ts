@@ -1,6 +1,8 @@
 import type { QueryResult } from '@/types/server';
 
 export type TmdbClientConfiguration = {
+  ProviderEnabled: boolean;
+  Configured?: boolean;
   IsTmdbEnabled: boolean;
   IsEnabled: boolean;
   Enabled: boolean;
@@ -10,7 +12,20 @@ export type TmdbClientConfiguration = {
   TmdbProxyUrl?: string | null;
 };
 
+export type TmdbLlmConfiguration = {
+  Enabled: boolean;
+  Configured: boolean;
+  HasApiKey: boolean;
+  ApiKeyHint?: string | null;
+  BaseUrl: string;
+  Model: string;
+  AuditCompleted: boolean;
+  AuditStatus: 'idle' | 'running' | 'completed' | 'failed' | string;
+};
+
 export type DoubanClientConfiguration = {
+  ProviderEnabled: boolean;
+  Configured?: boolean;
   IsDoubanEnabled: boolean;
   IsEnabled: boolean;
   Enabled: boolean;

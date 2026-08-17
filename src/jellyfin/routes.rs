@@ -15,10 +15,11 @@ use crate::{
         stream_audio, stream_audio_container, stream_audio_container_head, stream_audio_head,
         stream_audio_simple, stream_audio_simple_head, stream_subtitle, stream_subtitle_head,
         stream_subtitle_with_source, stream_subtitle_with_source_head, stream_subtitle_with_ticks,
-        stream_subtitle_with_ticks_head, stream_video, stream_video_head, stream_video_original,
-        stream_video_original_container, stream_video_original_container_head,
-        stream_video_original_head, stream_video_original_with_source,
-        stream_video_original_with_source_container,
+        stream_subtitle_with_ticks_head, stream_subtitle_with_ticks_no_source,
+        stream_subtitle_with_ticks_no_source_head, stream_video, stream_video_head,
+        stream_video_original, stream_video_original_container,
+        stream_video_original_container_head, stream_video_original_head,
+        stream_video_original_with_source, stream_video_original_with_source_container,
         stream_video_original_with_source_container_head, stream_video_original_with_source_head,
         stream_video_simple, stream_video_simple_head, stream_video_with_source,
         stream_video_with_source_head, stream_video_with_source_simple,
@@ -232,6 +233,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(system::tmdb_client_configuration),
         )
         .route(
+            "/Tmdb/LlmConfiguration",
+            get(system::tmdb_llm_configuration),
+        )
+        .route(
             "/Douban/ClientConfiguration",
             get(system::douban_client_configuration),
         )
@@ -240,12 +245,28 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(system::update_tmdb_api_key),
         )
         .route(
+            "/System/Configuration/TmdbEnabled",
+            post(system::update_tmdb_provider_enabled),
+        )
+        .route(
             "/System/Configuration/TmdbProxyUrl",
             post(system::update_tmdb_proxy_url),
         )
         .route(
+            "/System/Configuration/TmdbLlm",
+            post(system::update_tmdb_llm_configuration),
+        )
+        .route(
+            "/System/Configuration/TmdbLlm/Audit",
+            post(system::start_tmdb_llm_audit),
+        )
+        .route(
             "/System/Configuration/DoubanCookie",
             post(system::update_douban_cookie),
+        )
+        .route(
+            "/System/Configuration/DoubanEnabled",
+            post(system::update_douban_provider_enabled),
         )
         .route("/Devices/Info", get(system::device_info))
         .route("/Auth/Providers", get(auth::auth_providers))
@@ -986,6 +1007,11 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route(
             "/Videos/{item_id}/Subtitles/{index}/Stream.{format}",
             get(stream_subtitle).head(stream_subtitle_head),
+        )
+        .route(
+            "/Videos/{item_id}/Subtitles/{index}/{start_ticks}/Stream.{format}",
+            get(stream_subtitle_with_ticks_no_source)
+                .head(stream_subtitle_with_ticks_no_source_head),
         )
         .route(
             "/Videos/{item_id}/{media_source_id}/Subtitles/{index}/Stream.{format}",

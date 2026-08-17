@@ -56,6 +56,9 @@ const MAX_PLUGIN_REPOSITORIES: usize = 32;
 const MAX_PLUGIN_REPOSITORY_NAME_LEN: usize = 128;
 const MAX_PLUGIN_REPOSITORY_URL_LEN: usize = 2048;
 const MAX_DOUBAN_COOKIE_LEN: usize = 16 * 1024;
+const MAX_TMDB_LLM_API_KEY_LEN: usize = 16 * 1024;
+const MAX_TMDB_LLM_BASE_URL_LEN: usize = 2048;
+const MAX_TMDB_LLM_MODEL_LEN: usize = 256;
 const MAX_SCHEDULED_TASK_TRIGGERS: usize = 32;
 const MAX_SCHEDULED_TASK_TRIGGERS_JSON_BYTES: usize = 32 * 1024;
 const MAX_NOTIFICATION_NAME_LEN: usize = 256;
@@ -873,27 +876,201 @@ pub async fn utc_time() -> impl IntoResponse {
 }
 
 pub async fn tmdb_client_configuration(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let enabled = state
+    let has_api_key = state
         .tmdb_api_key
         .read()
         .await
         .as_deref()
         .is_some_and(|key| !key.is_empty());
+    let provider_enabled = crate::library::tmdb_metadata::tmdb_provider_enabled(&state.db).await;
     let proxy_url = state.tmdb_proxy_url.read().await.clone();
     Json(tmdb_client_configuration_value(
-        enabled,
+        provider_enabled,
+        has_api_key,
         proxy_url.as_deref(),
     ))
 }
 
-fn tmdb_client_configuration_value(enabled: bool, proxy_url: Option<&str>) -> JsonValue {
+pub async fn tmdb_llm_configuration(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(crate::library::tmdb_metadata::tmdb_llm_configuration_value(&state.db).await)
+}
+
+#[derive(Deserialize)]
+pub struct TmdbLlmConfigurationRequest {
+    #[serde(rename = "Enabled", alias = "enabled")]
+    enabled: bool,
+    #[serde(rename = "ApiKey", alias = "apiKey", alias = "api_key")]
+    api_key: Option<String>,
+    #[serde(rename = "BaseUrl", alias = "baseUrl", alias = "base_url")]
+    base_url: String,
+    #[serde(rename = "Model", alias = "model")]
+    model: String,
+}
+
+fn invalid_tmdb_llm_text(value: &str, max_len: usize) -> bool {
+    value.len() > max_len || value.contains('\0') || value.chars().any(char::is_control)
+}
+
+pub async fn update_tmdb_llm_configuration(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TmdbLlmConfigurationRequest>,
+) -> Response {
+    let base_url = request.base_url.trim();
+    let model = request.model.trim();
+    if invalid_tmdb_llm_text(base_url, MAX_TMDB_LLM_BASE_URL_LEN)
+        || invalid_tmdb_llm_text(model, MAX_TMDB_LLM_MODEL_LEN)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "Invalid LLM base URL or model" })),
+        )
+            .into_response();
+    }
+    let api_key = request.api_key.as_deref().map(str::trim);
+    if api_key.is_some_and(|value| invalid_tmdb_llm_text(value, MAX_TMDB_LLM_API_KEY_LEN)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "Invalid LLM API key" })),
+        )
+            .into_response();
+    }
+
+    let settings = &state.db;
+    let result = async {
+        crate::db::settings::set(
+            settings,
+            crate::library::tmdb_metadata::TMDB_LLM_ENABLED_KEY,
+            if request.enabled { "true" } else { "false" },
+        )
+        .await?;
+        if base_url.is_empty() {
+            crate::db::settings::delete(
+                settings,
+                crate::library::tmdb_metadata::TMDB_LLM_BASE_URL_KEY,
+            )
+            .await?;
+        } else {
+            crate::db::settings::set(
+                settings,
+                crate::library::tmdb_metadata::TMDB_LLM_BASE_URL_KEY,
+                base_url,
+            )
+            .await?;
+        }
+        if model.is_empty() {
+            crate::db::settings::delete(
+                settings,
+                crate::library::tmdb_metadata::TMDB_LLM_MODEL_KEY,
+            )
+            .await?;
+        } else {
+            crate::db::settings::set(
+                settings,
+                crate::library::tmdb_metadata::TMDB_LLM_MODEL_KEY,
+                model,
+            )
+            .await?;
+        }
+        if let Some(api_key) = api_key {
+            if api_key.is_empty() {
+                crate::db::settings::delete(
+                    settings,
+                    crate::library::tmdb_metadata::TMDB_LLM_API_KEY_KEY,
+                )
+                .await?;
+            } else {
+                crate::db::settings::set(
+                    settings,
+                    crate::library::tmdb_metadata::TMDB_LLM_API_KEY_KEY,
+                    api_key,
+                )
+                .await?;
+            }
+        }
+        crate::library::tmdb_metadata::mark_tmdb_llm_audit_pending(settings).await
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            Json(crate::library::tmdb_metadata::tmdb_llm_configuration_value(&state.db).await)
+                .into_response()
+        }
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn start_tmdb_llm_audit(State(state): State<Arc<AppState>>) -> Response {
+    let config = crate::library::tmdb_metadata::load_tmdb_llm_config(&state.db).await;
+    if !config.configured() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "LLM 刮削尚未配置完成" })),
+        )
+            .into_response();
+    }
+    let Some(tmdb_api_key) = state
+        .tmdb_api_key
+        .read()
+        .await
+        .clone()
+        .filter(|key| !key.trim().is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "Error": "TMDb API key is not configured" })),
+        )
+            .into_response();
+    };
+    if let Err(error) = crate::library::tmdb_metadata::mark_tmdb_llm_audit_pending(&state.db).await
+    {
+        return internal_error(error);
+    }
+
+    let database_url = crate::db::database_url_from_env();
+    let http_client = state.http_client.clone();
+    let tmdb_proxy_url = state.tmdb_proxy_url.read().await.clone();
+    tokio::spawn(async move {
+        let db = match crate::db::background_connection(&database_url).await {
+            Ok(db) => db,
+            Err(error) => {
+                tracing::error!("manual TMDb LLM audit could not connect to database: {error:#}");
+                return;
+            }
+        };
+        match crate::library::tmdb_metadata::audit_existing_tmdb(
+            &db,
+            &tmdb_api_key,
+            &http_client,
+            tmdb_proxy_url.as_deref(),
+        )
+        .await
+        {
+            Ok(repaired) => tracing::info!(
+                "manual TMDb LLM audit completed: repaired/refreshed {repaired} item(s)"
+            ),
+            Err(error) => tracing::error!("manual TMDb LLM audit failed: {error:#}"),
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(json!({ "Status": "Started" }))).into_response()
+}
+
+fn tmdb_client_configuration_value(
+    provider_enabled: bool,
+    has_api_key: bool,
+    proxy_url: Option<&str>,
+) -> JsonValue {
     let proxy_url = proxy_url.unwrap_or_default().trim();
     let has_proxy = !proxy_url.is_empty();
+    let configured = provider_enabled && has_api_key;
     json!({
-        "IsTmdbEnabled": enabled,
-        "IsEnabled": enabled,
-        "Enabled": enabled,
-        "HasApiKey": enabled,
+        "ProviderEnabled": provider_enabled,
+        "Configured": configured,
+        "IsTmdbEnabled": configured,
+        "IsEnabled": configured,
+        "Enabled": configured,
+        "HasApiKey": has_api_key,
         "HasProxy": has_proxy,
         "ProxyUrl": proxy_url,
         "TmdbProxyUrl": proxy_url
@@ -916,6 +1093,28 @@ pub async fn update_tmdb_api_key(
     Json(request): Json<TmdbApiKeyRequest>,
 ) -> Response {
     match state.set_tmdb_api_key(request.tmdb_api_key.trim()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MetadataProviderEnabledRequest {
+    #[serde(rename = "Enabled", alias = "enabled")]
+    enabled: bool,
+}
+
+pub async fn update_tmdb_provider_enabled(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<MetadataProviderEnabledRequest>,
+) -> Response {
+    match crate::db::settings::set(
+        &state.db,
+        crate::library::tmdb_metadata::TMDB_ENABLED_KEY,
+        if request.enabled { "true" } else { "false" },
+    )
+    .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => internal_error(error),
     }
@@ -956,16 +1155,40 @@ pub async fn douban_client_configuration(State(state): State<Arc<AppState>>) -> 
         .await
         .as_deref()
         .is_some_and(|cookie| !cookie.is_empty());
-    Json(douban_client_configuration_value(has_cookie))
+    let provider_enabled =
+        crate::library::douban_metadata::douban_provider_enabled(&state.db).await;
+    Json(douban_client_configuration_value(
+        provider_enabled,
+        has_cookie,
+    ))
 }
 
-fn douban_client_configuration_value(has_cookie: bool) -> JsonValue {
+fn douban_client_configuration_value(provider_enabled: bool, has_cookie: bool) -> JsonValue {
+    let configured = provider_enabled && has_cookie;
     json!({
-        "IsDoubanEnabled": true,
-        "IsEnabled": true,
-        "Enabled": true,
+        "ProviderEnabled": provider_enabled,
+        "Configured": configured,
+        "IsDoubanEnabled": configured,
+        "IsEnabled": configured,
+        "Enabled": configured,
         "HasCookie": has_cookie
     })
+}
+
+pub async fn update_douban_provider_enabled(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<MetadataProviderEnabledRequest>,
+) -> Response {
+    match crate::db::settings::set(
+        &state.db,
+        crate::library::douban_metadata::DOUBAN_ENABLED_KEY,
+        if request.enabled { "true" } else { "false" },
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
 }
 
 #[derive(Deserialize)]
@@ -6362,7 +6585,9 @@ mod tests {
 
     #[test]
     fn tmdb_client_configuration_reports_compatible_enabled_fields() {
-        let enabled = tmdb_client_configuration_value(true, Some("https://tmdb.qb.edu.kg"));
+        let enabled = tmdb_client_configuration_value(true, true, Some("https://tmdb.qb.edu.kg"));
+        assert_eq!(enabled["ProviderEnabled"], true);
+        assert_eq!(enabled["Configured"], true);
         assert_eq!(enabled["IsTmdbEnabled"], true);
         assert_eq!(enabled["IsEnabled"], true);
         assert_eq!(enabled["Enabled"], true);
@@ -6371,13 +6596,34 @@ mod tests {
         assert_eq!(enabled["ProxyUrl"], "https://tmdb.qb.edu.kg");
         assert_eq!(enabled["TmdbProxyUrl"], "https://tmdb.qb.edu.kg");
 
-        let disabled = tmdb_client_configuration_value(false, None);
+        let disabled = tmdb_client_configuration_value(false, true, None);
+        assert_eq!(disabled["ProviderEnabled"], false);
+        assert_eq!(disabled["Configured"], false);
         assert_eq!(disabled["IsTmdbEnabled"], false);
         assert_eq!(disabled["IsEnabled"], false);
         assert_eq!(disabled["Enabled"], false);
-        assert_eq!(disabled["HasApiKey"], false);
+        assert_eq!(disabled["HasApiKey"], true);
         assert_eq!(disabled["HasProxy"], false);
         assert_eq!(disabled["ProxyUrl"], "");
+
+        let unconfigured = tmdb_client_configuration_value(true, false, None);
+        assert_eq!(unconfigured["ProviderEnabled"], true);
+        assert_eq!(unconfigured["Configured"], false);
+        assert_eq!(unconfigured["HasApiKey"], false);
+    }
+
+    #[test]
+    fn douban_client_configuration_respects_provider_switch() {
+        let enabled = super::douban_client_configuration_value(true, true);
+        assert_eq!(enabled["ProviderEnabled"], true);
+        assert_eq!(enabled["Configured"], true);
+        assert_eq!(enabled["IsDoubanEnabled"], true);
+
+        let disabled = super::douban_client_configuration_value(false, true);
+        assert_eq!(disabled["ProviderEnabled"], false);
+        assert_eq!(disabled["Configured"], false);
+        assert_eq!(disabled["HasCookie"], true);
+        assert_eq!(disabled["IsDoubanEnabled"], false);
     }
 
     #[test]

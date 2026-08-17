@@ -1063,19 +1063,28 @@ pub async fn enrich_item_list(
     user_id: &str,
     mut items: Vec<MediaItem>,
 ) -> Vec<Value> {
-    let _ = crate::jellyfin::item_queries::attach_item_image_tags(db, &mut items).await;
     // Collect unique episode parent IDs and season IDs for parent lookups.
-    let parent_lookup_ids: Vec<&str> = items
+    // Keep these IDs owned so the image-tag query and the ancestor query can
+    // run at the same time without holding an immutable borrow of `items`.
+    let parent_lookup_ids: Vec<String> = items
         .iter()
         .filter_map(|i| match i.item_type.as_str() {
-            "Episode" => Some(i.parent_id.as_str()),
-            "Season" => Some(i.id.as_str()),
+            "Episode" => Some(i.parent_id.clone()),
+            "Season" => Some(i.id.clone()),
             _ => None,
         })
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
-    let parent_info_map = batch_episode_parent_info(db, &parent_lookup_ids).await;
+    let parent_lookup_refs = parent_lookup_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let (image_tags_result, parent_info_map) = tokio::join!(
+        crate::jellyfin::item_queries::attach_item_image_tags(db, &mut items),
+        batch_episode_parent_info(db, &parent_lookup_refs),
+    );
+    let _ = image_tags_result;
 
     // Collect unique series IDs and batch-query inherited image tags.
     let mut series_id_set = parent_info_map
@@ -1097,18 +1106,24 @@ pub async fn enrich_item_list(
     );
     parent_image_ids.sort();
     parent_image_ids.dedup();
-    let parent_image_tags =
-        crate::jellyfin::item_queries::batch_item_image_tags(db, &parent_image_ids)
-            .await
-            .unwrap_or_default();
-
     let item_ids: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
-    let provider_map = crate::jellyfin::item_queries::batch_item_provider_ids(db, &item_ids)
-        .await
-        .unwrap_or_default();
-    let mut relation_map = batch_item_relations(db, user_id, &item_ids)
-        .await
-        .unwrap_or_default();
+    let (parent_image_tags, provider_map, mut relation_map) = tokio::join!(
+        async {
+            crate::jellyfin::item_queries::batch_item_image_tags(db, &parent_image_ids)
+                .await
+                .unwrap_or_default()
+        },
+        async {
+            crate::jellyfin::item_queries::batch_item_provider_ids(db, &item_ids)
+                .await
+                .unwrap_or_default()
+        },
+        async {
+            batch_item_relations(db, user_id, &item_ids)
+                .await
+                .unwrap_or_default()
+        }
+    );
 
     let mut season_episode_count_map: HashMap<String, i64> = HashMap::new();
     let mut season_played_episode_count_map: HashMap<String, i64> = HashMap::new();
@@ -1122,7 +1137,10 @@ pub async fn enrich_item_list(
         let sql = format!(
             "SELECT parent_id, COUNT(DISTINCT (COALESCE(season_number, 0), COALESCE(episode_number, 0))) AS cnt FROM media_items WHERE parent_id IN ({placeholders}) AND item_type = 'Episode' AND {visible} GROUP BY parent_id"
         );
-        let values: Vec<sea_orm::Value> = parent_lookup_ids.iter().map(|id| (*id).into()).collect();
+        let values: Vec<sea_orm::Value> = parent_lookup_ids
+            .iter()
+            .map(|id| id.as_str().into())
+            .collect();
         if let Ok(rows) = db
             .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
             .await
@@ -1143,8 +1161,10 @@ pub async fn enrich_item_list(
         let sql = format!(
             "SELECT mi.parent_id, COUNT(DISTINCT (COALESCE(mi.season_number, 0), COALESCE(mi.episode_number, 0))) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id IN ({placeholders}) AND mi.item_type = 'Episode' AND {visible} AND ud.user_id = ? AND ud.played = 1 GROUP BY mi.parent_id"
         );
-        let mut values: Vec<sea_orm::Value> =
-            parent_lookup_ids.iter().map(|id| (*id).into()).collect();
+        let mut values: Vec<sea_orm::Value> = parent_lookup_ids
+            .iter()
+            .map(|id| id.as_str().into())
+            .collect();
         values.push(user_id.into());
         if let Ok(rows) = db
             .query_all_raw(crate::db::helpers::pg_statement(&sql, values))

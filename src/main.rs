@@ -40,6 +40,8 @@ mod ws;
 
 use app::state::{AdminHttpLogEntry, AppState, DEFAULT_USER_NAME, PlaybackDistribution};
 
+const STARTUP_METADATA_BACKFILL_KEY: &str = "metadata_startup_backfill_completed";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -77,9 +79,11 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let tmdb_api_key = app::state::load_tmdb_api_key(&db).await;
+    let tmdb_provider_enabled = library::tmdb_metadata::tmdb_provider_enabled(&db).await;
     let tmdb_proxy_url = app::state::load_tmdb_proxy_url(&db).await;
     let tmdb_http_client = util::http_client().context("failed to build TMDb HTTP client")?;
     let douban_cookie = app::state::load_douban_cookie(&db).await;
+    let douban_provider_enabled = library::douban_metadata::douban_provider_enabled(&db).await;
 
     let state = Arc::new(AppState {
         user_id: Uuid::new_v5(&Uuid::NAMESPACE_URL, default_username.as_bytes()),
@@ -106,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
 
     db::seed_default_data(&state).await?;
     jellyfin::system::start_scheduled_task_scheduler(state.clone()).await;
+    playback::streaming::start_embedded_subtitle_cache_scheduler(state.clone());
     if app::state::should_scan_on_startup() {
         let scan_state = state.clone();
         tokio::spawn(async move {
@@ -114,109 +119,219 @@ async fn main() -> anyhow::Result<()> {
     }
     library::watcher::start_watching(state.clone());
 
-    // Backfill existing TMDb metadata in the background. New scan results queue
-    // Season/Episode metadata from the scanner as each item is ingested.
-    if let Some(api_key) = state
-        .tmdb_api_key
-        .read()
-        .await
-        .clone()
-        .filter(|k| !k.is_empty())
-    {
-        let ep_state = state.clone();
-        let metadata_database_url = database_url.clone();
+    // Backfill existing metadata once. New scan results queue metadata as each item is ingested;
+    // repeating this whole-library pass on every restart makes startup increasingly expensive.
+    // Set JELLYFIN_RS_METADATA_BACKFILL_FORCE=true for an intentional full backfill.
+    let startup_backfill_completed =
+        crate::db::settings::get_bool(&state.db, STARTUP_METADATA_BACKFILL_KEY, false).await;
+    let startup_backfill_forced = std::env::var("JELLYFIN_RS_METADATA_BACKFILL_FORCE")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        });
+    let run_startup_metadata_backfill = !startup_backfill_completed || startup_backfill_forced;
+    if run_startup_metadata_backfill {
+        if !tmdb_provider_enabled {
+            tracing::info!("startup TMDb metadata backfill skipped: TMDb provider is disabled");
+        } else if let Some(api_key) = state
+            .tmdb_api_key
+            .read()
+            .await
+            .clone()
+            .filter(|k| !k.is_empty())
+        {
+            let ep_state = state.clone();
+            let metadata_database_url = database_url.clone();
+            tokio::spawn(async move {
+                let metadata_db =
+                    match crate::db::background_connection(&metadata_database_url).await {
+                        Ok(db) => db,
+                        Err(error) => {
+                            tracing::warn!("background TMDb metadata task skipped: {error:#}");
+                            return;
+                        }
+                    };
+                // First: fill in missing TMDb IDs for movies/series without tags
+                let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
+                let tmdb_client = ep_state.tmdb_http_client().await;
+                match library::tmdb_metadata::fill_missing_tmdb(
+                    &metadata_db,
+                    &api_key,
+                    &tmdb_client,
+                    tmdb_base_url.as_deref(),
+                )
+                .await
+                {
+                    Ok(0) => {
+                        tracing::info!("No missing TMDb metadata to fill");
+                    }
+                    Ok(n) => {
+                        tracing::info!("Filled TMDb metadata for {n} items via name search");
+                    }
+                    Err(e) => {
+                        tracing::warn!("fill_missing_tmdb failed: {e:#}");
+                    }
+                }
+
+                // Name-based backfill can make a previously ungroupable item
+                // identifiable (for example, a new Xunlei copy whose folder name
+                // differs from the existing Quark copy). Reconcile immediately so
+                // startup does not leave two top-level entries until the next scan.
+                match library::reconcile::reconcile_provider_duplicates(&metadata_db).await {
+                    Ok(stats) if stats.changed() => {
+                        tracing::info!(
+                            "startup provider reconciliation merged {} series, {} movies, and {} versions",
+                            stats.merged_series,
+                            stats.merged_movies,
+                            stats.merged_versions
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("startup provider reconciliation failed: {e:#}");
+                    }
+                }
+
+                let llm_config = library::tmdb_metadata::load_tmdb_llm_config(&metadata_db).await;
+                if llm_config.configured() {
+                    // Repair existing wrong matches as well as missing matches. This
+                    // is conservative: the resolver only selects IDs returned by
+                    // TMDb, and locked/manual items are skipped.
+                    match library::tmdb_metadata::audit_existing_tmdb(
+                        &metadata_db,
+                        &api_key,
+                        &tmdb_client,
+                        tmdb_base_url.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(0) => {
+                            tracing::info!("No existing TMDb matches needed LLM audit");
+                        }
+                        Ok(n) => {
+                            tracing::info!(
+                                "Audited and repaired/refreshed {n} existing TMDb item(s)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("audit_existing_tmdb failed: {e:#}");
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        "startup TMDb LLM audit skipped: LLM API key/base URL is not configured"
+                    );
+                }
+
+                match library::tmdb_metadata::refresh_existing_tmdb_titles(
+                    &metadata_db,
+                    &api_key,
+                    &tmdb_client,
+                    tmdb_base_url.as_deref(),
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!("Refreshed {n} existing TMDb item title(s)");
+                    }
+                    Err(e) => {
+                        tracing::warn!("refresh_existing_tmdb_titles failed: {e:#}");
+                    }
+                }
+
+                // Fetch person biographies and images in background
+                let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
+                let tmdb_client = ep_state.tmdb_http_client().await;
+                match library::tmdb_metadata::batch_fetch_person_tmdb(
+                    &metadata_db,
+                    &api_key,
+                    &tmdb_client,
+                    tmdb_base_url.as_deref(),
+                )
+                .await
+                {
+                    Ok(0) => {
+                        tracing::info!("No missing TMDb person data to fill");
+                    }
+                    Ok(n) => {
+                        tracing::info!("Fetched TMDb data for {n} people");
+                    }
+                    Err(e) => {
+                        tracing::warn!("batch_fetch_person_tmdb failed: {e:#}");
+                    }
+                }
+
+                // Backfill older or missed episode rows; scan-time items use the metadata pipeline.
+                let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
+                let tmdb_client = ep_state.tmdb_http_client().await;
+                match library::tmdb_metadata::batch_fetch_episode_tmdb(
+                    &metadata_db,
+                    &api_key,
+                    &tmdb_client,
+                    tmdb_base_url.as_deref(),
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!("episode TMDb batch fetched {n} titles");
+                    }
+                    Err(e) => {
+                        tracing::warn!("episode TMDb batch failed: {e:#}");
+                    }
+                }
+
+                if let Err(error) =
+                    crate::db::settings::set(&metadata_db, STARTUP_METADATA_BACKFILL_KEY, "true")
+                        .await
+                {
+                    tracing::warn!("failed to mark startup metadata backfill complete: {error:#}");
+                } else {
+                    tracing::info!(
+                        "startup metadata backfill completed; future restarts will skip the full pass"
+                    );
+                }
+            });
+        } else {
+            tracing::info!("startup TMDb metadata backfill skipped: no TMDb API key configured");
+        }
+    } else {
+        tracing::info!("startup metadata backfill skipped; library is already initialized");
+    }
+
+    // Provider reconciliation is a local database consistency pass and must
+    // not depend on the optional, slow metadata backfill.  Run it on every
+    // normal restart so duplicate cross-cloud Series/Movie roots are repaired
+    // even when a full library scan is still running or has no metadata jobs.
+    if !run_startup_metadata_backfill {
+        let reconcile_database_url = database_url.clone();
         tokio::spawn(async move {
-            let metadata_db = match crate::db::background_connection(&metadata_database_url).await {
+            let reconcile_db = match crate::db::background_connection(&reconcile_database_url).await
+            {
                 Ok(db) => db,
                 Err(error) => {
-                    tracing::warn!("background TMDb metadata task skipped: {error:#}");
+                    tracing::warn!("startup provider reconciliation skipped: {error:#}");
                     return;
                 }
             };
-            // First: fill in missing TMDb IDs for movies/series without tags
-            let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
-            let tmdb_client = ep_state.tmdb_http_client().await;
-            match library::tmdb_metadata::fill_missing_tmdb(
-                &metadata_db,
-                &api_key,
-                &tmdb_client,
-                tmdb_base_url.as_deref(),
-            )
-            .await
-            {
-                Ok(0) => {
-                    tracing::info!("No missing TMDb metadata to fill");
-                }
-                Ok(n) => {
-                    tracing::info!("Filled TMDb metadata for {n} items via name search");
-                }
-                Err(e) => {
-                    tracing::warn!("fill_missing_tmdb failed: {e:#}");
-                }
-            }
-
-            match library::tmdb_metadata::refresh_existing_tmdb_titles(
-                &metadata_db,
-                &api_key,
-                &tmdb_client,
-                tmdb_base_url.as_deref(),
-            )
-            .await
-            {
-                Ok(0) => {}
-                Ok(n) => {
-                    tracing::info!("Refreshed {n} existing TMDb item title(s)");
-                }
-                Err(e) => {
-                    tracing::warn!("refresh_existing_tmdb_titles failed: {e:#}");
-                }
-            }
-
-            // Fetch person biographies and images in background
-            let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
-            let tmdb_client = ep_state.tmdb_http_client().await;
-            match library::tmdb_metadata::batch_fetch_person_tmdb(
-                &metadata_db,
-                &api_key,
-                &tmdb_client,
-                tmdb_base_url.as_deref(),
-            )
-            .await
-            {
-                Ok(0) => {
-                    tracing::info!("No missing TMDb person data to fill");
-                }
-                Ok(n) => {
-                    tracing::info!("Fetched TMDb data for {n} people");
-                }
-                Err(e) => {
-                    tracing::warn!("batch_fetch_person_tmdb failed: {e:#}");
-                }
-            }
-
-            // Backfill older or missed episode rows; scan-time items use the metadata pipeline.
-            let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
-            let tmdb_client = ep_state.tmdb_http_client().await;
-            match library::tmdb_metadata::batch_fetch_episode_tmdb(
-                &metadata_db,
-                &api_key,
-                &tmdb_client,
-                tmdb_base_url.as_deref(),
-            )
-            .await
-            {
-                Ok(0) => {}
-                Ok(n) => {
-                    tracing::info!("episode TMDb batch fetched {n} titles");
-                }
-                Err(e) => {
-                    tracing::warn!("episode TMDb batch failed: {e:#}");
-                }
+            match library::reconcile::reconcile_provider_duplicates(&reconcile_db).await {
+                Ok(stats) if stats.changed() => tracing::info!(
+                    "startup provider reconciliation merged {} series, {} movies, and {} versions",
+                    stats.merged_series,
+                    stats.merged_movies,
+                    stats.merged_versions
+                ),
+                Ok(_) => tracing::info!("startup provider reconciliation found no duplicates"),
+                Err(error) => tracing::warn!("startup provider reconciliation failed: {error:#}"),
             }
         });
     }
 
-    {
+    if run_startup_metadata_backfill && douban_provider_enabled {
         let douban_state = state.clone();
         let douban_database_url = database_url.clone();
         tokio::spawn(async move {
@@ -229,13 +344,20 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             let cookie = douban_state.douban_cookie.read().await.clone();
-            match library::douban_metadata::fill_missing_douban(&douban_db, cookie.as_deref()).await
-            {
+            let Some(cookie) = cookie.filter(|value| !value.trim().is_empty()) else {
+                tracing::info!(
+                    "background Douban metadata task skipped: no Douban cookie configured"
+                );
+                return;
+            };
+            match library::douban_metadata::fill_missing_douban(&douban_db, Some(&cookie)).await {
                 Ok(0) => tracing::info!("No missing Douban metadata to fill"),
                 Ok(n) => tracing::info!("Filled Douban metadata for {n} items via name search"),
                 Err(e) => tracing::warn!("fill_missing_douban failed: {e:#}"),
             }
         });
+    } else if run_startup_metadata_backfill {
+        tracing::info!("startup Douban metadata backfill skipped: Douban provider is disabled");
     }
 
     let api_routes = jellyfin::routes::api_routes().route_layer(

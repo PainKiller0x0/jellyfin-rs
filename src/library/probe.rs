@@ -16,6 +16,10 @@ use serde::{Deserialize, Deserializer};
 
 const LOCAL_FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_FFPROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCAL_FFPROBE_ANALYZE_DURATION_MICROS: &str = "30000000";
+const LOCAL_FFPROBE_PROBE_SIZE_BYTES: &str = "100000000";
+const REMOTE_FFPROBE_ANALYZE_DURATION_MICROS: &str = "5000000";
+const REMOTE_FFPROBE_PROBE_SIZE_BYTES: &str = "10000000";
 const REMOTE_FFPROBE_RW_TIMEOUT_MICROS: &str = "5000000";
 const REMOTE_FFPROBE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -274,6 +278,9 @@ fn probed_stream_from_disc(index: i64, stream: crate::library::disc::DiscStream)
 }
 
 fn remote_probe_preferred_redirect(url: &reqwest::Url) -> Option<reqwest::Url> {
+    if !remote_probe_uses_ipv4_proxy(url) {
+        return None;
+    }
     let redirected_url = resolve_remote_probe_redirect(url)?;
     (redirected_url.as_str() != url.as_str()).then_some(redirected_url)
 }
@@ -288,9 +295,11 @@ fn probe_media_once(
         if !remote_probe_endpoint_available(url) {
             return Err(ProbeFailure::EndpointUnavailable);
         }
-        let ipv4_proxy = Ipv4ProbeProxy::start().ok_or(ProbeFailure::EndpointUnavailable)?;
-        http_proxy = Some(ipv4_proxy.url.clone());
-        proxy = Some(ipv4_proxy);
+        if remote_probe_uses_ipv4_proxy(url) {
+            let ipv4_proxy = Ipv4ProbeProxy::start().ok_or(ProbeFailure::EndpointUnavailable)?;
+            http_proxy = Some(ipv4_proxy.url.clone());
+            proxy = Some(ipv4_proxy);
+        }
     }
     let output = run_ffprobe(path, remote_url.is_some(), http_proxy.as_deref())
         .ok_or(ProbeFailure::Failed)?;
@@ -321,11 +330,11 @@ fn run_ffprobe(path: &Path, is_remote: bool, http_proxy: Option<&str>) -> Option
     let analyze_duration = std::env::var("JELLYFIN_RS_FFPROBE_ANALYZE_DURATION")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "30000000".to_string());
+        .unwrap_or_else(|| ffprobe_default_analyze_duration(is_remote).to_string());
     let probe_size = std::env::var("JELLYFIN_RS_FFPROBE_PROBE_SIZE")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "100000000".to_string());
+        .unwrap_or_else(|| ffprobe_default_probe_size(is_remote).to_string());
 
     let mut command = Command::new(ffprobe);
     command
@@ -335,10 +344,13 @@ fn run_ffprobe(path: &Path, is_remote: bool, http_proxy: Option<&str>) -> Option
         .arg("json")
         .arg("-show_format")
         .arg("-show_streams")
-        .arg("-show_chapters")
-        .arg("-show_frames")
-        .arg("-read_intervals")
-        .arg("%+#1");
+        .arg("-show_chapters");
+    if ffprobe_scans_frames(is_remote) {
+        command
+            .arg("-show_frames")
+            .arg("-read_intervals")
+            .arg("%+#1");
+    }
     if analyze_duration != "0" {
         command.arg("-analyzeduration").arg(analyze_duration);
     }
@@ -436,6 +448,31 @@ fn ffprobe_timeout(is_remote: bool) -> Duration {
         REMOTE_FFPROBE_TIMEOUT
     } else {
         LOCAL_FFPROBE_TIMEOUT
+    }
+}
+
+fn remote_probe_uses_ipv4_proxy(url: &reqwest::Url) -> bool {
+    url.host_str()
+        .is_none_or(|host| host.parse::<Ipv4Addr>().is_err())
+}
+
+fn ffprobe_scans_frames(is_remote: bool) -> bool {
+    !is_remote
+}
+
+fn ffprobe_default_analyze_duration(is_remote: bool) -> &'static str {
+    if is_remote {
+        REMOTE_FFPROBE_ANALYZE_DURATION_MICROS
+    } else {
+        LOCAL_FFPROBE_ANALYZE_DURATION_MICROS
+    }
+}
+
+fn ffprobe_default_probe_size(is_remote: bool) -> &'static str {
+    if is_remote {
+        REMOTE_FFPROBE_PROBE_SIZE_BYTES
+    } else {
+        LOCAL_FFPROBE_PROBE_SIZE_BYTES
     }
 }
 
@@ -1987,6 +2024,29 @@ mod tests {
     #[test]
     fn remote_probe_uses_shorter_ffprobe_timeout() {
         assert!(ffprobe_timeout(true) < ffprobe_timeout(false));
+    }
+
+    #[test]
+    fn ipv4_literal_remote_probe_connects_directly() {
+        let local = reqwest::Url::parse("http://127.0.0.1:8024/media").unwrap();
+        let hostname = reqwest::Url::parse("https://media.example.com/video").unwrap();
+
+        assert!(!remote_probe_uses_ipv4_proxy(&local));
+        assert!(remote_probe_uses_ipv4_proxy(&hostname));
+    }
+
+    #[test]
+    fn remote_probe_avoids_expensive_frame_scan() {
+        assert!(!ffprobe_scans_frames(true));
+        assert!(ffprobe_scans_frames(false));
+    }
+
+    #[test]
+    fn remote_probe_uses_bounded_analysis_defaults() {
+        assert_eq!(ffprobe_default_analyze_duration(true), "5000000");
+        assert_eq!(ffprobe_default_probe_size(true), "10000000");
+        assert_eq!(ffprobe_default_analyze_duration(false), "30000000");
+        assert_eq!(ffprobe_default_probe_size(false), "100000000");
     }
 
     #[test]

@@ -1131,6 +1131,7 @@ async fn stream_media_item(
     method: Method,
     download_filename: Option<String>,
 ) -> Response {
+    let media_source_id = media_source_id.or_else(|| query_media_source_id(&query));
     let user_id = request_user_id_or_default(&state, &request_headers, &query).await;
     let item =
         match find_stream_media_item(&state.db, &user_id, &item_id, media_source_id.as_deref())
@@ -1335,6 +1336,13 @@ fn preferred_media_source_id(item_id: &str, media_source_id: &str) -> bool {
             media_source_id.to_ascii_lowercase().as_str(),
             "default" | "main" | "primary"
         )
+}
+
+fn query_media_source_id(query: &HashMap<String, String>) -> Option<String> {
+    query
+        .iter()
+        .find(|(key, value)| key.eq_ignore_ascii_case("mediaSourceId") && !value.trim().is_empty())
+        .map(|(_, value)| value.trim().to_string())
 }
 
 fn playback_target_for_item(item: &MediaItem) -> anyhow::Result<PlaybackTarget> {
@@ -1687,8 +1695,8 @@ mod tests {
 
     use super::{
         PlaybackTarget, normalize_embedded_subtitle_window_start_ticks, parse_range_header,
-        playback_target_for_item, remote_stream_proxy_requested, remote_stream_redirect,
-        remote_stream_referer, shift_vtt_timestamps, vtt_to_track_events,
+        playback_target_for_item, query_media_source_id, remote_stream_proxy_requested,
+        remote_stream_redirect, remote_stream_referer, shift_vtt_timestamps, vtt_to_track_events,
     };
     use crate::library::models::MediaItem;
     use axum::http::{StatusCode, header};
@@ -1750,6 +1758,18 @@ mod tests {
         assert!(remote_stream_proxy_requested(&query));
         query.insert("JellyfinRsProxy".to_string(), "0".to_string());
         assert!(remote_stream_proxy_requested(&query));
+    }
+
+    #[test]
+    fn stream_query_preserves_selected_media_source_id() {
+        let mut query = HashMap::from([
+            ("JellyfinRsProxy".to_string(), "1".to_string()),
+            ("MEDIASOURCEID".to_string(), "version-2".to_string()),
+        ]);
+        assert_eq!(query_media_source_id(&query).as_deref(), Some("version-2"));
+
+        query.insert("mediaSourceId".to_string(), "  ".to_string());
+        assert_eq!(query_media_source_id(&query).as_deref(), Some("version-2"));
     }
 
     #[test]

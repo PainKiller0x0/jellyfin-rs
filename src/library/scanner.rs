@@ -14,6 +14,7 @@ use walkdir::WalkDir;
 use crate::{
     app::state::AppState,
     entities::{
+        image_assets::{self, Entity as ImageAssets},
         libraries::Entity as Libraries,
         library_paths::{self, Entity as LibraryPaths},
         media_genres::{self, Entity as MediaGenres},
@@ -2522,6 +2523,13 @@ async fn clear_scraped_folder_metadata(db: &sea_orm::DatabaseConnection, item_id
     {
         tracing::debug!("failed to clear media_people for folder {item_id}: {error:#}");
     }
+    if let Err(error) = ImageAssets::delete_many()
+        .filter(image_assets::Column::ItemId.eq(item_id))
+        .exec(db)
+        .await
+    {
+        tracing::debug!("failed to clear image_assets for folder {item_id}: {error:#}");
+    }
 
     match MediaItems::find_by_id(item_id.to_string()).one(db).await {
         Ok(Some(item)) if item.item_type == "Folder" => {
@@ -2546,6 +2554,7 @@ async fn clear_scraped_folder_metadata(db: &sea_orm::DatabaseConnection, item_id
             active.remote_trailers = Set(None);
             active.production_locations = Set(None);
             active.production_year = Set(None);
+            active.tmdb_metadata_version = Set(0);
             active.premiere_date = Set(None);
             active.end_date = Set(None);
             active.community_rating = Set(None);

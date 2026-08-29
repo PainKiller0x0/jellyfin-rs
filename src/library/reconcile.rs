@@ -6,11 +6,12 @@ use std::{
 use anyhow::Context;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
-    EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
+    EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait, sea_query::OnConflict,
 };
 
 use crate::{
     entities::{
+        image_assets::{self, Entity as ImageAssets},
         media_items::{self, Entity as MediaItems},
         provider_ids::{self, Entity as ProviderIds},
     },
@@ -24,6 +25,7 @@ pub struct ProviderReconcileStats {
     pub merged_versions: usize,
     pub normalized_series_dates: usize,
     pub normalized_episode_metadata: usize,
+    pub normalized_dimension_years: usize,
 }
 
 impl ProviderReconcileStats {
@@ -32,6 +34,7 @@ impl ProviderReconcileStats {
             || self.merged_movies > 0
             || self.normalized_series_dates > 0
             || self.normalized_episode_metadata > 0
+            || self.normalized_dimension_years > 0
     }
 }
 
@@ -67,6 +70,16 @@ pub async fn reconcile_provider_duplicates(
         .await
         .context("failed to load TMDb IDs for provider reconciliation")?;
 
+    let tmdb_ids_by_item: HashMap<String, String> = provider_ids
+        .iter()
+        .map(|provider_id| {
+            (
+                provider_id.item_id.clone(),
+                provider_id.provider_item_id.clone(),
+            )
+        })
+        .collect();
+
     let mut groups: HashMap<(String, String, String), Vec<String>> = HashMap::new();
     for provider_id in provider_ids {
         let Some(item) = roots.get(&provider_id.item_id) else {
@@ -77,6 +90,48 @@ pub async fn reconcile_provider_duplicates(
                 item.item_type.clone(),
                 item.library_id.clone(),
                 provider_id.provider_item_id,
+            ))
+            .or_default()
+            .push(item.id.clone());
+    }
+
+    // A newly discovered cloud copy may not have a TMDb row yet.  Match it to
+    // an already identified Series only when the normalized title maps to one
+    // TMDb identity in the same library.  This covers folders such as
+    // "Title" and "Title 第四季" without merging ambiguous same-name shows.
+    let mut known_series_identities: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    for item in roots.values().filter(|item| item.item_type == "Series") {
+        let Some(tmdb_id) = tmdb_ids_by_item.get(&item.id) else {
+            continue;
+        };
+        let identity = normalize_series_identity(&item.title);
+        if !identity.is_empty() {
+            known_series_identities
+                .entry((item.library_id.clone(), identity))
+                .or_default()
+                .insert(tmdb_id.clone());
+        }
+    }
+
+    for item in roots.values().filter(|item| item.item_type == "Series") {
+        if tmdb_ids_by_item.contains_key(&item.id) {
+            continue;
+        }
+        let identity = normalize_series_identity(&item.title);
+        let Some(tmdb_ids) = known_series_identities
+            .get(&(item.library_id.clone(), identity))
+            .filter(|ids| ids.len() == 1)
+        else {
+            continue;
+        };
+        let Some(tmdb_id) = tmdb_ids.iter().next() else {
+            continue;
+        };
+        groups
+            .entry((
+                item.item_type.clone(),
+                item.library_id.clone(),
+                tmdb_id.clone(),
             ))
             .or_default()
             .push(item.id.clone());
@@ -174,11 +229,46 @@ pub async fn reconcile_provider_duplicates(
 
     stats.normalized_series_dates =
         normalize_series_date_ranges(&txn, &all_items, &children_by_parent).await?;
+    stats.normalized_dimension_years = normalize_dimension_years(&txn).await?;
     stats.normalized_episode_metadata = normalize_episode_metadata(&txn).await?;
     txn.commit()
         .await
         .context("failed to commit provider reconciliation transaction")?;
     Ok(stats)
+}
+
+/// Clears production years that were parsed from a video dimension, such as
+/// `1920X1040`, before the filename parser excluded resolution tokens.
+async fn normalize_dimension_years(db: &DatabaseTransaction) -> anyhow::Result<usize> {
+    let items = MediaItems::find()
+        .filter(media_items::Column::ItemType.eq("Episode"))
+        .all(db)
+        .await
+        .context("failed to load episodes for dimension year normalization")?;
+    let mut changed = 0usize;
+
+    for item in items {
+        let Some(year) = item.production_year else {
+            continue;
+        };
+        if !crate::library::metadata::is_video_dimension_year(
+            std::path::Path::new(&item.path),
+            year,
+        ) {
+            continue;
+        }
+
+        let mut active: media_items::ActiveModel = item.clone().into();
+        active.production_year = Set(None);
+        active.updated_at = Set(now_unix());
+        active
+            .update(db)
+            .await
+            .with_context(|| format!("failed to normalize dimension year: {}", item.id))?;
+        changed += 1;
+    }
+
+    Ok(changed)
 }
 
 /// Repairs episode rows that were ingested before metadata was available or
@@ -361,6 +451,88 @@ fn source_fallback_key(path: &str) -> bool {
     !contains_xunlei_marker(path)
 }
 
+/// Returns the display priority for an item source. Xunlei is the preferred
+/// source, while other cloud roots remain fallback versions.
+pub(crate) fn source_priority_score(path: &str) -> u8 {
+    u8::from(!source_fallback_key(path))
+}
+
+fn normalize_series_identity(value: &str) -> String {
+    let value = value.trim();
+    let value = strip_trailing_year_suffix(value);
+    let value = strip_chinese_season_suffix(value);
+    let value = strip_latin_season_suffix(value);
+    value
+        .chars()
+        .map(normalize_series_character)
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn normalize_series_character(character: char) -> char {
+    match character {
+        // TMDb and cloud-folder naming commonly vary between the character
+        // used in "菈菈" and its homophone "拉拉".
+        '菈' => '拉',
+        _ => character,
+    }
+}
+
+fn strip_trailing_year_suffix(value: &str) -> &str {
+    let Some((open, close)) = value.rfind('(').zip(value.strip_suffix(')')) else {
+        return value;
+    };
+    let year = &close[open + '('.len_utf8()..];
+    if year.len() == 4 && year.chars().all(|character| character.is_ascii_digit()) {
+        return value[..open].trim_end();
+    }
+    value
+}
+
+fn strip_chinese_season_suffix(value: &str) -> &str {
+    let Some(index) = value.rfind('第') else {
+        return value;
+    };
+    let suffix = value[index..].trim();
+    let Some(number) = suffix
+        .strip_prefix('第')
+        .and_then(|suffix| suffix.strip_suffix('季'))
+    else {
+        return value;
+    };
+    if !number.is_empty()
+        && number.chars().all(|character| {
+            character.is_ascii_digit() || "零〇一二三四五六七八九十百千万两".contains(character)
+        })
+    {
+        return value[..index].trim_end();
+    }
+    value
+}
+
+fn strip_latin_season_suffix(value: &str) -> &str {
+    let lowercase = value.to_ascii_lowercase();
+    for marker in ["season", "s"] {
+        let Some(index) = lowercase.rfind(marker) else {
+            continue;
+        };
+        if index > 0
+            && lowercase[..index]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+        {
+            continue;
+        }
+        let number = lowercase[index + marker.len()..].trim();
+        if !number.is_empty() && number.chars().all(|character| character.is_ascii_digit()) {
+            return value[..index].trim_end_matches([' ', '-', '_']);
+        }
+    }
+    value
+}
+
 fn descendant_count(
     item_id: &str,
     children_by_parent: &HashMap<String, Vec<String>>,
@@ -384,6 +556,8 @@ async fn merge_series<C: ConnectionTrait>(
     representative_id: &str,
     duplicate_id: &str,
 ) -> anyhow::Result<()> {
+    preserve_series_metadata(db, representative_id, duplicate_id).await?;
+
     let duplicate_seasons = MediaItems::find()
         .filter(media_items::Column::ParentId.eq(duplicate_id))
         .filter(media_items::Column::ItemType.eq("Season"))
@@ -477,6 +651,151 @@ async fn merge_series<C: ConnectionTrait>(
             .await
             .with_context(|| format!("failed to remove duplicate series: {duplicate_id}"))?;
     }
+    Ok(())
+}
+
+/// Keep metadata from an already identified duplicate when the preferred
+/// source (currently Xunlei) was scanned first without provider metadata.
+/// Without this, choosing the preferred source as representative would delete
+/// the only TMDb-linked title, overview, and image assets together with the
+/// duplicate row.
+async fn preserve_series_metadata<C: ConnectionTrait>(
+    db: &C,
+    representative_id: &str,
+    duplicate_id: &str,
+) -> anyhow::Result<()> {
+    let Some(representative) = MediaItems::find_by_id(representative_id.to_string())
+        .one(db)
+        .await?
+    else {
+        return Ok(());
+    };
+    let Some(duplicate) = MediaItems::find_by_id(duplicate_id.to_string())
+        .one(db)
+        .await?
+    else {
+        return Ok(());
+    };
+
+    let representative_tmdb = ProviderIds::find()
+        .filter(provider_ids::Column::ItemId.eq(representative_id))
+        .filter(provider_ids::Column::Provider.eq("Tmdb"))
+        .one(db)
+        .await?;
+    let duplicate_tmdb = ProviderIds::find()
+        .filter(provider_ids::Column::ItemId.eq(duplicate_id))
+        .filter(provider_ids::Column::Provider.eq("Tmdb"))
+        .one(db)
+        .await?;
+    if representative_tmdb.is_some() || duplicate_tmdb.is_none() {
+        return Ok(());
+    }
+
+    let mut active: media_items::ActiveModel = representative.into();
+    active.title = Set(duplicate.title);
+    active.overview = Set(duplicate.overview);
+    active.official_rating = Set(duplicate.official_rating);
+    active.custom_rating = Set(duplicate.custom_rating);
+    active.original_title = Set(duplicate.original_title);
+    active.sort_name = Set(duplicate.sort_name);
+    active.forced_sort_name = Set(duplicate.forced_sort_name);
+    active.tagline = Set(duplicate.tagline);
+    active.collection_name = Set(duplicate.collection_name);
+    active.original_language = Set(duplicate.original_language);
+    active.preferred_metadata_language = Set(duplicate.preferred_metadata_language);
+    active.preferred_metadata_country_code = Set(duplicate.preferred_metadata_country_code);
+    active.series_status = Set(duplicate.series_status);
+    active.air_days = Set(duplicate.air_days);
+    active.air_time = Set(duplicate.air_time);
+    active.home_page_url = Set(duplicate.home_page_url);
+    active.remote_trailers = Set(duplicate.remote_trailers);
+    active.production_locations = Set(duplicate.production_locations);
+    active.production_year = Set(duplicate.production_year);
+    active.premiere_date = Set(duplicate.premiere_date);
+    active.end_date = Set(duplicate.end_date);
+    active.photo_metadata = Set(duplicate.photo_metadata);
+    active.display_order = Set(duplicate.display_order);
+    active.community_rating = Set(duplicate.community_rating);
+    active.critic_rating = Set(duplicate.critic_rating);
+    active.tmdb_metadata_version = Set(duplicate.tmdb_metadata_version);
+    active.updated_at = Set(now_unix());
+    active
+        .update(db)
+        .await
+        .with_context(|| format!("failed to preserve series metadata: {representative_id}"))?;
+
+    let existing_providers = ProviderIds::find()
+        .filter(provider_ids::Column::ItemId.eq(representative_id))
+        .all(db)
+        .await?;
+    let existing_provider_names: HashSet<String> = existing_providers
+        .into_iter()
+        .map(|provider| provider.provider)
+        .collect();
+    let duplicate_providers = ProviderIds::find()
+        .filter(provider_ids::Column::ItemId.eq(duplicate_id))
+        .all(db)
+        .await?;
+    let missing_providers: Vec<_> = duplicate_providers
+        .into_iter()
+        .filter(|provider| !existing_provider_names.contains(&provider.provider))
+        .map(|provider| provider_ids::ActiveModel {
+            item_id: Set(representative_id.to_string()),
+            provider: Set(provider.provider),
+            provider_item_id: Set(provider.provider_item_id),
+        })
+        .collect();
+    if !missing_providers.is_empty() {
+        ProviderIds::insert_many(missing_providers)
+            .exec_without_returning(db)
+            .await
+            .with_context(|| {
+                format!("failed to preserve series provider IDs: {representative_id}")
+            })?;
+    }
+
+    let duplicate_images = ImageAssets::find()
+        .filter(image_assets::Column::ItemId.eq(duplicate_id))
+        .all(db)
+        .await?;
+    for image in duplicate_images {
+        ImageAssets::insert(image_assets::ActiveModel {
+            id: Set(crate::util::stable_text_id(&format!(
+                "image-asset:{representative_id}:{}:{}",
+                image.image_type, image.image_index
+            ))),
+            item_id: Set(representative_id.to_string()),
+            image_type: Set(image.image_type),
+            image_index: Set(image.image_index),
+            path: Set(image.path),
+            etag: Set(image.etag),
+            width: Set(image.width),
+            height: Set(image.height),
+            size_bytes: Set(image.size_bytes),
+            created_at: Set(image.created_at),
+            updated_at: Set(now_unix()),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                image_assets::Column::ItemId,
+                image_assets::Column::ImageType,
+                image_assets::Column::ImageIndex,
+            ])
+            .update_columns([
+                image_assets::Column::Path,
+                image_assets::Column::Etag,
+                image_assets::Column::Width,
+                image_assets::Column::Height,
+                image_assets::Column::SizeBytes,
+                image_assets::Column::UpdatedAt,
+            ])
+            .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await
+        .with_context(|| format!("failed to preserve series image assets: {representative_id}"))?;
+    }
+
     Ok(())
 }
 
@@ -579,11 +898,29 @@ fn parse_year(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::source_fallback_key;
+    use super::{normalize_series_identity, source_fallback_key, source_priority_score};
 
     #[test]
     fn xunlei_is_primary_and_quark_is_fallback() {
         assert!(!source_fallback_key("/media/迅雷-番/幼女战记 (2017)"));
         assert!(source_fallback_key("/media/番/幼女战记 (2017)"));
+        assert_eq!(source_priority_score("/media/迅雷-番/幼女战记 (2017)"), 1);
+        assert_eq!(source_priority_score("/media/番/幼女战记 (2017)"), 0);
+    }
+
+    #[test]
+    fn season_suffixes_share_one_series_identity() {
+        assert_eq!(
+            normalize_series_identity("关于我转生变成史莱姆这档事"),
+            normalize_series_identity("关于我转生变成史莱姆这档事 第四季")
+        );
+        assert_eq!(
+            normalize_series_identity("Show (2026)"),
+            normalize_series_identity("Show Season 4")
+        );
+        assert_eq!(
+            normalize_series_identity("再见菈菈"),
+            normalize_series_identity("再见，拉拉")
+        );
     }
 }

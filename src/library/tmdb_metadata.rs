@@ -2325,7 +2325,15 @@ pub(crate) fn parse_lookup_title_year(path: &Path) -> Option<(String, Option<i64
     };
     let cleaned = clean_provider_tags(name);
     let year = lookup_year_regex()
-        .captures(name)
+        .captures_iter(name)
+        .find(|captures| {
+            let Some(year) = captures.name("year") else {
+                return false;
+            };
+            !video_dimension_regex().find_iter(name).any(|dimension| {
+                dimension.start() <= year.start() && year.start() < dimension.end()
+            })
+        })
         .and_then(|captures| captures.name("year"))
         .and_then(|year| year.as_str().parse::<i64>().ok());
     let fallback_title = cleaned
@@ -2353,9 +2361,17 @@ fn lookup_year_regex() -> &'static regex::Regex {
     static REGEX: OnceLock<regex::Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
         regex::Regex::new(
-            r"(?:^|[^0-9])(?P<year>18[89][0-9]|19[0-9]{2}|20[0-9]{2}|2100)(?:[^0-9]|$)",
+            r"(?i)(?:^|[^0-9xX])(?P<year>18[89][0-9]|19[0-9]{2}|20[0-9]{2}|2100)(?:[^0-9xX]|$)",
         )
         .expect("lookup year regex must compile")
+    })
+}
+
+fn video_dimension_regex() -> &'static regex::Regex {
+    static REGEX: OnceLock<regex::Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b[0-9]{3,5}\s*[x×]\s*[0-9]{3,5}\b")
+            .expect("video dimension regex must compile")
     })
 }
 
@@ -5044,6 +5060,28 @@ mod tests {
         assert_eq!(
             clean_title_with_year("美人心计【2010】"),
             ("美人心计".to_string(), Some(2010))
+        );
+    }
+
+    #[test]
+    fn lookup_name_does_not_treat_video_dimensions_as_year() {
+        assert_eq!(
+            parse_lookup_title_year(Path::new(
+                "Ghost in the Shell S.A.C. 2nd GIG [1920 X 1040].mkv",
+            ))
+            .and_then(|(_, year)| year),
+            None
+        );
+    }
+
+    #[test]
+    fn lookup_name_keeps_real_year_before_video_dimensions() {
+        assert_eq!(
+            parse_lookup_title_year(Path::new(
+                "Ghost in the Shell S.A.C. (2002) [1920 X 1040].mkv",
+            ))
+            .and_then(|(_, year)| year),
+            Some(2002)
         );
     }
 

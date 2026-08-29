@@ -4,7 +4,11 @@ use anyhow::Context;
 use sea_orm::{ConnectionTrait, DatabaseConnection};
 use serde_json::{Value, json};
 
-use crate::{db::row_ext::QueryResultExt, library::models::MediaItem, util::stable_text_id};
+use crate::{
+    db::row_ext::QueryResultExt,
+    library::{models::MediaItem, reconcile::source_priority_score},
+    util::stable_text_id,
+};
 
 fn visible_media_item_sql(alias: &str) -> String {
     format!(
@@ -1524,7 +1528,7 @@ async fn deduplicate_episode_versions(db: &DatabaseConnection, items: &mut Vec<M
 fn episode_representative_score<'a>(
     item: &'a MediaItem,
     provider_map: &HashMap<String, Value>,
-) -> (u8, i64, &'a str) {
+) -> (u8, u8, i64, &'a str) {
     let has_provider = provider_map
         .get(&item.id)
         .and_then(Value::as_object)
@@ -1542,6 +1546,7 @@ fn episode_representative_score<'a>(
     let metadata_score =
         (has_provider as u8) * 4 + (has_primary_image as u8) * 2 + (has_overview as u8);
     (
+        source_priority_score(&item.path),
         metadata_score,
         item.size_bytes.unwrap_or_default(),
         item.id.as_str(),

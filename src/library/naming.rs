@@ -122,6 +122,7 @@ fn parse_episode_name(path: &str, stem: &str, folder: &str) -> ParsedName {
                 .season_number
                 .is_some_and(is_invalid_episode_season_number)
             {
+                parsed.season_number = None;
                 continue;
             }
             parsed.episode_number = capture_i64(&captures, &["episode", "epnumber"], &[]);
@@ -358,6 +359,14 @@ fn episode_patterns() -> &'static [(Regex, EpisodeStyle)] {
             EpisodeStyle::TrailingTitle,
         ),
         (
+            // Bracket-heavy anime releases may place the episode after several
+            // title/group tags, for example `[POPGO][Title][S.A.C.][01][1080p]`.
+            // Match this before generic `1x02` handling so codec tags such as
+            // `FLACx2+AC3x1` cannot become fake season/episode numbers.
+            r#"(?i).*/(?:\[[^\]]+\])*(?P<title>\[[^\]]+\])\[(?P<episode>[0-9]{1,3})\](?:\[[^\]]+\])+(?:\.[^/]*)?$"#,
+            EpisodeStyle::Named,
+        ),
+        (
             // Multiple 1x02 - 1x03 / 1x02 - 1e03 naming.
             r#"(?i).*(?:/)(?P<title>.*?)(?P<season>[0-9]{1,4})x(?P<episode>[0-9]{1,3})(?:\s*-\s*[0-9]{1,4}[xe](?P<ending>[0-9]{1,3}))+[^/]*$"#,
             EpisodeStyle::Named,
@@ -498,15 +507,29 @@ fn ending_episode_capture_is_valid(path: &str, captures: &regex::Captures<'_>) -
 
 fn parse_compact_episode(value: &str) -> Option<(i64, i64)> {
     let regex = Regex::new(r#"(?i)(?:^|[^0-9])(?P<number>[0-9]{3,4})(?:[^0-9]|$)"#).ok()?;
-    let captures = regex.captures(value)?;
-    let digits = captures.name("number")?.as_str();
-    let split = digits.len().saturating_sub(2);
-    let season = digits[..split].parse().ok()?;
-    let episode = digits[split..].parse().ok()?;
-    if (200..1928).contains(&season) || season > 2500 {
-        return None;
+    for captures in regex.captures_iter(value) {
+        let matched = captures.name("number")?;
+        let digits = matched.as_str();
+        let number = digits.parse::<i64>().ok()?;
+        let before = value[..matched.start()].chars().next_back();
+        let after = value[matched.end()..].chars().next();
+        let is_resolution = matches!(number, 480 | 576 | 720 | 1080 | 1440 | 2160 | 4320)
+            && matches!(after, Some('p' | 'P' | 'i' | 'I'));
+        let is_dimension =
+            matches!(before, Some('x' | 'X' | '×')) || matches!(after, Some('x' | 'X' | '×'));
+        if is_resolution || is_dimension || (1880..=2100).contains(&number) {
+            continue;
+        }
+
+        let split = digits.len().saturating_sub(2);
+        let season = digits[..split].parse().ok()?;
+        let episode = digits[split..].parse().ok()?;
+        if (200..1928).contains(&season) || season > 2500 {
+            continue;
+        }
+        return Some((season, episode));
     }
-    Some((season, episode))
+    None
 }
 
 fn parse_version(stem: &str) -> Option<String> {
@@ -972,6 +995,39 @@ mod tests {
         let parsed = parse_media_name(Path::new("第十二集至第十五集.strm"), "tvshows");
         assert_eq!(parsed.episode_number, Some(12));
         assert_eq!(parsed.ending_episode_number, Some(15));
+    }
+
+    #[test]
+    fn parses_bracket_heavy_popgo_episode_before_resolution() {
+        for path in [
+            "/media/Show/Season 2/[POPGO][Ghost_in_the_Shell][S.A.C._2nd_GIG][01][AVC_FLACx2+AC3][BDrip][1080p][228A2730].(mkv).strm",
+            "/media/Show/Season 1/[POPGO][Stand_Alone_Complex][BDRIP][1080P]/[POPGO][Stand_Alone_Complex][01][1080P][BluRay][x264_FLACx2_AC3x1][chs_jpn][D4C0C6B6].(mkv).strm",
+        ] {
+            let parsed = parse_media_name(Path::new(path), "tvshows");
+
+            assert_eq!(parsed.season_number, None, "{path}");
+            assert_eq!(parsed.episode_number, Some(1), "{path}");
+            assert_ne!(parsed.title, "1080p", "{path}");
+        }
+    }
+
+    #[test]
+    fn compact_episode_skips_years_and_video_dimensions() {
+        let resolution = parse_media_name(Path::new("Show.1080p.mkv"), "tvshows");
+        assert_eq!(resolution.season_number, None);
+        assert_eq!(resolution.episode_number, None);
+
+        let dimensions = parse_media_name(Path::new("Show.1920X1040.mkv"), "tvshows");
+        assert_eq!(dimensions.season_number, None);
+        assert_eq!(dimensions.episode_number, None);
+
+        let year = parse_media_name(Path::new("Show.2026.mkv"), "tvshows");
+        assert_eq!(year.season_number, None);
+        assert_eq!(year.episode_number, None);
+
+        let actual_episode = parse_media_name(Path::new("Show.102.mkv"), "tvshows");
+        assert_eq!(actual_episode.season_number, Some(1));
+        assert_eq!(actual_episode.episode_number, Some(2));
     }
 
     #[test]

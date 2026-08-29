@@ -13,7 +13,7 @@ use crate::{
     app::state::AppState,
     jellyfin::item_queries::{attach_item_image_tags, batch_item_provider_ids},
     jellyfin::{auth::query_user_id_or_request, common::internal_error},
-    library::models::MediaItem,
+    library::{models::MediaItem, reconcile::source_priority_score},
 };
 
 fn visible_media_item_sql(alias: &str) -> String {
@@ -23,8 +23,8 @@ fn visible_media_item_sql(alias: &str) -> String {
 }
 
 /// Deduplicate episodes by (parent_id, season_number, episode_number).
-/// When multiple video files exist for the same episode, keep the best
-/// display representative first, then fall back to the largest source.
+/// When multiple video files exist for the same episode, prefer the configured
+/// source priority first, then metadata completeness and file size.
 fn deduplicate_episodes(
     items: Vec<MediaItem>,
     provider_map: &HashMap<String, Value>,
@@ -65,7 +65,7 @@ fn deduplicate_episodes(
 fn episode_representative_score<'a>(
     item: &'a MediaItem,
     provider_map: &HashMap<String, Value>,
-) -> (u8, i64, &'a str) {
+) -> (u8, u8, i64, &'a str) {
     let has_provider = provider_map
         .get(&item.id)
         .and_then(Value::as_object)
@@ -83,6 +83,7 @@ fn episode_representative_score<'a>(
     let metadata_score =
         (has_provider as u8) * 4 + (has_primary_image as u8) * 2 + (has_overview as u8);
     (
+        source_priority_score(&item.path),
         metadata_score,
         item.size_bytes.unwrap_or(0),
         item.id.as_str(),
@@ -251,7 +252,10 @@ async fn descendant_episodes(
 
 #[cfg(test)]
 mod tests {
-    use super::{child_items_by_type, descendant_episodes, show_episodes, show_seasons};
+    use super::{
+        MediaItem, child_items_by_type, descendant_episodes, episode_representative_score,
+        show_episodes, show_seasons,
+    };
     use crate::entities::{
         image_assets::{self, Entity as ImageAssets},
         libraries::{self, Entity as Libraries},
@@ -470,6 +474,30 @@ mod tests {
         assert_eq!(episodes.len(), 1);
         assert_eq!(episodes[0].id, "smaller-scraped");
         assert_eq!(episodes[0].image_tags, Some(json!({"Primary": "etag-1"})));
+    }
+
+    #[test]
+    fn show_episode_source_priority_beats_metadata_completeness() {
+        let quark = MediaItem {
+            id: "quark".to_string(),
+            path: "/media/番/穹庐下的魔女 (2026)/S01E01.strm".to_string(),
+            overview: Some("scraped overview".to_string()),
+            size_bytes: Some(10_000),
+            ..Default::default()
+        };
+        let xunlei = MediaItem {
+            id: "xunlei".to_string(),
+            path: "/media/迅雷-番/穹庐下的魔女 (2026)/S01E01.strm".to_string(),
+            size_bytes: Some(1_000),
+            ..Default::default()
+        };
+        let mut provider_map = std::collections::HashMap::new();
+        provider_map.insert(quark.id.clone(), json!({"Tmdb": "episode-tmdb"}));
+
+        assert!(
+            episode_representative_score(&xunlei, &provider_map)
+                > episode_representative_score(&quark, &provider_map)
+        );
     }
 
     #[tokio::test]

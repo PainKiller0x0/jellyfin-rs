@@ -183,10 +183,11 @@ async fn main() -> anyhow::Result<()> {
                 match library::reconcile::reconcile_provider_duplicates(&metadata_db).await {
                     Ok(stats) if stats.changed() => {
                         tracing::info!(
-                            "startup provider reconciliation merged {} series, {} movies, and {} versions",
+                            "startup provider reconciliation merged {} series, {} movies, and {} versions; normalized {} dimension year(s)",
                             stats.merged_series,
                             stats.merged_movies,
-                            stats.merged_versions
+                            stats.merged_versions,
+                            stats.normalized_dimension_years
                         );
                     }
                     Ok(_) => {}
@@ -320,10 +321,11 @@ async fn main() -> anyhow::Result<()> {
             };
             match library::reconcile::reconcile_provider_duplicates(&reconcile_db).await {
                 Ok(stats) if stats.changed() => tracing::info!(
-                    "startup provider reconciliation merged {} series, {} movies, and {} versions",
+                    "startup provider reconciliation merged {} series, {} movies, and {} versions; normalized {} dimension year(s)",
                     stats.merged_series,
                     stats.merged_movies,
-                    stats.merged_versions
+                    stats.merged_versions,
+                    stats.normalized_dimension_years
                 ),
                 Ok(_) => tracing::info!("startup provider reconciliation found no duplicates"),
                 Err(error) => tracing::warn!("startup provider reconciliation failed: {error:#}"),

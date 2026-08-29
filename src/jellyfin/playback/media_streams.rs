@@ -19,6 +19,7 @@ use crate::{
         MediaItem, MediaStreamRow, MediaStreamSelectionPreferences, SubtitlePlaybackMode,
         apply_media_source_user_preferences, child_video_source_json_for_item,
     },
+    library::reconcile::source_priority_score,
 };
 
 type EpisodeVersionKey = (String, Option<i64>, i64);
@@ -105,6 +106,26 @@ fn retain_primary_stack_parts_by_parent(rows: &mut Vec<(String, VideoSourceRow)>
                 .is_some()
                 .cmp(&stack_info_for_source(left).is_some())
                 .then_with(|| left.title.cmp(&right.title))
+        })
+    });
+}
+
+fn sort_video_sources_by_preference(rows: &mut [VideoSourceRow]) {
+    rows.sort_by(|left, right| {
+        source_priority_score(&right.path)
+            .cmp(&source_priority_score(&left.path))
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+}
+
+fn sort_video_sources_by_parent_preference(rows: &mut [(String, VideoSourceRow)]) {
+    rows.sort_by(|(left_parent, left), (right_parent, right)| {
+        left_parent.cmp(right_parent).then_with(|| {
+            source_priority_score(&right.path)
+                .cmp(&source_priority_score(&left.path))
+                .then_with(|| left.title.cmp(&right.title))
+                .then_with(|| left.path.cmp(&right.path))
         })
     });
 }
@@ -411,6 +432,7 @@ pub(crate) async fn child_video_sources(
         visible_rows.push(VideoSourceRow::from(row));
     }
     retain_primary_stack_parts(&mut visible_rows);
+    sort_video_sources_by_preference(&mut visible_rows);
 
     let mut sources = Vec::new();
     for row in visible_rows {
@@ -473,6 +495,7 @@ pub(crate) async fn batch_child_video_sources(
         }
     }
     retain_primary_stack_parts_by_parent(&mut source_rows);
+    sort_video_sources_by_parent_preference(&mut source_rows);
 
     let stream_map = if include_streams {
         let mut source_ids = source_rows
@@ -779,6 +802,7 @@ mod tests {
     use super::{
         VideoSourceRow, batch_episode_version_sources, child_video_sources,
         episode_version_sources, media_streams_for_item, retain_primary_stack_parts,
+        sort_video_sources_by_preference,
     };
     use crate::entities::{
         media_items::{self, Entity as MediaItems},
@@ -813,6 +837,31 @@ mod tests {
         assert!(ids.contains(&"4k-1".to_string()));
         assert!(ids.contains(&"1080-1".to_string()));
         assert!(ids.contains(&"standalone".to_string()));
+    }
+
+    #[test]
+    fn xunlei_source_precedes_fallback_source() {
+        let mut rows = vec![
+            VideoSourceRow {
+                id: "quark".to_string(),
+                title: "Episode".to_string(),
+                path: "/media/番/穹庐下的魔女 (2026)/S01E01.strm".to_string(),
+                container: "strm".to_string(),
+                runtime_ticks: None,
+                size_bytes: Some(10_000),
+            },
+            VideoSourceRow {
+                id: "xunlei".to_string(),
+                title: "Episode".to_string(),
+                path: "/media/迅雷-番/穹庐下的魔女 (2026)/S01E01.strm".to_string(),
+                container: "strm".to_string(),
+                runtime_ticks: None,
+                size_bytes: Some(1_000),
+            },
+        ];
+
+        sort_video_sources_by_preference(&mut rows);
+        assert_eq!(rows[0].id, "xunlei");
     }
 
     #[tokio::test]

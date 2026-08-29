@@ -1069,12 +1069,47 @@ fn attribute_value(tag: &str, name: &str) -> Option<String> {
 }
 
 fn find_year(value: &str) -> Option<i64> {
-    value
-        .as_bytes()
+    let bytes = value.as_bytes();
+    let dimensions = video_dimension_regex();
+    bytes
         .windows(4)
-        .filter_map(|digits| std::str::from_utf8(digits).ok())
+        .enumerate()
+        .filter(|(start, digits)| {
+            if !digits.iter().all(u8::is_ascii_digit) {
+                return false;
+            }
+            let start = *start;
+            let before = start.checked_sub(1).and_then(|index| bytes.get(index));
+            let after = bytes.get(start + 4);
+            !dimensions
+                .find_iter(value)
+                .any(|matched| matched.start() <= start && start < matched.end())
+                && !before.is_some_and(|byte| byte.is_ascii_digit())
+                && !after.is_some_and(|byte| byte.is_ascii_digit())
+        })
+        .filter_map(|(_, digits)| std::str::from_utf8(digits).ok())
         .filter_map(|digits| digits.parse::<i64>().ok())
         .find(|year| (1880..=2100).contains(year))
+}
+
+fn video_dimension_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)\b(?P<width>[0-9]{3,5})\s*[x×]\s*[0-9]{3,5}\b")
+            .expect("video dimension regex must compile")
+    })
+}
+
+pub(crate) fn is_video_dimension_year(path: &Path, year: i64) -> bool {
+    let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    video_dimension_regex().captures_iter(name).any(|captures| {
+        captures
+            .name("width")
+            .and_then(|width| width.as_str().parse::<i64>().ok())
+            == Some(year)
+    })
 }
 
 fn decode_xml_text(value: &str) -> String {
@@ -1151,6 +1186,32 @@ mod tests {
         assert_eq!(metadata.season_number, Some(2));
         assert_eq!(metadata.episode_number, Some(3));
         assert_eq!(metadata.ending_episode_number, Some(4));
+    }
+
+    #[test]
+    fn video_dimensions_are_not_parsed_as_production_year() {
+        let metadata = parse_filename_metadata(Path::new(
+            "[VCB-S][Ghost in the Shell S.A.C. 2nd GIG][01][1920X1040].(mkv).strm",
+        ));
+
+        assert_eq!(metadata.production_year, None);
+    }
+
+    #[test]
+    fn real_year_is_kept_when_video_dimensions_are_present() {
+        let metadata = parse_filename_metadata(Path::new(
+            "Ghost in the Shell STAND ALONE COMPLEX (2002) [1920 X 1040].mkv",
+        ));
+
+        assert_eq!(metadata.production_year, Some(2002));
+    }
+
+    #[test]
+    fn dimension_year_helper_matches_only_the_dimension_width() {
+        let path = Path::new("episode [1920X1040].mkv");
+
+        assert!(is_video_dimension_year(path, 1920));
+        assert!(!is_video_dimension_year(path, 1040));
     }
 
     #[test]

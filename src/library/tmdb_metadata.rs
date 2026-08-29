@@ -1275,7 +1275,8 @@ pub async fn fetch_and_apply_episode_tmdb_metadata(
         None => preferred_metadata_language_for_item(db, item_id).await,
     };
     let episode_metadata_is_current = row.get_opt_str("episode_tmdb_id").ok().flatten().is_some()
-        && row.get_i64("tmdb_metadata_version").unwrap_or_default() == TMDB_METADATA_VERSION;
+        && row.get_i64("tmdb_metadata_version").unwrap_or_default() == TMDB_METADATA_VERSION
+        && !is_replaceable_episode_title(&current_title, &series_title, series_year);
     let has_primary = row.get_i64("has_primary").unwrap_or_default() != 0;
     if (!policy.refresh_metadata || episode_metadata_is_current)
         && (!policy.refresh_images || has_primary)
@@ -1609,7 +1610,12 @@ async fn apply_episode_tmdb_response(
         cast_locked = metadata_field_locked(&item, "Cast");
         let mut active: media_items::ActiveModel = item.clone().into();
         if !metadata_field_locked(&item, "Name")
-            && (!preserve_existing_metadata || item.title.trim().is_empty())
+            && (!preserve_existing_metadata
+                || is_replaceable_episode_title(
+                    &target.current_title,
+                    &target.series_title,
+                    target.series_year,
+                ))
             && let Some(title) = episode_title_candidate(
                 episode.name.as_deref(),
                 &target.current_title,
@@ -2066,7 +2072,7 @@ fn episode_title_candidate(
         }
     }
 
-    if is_generic_series_episode_title(current_title, series_title, series_year) {
+    if is_replaceable_episode_title(current_title, series_title, series_year) {
         return local_episode_title_from_path(path)
             .filter(|title| !is_generic_series_episode_title(title, series_title, series_year))
             .or_else(|| Some(format!("Episode {episode_number}")));
@@ -2091,6 +2097,10 @@ fn is_generic_series_episode_title(
     series_year
         .map(|year| title == format!("{series_title}{year}"))
         .unwrap_or(false)
+}
+
+fn is_replaceable_episode_title(title: &str, series_title: &str, series_year: Option<i64>) -> bool {
+    is_generic_series_episode_title(title, series_title, series_year) || title.trim().contains("][")
 }
 
 fn compact_title_for_compare(value: &str) -> String {
@@ -4610,13 +4620,14 @@ mod tests {
         TmdbEpisodeGroup, TmdbEpisodeGroupCollection, TmdbEpisodeGroupEpisode, TmdbFindResponse,
         TmdbImageEntry, TmdbImagesResponse, TmdbLibraryProviderOptions, TmdbPersonResponse,
         apply_tmdb_person_response, clean_provider_tags, clean_title_with_year,
-        episode_remote_trailers, episode_title_candidate, extract_tmdb_id, is_tmdb_image_asset,
-        local_episode_title_from_path, merge_metadata_string_list, merge_remote_trailers,
-        metadata_field_locked_storage, normalize_tmdb_overview, parse_lookup_title_year,
-        parse_season_number, redact_tmdb_api_key, resolve_tmdb_episode_group_mapping,
-        should_skip_name_based_tmdb_lookup, tmdb_candidate_score, tmdb_credit_people,
-        tmdb_episode_group_type, tmdb_episode_response_for_target, tmdb_find_result_id,
-        tmdb_search_query_variants, tmdb_title_match_score, upsert_tmdb_people,
+        episode_remote_trailers, episode_title_candidate, extract_tmdb_id,
+        is_replaceable_episode_title, is_tmdb_image_asset, local_episode_title_from_path,
+        merge_metadata_string_list, merge_remote_trailers, metadata_field_locked_storage,
+        normalize_tmdb_overview, parse_lookup_title_year, parse_season_number, redact_tmdb_api_key,
+        resolve_tmdb_episode_group_mapping, should_skip_name_based_tmdb_lookup,
+        tmdb_candidate_score, tmdb_credit_people, tmdb_episode_group_type,
+        tmdb_episode_response_for_target, tmdb_find_result_id, tmdb_search_query_variants,
+        tmdb_title_match_score, upsert_tmdb_people,
     };
     use crate::{
         entities::{
@@ -5298,6 +5309,20 @@ mod tests {
                 .as_deref(),
             Some("双头蛇")
         );
+    }
+
+    #[test]
+    fn technical_filename_fragment_is_replaceable_episode_title() {
+        assert!(is_replaceable_episode_title(
+            "chs jpn][F17589F6",
+            "攻壳机动队 STAND ALONE COMPLEX",
+            Some(2002),
+        ));
+        assert!(!is_replaceable_episode_title(
+            "硝烟弹雨",
+            "攻壳机动队 STAND ALONE COMPLEX",
+            Some(2002),
+        ));
     }
 
     #[test]

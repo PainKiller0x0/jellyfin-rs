@@ -32,6 +32,7 @@ use crate::{
 
 static EPISODE_TMDB_BATCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TMDB_LLM_AUDIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TMDB_LLM_EPISODE_BACKFILL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 type EpisodeGroupCacheCell = Arc<OnceCell<Option<Arc<TmdbEpisodeGroupCollection>>>>;
 static EPISODE_GROUP_CACHE: OnceLock<Mutex<HashMap<String, EpisodeGroupCacheCell>>> =
     OnceLock::new();
@@ -1988,6 +1989,178 @@ pub async fn batch_fetch_episode_tmdb(
 
     tracing::info!("TMDb episode metadata fetched for {count} episodes");
     Ok(count)
+}
+
+/// Use the configured LLM to confirm the TMDb series for incomplete episode
+/// rows, then let TMDb provide the authoritative episode title, overview and
+/// still image. Complete rows are excluded from the query so this is safe to
+/// run periodically.
+pub async fn refresh_existing_episode_tmdb_with_llm(
+    db: &sea_orm::DatabaseConnection,
+    api_key: &str,
+    client: &reqwest::Client,
+    tmdb_base_url: Option<&str>,
+) -> anyhow::Result<usize> {
+    if api_key.trim().is_empty() {
+        tracing::info!("LLM episode metadata refresh skipped: no TMDb API key configured");
+        return Ok(0);
+    }
+    let llm_config = load_tmdb_llm_config(db).await;
+    if !llm_config.configured() {
+        tracing::info!("LLM episode metadata refresh skipped: LLM is not configured");
+        return Ok(0);
+    }
+
+    let lock = TMDB_LLM_EPISODE_BACKFILL_LOCK.get_or_init(|| Mutex::new(()));
+    let Ok(_guard) = lock.try_lock() else {
+        tracing::info!("LLM episode metadata refresh already running; skipping overlap");
+        return Ok(0);
+    };
+
+    let library_options = load_tmdb_library_provider_options(db).await?;
+    let rows = db
+        .query_all_raw(crate::db::helpers::pg_statement(
+            r#"SELECT DISTINCT s.id,
+                      s.title,
+                      s.path,
+                      s.library_id,
+                      s.locked_fields,
+                      p.provider_item_id AS tmdb_id
+               FROM media_items s
+               JOIN media_items e ON e.item_type = 'Episode' AND e.lock_data = 0
+               JOIN media_items parent ON parent.id = e.parent_id
+               LEFT JOIN provider_ids p ON p.item_id = s.id AND p.provider = 'Tmdb'
+               WHERE s.item_type = 'Series'
+                 AND s.lock_data = 0
+                 AND (parent.id = s.id OR parent.parent_id = s.id)
+                 AND (
+                     e.tmdb_metadata_version < ?
+                     OR NOT EXISTS (
+                         SELECT 1 FROM provider_ids ep
+                         WHERE ep.item_id = e.id AND ep.provider = 'Tmdb'
+                     )
+                     OR e.overview IS NULL
+                     OR btrim(e.overview) = ''
+                     OR e.title = s.title
+                     OR (s.production_year IS NOT NULL
+                         AND e.title = CONCAT(s.title, ' ', s.production_year))
+                     OR (e.production_year IS NOT NULL
+                         AND e.title = CONCAT(s.title, ' ', e.production_year))
+                     OR e.title LIKE '%][%'
+                     OR NOT EXISTS (
+                         SELECT 1 FROM image_assets ia
+                         WHERE ia.item_id = e.id AND ia.image_type = 'Primary'
+                     )
+               )
+               ORDER BY s.path"#,
+            vec![TMDB_METADATA_VERSION.into()],
+        ))
+        .await?;
+
+    let mut repaired_series = 0usize;
+    let total_batches = rows.len().div_ceil(20);
+    for (batch_index, batch) in rows.chunks(20).enumerate() {
+        for row in batch {
+            let Ok(library_id) = row.get_str("library_id") else {
+                continue;
+            };
+            let Some(episode_policy) = library_options
+                .get(&library_id)
+                .and_then(|options| options.automatic_policy("Episode", false))
+            else {
+                continue;
+            };
+            if !episode_policy.refresh_metadata && !episode_policy.refresh_images {
+                continue;
+            }
+
+            let item_id = row.get_str("id")?;
+            let locked_fields = row.get_opt_str("locked_fields").ok().flatten();
+            if metadata_field_locked_storage(locked_fields.as_deref(), "Name")
+                || metadata_field_locked_storage(locked_fields.as_deref(), "ProviderIds")
+            {
+                continue;
+            }
+            let title = row.get_str("title").unwrap_or_default();
+            let path = row.get_str("path").unwrap_or_default();
+            let (name, year) = match parse_lookup_title_year(Path::new(&path)) {
+                Some((name, year)) if !should_skip_name_based_tmdb_lookup(&name) => (name, year),
+                _ if !should_skip_name_based_tmdb_lookup(&title) => (title.clone(), None),
+                _ => continue,
+            };
+            let metadata_language = preferred_metadata_language_for_item(db, &item_id).await;
+            let candidate = match lookup_tmdb_id_by_name_with_llm_cleanup(
+                client,
+                api_key,
+                tmdb_base_url,
+                &name,
+                year,
+                true,
+                &metadata_language,
+                Some(&llm_config),
+            )
+            .await
+            {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    tracing::warn!(
+                        "LLM episode metadata refresh search failed for '{name}': {}",
+                        redact_tmdb_error(&error)
+                    );
+                    continue;
+                }
+            };
+            let Some(candidate_id) = candidate else {
+                continue;
+            };
+            let current_id = row.get_opt_str("tmdb_id").ok().flatten();
+            if current_id.as_deref() == Some(candidate_id.as_str()) {
+                continue;
+            }
+
+            crate::db::provider_ids::upsert(db, &item_id, "Tmdb", &candidate_id).await?;
+            if let Some(series_policy) = library_options
+                .get(&library_id)
+                .and_then(|options| options.automatic_policy("Series", false))
+            {
+                if let Err(error) = fetch_and_apply_tmdb_metadata(
+                    db,
+                    &item_id,
+                    "Series",
+                    Path::new(&path),
+                    api_key,
+                    client,
+                    tmdb_base_url,
+                    series_policy,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "LLM episode metadata refresh failed to update series '{name}': {error:#}"
+                    );
+                }
+            }
+            repaired_series += 1;
+            tracing::info!(
+                "LLM episode metadata refresh matched '{name}' -> tmdb-{candidate_id}{}",
+                current_id
+                    .as_deref()
+                    .map(|id| format!(" (was tmdb-{id})"))
+                    .unwrap_or_default()
+            );
+        }
+        tracing::info!(
+            "LLM episode metadata refresh series progress: {}/{} batch(es)",
+            batch_index + 1,
+            total_batches
+        );
+    }
+
+    let refreshed = batch_fetch_episode_tmdb(db, api_key, client, tmdb_base_url).await?;
+    tracing::info!(
+        "LLM episode metadata refresh completed: repaired {repaired_series} series, refreshed {refreshed} episode(s)"
+    );
+    Ok(refreshed)
 }
 
 fn episode_numbers_for_target(target: &EpisodeTmdbTarget) -> impl Iterator<Item = i64> {

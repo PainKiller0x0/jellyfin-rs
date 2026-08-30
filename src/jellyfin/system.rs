@@ -71,6 +71,7 @@ const CAMERA_UPLOADS_PATH: &str = "data/camera_uploads";
 const USER_USAGE_BACKUP_PATH: &str = "data/user_usage_stats";
 const FALLBACK_FONTS_PATH: &str = "data/fonts";
 const TICKS_PER_SECOND: i64 = 10_000_000;
+const TMDB_EPISODE_METADATA_TASK_ID: &str = "RefreshTmdbEpisodeMetadata";
 
 mod configuration;
 mod localization;
@@ -1779,6 +1780,7 @@ pub async fn scheduled_tasks(State(state): State<Arc<AppState>>) -> impl IntoRes
     Json(vec![
         scan_library_task_for_state(&state).await,
         chapter_images_task_for_state(&state).await,
+        tmdb_episode_metadata_task_for_state(&state).await,
     ])
 }
 
@@ -1834,6 +1836,7 @@ pub async fn start_scheduled_task(
     match task_id.as_str() {
         "scan-library" => crate::jellyfin::items::scan_handler(state).await,
         "RefreshChapterImages" => start_chapter_images_task(state).await,
+        TMDB_EPISODE_METADATA_TASK_ID => start_tmdb_episode_metadata_task(state).await,
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -1859,12 +1862,16 @@ pub async fn stop_scheduled_task(
 }
 
 fn is_known_scheduled_task(task_id: &str) -> bool {
-    matches!(task_id, "scan-library" | "RefreshChapterImages")
+    matches!(
+        task_id,
+        "scan-library" | "RefreshChapterImages" | TMDB_EPISODE_METADATA_TASK_ID
+    )
 }
 
 async fn scheduled_task_for_state(state: &AppState, task_id: &str) -> JsonValue {
     match task_id {
         "RefreshChapterImages" => chapter_images_task_for_state(state).await,
+        TMDB_EPISODE_METADATA_TASK_ID => tmdb_episode_metadata_task_for_state(state).await,
         _ => scan_library_task_for_state(state).await,
     }
 }
@@ -1874,6 +1881,110 @@ async fn start_chapter_images_task(State(state): State<Arc<AppState>>) -> Respon
         return Json(json!({ "Running": true, "AlreadyRunning": true })).into_response();
     }
     Json(json!({ "Running": true })).into_response()
+}
+
+async fn start_tmdb_episode_metadata_task(State(state): State<Arc<AppState>>) -> Response {
+    if !queue_tmdb_episode_metadata_task(state, None).await {
+        return Json(json!({ "Running": true, "AlreadyRunning": true })).into_response();
+    }
+    Json(json!({ "Running": true })).into_response()
+}
+
+async fn queue_tmdb_episode_metadata_task(
+    state: Arc<AppState>,
+    max_runtime: Option<Duration>,
+) -> bool {
+    let already_running = last_task_result(&state.db, TMDB_EPISODE_METADATA_TASK_ID)
+        .await
+        .and_then(|result| {
+            result
+                .get("Status")
+                .and_then(JsonValue::as_str)
+                .map(|status| status == "Running")
+        })
+        .unwrap_or(false);
+    if already_running {
+        return false;
+    }
+
+    tokio::spawn(async move {
+        let start = now_unix();
+        upsert_task_result(
+            &state,
+            TMDB_EPISODE_METADATA_TASK_ID,
+            "Running",
+            start,
+            start,
+            Some("LLM episode TMDb metadata refresh is running"),
+        )
+        .await;
+
+        let run = async {
+            let database_url = crate::db::database_url_from_env();
+            let db = crate::db::background_connection(&database_url)
+                .await
+                .context("failed to connect to the metadata database")?;
+            if !crate::library::tmdb_metadata::tmdb_provider_enabled(&db).await {
+                return Ok::<String, anyhow::Error>(
+                    "TMDb provider is disabled; episode metadata refresh skipped".to_string(),
+                );
+            }
+            let Some(api_key) = state
+                .tmdb_api_key
+                .read()
+                .await
+                .clone()
+                .filter(|key| !key.trim().is_empty())
+            else {
+                return Ok(
+                    "TMDb API key is not configured; episode metadata refresh skipped".to_string(),
+                );
+            };
+            let config = crate::library::tmdb_metadata::load_tmdb_llm_config(&db).await;
+            if !config.configured() {
+                return Ok(
+                    "TMDb LLM is not configured; episode metadata refresh skipped".to_string(),
+                );
+            }
+            let client = state.tmdb_http_client().await;
+            let tmdb_base_url = state.tmdb_proxy_url.read().await.clone();
+            let count = crate::library::tmdb_metadata::refresh_existing_episode_tmdb_with_llm(
+                &db,
+                &api_key,
+                &client,
+                tmdb_base_url.as_deref(),
+            )
+            .await?;
+            Ok(format!(
+                "Episode TMDb metadata refresh completed; refreshed {count} episode(s)"
+            ))
+        };
+        let result = match max_runtime {
+            Some(limit) => match tokio::time::timeout(limit, run).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "episode TMDb metadata refresh exceeded its maximum runtime of {} seconds",
+                    limit.as_secs()
+                )),
+            },
+            None => run.await,
+        };
+        let end = now_unix();
+        let (status, message) = match result {
+            Ok(message) => ("Completed", message),
+            Err(error) => ("Failed", format!("{error:#}")),
+        };
+        upsert_task_result(
+            &state,
+            TMDB_EPISODE_METADATA_TASK_ID,
+            status,
+            start,
+            end,
+            Some(&message),
+        )
+        .await;
+    });
+    true
 }
 
 async fn queue_chapter_images_task(state: Arc<AppState>, max_runtime: Option<Duration>) -> bool {
@@ -2095,6 +2206,26 @@ async fn chapter_images_task_for_state(state: &AppState) -> JsonValue {
     })
 }
 
+async fn tmdb_episode_metadata_task_for_state(state: &AppState) -> JsonValue {
+    let result = last_task_result(&state.db, TMDB_EPISODE_METADATA_TASK_ID).await;
+    let is_running = result
+        .as_ref()
+        .and_then(|value| value.get("Status"))
+        .and_then(JsonValue::as_str)
+        == Some("Running");
+    json!({
+        "Name": "Refresh episode TMDb metadata",
+        "State": if is_running { "Running" } else { "Idle" },
+        "Id": TMDB_EPISODE_METADATA_TASK_ID,
+        "Key": TMDB_EPISODE_METADATA_TASK_ID,
+        "Description": "Uses the configured LLM to resolve incomplete series and refreshes episode titles, overviews, and images from TMDb.",
+        "Category": "Library",
+        "IsHidden": false,
+        "LastExecutionResult": result,
+        "Triggers": tmdb_episode_metadata_triggers(&state.db).await,
+    })
+}
+
 async fn scan_library_task_value(db: &DatabaseConnection, is_running: bool) -> JsonValue {
     let scan_result = last_task_result(db, "scan-library").await;
     json!({
@@ -2120,6 +2251,7 @@ async fn scan_library_triggers(db: &DatabaseConnection) -> JsonValue {
 async fn scheduled_task_triggers_value(db: &DatabaseConnection, task_id: &str) -> JsonValue {
     match task_id {
         "RefreshChapterImages" => chapter_images_triggers(db).await,
+        TMDB_EPISODE_METADATA_TASK_ID => tmdb_episode_metadata_triggers(db).await,
         _ => scan_library_triggers(db).await,
     }
 }
@@ -2137,6 +2269,21 @@ async fn chapter_images_triggers(db: &DatabaseConnection) -> JsonValue {
         })
 }
 
+async fn tmdb_episode_metadata_triggers(db: &DatabaseConnection) -> JsonValue {
+    serde_json::from_str(
+        &app_setting(db, "ScheduledTask.RefreshTmdbEpisodeMetadata.Triggers", "").await,
+    )
+    .ok()
+    .and_then(|value| normalize_scheduled_task_triggers(value).ok())
+    .unwrap_or_else(|| {
+        json!([{
+            "Type": "DailyTrigger",
+            "TimeOfDayTicks": (4 * 60 * 60 + 10 * 60) * 10_000_000_i64,
+            "MaxRuntimeTicks": 4 * 60 * 60 * 10_000_000_i64,
+        }])
+    })
+}
+
 const SCHEDULE_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 const TICKS_PER_DAY: i64 = 24 * 60 * 60 * TICKS_PER_SECOND;
 
@@ -2148,9 +2295,12 @@ struct DailyTaskSchedule {
 
 pub async fn start_scheduled_task_scheduler(state: Arc<AppState>) {
     recover_stale_chapter_image_task(&state).await;
+    recover_stale_tmdb_episode_metadata_task(&state).await;
+
+    let chapter_state = state.clone();
     tokio::spawn(async move {
         loop {
-            let triggers = chapter_images_triggers(&state.db).await;
+            let triggers = chapter_images_triggers(&chapter_state.db).await;
             let Some(schedule) =
                 next_daily_task_schedule(&triggers, chrono::Local::now().naive_local())
             else {
@@ -2164,12 +2314,38 @@ pub async fn start_scheduled_task_scheduler(state: Arc<AppState>) {
                 continue;
             }
 
-            if !queue_chapter_images_task(state.clone(), schedule.max_runtime).await {
+            if !queue_chapter_images_task(chapter_state.clone(), schedule.max_runtime).await {
                 tracing::info!(
                     "scheduled chapter image refresh skipped because the task is already running"
                 );
             }
             // Move beyond an exact wall-clock match before calculating tomorrow's trigger.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+
+    let tmdb_state = state;
+    tokio::spawn(async move {
+        loop {
+            let triggers = tmdb_episode_metadata_triggers(&tmdb_state.db).await;
+            let Some(schedule) =
+                next_daily_task_schedule(&triggers, chrono::Local::now().naive_local())
+            else {
+                tokio::time::sleep(SCHEDULE_RELOAD_INTERVAL).await;
+                continue;
+            };
+
+            let wait = schedule.delay.min(SCHEDULE_RELOAD_INTERVAL);
+            tokio::time::sleep(wait).await;
+            if wait < schedule.delay {
+                continue;
+            }
+
+            if !queue_tmdb_episode_metadata_task(tmdb_state.clone(), schedule.max_runtime).await {
+                tracing::info!(
+                    "scheduled TMDb episode metadata refresh skipped because the task is already running"
+                );
+            }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
@@ -2195,6 +2371,31 @@ async fn recover_stale_chapter_image_task(state: &AppState) {
             now,
             now,
             Some("Chapter image refresh was interrupted by a server restart"),
+        )
+        .await;
+    }
+}
+
+async fn recover_stale_tmdb_episode_metadata_task(state: &AppState) {
+    let was_running = last_task_result(&state.db, TMDB_EPISODE_METADATA_TASK_ID)
+        .await
+        .and_then(|result| {
+            result
+                .get("Status")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("Running");
+    if was_running {
+        let now = now_unix();
+        upsert_task_result(
+            state,
+            TMDB_EPISODE_METADATA_TASK_ID,
+            "Cancelled",
+            now,
+            now,
+            Some("TMDb episode metadata refresh was interrupted by a server restart"),
         )
         .await;
     }
@@ -3551,6 +3752,7 @@ fn scheduled_task_name(task_id: &str) -> &str {
     match task_id {
         "scan-library" => "Scan media library",
         "RefreshChapterImages" => "Extract chapter images",
+        TMDB_EPISODE_METADATA_TASK_ID => "Refresh episode TMDb metadata",
         _ => task_id,
     }
 }
@@ -5599,8 +5801,9 @@ mod tests {
     };
     use super::{
         DailyTaskSchedule, DeviceIdQuery, DirectoryContentsQuery, ParentPathQuery,
-        ValidatePathRequest, device_options_key, next_daily_task_schedule, next_daily_trigger,
-        queue_chapter_images_task, recover_stale_chapter_image_task, set_app_setting,
+        TMDB_EPISODE_METADATA_TASK_ID, ValidatePathRequest, device_options_key,
+        next_daily_task_schedule, next_daily_trigger, queue_chapter_images_task,
+        recover_stale_chapter_image_task, set_app_setting, tmdb_episode_metadata_task_for_state,
         upsert_task_result,
     };
     use crate::app::state::AppState;
@@ -6227,6 +6430,7 @@ mod tests {
     fn start_scheduled_task_rejects_unknown_task() {
         assert!(is_known_scheduled_task("scan-library"));
         assert!(is_known_scheduled_task("RefreshChapterImages"));
+        assert!(is_known_scheduled_task(TMDB_EPISODE_METADATA_TASK_ID));
         assert!(!is_known_scheduled_task("missing"));
     }
 
@@ -6252,6 +6456,14 @@ mod tests {
         assert_eq!(
             chapter_task["Triggers"][0]["TimeOfDayTicks"],
             72_000_000_000_i64
+        );
+
+        let tmdb_task = tmdb_episode_metadata_task_for_state(&state).await;
+        assert_eq!(tmdb_task["Id"], TMDB_EPISODE_METADATA_TASK_ID);
+        assert_eq!(tmdb_task["Triggers"][0]["Type"], "DailyTrigger");
+        assert_eq!(
+            tmdb_task["Triggers"][0]["TimeOfDayTicks"],
+            (4 * 60 * 60 + 10 * 60) * 10_000_000_i64
         );
     }
 

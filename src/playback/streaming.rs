@@ -484,13 +484,13 @@ async fn stream_subtitle_item(
         Ok(path) => path,
         Err(error) => return internal_error(error),
     };
-    let bytes = match path {
+    let (bytes, is_external) = match path {
         Some(path) => {
             if !readable_media_path(&state.db, &path).await {
                 return StatusCode::NOT_FOUND.into_response();
             }
             match tokio::fs::read(&path).await {
-                Ok(bytes) => bytes,
+                Ok(bytes) => (bytes, true),
                 Err(error) => {
                     return (
                         StatusCode::NOT_FOUND,
@@ -534,17 +534,11 @@ async fn stream_subtitle_item(
                     }
                 }
             };
-            bytes
+            (bytes, false)
         }
     };
-    let (content_type, bytes) = if format.eq_ignore_ascii_case("js") {
-        (
-            "application/json; charset=utf-8",
-            vtt_to_track_events(&bytes),
-        )
-    } else if format.eq_ignore_ascii_case("vtt") {
-        ("text/vtt; charset=utf-8", bytes)
-    } else {
+    let Some((content_type, bytes)) = subtitle_response_payload(&format, bytes, is_external)
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let mut headers = HeaderMap::new();
@@ -558,6 +552,27 @@ async fn stream_subtitle_item(
         (StatusCode::OK, headers, Body::empty()).into_response()
     } else {
         (StatusCode::OK, headers, Body::from(bytes)).into_response()
+    }
+}
+
+fn subtitle_response_payload(
+    format: &str,
+    bytes: Vec<u8>,
+    is_external: bool,
+) -> Option<(&'static str, Vec<u8>)> {
+    if format.eq_ignore_ascii_case("js") {
+        Some((
+            "application/json; charset=utf-8",
+            vtt_to_track_events(&bytes),
+        ))
+    } else if format.eq_ignore_ascii_case("vtt") {
+        Some(("text/vtt; charset=utf-8", bytes))
+    } else if is_external
+        && (format.eq_ignore_ascii_case("ass") || format.eq_ignore_ascii_case("ssa"))
+    {
+        Some(("text/x-ssa; charset=utf-8", bytes))
+    } else {
+        None
     }
 }
 
@@ -1696,7 +1711,8 @@ mod tests {
     use super::{
         PlaybackTarget, normalize_embedded_subtitle_window_start_ticks, parse_range_header,
         playback_target_for_item, query_media_source_id, remote_stream_proxy_requested,
-        remote_stream_redirect, remote_stream_referer, shift_vtt_timestamps, vtt_to_track_events,
+        remote_stream_redirect, remote_stream_referer, shift_vtt_timestamps,
+        subtitle_response_payload, vtt_to_track_events,
     };
     use crate::library::models::MediaItem;
     use axum::http::{StatusCode, header};
@@ -1806,6 +1822,19 @@ mod tests {
         assert_eq!(events[0]["EndPositionTicks"], 39_000_000);
         assert_eq!(events[0]["Text"], "hello");
         assert_eq!(events[1]["StartPositionTicks"], 102_400_000);
+    }
+
+    #[test]
+    fn external_ass_subtitles_are_served_in_their_original_format() {
+        let bytes = b"[Script Info]\nTitle: test\n".to_vec();
+        let (content_type, response) = subtitle_response_payload("ass", bytes.clone(), true)
+            .expect("external ASS should be supported");
+
+        assert_eq!(content_type, "text/x-ssa; charset=utf-8");
+        assert_eq!(response, bytes);
+
+        assert!(subtitle_response_payload("ass", b"ass".to_vec(), false).is_none());
+        assert!(subtitle_response_payload("ssa", b"ssa".to_vec(), true).is_some());
     }
 
     #[test]

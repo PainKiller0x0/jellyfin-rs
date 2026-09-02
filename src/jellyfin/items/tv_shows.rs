@@ -11,16 +11,10 @@ use serde_json::{Value, json};
 
 use crate::{
     app::state::AppState,
-    jellyfin::item_queries::{attach_item_image_tags, batch_item_provider_ids},
+    jellyfin::item_queries::{self, attach_item_image_tags, batch_item_provider_ids},
     jellyfin::{auth::query_user_id_or_request, common::internal_error},
     library::{models::MediaItem, reconcile::source_priority_score},
 };
-
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
-}
 
 /// Deduplicate episodes by (parent_id, season_number, episode_number).
 /// When multiple video files exist for the same episode, prefer the configured
@@ -183,7 +177,7 @@ async fn child_items_by_type(
         .query_all_raw(crate::db::helpers::pg_statement(
             &crate::jellyfin::item_queries::media_item_select_sql(&format!(
                 "WHERE media_items.parent_id = ? AND media_items.item_type = ? AND {} {order}",
-                visible_media_item_sql("media_items")
+                item_queries::visible_media_item_sql("media_items")
             )),
             vec![user_id.into(), parent_id.into(), item_type.into()],
         ))
@@ -220,11 +214,11 @@ async fn descendant_episodes(
         .query_all_raw(crate::db::helpers::pg_statement(
             &format!(
                 r#"WITH RECURSIVE tree(id) AS (SELECT media_items.id FROM media_items WHERE media_items.id = ? AND {} UNION ALL SELECT media_items.id FROM media_items JOIN tree ON media_items.parent_id = tree.id WHERE {}) {} WHERE media_items.id IN (SELECT id FROM tree WHERE id <> ?) AND media_items.item_type = 'Episode' AND {} ORDER BY media_items.title ASC"#,
-                visible_media_item_sql("media_items"),
-                visible_media_item_sql("media_items"),
+                item_queries::visible_media_item_sql("media_items"),
+                item_queries::visible_media_item_sql("media_items"),
                 crate::jellyfin::item_queries::media_item_select_sql("").trim()
                 ,
-                visible_media_item_sql("media_items")
+                item_queries::visible_media_item_sql("media_items")
             ),
             vec![show_id.into(), user_id.into(), show_id.into()],
         ))

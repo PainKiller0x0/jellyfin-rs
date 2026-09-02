@@ -12,14 +12,8 @@ use serde_json::{Value, json};
 use crate::{
     app::state::AppState,
     db::row_ext::QueryResultExt,
-    jellyfin::{auth::query_user_id_or_request, common::internal_error},
+    jellyfin::{auth::query_user_id_or_request, common::internal_error, item_queries},
 };
-
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
-}
 
 fn query_value<'a>(query: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
     query
@@ -60,8 +54,8 @@ async fn movie_recommendations_inner(
     item_limit: usize,
 ) -> anyhow::Result<Vec<Value>> {
     let mut category_counter: i64 = 1;
-    let media_visible = visible_media_item_sql("media_items");
-    let related_visible = visible_media_item_sql("mi_rel");
+    let media_visible = item_queries::visible_media_item_sql("media_items");
+    let related_visible = item_queries::visible_media_item_sql("mi_rel");
 
     // Jellyfin Movie items may be file-backed, ISO, DVD, or Blu-ray paths.
     let recent_movies = db
@@ -270,7 +264,7 @@ pub async fn user_suggestions(
     let parent_id = query_value(&query, &["ParentId", "parentId"]);
 
     // Return recently added unplayed items as suggestions
-    let visible = visible_media_item_sql("media_items");
+    let visible = item_queries::visible_media_item_sql("media_items");
     let (sql, vals) = if let Some(pid) = parent_id {
         (
             format!(

@@ -18,11 +18,6 @@ use crate::{
 };
 
 /// GET /Items/{item_id}/Intros — get intros (returns empty, not supported)
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
-}
 
 pub async fn item_intros(
     State(state): State<Arc<AppState>>,
@@ -189,9 +184,9 @@ async fn item_extras(
     item_id: &str,
     kind: ExtraKind,
 ) -> anyhow::Result<Vec<MediaItem>> {
-    let target_visible = visible_media_item_sql("media_items");
-    let child_visible = visible_media_item_sql("child");
-    let item_visible = visible_media_item_sql("media_items");
+    let target_visible = item_queries::visible_media_item_sql("media_items");
+    let child_visible = item_queries::visible_media_item_sql("child");
+    let item_visible = item_queries::visible_media_item_sql("media_items");
     let kind_filter = kind.sql_filter();
     let sql = item_queries::media_item_select_sql(&format!(
         r#"WHERE media_items.id IN (
@@ -415,7 +410,7 @@ async fn public_item_runtime_ticks(
     db: &DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Option<i64>> {
-    let visible = visible_media_item_sql("media_items");
+    let visible = item_queries::visible_media_item_sql("media_items");
     let sql =
         format!("SELECT runtime_ticks FROM media_items WHERE media_items.id = ? AND {visible}");
     Ok(db
@@ -532,7 +527,7 @@ async fn music_genre_instant_mix_for_value(
 }
 
 async fn seed_ids_for_item(db: &DatabaseConnection, item_id: &str) -> anyhow::Result<Vec<String>> {
-    let visible = visible_media_item_sql("media_items");
+    let visible = item_queries::visible_media_item_sql("media_items");
     let seed_sql = format!(
         "SELECT item_type, is_folder FROM media_items WHERE media_items.id = ? AND {visible}"
     );
@@ -550,8 +545,8 @@ async fn seed_ids_for_item(db: &DatabaseConnection, item_id: &str) -> anyhow::Re
     let is_folder = row.get_i64("is_folder").unwrap_or_default() != 0;
 
     if matches!(item_type.as_str(), "Playlist" | "BoxSet") {
-        let source_visible = visible_media_item_sql("source");
-        let audio_visible = visible_media_item_sql("audio");
+        let source_visible = item_queries::visible_media_item_sql("source");
+        let audio_visible = item_queries::visible_media_item_sql("audio");
         let sql = format!(
             r#"SELECT audio.id
                FROM linked_children lc
@@ -565,7 +560,7 @@ async fn seed_ids_for_item(db: &DatabaseConnection, item_id: &str) -> anyhow::Re
     }
 
     if is_folder || item_type == "MusicAlbum" {
-        let child_visible = visible_media_item_sql("media_items");
+        let child_visible = item_queries::visible_media_item_sql("media_items");
         let sql = format!(
             "SELECT id FROM media_items WHERE parent_id = ? AND item_type = 'Audio' AND is_folder = 0 AND {child_visible} ORDER BY title ASC"
         );
@@ -585,8 +580,8 @@ async fn seed_ids_for_artist(
     let Some(person_id) = resolve_named_id(db, "people", id_or_name).await? else {
         return Ok(Vec::new());
     };
-    let source_visible = visible_media_item_sql("source");
-    let audio_visible = visible_media_item_sql("audio");
+    let source_visible = item_queries::visible_media_item_sql("source");
+    let audio_visible = item_queries::visible_media_item_sql("audio");
     let sql = format!(
         r#"SELECT audio.id
            FROM media_people mp
@@ -612,8 +607,8 @@ async fn seed_ids_for_music_genre(
     let Some(genre_id) = resolve_named_id(db, "genres", id_or_name).await? else {
         return Ok(Vec::new());
     };
-    let source_visible = visible_media_item_sql("source");
-    let audio_visible = visible_media_item_sql("audio");
+    let source_visible = item_queries::visible_media_item_sql("source");
+    let audio_visible = item_queries::visible_media_item_sql("audio");
     let sql = format!(
         r#"SELECT audio.id
            FROM media_genres mg
@@ -646,7 +641,7 @@ async fn instant_mix_from_seed_ids(
     let item_types = include_item_types(query);
     let seed_placeholders = placeholders(seed_ids.len());
     let type_placeholders = placeholders(item_types.len());
-    let item_visible = visible_media_item_sql("mi");
+    let item_visible = item_queries::visible_media_item_sql("mi");
     let sql = format!(
         r#"SELECT mg_rel.item_id
            FROM media_genres mg_src
@@ -696,7 +691,7 @@ async fn fetch_items_by_ids(
 
     let id_placeholders = placeholders(ids.len());
     let type_placeholders = placeholders(item_types.len());
-    let visible = visible_media_item_sql("media_items");
+    let visible = item_queries::visible_media_item_sql("media_items");
     let sql = item_queries::media_item_select_sql(&format!(
         "WHERE media_items.id IN ({id_placeholders}) AND media_items.is_folder = 0 AND {visible} AND media_items.item_type IN ({type_placeholders})"
     ));

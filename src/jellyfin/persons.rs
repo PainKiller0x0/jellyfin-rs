@@ -24,14 +24,9 @@ use crate::{
     jellyfin::{
         auth::request_user_id_and_admin_or_default,
         common::{image as placeholder_image, internal_error, ok_response, wants_json_response},
+        item_queries,
     },
 };
-
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
-}
 
 pub async fn person_by_name(
     State(state): State<Arc<AppState>>,
@@ -222,7 +217,7 @@ async fn artist_list(
     );
     let mut values: Vec<Value> = person_types.iter().map(|value| (*value).into()).collect();
     if !include_private {
-        sql.push_str(&format!(" AND {}", visible_media_item_sql("mi")));
+        sql.push_str(&format!(" AND {}", item_queries::visible_media_item_sql("mi")));
     }
 
     if let Some(item_id) = query_param(query, &["ItemId", "itemId", "ParentId", "parentId"])
@@ -518,7 +513,7 @@ async fn fetch_tagged_items(
     // Build WHERE conditions
     let mut where_parts = vec!["mp.person_id = ?".to_string()];
     if !include_private {
-        where_parts.push(visible_media_item_sql("mi"));
+        where_parts.push(item_queries::visible_media_item_sql("mi"));
     }
     for _ in include_item_types {
         where_parts.push("mi.item_type = ?".to_string());
@@ -629,7 +624,7 @@ async fn count_tagged_items(
     );
     let mut values: Vec<Value> = vec![person_id.into()];
     if !include_private {
-        sql.push_str(&format!(" AND {}", visible_media_item_sql("mi")));
+        sql.push_str(&format!(" AND {}", item_queries::visible_media_item_sql("mi")));
     }
 
     if !include_item_types.is_empty() {

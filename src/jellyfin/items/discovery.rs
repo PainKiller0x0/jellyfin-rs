@@ -16,12 +16,6 @@ use crate::{
     library::models::MediaItem,
 };
 
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
-}
-
 pub async fn similar_items(
     State(state): State<Arc<AppState>>,
     Path(item_id): Path<String>,
@@ -306,8 +300,8 @@ async fn next_up_inner(
         return next_up_for_series(db, user_id, series_id).await;
     }
 
-    let episode_visible = visible_media_item_sql("media_items");
-    let candidate_visible = visible_media_item_sql("mi3");
+    let episode_visible = item_queries::visible_media_item_sql("media_items");
+    let candidate_visible = item_queries::visible_media_item_sql("mi3");
     let sql = format!(
         r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0
             AND {episode_visible}
@@ -339,8 +333,8 @@ async fn next_up_for_series(
     user_id: &str,
     series_id: &str,
 ) -> anyhow::Result<Vec<MediaItem>> {
-    let episode_visible = visible_media_item_sql("media_items");
-    let season_visible = visible_media_item_sql("s");
+    let episode_visible = item_queries::visible_media_item_sql("media_items");
+    let season_visible = item_queries::visible_media_item_sql("s");
     let resume_sql = format!(
         r#"{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0
             AND {episode_visible}
@@ -362,8 +356,8 @@ async fn next_up_for_series(
         return Ok(resume_items);
     }
 
-    let played_episode_visible = visible_media_item_sql("mi");
-    let played_season_visible = visible_media_item_sql("s");
+    let played_episode_visible = item_queries::visible_media_item_sql("mi");
+    let played_season_visible = item_queries::visible_media_item_sql("s");
     let last_played_sql = format!(
         r#"SELECT COALESCE(mi.season_number, 0) AS season_number,
                   COALESCE(mi.episode_number, 0) AS episode_number

@@ -10,7 +10,8 @@ use crate::{
     util::stable_text_id,
 };
 
-fn visible_media_item_sql(alias: &str) -> String {
+/// Build the visibility predicate shared by client-facing media queries.
+pub(crate) fn visible_media_item_sql(alias: &str) -> String {
     format!(
         "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
     )

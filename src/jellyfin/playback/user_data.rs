@@ -24,12 +24,6 @@ use crate::{
 
 const USER_DATA_TARGET_NOT_FOUND: &str = "user data target not found";
 
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
-}
-
 pub async fn favorite_item(
     State(state): State<Arc<AppState>>,
     Path((user_id, item_id)): Path<(String, String)>,
@@ -538,7 +532,7 @@ pub(crate) async fn playback_user_data_item_ids(
         } else {
             "mi.season_number IS NULL"
         };
-        let visible = visible_media_item_sql("mi");
+        let visible = item_queries::visible_media_item_sql("mi");
         let sql = format!(
             "SELECT mi.id FROM media_items mi WHERE mi.parent_id = ? AND mi.item_type = 'Episode' AND mi.is_folder = 0 AND {season_clause} AND mi.episode_number = ? AND {visible} ORDER BY mi.id ASC"
         );
@@ -551,8 +545,8 @@ pub(crate) async fn playback_user_data_item_ids(
     }
 
     if (item_type == "Movie" || item_type == "Episode") && is_folder {
-        let parent_visible = visible_media_item_sql("parent");
-        let child_visible = visible_media_item_sql("child");
+        let parent_visible = item_queries::visible_media_item_sql("parent");
+        let child_visible = item_queries::visible_media_item_sql("child");
         let sql = format!(
             "SELECT parent.id FROM media_items parent WHERE parent.id = ? AND {parent_visible} UNION SELECT child.id FROM media_items child JOIN media_items parent ON parent.id = child.parent_id WHERE child.parent_id = ? AND child.item_type = 'Video' AND {child_visible} AND {parent_visible} ORDER BY id ASC"
         );
@@ -563,8 +557,8 @@ pub(crate) async fn playback_user_data_item_ids(
         let parent_item_type = row.get_opt_str("parent_item_type")?.unwrap_or_default();
         let parent_is_folder = row.get_i64("parent_is_folder").unwrap_or(0) != 0;
         if parent_is_folder && (parent_item_type == "Movie" || parent_item_type == "Episode") {
-            let parent_visible = visible_media_item_sql("parent");
-            let child_visible = visible_media_item_sql("child");
+            let parent_visible = item_queries::visible_media_item_sql("parent");
+            let child_visible = item_queries::visible_media_item_sql("child");
             let sql = format!(
                 "SELECT parent.id FROM media_items parent WHERE parent.id = ? AND {parent_visible} UNION SELECT child.id FROM media_items child JOIN media_items parent ON parent.id = child.parent_id WHERE child.parent_id = ? AND child.item_type = 'Video' AND {child_visible} AND {parent_visible} ORDER BY id ASC"
             );

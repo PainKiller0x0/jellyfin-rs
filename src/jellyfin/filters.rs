@@ -10,13 +10,11 @@ use axum::{
 use sea_orm::{ConnectionTrait, DatabaseConnection, Value as DbValue};
 use serde_json::{Value, json};
 
-use crate::{app::state::AppState, db::row_ext::QueryResultExt, jellyfin::common::internal_error};
-
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
-}
+use crate::{
+    app::state::AppState,
+    db::row_ext::QueryResultExt,
+    jellyfin::{common::internal_error, item_queries},
+};
 
 pub async fn genres(
     State(state): State<Arc<AppState>>,
@@ -114,7 +112,7 @@ async fn list_extended_video_types_inner(
     db: &DatabaseConnection,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
-    let visible = visible_media_item_sql("mi");
+    let visible = item_queries::visible_media_item_sql("mi");
     let sql = format!(
         "SELECT mi.extended_video_type FROM media_items mi WHERE {visible} AND mi.extended_video_type IS NOT NULL AND mi.extended_video_type <> ''"
     );
@@ -212,7 +210,7 @@ async fn list_years_inner(
     db: &DatabaseConnection,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
-    let visible = visible_media_item_sql("mi");
+    let visible = item_queries::visible_media_item_sql("mi");
     let sql = format!(
         "SELECT DISTINCT mi.production_year FROM media_items mi WHERE {visible} AND mi.production_year IS NOT NULL AND mi.production_year > 0 ORDER BY mi.production_year DESC"
     );
@@ -239,7 +237,7 @@ async fn list_years_inner(
 }
 
 async fn year_exists(db: &DatabaseConnection, year: i64) -> anyhow::Result<bool> {
-    let visible = visible_media_item_sql("mi");
+    let visible = item_queries::visible_media_item_sql("mi");
     let sql = format!(
         "SELECT COUNT(*) AS cnt FROM media_items mi WHERE {visible} AND mi.production_year = ?"
     );
@@ -294,7 +292,7 @@ async fn list_distinct_values_inner(
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
     debug_assert_eq!(table, "media_items");
-    let visible = visible_media_item_sql("mi");
+    let visible = item_queries::visible_media_item_sql("mi");
     let sql = format!(
         "SELECT DISTINCT mi.{column} FROM {table} mi WHERE {visible} AND mi.{column} IS NOT NULL AND mi.{column} <> '' ORDER BY mi.{column} ASC"
     );
@@ -335,7 +333,7 @@ async fn list_media_stream_values_inner(
     column: &str,
     query: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<Value>> {
-    let visible = visible_media_item_sql("mi");
+    let visible = item_queries::visible_media_item_sql("mi");
     let sql = format!(
         "SELECT DISTINCT media_streams.{column} FROM media_streams JOIN media_items mi ON mi.id = media_streams.item_id WHERE {visible} AND media_streams.{column} IS NOT NULL AND media_streams.{column} <> '' ORDER BY media_streams.{column} ASC"
     );
@@ -461,7 +459,7 @@ async fn list_filter_items_inner(
             if has_fav_filter && user_id.is_some() {
                 // Filter persons by user_data.is_favorite
                 if let Some(uid) = user_id {
-                    let visible = visible_media_item_sql("mi");
+                    let visible = item_queries::visible_media_item_sql("mi");
                     let sql = format!(
                         "SELECT DISTINCT p.id, p.name, ia.etag AS primary_image_tag FROM people p JOIN user_data ud ON ud.item_id = p.id JOIN media_people mp ON mp.person_id = p.id JOIN media_items mi ON mi.id = mp.item_id LEFT JOIN image_assets ia ON ia.item_id = p.id AND ia.image_type = 'Primary' WHERE {visible} AND ud.user_id = ? AND ud.is_favorite = 1 ORDER BY p.name ASC"
                     );
@@ -556,7 +554,7 @@ async fn list_public_related_items(
     item_type: &str,
     context: Option<&'static str>,
 ) -> anyhow::Result<Vec<Value>> {
-    let visible = visible_media_item_sql("mi");
+    let visible = item_queries::visible_media_item_sql("mi");
     let sql = format!(
         "SELECT DISTINCT named.id, named.name FROM {table} named JOIN {relation_table} rel ON rel.{relation_column} = named.id JOIN media_items mi ON mi.id = rel.item_id WHERE {visible} ORDER BY named.name ASC"
     );
@@ -579,7 +577,7 @@ async fn list_public_related_items(
 }
 
 async fn list_media_item_prefixes(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>> {
-    let visible = visible_media_item_sql("mi");
+    let visible = item_queries::visible_media_item_sql("mi");
     let sql = format!(
         "SELECT DISTINCT UPPER(SUBSTR(mi.title, 1, 1)) AS prefix FROM media_items mi WHERE {visible} AND mi.title IS NOT NULL AND mi.title <> '' ORDER BY prefix ASC"
     );
@@ -587,7 +585,7 @@ async fn list_media_item_prefixes(db: &DatabaseConnection) -> anyhow::Result<Vec
 }
 
 async fn list_artist_prefixes(db: &DatabaseConnection) -> anyhow::Result<Vec<Value>> {
-    let visible = visible_media_item_sql("mi");
+    let visible = item_queries::visible_media_item_sql("mi");
     let sql = format!(
         "SELECT DISTINCT UPPER(SUBSTR(p.name, 1, 1)) AS prefix FROM people p JOIN media_people mp ON mp.person_id = p.id JOIN media_items mi ON mi.id = mp.item_id WHERE {visible} AND p.name IS NOT NULL AND p.name <> '' ORDER BY prefix ASC"
     );

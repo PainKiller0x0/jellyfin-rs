@@ -15,12 +15,6 @@ use crate::{
     jellyfin::{auth::query_user_id_or_request, common::internal_error, item_queries},
 };
 
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
-}
-
 /// GET /Items/Filters2 — return available filter values for a query
 pub async fn filters2(
     State(state): State<Arc<AppState>>,
@@ -71,7 +65,7 @@ async fn filter_values(
         .map(|v| v.split(',').map(str::trim).collect::<Vec<_>>());
 
     // Build WHERE clause based on ParentId and IncludeItemTypes
-    let mut conditions = vec![visible_media_item_sql("media_items")];
+    let mut conditions = vec![item_queries::visible_media_item_sql("media_items")];
     let mut values: Vec<sea_orm::Value> = Vec::new();
 
     if let Some(pid) = parent_id {
@@ -320,7 +314,7 @@ pub async fn shows_upcoming(
     let user_id = query_user_id_or_request(&query, &request_user_id);
     let start_index = query_usize(&query, &["StartIndex", "startIndex"], 0);
     let limit = query_usize(&query, &["Limit", "limit"], 16).min(200);
-    let visible = visible_media_item_sql("media_items");
+    let visible = item_queries::visible_media_item_sql("media_items");
     let sql = format!(
         "{} WHERE media_items.item_type = 'Episode' AND media_items.is_folder = 0 AND {visible} ORDER BY media_items.created_at DESC",
         crate::jellyfin::item_queries::media_item_select_sql("")
@@ -453,7 +447,7 @@ async fn named_item_by_name_inner(
     name: &str,
     relation: NamedRelation,
 ) -> anyhow::Result<Option<Value>> {
-    let visible = visible_media_item_sql("media_items");
+    let visible = item_queries::visible_media_item_sql("media_items");
     let sql = format!(
         "SELECT DISTINCT named.id, named.name FROM {} named JOIN {} rel ON rel.{} = named.id JOIN media_items ON media_items.id = rel.item_id WHERE {visible} AND named.name = ? LIMIT 1",
         relation.table, relation.relation_table, relation.relation_column

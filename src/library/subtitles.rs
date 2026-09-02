@@ -61,27 +61,34 @@ pub async fn clear_sidecar_audio(db: &DatabaseConnection, item_id: &str) -> anyh
 fn external_audio_candidates(
     media_path: &Path,
 ) -> Vec<(std::path::PathBuf, ExternalAudioMetadata)> {
-    let Some(parent) = media_path.parent() else {
-        return Vec::new();
-    };
     let Some(media_stem) = media_path.file_stem().and_then(|stem| stem.to_str()) else {
         return Vec::new();
     };
-    let mut candidates = std::fs::read_dir(parent)
+    let mut candidates = sidecar_files(media_path)
         .into_iter()
-        .flatten()
-        .flatten()
         .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_file() || !crate::library::classify::is_audio_path(&path) {
+            if !crate::library::classify::is_audio_path(&entry) {
                 return None;
             }
-            let stem = path.file_stem()?.to_str()?;
-            external_audio_metadata(stem, media_stem).map(|metadata| (path, metadata))
+            let stem = entry.file_stem()?.to_str()?;
+            external_audio_metadata(stem, media_stem).map(|metadata| (entry, metadata))
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.0.cmp(&right.0));
     candidates
+}
+
+fn sidecar_files(media_path: &Path) -> Vec<std::path::PathBuf> {
+    let Some(parent) = media_path.parent() else {
+        return Vec::new();
+    };
+    std::fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 fn external_audio_metadata(stem: &str, media_stem: &str) -> Option<ExternalAudioMetadata> {
@@ -120,21 +127,29 @@ fn external_audio_metadata(stem: &str, media_stem: &str) -> Option<ExternalAudio
 
 fn normalize_external_language(language: &str) -> Option<String> {
     let language = language.to_ascii_lowercase();
-    let normalized = match language.as_str() {
-        "chs" | "zh" | "zho" | "chi" | "cn" => "zh-CN",
-        "cht" | "tc" | "zh-tw" => "zh-TW",
-        "en" | "eng" => "en",
-        "ja" | "jpn" => "ja",
-        "ko" | "kor" => "ko",
-        "fr" | "fra" | "fre" => "fr",
-        "de" | "deu" | "ger" => "de",
-        "es" | "spa" => "es",
-        "it" | "ita" => "it",
-        "pt" | "por" | "pt-br" => language.as_str(),
-        "ru" | "rus" => "ru",
-        _ => return None,
-    };
+    let normalized = normalize_common_external_language(&language).or_else(|| {
+        match language.as_str() {
+            "fr" | "fra" | "fre" => Some("fr"),
+            "de" | "deu" | "ger" => Some("de"),
+            "es" | "spa" => Some("es"),
+            "it" | "ita" => Some("it"),
+            "pt" | "por" | "pt-br" => Some(language.as_str()),
+            "ru" | "rus" => Some("ru"),
+            _ => None,
+        }
+    })?;
     Some(normalized.to_string())
+}
+
+fn normalize_common_external_language(language: &str) -> Option<&'static str> {
+    match language {
+        "chs" | "zh" | "zho" | "chi" | "cn" => Some("zh-CN"),
+        "cht" | "tc" | "zh-tw" => Some("zh-TW"),
+        "en" | "eng" => Some("en"),
+        "ja" | "jpn" => Some("ja"),
+        "ko" | "kor" => Some("ko"),
+        _ => None,
+    }
 }
 
 pub async fn upsert_sidecar_subtitles(
@@ -142,17 +157,13 @@ pub async fn upsert_sidecar_subtitles(
     media_path: &Path,
     item_id: &str,
 ) -> anyhow::Result<()> {
-    let Some(parent) = media_path.parent() else {
-        return Ok(());
-    };
     let Some(media_stem) = media_path.file_stem().and_then(|stem| stem.to_str()) else {
         return Ok(());
     };
     clear_sidecar_subtitles(db, item_id).await?;
     let mut subtitle_index = next_external_subtitle_index(db, item_id).await?;
-    for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
-        let path = entry.path();
-        if !path.is_file() || !is_subtitle_path(&path) || !is_sidecar_for_media(&path, media_stem) {
+    for path in sidecar_files(media_path) {
+        if !is_subtitle_path(&path) || !is_sidecar_for_media(&path, media_stem) {
             continue;
         }
         upsert_subtitle_stream(db, item_id, subtitle_index, &path).await?;
@@ -369,16 +380,10 @@ fn infer_subtitle_language(path: &Path) -> Option<String> {
         return None;
     }
     let language = language.to_ascii_lowercase();
-    let normalized = match language.as_str() {
-        "chs" | "zh" | "zho" | "chi" | "cn" => "zh-CN",
-        "cht" | "tc" | "zh-tw" => "zh-TW",
-        "en" | "eng" => "en",
-        "ja" | "jpn" => "ja",
-        "ko" | "kor" => "ko",
-        other if other.len() >= 2 && other.len() <= 8 => other,
-        _ => return None,
-    };
-    Some(normalized.to_string())
+    if let Some(normalized) = normalize_common_external_language(&language) {
+        return Some(normalized.to_string());
+    }
+    (2..=8).contains(&language.len()).then_some(language)
 }
 
 #[cfg(test)]
@@ -426,6 +431,22 @@ mod tests {
 
         assert!(external_audio_metadata("Movie.flac", "Movie").is_some());
         assert!(external_audio_metadata("MovieExtended.eng", "Movie").is_none());
+    }
+
+    #[test]
+    fn sidecar_subtitle_language_reuses_common_aliases() {
+        assert_eq!(
+            infer_subtitle_language(Path::new("Movie.jpn.ass")).as_deref(),
+            Some("ja")
+        );
+        assert_eq!(
+            infer_subtitle_language(Path::new("Movie.cht.ass")).as_deref(),
+            Some("zh-TW")
+        );
+        assert_eq!(
+            infer_subtitle_language(Path::new("Movie.rus.ass")).as_deref(),
+            Some("rus")
+        );
     }
 
     #[tokio::test]

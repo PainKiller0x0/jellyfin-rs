@@ -44,12 +44,6 @@ const MAX_METADATA_WRITE_IDS: usize = 1000;
 const MAX_METADATA_WRITE_ID_LEN: usize = 256;
 const MAX_MERGE_VERSION_IDS: usize = 100;
 
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
-}
-
 #[derive(Deserialize)]
 pub struct UploadSubtitleRequest {
     #[serde(rename = "Data")]
@@ -178,7 +172,7 @@ async fn item_lyrics_inner(
     db: &sea_orm::DatabaseConnection,
     item_id: &str,
 ) -> anyhow::Result<Option<Value>> {
-    let visible = visible_media_item_sql("media_items");
+    let visible = item_queries::visible_media_item_sql("media_items");
     let Some(row) = db
         .query_one_raw(crate::db::helpers::pg_statement(
             &format!("SELECT title, path, runtime_ticks FROM media_items WHERE id = ? AND item_type = 'Audio' AND {visible}"),
@@ -712,7 +706,7 @@ async fn item_counts_inner(
         .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let mut values = Vec::new();
     let mut join = String::new();
-    let mut filters = vec![visible_media_item_sql("mi")];
+    let mut filters = vec![item_queries::visible_media_item_sql("mi")];
 
     if favorite_only {
         if let Some(user_id) = user_id.as_deref() {
@@ -1469,7 +1463,7 @@ async fn alternate_sources_inner(
         .query_all_raw(crate::db::helpers::pg_statement(
             &item_queries::media_item_select_sql(&format!(
                 "WHERE media_items.parent_id = ? AND media_items.id <> ? AND media_items.item_type = 'Video' AND {} ORDER BY media_items.title ASC",
-                visible_media_item_sql("media_items")
+                item_queries::visible_media_item_sql("media_items")
             )),
             vec!["".into(), parent_id.into(), item.id.as_str().into()],
         ))
@@ -1519,7 +1513,7 @@ async fn audiobooks_next_up_inner(
         .query_all_raw(crate::db::helpers::pg_statement(
             &item_queries::media_item_select_sql(&format!(
                 "WHERE media_items.item_type = 'Audio' AND media_items.is_folder = 0 AND {} AND COALESCE(user_data.played, 0) = 0 AND COALESCE(user_data.playback_position_ticks, 0) > 0 ORDER BY user_data.updated_at DESC",
-                visible_media_item_sql("media_items")
+                item_queries::visible_media_item_sql("media_items")
             )),
             vec![user_id.into()],
         ))

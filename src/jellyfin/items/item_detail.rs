@@ -17,16 +17,10 @@ use crate::{
     jellyfin::{
         auth::{query_user_id_or_request, request_user_id_and_admin_or_default},
         common::{internal_error, strip_nulls},
-        item_queries::find_library_as_item,
+        item_queries::{self, find_library_as_item},
     },
     library::models::{MediaItem, media_source_json_with_streams},
 };
-
-fn visible_media_item_sql(alias: &str) -> String {
-    format!(
-        "{alias}.is_public = 1 AND ({alias}.parent_id = '' OR EXISTS (SELECT 1 FROM libraries library_parent WHERE library_parent.id = {alias}.parent_id) OR EXISTS (SELECT 1 FROM media_items parent WHERE parent.id = {alias}.parent_id AND parent.is_public = 1))"
-    )
-}
 
 pub async fn item_by_id(
     State(state): State<Arc<AppState>>,
@@ -299,7 +293,7 @@ async fn item_json_with_provider_ids(
 
     // Enrich Season items with series info
     if item.item_type == "Season" {
-        let parent_visible = visible_media_item_sql("media_items");
+        let parent_visible = item_queries::visible_media_item_sql("media_items");
         if let Ok(Some(row)) = db
             .query_one_raw(crate::db::helpers::pg_statement(
                 &format!("SELECT id, title FROM media_items WHERE id = ? AND {parent_visible}"),
@@ -319,7 +313,7 @@ async fn item_json_with_provider_ids(
             }
         }
         // RecursiveItemCount for Season = episode count
-        let episode_visible = visible_media_item_sql("media_items");
+        let episode_visible = item_queries::visible_media_item_sql("media_items");
         if let Ok(Some(row)) = db
             .query_one_raw(crate::db::helpers::pg_statement(
                 &format!("SELECT COUNT(DISTINCT (COALESCE(season_number, 0), COALESCE(episode_number, 0))) AS cnt FROM media_items WHERE parent_id = ? AND item_type = 'Episode' AND {episode_visible}"),
@@ -334,7 +328,7 @@ async fn item_json_with_provider_ids(
             // UnplayedItemCount = total - played episodes in this season
             if let Ok(Some(ud_row)) = db
                 .query_one_raw(crate::db::helpers::pg_statement(
-                    &format!("SELECT COUNT(DISTINCT (COALESCE(mi.season_number, 0), COALESCE(mi.episode_number, 0))) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id = ? AND mi.item_type = 'Episode' AND {} AND ud.user_id = ? AND ud.played = 1", visible_media_item_sql("mi")),
+                    &format!("SELECT COUNT(DISTINCT (COALESCE(mi.season_number, 0), COALESCE(mi.episode_number, 0))) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id = ? AND mi.item_type = 'Episode' AND {} AND ud.user_id = ? AND ud.played = 1", item_queries::visible_media_item_sql("mi")),
                     vec![item.id.clone().into(), user_id.into()],
                 ))
                 .await
@@ -348,7 +342,7 @@ async fn item_json_with_provider_ids(
     // Enrich Series items with child counts
     if item.item_type == "Series" {
         // ChildCount = number of seasons
-        let season_visible = visible_media_item_sql("media_items");
+        let season_visible = item_queries::visible_media_item_sql("media_items");
         if let Ok(Some(row)) = db
             .query_one_raw(crate::db::helpers::pg_statement(
                 &format!("SELECT COUNT(*) AS cnt FROM media_items WHERE parent_id = ? AND item_type = 'Season' AND {season_visible}"),
@@ -361,8 +355,8 @@ async fn item_json_with_provider_ids(
             value["SeasonCount"] = json!(season_cnt);
         }
         // RecursiveItemCount = total episodes under all seasons of this series
-        let episode_visible = visible_media_item_sql("media_items");
-        let season_visible = visible_media_item_sql("s");
+        let episode_visible = item_queries::visible_media_item_sql("media_items");
+        let season_visible = item_queries::visible_media_item_sql("s");
         if let Ok(Some(row)) = db
             .query_one_raw(crate::db::helpers::pg_statement(
                 &format!("SELECT COUNT(DISTINCT (parent_id, COALESCE(season_number, 0), COALESCE(episode_number, 0))) AS cnt FROM media_items WHERE item_type = 'Episode' AND {episode_visible} AND parent_id IN (SELECT s.id FROM media_items s WHERE s.parent_id = ? AND s.item_type = 'Season' AND {season_visible})"),
@@ -377,7 +371,7 @@ async fn item_json_with_provider_ids(
             // UnplayedItemCount = episodes not played by user
             if let Ok(Some(ud_row)) = db
                 .query_one_raw(crate::db::helpers::pg_statement(
-                    &format!("SELECT COUNT(DISTINCT (mi.parent_id, COALESCE(mi.season_number, 0), COALESCE(mi.episode_number, 0))) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.item_type = 'Episode' AND {} AND mi.parent_id IN (SELECT s.id FROM media_items s WHERE s.parent_id = ? AND s.item_type = 'Season' AND {}) AND ud.user_id = ? AND ud.played = 1", visible_media_item_sql("mi"), visible_media_item_sql("s")),
+                    &format!("SELECT COUNT(DISTINCT (mi.parent_id, COALESCE(mi.season_number, 0), COALESCE(mi.episode_number, 0))) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.item_type = 'Episode' AND {} AND mi.parent_id IN (SELECT s.id FROM media_items s WHERE s.parent_id = ? AND s.item_type = 'Season' AND {}) AND ud.user_id = ? AND ud.played = 1", item_queries::visible_media_item_sql("mi"), item_queries::visible_media_item_sql("s")),
                     vec![item.id.clone().into(), user_id.into()],
                 ))
                 .await
@@ -421,7 +415,7 @@ async fn extra_counts_for_item(
     } else {
         item.id.as_str()
     };
-    let visible = visible_media_item_sql("media_items");
+    let visible = item_queries::visible_media_item_sql("media_items");
     let row = db
         .query_one_raw(crate::db::helpers::pg_statement(
             &format!(
@@ -1133,7 +1127,7 @@ pub async fn enrich_item_list(
             .map(|_| "?")
             .collect::<Vec<_>>()
             .join(",");
-        let visible = visible_media_item_sql("media_items");
+        let visible = item_queries::visible_media_item_sql("media_items");
         let sql = format!(
             "SELECT parent_id, COUNT(DISTINCT (COALESCE(season_number, 0), COALESCE(episode_number, 0))) AS cnt FROM media_items WHERE parent_id IN ({placeholders}) AND item_type = 'Episode' AND {visible} GROUP BY parent_id"
         );
@@ -1157,7 +1151,7 @@ pub async fn enrich_item_list(
             .map(|_| "?")
             .collect::<Vec<_>>()
             .join(",");
-        let visible = visible_media_item_sql("mi");
+        let visible = item_queries::visible_media_item_sql("mi");
         let sql = format!(
             "SELECT mi.parent_id, COUNT(DISTINCT (COALESCE(mi.season_number, 0), COALESCE(mi.episode_number, 0))) AS cnt FROM user_data ud JOIN media_items mi ON mi.id = ud.item_id WHERE mi.parent_id IN ({placeholders}) AND mi.item_type = 'Episode' AND {visible} AND ud.user_id = ? AND ud.played = 1 GROUP BY mi.parent_id"
         );
@@ -1183,7 +1177,7 @@ pub async fn enrich_item_list(
     let mut series_played_episode_count_map: HashMap<String, i64> = HashMap::new();
     if !series_ids.is_empty() {
         let placeholders = series_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let season_visible = visible_media_item_sql("media_items");
+        let season_visible = item_queries::visible_media_item_sql("media_items");
         let sql = format!(
             "SELECT parent_id AS series_id, COUNT(*) AS cnt FROM media_items WHERE parent_id IN ({placeholders}) AND item_type = 'Season' AND {season_visible} GROUP BY parent_id"
         );
@@ -1200,8 +1194,8 @@ pub async fn enrich_item_list(
         }
 
         let placeholders = series_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let episode_visible = visible_media_item_sql("episode");
-        let season_visible = visible_media_item_sql("season");
+        let episode_visible = item_queries::visible_media_item_sql("episode");
+        let season_visible = item_queries::visible_media_item_sql("season");
         let sql = format!(
             "SELECT season.parent_id AS series_id, COUNT(DISTINCT (episode.parent_id, COALESCE(episode.season_number, 0), COALESCE(episode.episode_number, 0))) AS cnt FROM media_items episode JOIN media_items season ON season.id = episode.parent_id WHERE season.parent_id IN ({placeholders}) AND season.item_type = 'Season' AND episode.item_type = 'Episode' AND {episode_visible} AND {season_visible} GROUP BY season.parent_id"
         );
@@ -1218,8 +1212,8 @@ pub async fn enrich_item_list(
         }
 
         let placeholders = series_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let episode_visible = visible_media_item_sql("episode");
-        let season_visible = visible_media_item_sql("season");
+        let episode_visible = item_queries::visible_media_item_sql("episode");
+        let season_visible = item_queries::visible_media_item_sql("season");
         let sql = format!(
             "SELECT season.parent_id AS series_id, COUNT(DISTINCT (episode.parent_id, COALESCE(episode.season_number, 0), COALESCE(episode.episode_number, 0))) AS cnt FROM user_data ud JOIN media_items episode ON episode.id = ud.item_id JOIN media_items season ON season.id = episode.parent_id WHERE season.parent_id IN ({placeholders}) AND season.item_type = 'Season' AND episode.item_type = 'Episode' AND {episode_visible} AND {season_visible} AND ud.user_id = ? AND ud.played = 1 GROUP BY season.parent_id"
         );

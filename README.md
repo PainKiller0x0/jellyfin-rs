@@ -191,6 +191,18 @@ STRM Assistant 相关配置既可通过数据库中的 `sa.*` 设置保存，也
 
 ## 开发与验证
 
+项目通过 `rust-toolchain.toml` 固定 Rust 版本和 Rustfmt 版本。安装 Rustup 后，在仓库根目录执行格式化：
+
+```bash
+cargo fmt --all
+```
+
+提交前可只检查格式而不修改文件：
+
+```bash
+cargo fmt --all -- --check
+```
+
 构建后端：
 
 ```bash

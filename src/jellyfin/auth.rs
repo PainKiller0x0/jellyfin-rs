@@ -1756,11 +1756,7 @@ pub async fn require_auth(
     next.run(request).await
 }
 
-fn signed_download_request(
-    method: &Method,
-    path: &str,
-    query: &HashMap<String, String>,
-) -> bool {
+fn signed_download_request(method: &Method, path: &str, query: &HashMap<String, String>) -> bool {
     if !matches!(method, &Method::GET | &Method::HEAD) {
         return false;
     }
@@ -1788,14 +1784,12 @@ fn signed_download_request(
 
 fn is_download_path(path: &str) -> bool {
     path == "Download"
-        || path
-            .strip_prefix("Download.")
-            .is_some_and(|extension| {
-                !extension.is_empty()
-                    && extension
-                        .chars()
-                        .all(|character| character.is_ascii_alphanumeric())
-            })
+        || path.strip_prefix("Download.").is_some_and(|extension| {
+            !extension.is_empty()
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
 }
 
 fn is_public_request(method: &Method, path: &str) -> bool {

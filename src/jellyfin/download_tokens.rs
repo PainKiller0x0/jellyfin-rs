@@ -27,10 +27,7 @@ pub fn public_download_path_with_filename_with_base(
         .unwrap_or(path)
 }
 
-pub fn valid_download_token(
-    item_id: &str,
-    query: &HashMap<String, String>,
-) -> bool {
+pub fn valid_download_token(item_id: &str, query: &HashMap<String, String>) -> bool {
     let Some(secret) = configured_secret() else {
         return false;
     };
@@ -111,8 +108,8 @@ fn token_payload(item_id: &str, expires_at: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        public_download_path_with_filename_with_base, signed_download_path_with_filename,
-        valid_download_token_with_secret, DOWNLOAD_TOKEN_TTL_SECONDS,
+        DOWNLOAD_TOKEN_TTL_SECONDS, public_download_path_with_filename_with_base,
+        signed_download_path_with_filename, valid_download_token_with_secret,
     };
     use std::collections::HashMap;
 
@@ -122,9 +119,15 @@ mod tests {
         let token = path.split("download_token=").nth(1).unwrap();
         let query = HashMap::from([(String::from("download_token"), token.to_string())]);
 
-        assert!(valid_download_token_with_secret("movie", token, "secret", 100));
-        assert!(!valid_download_token_with_secret("other", token, "secret", 100));
-        assert!(!valid_download_token_with_secret("movie", token, "wrong", 100));
+        assert!(valid_download_token_with_secret(
+            "movie", token, "secret", 100
+        ));
+        assert!(!valid_download_token_with_secret(
+            "other", token, "secret", 100
+        ));
+        assert!(!valid_download_token_with_secret(
+            "movie", token, "wrong", 100
+        ));
         assert!(!valid_download_token_with_secret(
             "movie",
             token,

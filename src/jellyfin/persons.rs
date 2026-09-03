@@ -217,7 +217,10 @@ async fn artist_list(
     );
     let mut values: Vec<Value> = person_types.iter().map(|value| (*value).into()).collect();
     if !include_private {
-        sql.push_str(&format!(" AND {}", item_queries::visible_media_item_sql("mi")));
+        sql.push_str(&format!(
+            " AND {}",
+            item_queries::visible_media_item_sql("mi")
+        ));
     }
 
     if let Some(item_id) = query_param(query, &["ItemId", "itemId", "ParentId", "parentId"])
@@ -624,7 +627,10 @@ async fn count_tagged_items(
     );
     let mut values: Vec<Value> = vec![person_id.into()];
     if !include_private {
-        sql.push_str(&format!(" AND {}", item_queries::visible_media_item_sql("mi")));
+        sql.push_str(&format!(
+            " AND {}",
+            item_queries::visible_media_item_sql("mi")
+        ));
     }
 
     if !include_item_types.is_empty() {

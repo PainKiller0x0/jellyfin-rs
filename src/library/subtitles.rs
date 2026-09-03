@@ -127,8 +127,8 @@ fn external_audio_metadata(stem: &str, media_stem: &str) -> Option<ExternalAudio
 
 fn normalize_external_language(language: &str) -> Option<String> {
     let language = language.to_ascii_lowercase();
-    let normalized = normalize_common_external_language(&language).or_else(|| {
-        match language.as_str() {
+    let normalized =
+        normalize_common_external_language(&language).or_else(|| match language.as_str() {
             "fr" | "fra" | "fre" => Some("fr"),
             "de" | "deu" | "ger" => Some("de"),
             "es" | "spa" => Some("es"),
@@ -136,8 +136,7 @@ fn normalize_external_language(language: &str) -> Option<String> {
             "pt" | "por" | "pt-br" => Some(language.as_str()),
             "ru" | "rus" => Some("ru"),
             _ => None,
-        }
-    })?;
+        })?;
     Some(normalized.to_string())
 }
 

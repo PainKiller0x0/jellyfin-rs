@@ -674,8 +674,7 @@ fn sanitize_download_part(value: &str) -> String {
     value
         .chars()
         .filter(|c| {
-            !c.is_control()
-                && !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            !c.is_control() && !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
         })
         .collect::<String>()
         .trim_matches([' ', '.'])
@@ -870,13 +869,13 @@ mod tests {
         additional_parts, attachment_path, attachment_source, item_by_file_inner,
         parse_attachment_index, safe_attachment_cache_part, safe_download_filename,
     };
-    use crate::library::naming::download_filename_from_path;
     use crate::entities::{
         libraries::{self, Entity as Libraries},
         library_paths::{self, Entity as LibraryPaths},
         media_items::{self, Entity as MediaItems},
         media_streams::{self, Entity as MediaStreams},
     };
+    use crate::library::naming::download_filename_from_path;
     use sea_orm::{EntityTrait, Set};
     use std::process::Command as StdCommand;
 

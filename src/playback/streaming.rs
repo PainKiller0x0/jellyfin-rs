@@ -538,8 +538,7 @@ async fn stream_subtitle_item(
             (bytes, false)
         }
     };
-    let Some((content_type, bytes)) = subtitle_response_payload(&format, bytes, is_external)
-    else {
+    let Some((content_type, bytes)) = subtitle_response_payload(&format, bytes, is_external) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let mut headers = HeaderMap::new();
@@ -1363,7 +1362,10 @@ async fn remote_download_kind(url: &str) -> anyhow::Result<RemoteDownloadKind> {
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok());
-        return Ok(remote_download_kind_from_metadata(content_type, &current_url));
+        return Ok(remote_download_kind_from_metadata(
+            content_type,
+            &current_url,
+        ));
     }
 
     anyhow::bail!("remote download probe exceeded redirect limit")
@@ -1471,7 +1473,12 @@ async fn hls_download_response(
     };
 
     let output = FfmpegOutput { child, stdout };
-    (StatusCode::OK, headers, Body::from_stream(ReaderStream::new(output))).into_response()
+    (
+        StatusCode::OK,
+        headers,
+        Body::from_stream(ReaderStream::new(output)),
+    )
+        .into_response()
 }
 
 fn insert_known_content_length(headers: &mut HeaderMap, size_bytes: Option<i64>) {
@@ -1952,10 +1959,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        PlaybackTarget, normalize_embedded_subtitle_window_start_ticks, parse_range_header,
+        PlaybackTarget, content_disposition_for_filename, insert_known_content_length,
+        is_hls_content_type, normalize_embedded_subtitle_window_start_ticks, parse_range_header,
         playback_target_for_item, query_media_source_id, remote_stream_proxy_requested,
         remote_stream_redirect, remote_stream_referer, shift_vtt_timestamps,
-        content_disposition_for_filename, insert_known_content_length, is_hls_content_type,
         subtitle_response_payload, vtt_to_track_events,
     };
     use crate::library::models::MediaItem;
@@ -2058,9 +2065,9 @@ mod tests {
         let value = value.to_str().unwrap();
         assert!(value.is_ascii());
         assert!(value.contains("filename=\"____ - S01E01.mp4\""));
-        assert!(value.contains(
-            "filename*=UTF-8''%E6%9E%81%E9%80%9F%E8%BD%A6%E9%AD%82%20-%20S01E01.mp4"
-        ));
+        assert!(
+            value.contains("filename*=UTF-8''%E6%9E%81%E9%80%9F%E8%BD%A6%E9%AD%82%20-%20S01E01.mp4")
+        );
     }
 
     #[test]

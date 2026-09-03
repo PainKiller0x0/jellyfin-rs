@@ -736,11 +736,9 @@ pub fn media_source_json_with_streams(
     };
     let (protocol, source_path, is_remote) =
         media_source_protocol_path_with_target(&item.path, remote_target.as_deref());
-    let download_path = remote_target
-        .as_ref()
-        .map(|_| {
-            public_item_download_path(&item.id, &item.path, &item.title, item.container.as_deref())
-        });
+    let download_path = remote_target.as_ref().map(|_| {
+        public_item_download_path(&item.id, &item.path, &item.title, item.container.as_deref())
+    });
     let video_type = opt_str(&resolved_video_type(item));
     let iso_type = opt_str(&resolved_iso_type(item));
 

@@ -2066,7 +2066,8 @@ mod tests {
         assert!(value.is_ascii());
         assert!(value.contains("filename=\"____ - S01E01.mp4\""));
         assert!(
-            value.contains("filename*=UTF-8''%E6%9E%81%E9%80%9F%E8%BD%A6%E9%AD%82%20-%20S01E01.mp4")
+            value
+                .contains("filename*=UTF-8''%E6%9E%81%E9%80%9F%E8%BD%A6%E9%AD%82%20-%20S01E01.mp4")
         );
     }
 

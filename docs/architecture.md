@@ -11,7 +11,7 @@
 - 常用 Jellyfin/Emby 客户端的浏览、播放、进度和管理接口；
 - 在 PostgreSQL 和有限 VPS/NAS 资源上的可控并发。
 
-转码、HLS、完整插件系统和直播电视不属于当前核心实现。
+通用转码、HLS 播放、完整插件系统和直播电视不属于当前核心实现；下载接口保留一个面向远程 STRM 的 HLS 兼容桥接。
 
 ## 2. 运行时结构
 
@@ -45,7 +45,7 @@ jellyfin::routes              路由与 Axum Adapter
 | `jellyfin::item_queries` | 媒体项 SQL、行解码、查询结果补充 | `media_item_select_sql`、`decode_media_items`、`visible_media_item_sql` |
 | `jellyfin::items` | 浏览、详情、发现、剧集、推荐和元数据管理 | 各端点的请求解析与领域编排 |
 | `jellyfin::playback` | 播放进度、收藏、播放状态和会话 | 用户数据处理与播放相关 API |
-| `playback::streaming` | 解析播放目标并返回本地/远程媒体 | Range 响应、STRM 重定向/代理、字幕响应 |
+| `playback::streaming` | 解析播放目标并返回本地/远程媒体 | Range 响应、STRM 重定向/代理、下载专用 HLS 桥接、字幕响应 |
 | `library::scanner` | 遍历媒体库并识别媒体项 | 扫描、入库、探测和旁车文件处理 |
 | `library::storage` | 将扫描、探测和元数据写入数据库 | 媒体项、流、关系和外部流的持久化 |
 | `library::naming` / `classify` | 文件名解析、媒体类型和剧集编号识别 | 纯本地解析实现 |
@@ -84,7 +84,20 @@ client playback request
 
 外部 `.ass`/`.ssa` 字幕按原始格式返回，嵌入式字幕仍按缓存和 VTT/track-events 流程处理。外部旁车字幕只在同目录并且文件名与媒体主文件匹配时入库：支持精确主文件名、主文件名加后缀和同季同集匹配。
 
-### 4.3 元数据
+### 4.3 下载
+
+```text
+client download request
+    -> /Items/{id}/Download
+    -> local file Range response
+       or remote STRM target probe
+          -> direct MP4 redirect
+          -> HLS-only ffmpeg remux to fragmented MP4
+```
+
+下载路径与播放路径保持不同策略：远程媒体源的 `DirectStreamUrl` 继续指向原始直链供在线播放，`Path`/`DownloadUrl` 指向配置的 Jellyfin 公网地址下的 `/Items/{id}/Download/{encoded filename}` 供支持下载的客户端使用；旧的 `/Download` 与 `/Download.{container}` 入口仍保留用于客户端兼容。生产环境的下载地址附带仅绑定当前媒体项且有有效期的签名参数，避免为兼容下载客户端而公开整个下载接口。未配置公网地址或签名密钥时回退为相对路径。远程 STRM 原名到实际下载文件名的规则集中在 `library::naming::download_filename_from_path`，避免模型响应和下载响应产生不同文件名。远程目标只有在下载请求中才做媒体类型探测。已经返回可分段下载的 MP4 时继续 307 直跳，不经过 jellyfin-rs；检测到 HLS 播放列表时，才由 jellyfin-rs 临时转封装为 MP4，并在媒体元数据提供已知大小时补充 `Content-Length`，不把 HLS 播放列表大小误当作视频大小。播放请求不触发该桥接，因此不会改变夸克直链播放的流量路径。
+
+### 4.4 元数据
 
 TMDb、豆瓣和 LLM 是独立的外部 Adapter。调用前先检查对应的设置开关和凭据；未启用或未配置时跳过，避免无效网络请求。结果通过 `library::storage` 写入媒体项、季、集、人物和图片关系。
 
@@ -127,12 +140,15 @@ TMDb、豆瓣和 LLM 是独立的外部 Adapter。调用前先检查对应的设
 
 1. 将 10 个 endpoint Module 中重复的公开媒体项 SQL 谓词集中到 `jellyfin::item_queries`，减少重复实现并统一未来修改入口。
 2. 将旁车字幕/音频的同目录文件枚举和通用字幕/音频语言别名映射集中到 `library::subtitles` 的私有实现，保持音频排序、字幕索引和未知语言行为不变。
+3. 将远程 STRM 下载文件名规范集中到 `library::naming::download_filename_from_path`，并让媒体源 JSON 与实际下载响应共用同一规则；同时删除不再使用的旧下载 URL/token 包装层。
+4. 保持不同下载路径的公开 Adapter 为薄入口，共享 `download_item_response`；保持 `remote_stream_client`、文件名响应头和 HLS 下载响应的公共实现，避免兼容路径各自维护一套行为。
 
 以下相似代码本次保留：
 
 - 播放路由薄 Adapter：它们承担客户端路径和 HTTP 方法兼容，删除会降低接口兼容性；
 - 递归媒体树 SQL：查询方向和根节点不同；
 - TMDb 与豆瓣 provider：协议和解析差异足以形成独立 Adapter。
+- 媒体源 JSON 的主项与子项构造：两者虽然字段相似，但来源标识、媒体流和版本语义不同；合并成一个超长参数函数会降低可读性和 Module Depth。
 
 ## 8. 验证
 

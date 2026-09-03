@@ -28,9 +28,11 @@ uuid = { version = "1.24", features = ["v4", "v5", "serde"] }
 walkdir = "2.5"
 notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+hmac = "0.13"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 kamadak-exif = "0.6"
 dashmap = "6"
+sha2 = "0.11"
 xdb-parse = "0.2"
 bdinfo-rs-core = "2.0"
 

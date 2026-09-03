@@ -25,7 +25,7 @@ use crate::{
     },
     library::{
         models::{MediaItem, attachment_mime_type},
-        naming::parse_media_name,
+        naming::{download_filename_from_path, parse_media_name},
     },
     playback::streaming::{readable_media_path, stream_item_file},
 };
@@ -594,6 +594,46 @@ pub async fn download_item_head(
     download_item_response(state, headers, item_id, query, Method::HEAD).await
 }
 
+/// GET /Items/{item_id}/Download.{container} — extension-bearing download alias
+pub async fn download_item_with_container(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((item_id, _container)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    download_item_response(state, headers, item_id, query, Method::GET).await
+}
+
+/// HEAD /Items/{item_id}/Download.{container} — extension-bearing download alias
+pub async fn download_item_with_container_head(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((item_id, _container)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    download_item_response(state, headers, item_id, query, Method::HEAD).await
+}
+
+/// GET /Items/{item_id}/Download/{filename} — filename-bearing download alias
+pub async fn download_item_with_filename(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((item_id, _filename)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    download_item_response(state, headers, item_id, query, Method::GET).await
+}
+
+/// HEAD /Items/{item_id}/Download/{filename} — filename-bearing download alias
+pub async fn download_item_with_filename_head(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((item_id, _filename)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    download_item_response(state, headers, item_id, query, Method::HEAD).await
+}
+
 async fn download_item_response(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -603,13 +643,18 @@ async fn download_item_response(
 ) -> Response {
     match visible_item_from_request(&state, &headers, &query, &item_id).await {
         Ok(Some(item)) => {
-            let filename =
-                safe_download_filename(&item.title, item.container.as_deref().unwrap_or_default());
+            let filename = download_filename_for_item(&item);
             stream_item_file(state, item_id, headers, query, method, Some(filename)).await
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => internal_error(error),
     }
+}
+
+fn download_filename_for_item(item: &MediaItem) -> String {
+    let filename = download_filename_from_path(&item.path, &item.title, item.container.as_deref());
+    let (stem, extension) = filename.rsplit_once('.').unwrap_or((&filename, "mp4"));
+    safe_download_filename(stem, extension)
 }
 
 fn safe_download_filename(title: &str, container: &str) -> String {
@@ -619,7 +664,7 @@ fn safe_download_filename(title: &str, container: &str) -> String {
     }
     let extension = sanitize_download_part(container);
     if extension.is_empty() {
-        stem
+        format!("{stem}.mp4")
     } else {
         format!("{stem}.{extension}")
     }
@@ -628,7 +673,10 @@ fn safe_download_filename(title: &str, container: &str) -> String {
 fn sanitize_download_part(value: &str) -> String {
     value
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-'))
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
         .collect::<String>()
         .trim_matches([' ', '.'])
         .to_string()
@@ -822,6 +870,7 @@ mod tests {
         additional_parts, attachment_path, attachment_source, item_by_file_inner,
         parse_attachment_index, safe_attachment_cache_part, safe_download_filename,
     };
+    use crate::library::naming::download_filename_from_path;
     use crate::entities::{
         libraries::{self, Entity as Libraries},
         library_paths::{self, Entity as LibraryPaths},
@@ -838,7 +887,23 @@ mod tests {
             "moviebad.mkv"
         );
         assert_eq!(safe_download_filename("../secret", "m/p4"), "secret.mp4");
-        assert_eq!(safe_download_filename("", ""), "download");
+        assert_eq!(
+            safe_download_filename("极速车魂 - S01E01", ""),
+            "极速车魂 - S01E01.mp4"
+        );
+        assert_eq!(safe_download_filename("", ""), "download.mp4");
+    }
+
+    #[test]
+    fn download_filename_uses_the_original_strm_file_name() {
+        assert_eq!(
+            download_filename_from_path(
+                "/media/番/极速车魂 (2023)/Season 1/极速车魂 - S01E01.(mp4).strm",
+                "fallback",
+                Some("mp4"),
+            ),
+            "极速车魂 - S01E01.mp4"
+        );
     }
 
     #[test]

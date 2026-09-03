@@ -100,6 +100,50 @@ pub fn parse_media_name(path: &Path, collection_type: &str) -> ParsedName {
     }
 }
 
+/// Build the download filename exposed for a media item.
+///
+/// STRM files may preserve the source container in a wrapped suffix such as
+/// `episode.(mp4).strm`; clients should receive the original media stem with
+/// a real downloadable extension instead of the `.strm` wrapper.
+pub fn download_filename_from_path(path: &str, title: &str, container: Option<&str>) -> String {
+    let extension = container
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("strm"))
+        .or_else(|| {
+            Path::new(path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.eq_ignore_ascii_case("strm"))
+        })
+        .unwrap_or("mp4");
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(title);
+    let without_strm = strip_download_suffix(file_name, ".strm");
+    let without_wrapper = strip_download_suffix(without_strm, &format!(".({extension})"));
+    let stem = Path::new(without_wrapper)
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| value.eq_ignore_ascii_case(extension))
+        .and_then(|_| Path::new(without_wrapper).file_stem())
+        .and_then(|value| value.to_str())
+        .unwrap_or(without_wrapper)
+        .trim();
+    let stem = if stem.is_empty() { title.trim() } else { stem };
+    let stem = if stem.is_empty() { "download" } else { stem };
+    format!("{stem}.{extension}")
+}
+
+fn strip_download_suffix<'a>(value: &'a str, suffix: &str) -> &'a str {
+    let start = value.len().checked_sub(suffix.len()).unwrap_or_default();
+    if value.is_char_boundary(start) && value[start..].eq_ignore_ascii_case(suffix) {
+        &value[..start]
+    } else {
+        value
+    }
+}
+
 fn parse_episode_name(path: &str, stem: &str, folder: &str) -> ParsedName {
     let normalized = normalize_separators(stem);
     let mut parsed = ParsedName {
@@ -802,6 +846,26 @@ fn part_number(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_download_filename_from_strm_path() {
+        assert_eq!(
+            download_filename_from_path(
+                "/media/番/极速车魂 (2023)/Season 1/极速车魂 - S01E01.(mp4).strm",
+                "fallback",
+                Some("mp4"),
+            ),
+            "极速车魂 - S01E01.mp4"
+        );
+        assert_eq!(
+            download_filename_from_path("/media/movie/movie.mkv.strm", "fallback", None),
+            "movie.mkv.mp4"
+        );
+        assert_eq!(
+            download_filename_from_path("", "", Some("strm")),
+            "download.mp4"
+        );
+    }
 
     #[test]
     fn parses_jellyfin_book_names() {

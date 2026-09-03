@@ -611,6 +611,16 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(super::user_extras::download_item).head(super::user_extras::download_item_head),
         )
         .route(
+            "/Items/{item_id}/Download.{container}",
+            get(super::user_extras::download_item_with_container)
+                .head(super::user_extras::download_item_with_container_head),
+        )
+        .route(
+            "/Items/{item_id}/Download/{filename}",
+            get(super::user_extras::download_item_with_filename)
+                .head(super::user_extras::download_item_with_filename_head),
+        )
+        .route(
             "/Items/{item_id}/File",
             get(super::user_extras::item_file_info).head(super::user_extras::item_file_info_head),
         )

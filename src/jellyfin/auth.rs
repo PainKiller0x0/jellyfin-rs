@@ -1678,6 +1678,9 @@ pub async fn require_auth(
     }
 
     let query = query_map(request.uri().query().unwrap_or_default());
+    if signed_download_request(request.method(), path, &query) {
+        return next.run(request).await;
+    }
     let Some(user_id) = (match authenticated_user_id(&state.db, request.headers(), &query).await {
         Ok(user_id) => user_id,
         Err(error) => return internal_error(error),
@@ -1751,6 +1754,48 @@ pub async fn require_auth(
 
     request.extensions_mut().insert(user_id);
     next.run(request).await
+}
+
+fn signed_download_request(
+    method: &Method,
+    path: &str,
+    query: &HashMap<String, String>,
+) -> bool {
+    if !matches!(method, &Method::GET | &Method::HEAD) {
+        return false;
+    }
+    let Some(rest) = path.strip_prefix("/Items/") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    let Some(item_id) = parts.next() else {
+        return false;
+    };
+    let Some(download_path) = parts.next() else {
+        return false;
+    };
+    let remaining = parts.collect::<Vec<_>>();
+    let valid_path = if download_path == "Download" {
+        remaining.len() <= 1
+    } else {
+        remaining.is_empty() && is_download_path(download_path)
+    };
+    if !valid_path {
+        return false;
+    }
+    crate::jellyfin::download_tokens::valid_download_token(item_id, query)
+}
+
+fn is_download_path(path: &str) -> bool {
+    path == "Download"
+        || path
+            .strip_prefix("Download.")
+            .is_some_and(|extension| {
+                !extension.is_empty()
+                    && extension
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric())
+            })
 }
 
 fn is_public_request(method: &Method, path: &str) -> bool {
@@ -3016,6 +3061,16 @@ mod tests {
         assert!(!is_public_request(&Method::GET, "/Videos/ActiveEncodings"));
         assert!(!is_public_request(&Method::POST, "/Videos/MergeVersions"));
         assert!(!is_public_request(&Method::GET, "/Items/File"));
+    }
+
+    #[test]
+    fn signed_download_route_accepts_extension_suffixes() {
+        assert!(is_download_path("Download"));
+        assert!(is_download_path("Download.mp4"));
+        assert!(is_download_path("Download.mkv"));
+        assert!(!is_download_path("Download/extra"));
+        assert!(!is_download_path("Download."));
+        assert!(!is_download_path("download.mp4"));
     }
 
     #[test]

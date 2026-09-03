@@ -734,8 +734,13 @@ pub fn media_source_json_with_streams(
             _ => format!("/Videos/{}/stream", item.id),
         },
     };
-    let (protocol, path, is_remote) =
+    let (protocol, source_path, is_remote) =
         media_source_protocol_path_with_target(&item.path, remote_target.as_deref());
+    let download_path = remote_target
+        .as_ref()
+        .map(|_| {
+            public_item_download_path(&item.id, &item.path, &item.title, item.container.as_deref())
+        });
     let video_type = opt_str(&resolved_video_type(item));
     let iso_type = opt_str(&resolved_iso_type(item));
 
@@ -744,7 +749,10 @@ pub fn media_source_json_with_streams(
     map.insert("Name".into(), JsonValue::String(item.title.clone()));
     map.insert("Type".into(), JsonValue::String("Default".to_string()));
     map.insert("Protocol".into(), JsonValue::String(protocol));
-    map.insert("Path".into(), JsonValue::String(path));
+    map.insert(
+        "Path".into(),
+        JsonValue::String(download_path.clone().unwrap_or(source_path)),
+    );
     map.insert("Container".into(), opt_str(&item.container));
     map.insert("Size".into(), opt_i64(item.size_bytes));
     map.insert("RunTimeTicks".into(), opt_i64(item.runtime_ticks));
@@ -792,6 +800,9 @@ pub fn media_source_json_with_streams(
         "DirectStreamUrl".into(),
         JsonValue::String(direct_stream_url),
     );
+    if let Some(download_path) = download_path {
+        map.insert("DownloadUrl".into(), JsonValue::String(download_path));
+    }
     map.insert("EncoderPath".into(), JsonValue::Null);
     map.insert("EncoderProtocol".into(), JsonValue::Null);
     map.insert("BufferMs".into(), JsonValue::Null);
@@ -847,6 +858,43 @@ fn rewrite_public_strm_target_with_base(target: &str, public_base: Option<&str>)
         }
     }
     target.to_string()
+}
+
+static JELLYFIN_PUBLIC_BASE: OnceLock<Option<String>> = OnceLock::new();
+
+fn public_item_download_path(
+    item_id: &str,
+    path: &str,
+    title: &str,
+    container: Option<&str>,
+) -> String {
+    let public_base = JELLYFIN_PUBLIC_BASE.get_or_init(|| {
+        std::env::var("JELLYFIN_RS_PUBLIC_URL")
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+    });
+    let filename = crate::library::naming::download_filename_from_path(path, title, container);
+    crate::jellyfin::download_tokens::public_download_path_with_filename_with_base(
+        item_id,
+        &filename,
+        public_base.as_deref(),
+    )
+}
+
+fn public_item_download_path_with_base(
+    item_id: &str,
+    path: &str,
+    title: &str,
+    container: Option<&str>,
+    public_base: Option<&str>,
+) -> String {
+    let filename = crate::library::naming::download_filename_from_path(path, title, container);
+    crate::jellyfin::download_tokens::public_download_path_with_filename_with_base(
+        item_id,
+        &filename,
+        public_base,
+    )
 }
 
 fn split_media_streams_and_attachments(
@@ -1671,20 +1719,26 @@ pub fn child_video_source_json_for_item(
     let direct_stream_url = remote_target
         .clone()
         .unwrap_or_else(|| format!("/Videos/{item_id}/{media_source_id}/stream"));
-    let (protocol, path, is_remote) =
+    let (protocol, source_path, is_remote) =
         media_source_protocol_path_with_target(path, remote_target.as_deref());
-    let video_type = crate::library::classify::file_video_type(std::path::Path::new(&path))
+    let download_path = remote_target
+        .as_ref()
+        .map(|_| public_item_download_path(media_source_id, path, title, Some(container)));
+    let video_type = crate::library::classify::file_video_type(std::path::Path::new(&source_path))
         .unwrap_or("VideoFile")
         .to_string();
-    let iso_type = crate::library::classify::iso_type_from_name(std::path::Path::new(&path))
+    let iso_type = crate::library::classify::iso_type_from_name(std::path::Path::new(&source_path))
         .map(ToString::to_string);
-    let video_3d_format = crate::library::naming::parse_video_3d_format(&path);
+    let video_3d_format = crate::library::naming::parse_video_3d_format(&source_path);
     let mut map = Map::new();
     map.insert("Id".into(), JsonValue::String(media_source_id.to_string()));
     map.insert("Name".into(), JsonValue::String(title.to_string()));
     map.insert("Type".into(), JsonValue::String("Default".to_string()));
     map.insert("Protocol".into(), JsonValue::String(protocol));
-    map.insert("Path".into(), JsonValue::String(path));
+    map.insert(
+        "Path".into(),
+        JsonValue::String(download_path.clone().unwrap_or(source_path)),
+    );
     map.insert("Container".into(), JsonValue::String(container.to_string()));
     map.insert("Size".into(), opt_i64(size));
     map.insert("RunTimeTicks".into(), opt_i64(runtime_ticks));
@@ -1732,6 +1786,9 @@ pub fn child_video_source_json_for_item(
         "DirectStreamUrl".into(),
         JsonValue::String(direct_stream_url),
     );
+    if let Some(download_path) = download_path {
+        map.insert("DownloadUrl".into(), JsonValue::String(download_path));
+    }
     map.insert("EncoderPath".into(), JsonValue::Null);
     map.insert("EncoderProtocol".into(), JsonValue::Null);
     map.insert("BufferMs".into(), JsonValue::Null);
@@ -1989,7 +2046,8 @@ mod tests {
         let source = media_source_json_with_streams(&item, sample_streams());
 
         assert_eq!(source["Protocol"], "Http");
-        assert_eq!(source["Path"], "https://example.test/movie.mp4?token=1");
+        assert_eq!(source["Path"], "/Items/movie/Download/movie.mp4");
+        assert_eq!(source["DownloadUrl"], "/Items/movie/Download/movie.mp4");
         assert_eq!(source["IsRemote"], true);
         assert_eq!(source["AddApiKeyToDirectStreamUrl"], false);
         assert_eq!(
@@ -1998,6 +2056,30 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn public_item_download_path_uses_configured_base() {
+        assert_eq!(
+            super::public_item_download_path_with_base(
+                "movie",
+                "/media/movie/movie.mp4.strm",
+                "movie.mp4",
+                Some("mp4"),
+                Some("https://jellyfin.example.test/"),
+            ),
+            "https://jellyfin.example.test/Items/movie/Download/movie.mp4"
+        );
+        assert_eq!(
+            super::public_item_download_path_with_base(
+                "movie",
+                "/media/movie/movie.mp4.strm",
+                "movie.mp4",
+                Some("mp4"),
+                None,
+            ),
+            "/Items/movie/Download/movie.mp4"
+        );
     }
 
     #[test]
@@ -2019,7 +2101,8 @@ mod tests {
         );
 
         assert_eq!(source["Protocol"], "Http");
-        assert_eq!(source["Path"], "https://example.test/part.mkv");
+        assert_eq!(source["Path"], "/Items/part1/Download/part.mkv");
+        assert_eq!(source["DownloadUrl"], "/Items/part1/Download/part.mkv");
         assert_eq!(source["IsRemote"], true);
         assert_eq!(source["AddApiKeyToDirectStreamUrl"], false);
         assert_eq!(source["DirectStreamUrl"], "https://example.test/part.mkv");

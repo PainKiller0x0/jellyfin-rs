@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
-    io::SeekFrom,
+    io::{self, SeekFrom},
+    pin::Pin,
     process::Stdio,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
@@ -18,8 +19,8 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde_json::json;
 use tokio::{
     fs::{self, File},
-    io::{AsyncReadExt, AsyncSeekExt},
-    process::Command,
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf},
+    process::{Child, ChildStdout, Command},
     sync::{Mutex, OnceCell, RwLock},
     time::timeout,
 };
@@ -1173,6 +1174,29 @@ async fn stream_media_item(
 
     let playback_target = match playback_target_for_item(&item) {
         Ok(PlaybackTarget::RemoteUrl(url)) => {
+            if download_filename.is_some() {
+                match remote_download_kind(&url).await {
+                    Ok(RemoteDownloadKind::Hls) => {
+                        return hls_download_response(
+                            &state,
+                            &url,
+                            &request_headers,
+                            method,
+                            download_filename,
+                            item.size_bytes,
+                        )
+                        .await;
+                    }
+                    Ok(RemoteDownloadKind::Direct) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %item.id,
+                            url = %redacted_remote_stream_url(&url),
+                            "remote download probe failed; falling back to direct URL: {error:#}"
+                        );
+                    }
+                }
+            }
             if remote_stream_proxy_requested(&query) {
                 return remote_stream_proxy(
                     &url,
@@ -1255,8 +1279,7 @@ async fn stream_media_item(
     if let Some(filename) = download_filename {
         headers.insert(
             header::CONTENT_DISPOSITION,
-            HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
-                .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+            content_disposition_for_filename(&filename),
         );
     }
 
@@ -1299,6 +1322,222 @@ pub(crate) async fn stream_item_file(
         download_filename,
     )
     .await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteDownloadKind {
+    Direct,
+    Hls,
+}
+
+async fn remote_download_kind(url: &str) -> anyhow::Result<RemoteDownloadKind> {
+    let client = remote_stream_client();
+    let mut current_url = url.to_string();
+
+    for _ in 0..8 {
+        let mut request = client.head(&current_url);
+        if let Some(referer) =
+            remote_stream_referer(&current_url).or_else(|| remote_stream_referer(url))
+        {
+            request = request.header(header::REFERER, referer);
+        }
+        let response = timeout(Duration::from_secs(10), request.send())
+            .await
+            .map_err(|_| anyhow::anyhow!("remote download probe timed out"))??;
+
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| anyhow::anyhow!("remote download redirect has no location"))?;
+            current_url = response.url().join(location)?.to_string();
+            continue;
+        }
+
+        if !response.status().is_success() {
+            anyhow::bail!("remote download probe returned {}", response.status());
+        }
+
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        return Ok(remote_download_kind_from_metadata(content_type, &current_url));
+    }
+
+    anyhow::bail!("remote download probe exceeded redirect limit")
+}
+
+fn remote_download_kind_from_metadata(
+    content_type: Option<&str>,
+    final_url: &str,
+) -> RemoteDownloadKind {
+    if content_type.is_some_and(is_hls_content_type)
+        || reqwest::Url::parse(final_url)
+            .ok()
+            .is_some_and(|url| url.path().to_ascii_lowercase().ends_with(".m3u8"))
+    {
+        RemoteDownloadKind::Hls
+    } else {
+        RemoteDownloadKind::Direct
+    }
+}
+
+fn is_hls_content_type(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("mpegurl")
+}
+
+async fn hls_download_response(
+    state: &Arc<AppState>,
+    url: &str,
+    request_headers: &HeaderMap,
+    method: Method,
+    download_filename: Option<String>,
+    source_size_bytes: Option<i64>,
+) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    insert_known_content_length(&mut headers, source_size_bytes);
+    if let Some(filename) = download_filename {
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            content_disposition_for_filename(&filename),
+        );
+    }
+    if method == Method::HEAD {
+        return (StatusCode::OK, headers, Body::empty()).into_response();
+    }
+
+    let mut command = Command::new(&state.sa_config.ffmpeg_path);
+    command
+        .kill_on_drop(true)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin")
+        .arg("-protocol_whitelist")
+        .arg("file,http,https,tcp,tls,crypto");
+    if let Some(referer) = remote_stream_referer(url) {
+        command
+            .arg("-headers")
+            .arg(format!("Referer: {referer}\r\n"));
+    }
+    if let Some(user_agent) = request_headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.contains(['\r', '\n']))
+    {
+        command.arg("-user_agent").arg(user_agent);
+    }
+    command
+        .arg("-i")
+        .arg(url)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("0:a?")
+        .arg("-c")
+        .arg("copy")
+        .arg("-bsf:a")
+        .arg("aac_adtstoasc")
+        .arg("-movflags")
+        .arg("frag_keyframe+empty_moov+default_base_moof")
+        .arg("-f")
+        .arg("mp4")
+        .arg("pipe:1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            tracing::warn!("failed to start HLS download remux: {error}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "Error": "failed to start HLS download" })),
+            )
+                .into_response();
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.start_kill();
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "Error": "HLS download has no output stream" })),
+        )
+            .into_response();
+    };
+
+    let output = FfmpegOutput { child, stdout };
+    (StatusCode::OK, headers, Body::from_stream(ReaderStream::new(output))).into_response()
+}
+
+fn insert_known_content_length(headers: &mut HeaderMap, size_bytes: Option<i64>) {
+    let Some(size_bytes) = size_bytes.filter(|size| *size > 0) else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(&size_bytes.to_string()) {
+        headers.insert(header::CONTENT_LENGTH, value);
+    }
+}
+
+fn content_disposition_for_filename(filename: &str) -> HeaderValue {
+    let fallback = filename
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, ' ' | '.' | '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let fallback = if fallback.trim_matches([' ', '.', '_']).is_empty() {
+        "download.mp4".to_string()
+    } else {
+        fallback
+    };
+    let encoded = percent_encode_filename(filename);
+    HeaderValue::from_str(&format!(
+        "attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+    ))
+    .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"download.mp4\""))
+}
+
+fn percent_encode_filename(filename: &str) -> String {
+    const SAFE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    let mut encoded = String::with_capacity(filename.len());
+    for byte in filename.as_bytes() {
+        if SAFE.contains(byte) {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+struct FfmpegOutput {
+    child: Child,
+    stdout: ChildStdout,
+}
+
+impl AsyncRead for FfmpegOutput {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut self.stdout).poll_read(cx, buf)
+    }
+}
+
+impl Drop for FfmpegOutput {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
 }
 
 enum PlaybackTarget {
@@ -1400,17 +1639,7 @@ async fn remote_stream_proxy(
     content_type: &'static str,
     runtime_ticks: Option<i64>,
 ) -> Response {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    let client = CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            // Follow redirects below so the cloud-drive Referer can be
-            // re-applied after SmartStrm crosses from its local endpoint to
-            // the CDN host.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("build remote stream proxy client")
-    });
+    let client = remote_stream_client();
 
     let reqwest_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
@@ -1525,6 +1754,20 @@ async fn remote_stream_proxy(
     }
 
     (status, headers, Body::from_stream(upstream.bytes_stream())).into_response()
+}
+
+fn remote_stream_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            // Follow redirects below so the cloud-drive Referer can be
+            // re-applied after SmartStrm crosses from its local endpoint to
+            // the CDN host.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build remote stream client")
+    })
 }
 
 fn remote_stream_proxy_requested(query: &HashMap<String, String>) -> bool {
@@ -1712,6 +1955,7 @@ mod tests {
         PlaybackTarget, normalize_embedded_subtitle_window_start_ticks, parse_range_header,
         playback_target_for_item, query_media_source_id, remote_stream_proxy_requested,
         remote_stream_redirect, remote_stream_referer, shift_vtt_timestamps,
+        content_disposition_for_filename, insert_known_content_length, is_hls_content_type,
         subtitle_response_payload, vtt_to_track_events,
     };
     use crate::library::models::MediaItem;
@@ -1799,6 +2043,34 @@ mod tests {
             Some("http://pan.xunlei.com/")
         );
         assert_eq!(remote_stream_referer("https://example.test/file"), None);
+    }
+
+    #[test]
+    fn download_probe_recognizes_hls_content_types() {
+        assert!(is_hls_content_type("application/vnd.apple.mpegurl"));
+        assert!(is_hls_content_type("application/x-mpegURL; charset=utf-8"));
+        assert!(!is_hls_content_type("video/mp4"));
+    }
+
+    #[test]
+    fn download_content_disposition_supports_unicode_names_and_extensions() {
+        let value = content_disposition_for_filename("极速车魂 - S01E01.mp4");
+        let value = value.to_str().unwrap();
+        assert!(value.is_ascii());
+        assert!(value.contains("filename=\"____ - S01E01.mp4\""));
+        assert!(value.contains(
+            "filename*=UTF-8''%E6%9E%81%E9%80%9F%E8%BD%A6%E9%AD%82%20-%20S01E01.mp4"
+        ));
+    }
+
+    #[test]
+    fn hls_download_headers_expose_known_media_size() {
+        let mut headers = axum::http::HeaderMap::new();
+        insert_known_content_length(&mut headers, Some(1_130_205_029));
+        assert_eq!(headers[header::CONTENT_LENGTH], "1130205029");
+
+        insert_known_content_length(&mut headers, Some(0));
+        assert_eq!(headers[header::CONTENT_LENGTH], "1130205029");
     }
 
     #[test]

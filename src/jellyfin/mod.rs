@@ -2,6 +2,7 @@ pub mod auth;
 pub mod backup;
 pub mod collect;
 pub mod common;
+pub mod download_tokens;
 pub mod dlna;
 pub mod filters;
 pub mod images;

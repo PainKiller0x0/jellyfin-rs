@@ -979,10 +979,13 @@ async fn scan_root(
             .and_then(|name| name.to_str())
             .map(crate::library::tmdb_metadata::clean_title_with_year)
             .unzip();
-        let mut season_number = parsed_metadata
-            .season_number
-            .or(parsed_name.season_number)
-            .or_else(|| episode_season_number_from_path(path, &root, &collection_type));
+        let mut season_number = resolve_episode_season_number(
+            path,
+            &root,
+            &collection_type,
+            parsed_metadata.season_number,
+            parsed_name.season_number,
+        );
         let episode_number = parsed_metadata
             .episode_number
             .or(parsed_name.episode_number);
@@ -1244,12 +1247,16 @@ fn episode_version_owners<'a>(
             continue;
         }
         let parsed = parse_media_name(path, collection_type);
-        let season = parsed
-            .season_number
-            .or_else(|| episode_season_number_from_path(path, library_root, collection_type))
-            .or_else(|| {
-                (parsed.episode_number.is_some() || parsed.premiere_date.is_some()).then_some(1)
-            });
+        let season = resolve_episode_season_number(
+            path,
+            library_root,
+            collection_type,
+            None,
+            parsed.season_number,
+        )
+        .or_else(|| {
+            (parsed.episode_number.is_some() || parsed.premiere_date.is_some()).then_some(1)
+        });
         let episode_key = if let Some(episode) = parsed.episode_number {
             format!(
                 "E{episode}:{}",
@@ -2462,6 +2469,18 @@ fn episode_season_number_from_path(
         current = parent.parent();
     }
     None
+}
+
+fn resolve_episode_season_number(
+    path: &std::path::Path,
+    root: &std::path::Path,
+    collection_type: &str,
+    metadata_season: Option<i64>,
+    filename_season: Option<i64>,
+) -> Option<i64> {
+    metadata_season
+        .or_else(|| episode_season_number_from_path(path, root, collection_type))
+        .or(filename_season)
 }
 
 fn same_normalized_path(left: &std::path::Path, right: &std::path::Path) -> bool {
@@ -3846,6 +3865,31 @@ mod tests {
 
         assert_eq!(
             episode_season_number_from_path(&path, &root, "tvshows"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn episode_season_number_prefers_archive_folder_over_filename() {
+        let root = PathBuf::from("/media/迅雷-番");
+        let path = root.join("JOJO/Season 6/套马的汉子 - S01E04.strm");
+
+        assert_eq!(
+            resolve_episode_season_number(&path, &root, "tvshows", None, Some(1)),
+            Some(6)
+        );
+        assert_eq!(
+            resolve_episode_season_number(&path, &root, "tvshows", Some(7), Some(1)),
+            Some(7)
+        );
+        assert_eq!(
+            resolve_episode_season_number(
+                &root.join("JOJO/套马的汉子 - S01E04.strm"),
+                &root,
+                "tvshows",
+                None,
+                Some(1),
+            ),
             Some(1)
         );
     }

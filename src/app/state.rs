@@ -13,6 +13,7 @@ use sea_orm::DatabaseConnection;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::util::{now_unix, unix_to_jellyfin_date};
@@ -38,6 +39,7 @@ pub struct AppState {
     pub tmdb_http_client: Arc<RwLock<reqwest::Client>>,
     pub douban_cookie: RwLock<Option<String>>,
     pub scan_lock: Mutex<()>,
+    pub scan_task: ScanTaskControl,
     pub chapter_image_task_cancel: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     pub playback_sessions: RwLock<HashMap<String, PlaybackSession>>,
     pub session_capabilities: RwLock<HashMap<String, SessionCapabilities>>,
@@ -50,6 +52,67 @@ pub struct AppState {
     pub intro_detector: Arc<crate::intro_skip::detector::IntroDetector>,
     #[allow(dead_code)]
     pub queue_manager: Arc<crate::queue::QueueManager>,
+}
+
+pub struct ScanTaskControl {
+    cancellation: std::sync::Mutex<Option<CancellationToken>>,
+    progress_basis_points: Arc<AtomicU64>,
+}
+
+impl Default for ScanTaskControl {
+    fn default() -> Self {
+        Self {
+            cancellation: std::sync::Mutex::new(None),
+            progress_basis_points: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl ScanTaskControl {
+    pub fn start(&self) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.progress_basis_points.store(0, Ordering::Relaxed);
+        *self.cancellation.lock().unwrap_or_else(|e| e.into_inner()) = Some(token.clone());
+        token
+    }
+
+    pub fn cancel(&self) -> bool {
+        let current = self.cancellation.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(token) = current.as_ref() else {
+            return false;
+        };
+        token.cancel();
+        true
+    }
+
+    pub fn finish(&self) {
+        self.cancellation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
+    pub fn progress(&self) -> ScanProgressReporter {
+        ScanProgressReporter {
+            basis_points: self.progress_basis_points.clone(),
+        }
+    }
+
+    pub fn progress_percentage(&self) -> f64 {
+        self.progress_basis_points.load(Ordering::Relaxed) as f64 / 100.0
+    }
+}
+
+#[derive(Clone)]
+pub struct ScanProgressReporter {
+    basis_points: Arc<AtomicU64>,
+}
+
+impl ScanProgressReporter {
+    pub fn set(&self, percentage: f64) {
+        let basis_points = (percentage.clamp(0.0, 100.0) * 100.0).round() as u64;
+        self.basis_points.fetch_max(basis_points, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -803,9 +866,23 @@ fn stable_hash(value: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        china_province_code, normalize_douban_cookie_value, normalize_remote_ip,
+        ScanTaskControl, china_province_code, normalize_douban_cookie_value, normalize_remote_ip,
         normalize_tmdb_proxy_url, parse_ip2region_location, playback_region_for_ip,
     };
+
+    #[test]
+    fn scan_progress_is_precise_and_monotonic() {
+        let control = ScanTaskControl::default();
+        control.start();
+        let progress = control.progress();
+
+        progress.set(12.34);
+        progress.set(8.0);
+        assert_eq!(control.progress_percentage(), 12.34);
+
+        progress.set(100.0);
+        assert_eq!(control.progress_percentage(), 100.0);
+    }
 
     #[test]
     fn remote_ip_normalization_accepts_socket_addresses_and_forwarded_for() {

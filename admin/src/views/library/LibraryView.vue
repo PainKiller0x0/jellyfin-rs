@@ -5,7 +5,7 @@ import { computed, onMounted, reactive, ref } from 'vue';
 import DirectoryPicker from '@/components/DirectoryPicker.vue';
 import * as libraryApi from '@/services/library';
 import { useAuthStore } from '@/stores/auth';
-import type { VirtualFolder } from '@/types/library';
+import type { LibraryOptions, LibraryTypeOptions, VirtualFolder } from '@/types/library';
 
 type LibraryForm = {
   name: string;
@@ -16,6 +16,20 @@ type LibraryForm = {
 type PathForm = {
   name: string;
   path: string;
+  originalPath: string;
+};
+
+type SettingsForm = {
+  name: string;
+  enabled: boolean;
+  realtimeMonitor: boolean;
+  enablePhotos: boolean;
+  automaticSeriesGrouping: boolean;
+  preferredMetadataLanguage: string;
+  metadataCountryCode: string;
+  saveLocalMetadata: boolean;
+  tmdbMetadata: boolean;
+  tmdbImages: boolean;
 };
 
 const authStore = useAuthStore();
@@ -24,18 +38,25 @@ const saving = ref(false);
 const imageVersion = ref(Date.now());
 const uploadingImageId = ref('');
 const deletingImageId = ref('');
+const scanningLibraryId = ref('');
 const folders = ref<VirtualFolder[]>([]);
 const createDialogVisible = ref(false);
 const pathDialogVisible = ref(false);
+const settingsDialogVisible = ref(false);
 const directoryPickerVisible = ref(false);
 const directoryPickerTarget = ref<'create' | 'path'>('create');
 const formRef = ref<FormInstance>();
 const pathFormRef = ref<FormInstance>();
+const settingsFolder = ref<VirtualFolder>();
 
 const collectionTypes = [
   { label: '电影', value: 'movies' },
   { label: '剧集', value: 'tvshows' },
   { label: '音乐', value: 'music' },
+  { label: '音乐视频', value: 'musicvideos' },
+  { label: '家庭视频', value: 'homevideos' },
+  { label: '书籍', value: 'books' },
+  { label: '照片', value: 'photos' },
   { label: '混合内容', value: 'mixed' }
 ];
 
@@ -47,7 +68,21 @@ const form = reactive<LibraryForm>({
 
 const pathForm = reactive<PathForm>({
   name: '',
-  path: ''
+  path: '',
+  originalPath: ''
+});
+
+const settingsForm = reactive<SettingsForm>({
+  name: '',
+  enabled: true,
+  realtimeMonitor: true,
+  enablePhotos: true,
+  automaticSeriesGrouping: true,
+  preferredMetadataLanguage: 'zh-CN',
+  metadataCountryCode: 'CN',
+  saveLocalMetadata: false,
+  tmdbMetadata: true,
+  tmdbImages: true
 });
 
 const rules: FormRules<LibraryForm> = {
@@ -117,6 +152,7 @@ function resetForm() {
 function resetPathForm(folder?: VirtualFolder) {
   pathForm.name = folder?.Name ?? '';
   pathForm.path = '';
+  pathForm.originalPath = '';
   pathFormRef.value?.clearValidate();
 }
 
@@ -183,8 +219,17 @@ async function submitPath() {
 
   saving.value = true;
   try {
-    await libraryApi.addLibraryPath(authStore.token, pathForm);
-    ElMessage.success('路径已添加');
+    if (pathForm.originalPath) {
+      await libraryApi.updateLibraryPath(authStore.token, {
+        name: pathForm.name,
+        path: pathForm.originalPath,
+        newPath: pathForm.path
+      });
+      ElMessage.success('路径已更新');
+    } else {
+      await libraryApi.addLibraryPath(authStore.token, pathForm);
+      ElMessage.success('路径已添加');
+    }
     pathDialogVisible.value = false;
     resetPathForm();
     await loadFolders();
@@ -237,20 +282,23 @@ async function removePath(folder: VirtualFolder, path: string) {
   }
 }
 
-async function scanLibrary() {
+async function scanLibrary(folder?: VirtualFolder) {
   if (!authStore.token) {
     return;
   }
 
+  scanningLibraryId.value = folder?.Id ?? 'all';
   try {
-    const result = await libraryApi.refreshLibrary(authStore.token);
+    const result = await libraryApi.refreshLibrary(authStore.token, folder?.Id);
     if (result.AlreadyRunning) {
       ElMessage.info('媒体库扫描已在运行');
     } else {
-      ElMessage.success('已触发媒体库扫描');
+      ElMessage.success(folder ? `已开始扫描“${folder.Name}”` : '已触发全部媒体库扫描');
     }
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '触发扫描失败');
+  } finally {
+    scanningLibraryId.value = '';
   }
 }
 
@@ -285,11 +333,23 @@ function collectionTypeIcon(value: string) {
   if (value === 'music') {
     return 'Headset';
   }
+  if (value === 'photos') {
+    return 'Picture';
+  }
+  if (value === 'books') {
+    return 'Notebook';
+  }
+  if (value === 'homevideos') {
+    return 'House';
+  }
+  if (value === 'musicvideos') {
+    return 'VideoCamera';
+  }
   return 'Collection';
 }
 
 function collectionTypeClass(value: string) {
-  if (value === 'movies' || value === 'tvshows' || value === 'music') {
+  if (collectionTypes.some(item => item.value === value)) {
     return `library-page__cover--${value}`;
   }
   return 'library-page__cover--mixed';
@@ -349,6 +409,100 @@ function openPathDialog(folder?: VirtualFolder) {
   pathDialogVisible.value = true;
 }
 
+function openPathEditDialog(folder: VirtualFolder, path: string) {
+  pathForm.name = folder.Name;
+  pathForm.path = path;
+  pathForm.originalPath = path;
+  pathDialogVisible.value = true;
+}
+
+function libraryItemTypes(collectionType: string) {
+  const types: Record<string, string[]> = {
+    movies: ['Movie'],
+    tvshows: ['Series', 'Season', 'Episode'],
+    music: ['MusicArtist', 'MusicAlbum', 'Audio'],
+    musicvideos: ['MusicVideo'],
+    homevideos: ['Video', 'Photo'],
+    books: ['Book', 'AudioBook'],
+    photos: ['Photo']
+  };
+  return types[collectionType] ?? ['Movie', 'Series', 'Season', 'Episode'];
+}
+
+function providerEnabled(options: LibraryOptions, collectionType: string, field: 'MetadataFetchers' | 'ImageFetchers') {
+  const typeOptions = options.TypeOptions ?? [];
+  const relevant = typeOptions.filter(option => libraryItemTypes(collectionType).includes(option.Type));
+  if (!relevant.length) {
+    return true;
+  }
+  return relevant.some(option => (option[field] ?? []).includes('TheMovieDb'));
+}
+
+function openSettingsDialog(folder: VirtualFolder) {
+  const options = folder.LibraryOptions ?? {};
+  settingsFolder.value = folder;
+  settingsForm.name = folder.Name;
+  settingsForm.enabled = options.Enabled !== false;
+  settingsForm.realtimeMonitor = options.EnableRealtimeMonitor !== false;
+  settingsForm.enablePhotos = options.EnablePhotos !== false;
+  settingsForm.automaticSeriesGrouping = options.EnableAutomaticSeriesGrouping !== false;
+  settingsForm.preferredMetadataLanguage = options.PreferredMetadataLanguage || 'zh-CN';
+  settingsForm.metadataCountryCode = options.MetadataCountryCode || 'CN';
+  settingsForm.saveLocalMetadata = options.SaveLocalMetadata === true;
+  settingsForm.tmdbMetadata = providerEnabled(options, folder.CollectionType, 'MetadataFetchers');
+  settingsForm.tmdbImages = providerEnabled(options, folder.CollectionType, 'ImageFetchers');
+  settingsDialogVisible.value = true;
+}
+
+function updatedTypeOptions(folder: VirtualFolder): LibraryTypeOptions[] {
+  const itemTypes = libraryItemTypes(folder.CollectionType);
+  const existing = folder.LibraryOptions.TypeOptions ?? [];
+  const unrelated = existing.filter(option => !itemTypes.includes(option.Type));
+  const currentByType = new Map(existing.map(option => [option.Type, option]));
+  return [
+    ...unrelated,
+    ...itemTypes.map(type => ({
+      ...(currentByType.get(type) ?? {}),
+      Type: type,
+      MetadataFetchers: settingsForm.tmdbMetadata ? ['TheMovieDb'] : [],
+      ImageFetchers: settingsForm.tmdbImages ? ['TheMovieDb'] : []
+    }))
+  ];
+}
+
+async function submitSettings() {
+  const folder = settingsFolder.value;
+  if (!authStore.token || !folder || !settingsForm.name.trim()) {
+    return;
+  }
+
+  saving.value = true;
+  try {
+    const nextName = settingsForm.name.trim();
+    if (nextName !== folder.Name) {
+      await libraryApi.renameVirtualFolder(authStore.token, folder.Name, nextName);
+    }
+    await libraryApi.updateLibraryOptions(authStore.token, folder.Id, {
+      ...folder.LibraryOptions,
+      Enabled: settingsForm.enabled,
+      EnableRealtimeMonitor: settingsForm.realtimeMonitor,
+      EnablePhotos: settingsForm.enablePhotos,
+      EnableAutomaticSeriesGrouping: settingsForm.automaticSeriesGrouping,
+      PreferredMetadataLanguage: settingsForm.preferredMetadataLanguage,
+      MetadataCountryCode: settingsForm.metadataCountryCode,
+      SaveLocalMetadata: settingsForm.saveLocalMetadata,
+      TypeOptions: updatedTypeOptions(folder)
+    });
+    ElMessage.success('媒体库设置已保存');
+    settingsDialogVisible.value = false;
+    await loadFolders();
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存媒体库设置失败');
+  } finally {
+    saving.value = false;
+  }
+}
+
 function openDirectoryPicker(target: 'create' | 'path') {
   directoryPickerTarget.value = target;
   directoryPickerVisible.value = true;
@@ -379,7 +533,7 @@ onMounted(loadFolders);
           </ElIcon>
           刷新
         </ElButton>
-        <ElButton @click="scanLibrary">
+        <ElButton :loading="scanningLibraryId === 'all'" @click="scanLibrary()">
           <ElIcon>
             <VideoPlay />
           </ElIcon>
@@ -428,6 +582,14 @@ onMounted(loadFolders);
                 <span>{{ folder.ItemId }}</span>
               </div>
               <ElTag effect="plain" type="success">{{ collectionTypeLabel(folder.CollectionType) }}</ElTag>
+              <ElTag v-if="folder.LibraryOptions.Enabled === false" effect="plain" type="info">已停用</ElTag>
+              <ElTag
+                v-else-if="folder.LibraryOptions.EnableRealtimeMonitor !== false"
+                effect="plain"
+                type="success"
+              >
+                实时监控
+              </ElTag>
             </div>
 
             <div class="library-page__paths">
@@ -436,6 +598,11 @@ onMounted(loadFolders);
                   <Folder />
                 </ElIcon>
                 <span>{{ path }}</span>
+                <ElButton circle text title="编辑路径" @click="openPathEditDialog(folder, path)">
+                  <ElIcon>
+                    <Edit />
+                  </ElIcon>
+                </ElButton>
                 <ElButton circle text type="danger" @click="removePath(folder, path)">
                   <ElIcon>
                     <Close />
@@ -453,6 +620,18 @@ onMounted(loadFolders);
         </div>
 
         <div class="library-page__card-actions">
+          <ElButton :loading="scanningLibraryId === folder.Id" type="primary" @click="scanLibrary(folder)">
+            <ElIcon>
+              <VideoPlay />
+            </ElIcon>
+            扫描
+          </ElButton>
+          <ElButton @click="openSettingsDialog(folder)">
+            <ElIcon>
+              <Setting />
+            </ElIcon>
+            管理
+          </ElButton>
           <ElButton @click="openPathDialog(folder)">
             <ElIcon>
               <FolderAdd />
@@ -575,7 +754,12 @@ onMounted(loadFolders);
       </template>
     </ElDialog>
 
-    <ElDialog v-model="pathDialogVisible" title="添加路径" width="520px" @closed="resetPathForm()">
+    <ElDialog
+      v-model="pathDialogVisible"
+      :title="pathForm.originalPath ? '编辑路径' : '添加路径'"
+      width="520px"
+      @closed="resetPathForm()"
+    >
       <ElForm ref="pathFormRef" :model="pathForm" :rules="pathRules" label-position="top">
         <ElFormItem label="媒体库" prop="name">
           <ElSelect v-model="pathForm.name" class="library-page__control">
@@ -597,6 +781,67 @@ onMounted(loadFolders);
       <template #footer>
         <ElButton @click="pathDialogVisible = false">取消</ElButton>
         <ElButton :loading="saving" type="primary" @click="submitPath">保存</ElButton>
+      </template>
+    </ElDialog>
+
+    <ElDialog
+      v-model="settingsDialogVisible"
+      class="library-page__settings-dialog"
+      title="媒体库设置"
+      width="min(680px, calc(100vw - 32px))"
+    >
+      <ElForm class="library-page__settings-form" :model="settingsForm" label-position="top">
+        <ElFormItem label="名称">
+          <ElInput v-model.trim="settingsForm.name" maxlength="128" />
+        </ElFormItem>
+
+        <div class="library-page__settings-section">
+          <h3>扫描</h3>
+          <ElSwitch v-model="settingsForm.enabled" active-text="启用此媒体库" />
+          <ElSwitch v-model="settingsForm.realtimeMonitor" active-text="实时监控文件变化" />
+          <ElSwitch
+            v-if="settingsFolder?.CollectionType === 'homevideos'"
+            v-model="settingsForm.enablePhotos"
+            active-text="识别照片"
+          />
+          <ElSwitch
+            v-if="settingsFolder?.CollectionType === 'tvshows'"
+            v-model="settingsForm.automaticSeriesGrouping"
+            active-text="自动合并分布在多个路径中的剧集"
+          />
+        </div>
+
+        <div class="library-page__settings-section">
+          <h3>元数据</h3>
+          <div class="library-page__settings-grid">
+            <ElFormItem label="首选语言">
+              <ElSelect v-model="settingsForm.preferredMetadataLanguage">
+                <ElOption label="简体中文" value="zh-CN" />
+                <ElOption label="繁体中文" value="zh-TW" />
+                <ElOption label="English" value="en-US" />
+                <ElOption label="日本語" value="ja-JP" />
+                <ElOption label="한국어" value="ko-KR" />
+              </ElSelect>
+            </ElFormItem>
+            <ElFormItem label="国家或地区">
+              <ElSelect v-model="settingsForm.metadataCountryCode">
+                <ElOption label="中国大陆" value="CN" />
+                <ElOption label="中国台湾" value="TW" />
+                <ElOption label="中国香港" value="HK" />
+                <ElOption label="美国" value="US" />
+                <ElOption label="日本" value="JP" />
+                <ElOption label="韩国" value="KR" />
+              </ElSelect>
+            </ElFormItem>
+          </div>
+          <ElSwitch v-model="settingsForm.tmdbMetadata" active-text="从 TMDb 获取元数据" />
+          <ElSwitch v-model="settingsForm.tmdbImages" active-text="从 TMDb 获取图片" />
+          <ElSwitch v-model="settingsForm.saveLocalMetadata" active-text="将元数据保存到媒体目录" />
+        </div>
+      </ElForm>
+      <template #footer>
+        <ElButton @click="settingsDialogVisible = false">取消</ElButton>
+        <ElButton :loading="saving" type="primary" @click="submitSettings">保存</ElButton>
       </template>
     </ElDialog>
 
@@ -659,7 +904,7 @@ onMounted(loadFolders);
   border-radius: 8px;
   background: var(--admin-surface);
 
-  span {
+  > span {
     min-width: 0;
     overflow: hidden;
     color: var(--admin-muted);
@@ -739,7 +984,7 @@ onMounted(loadFolders);
     white-space: nowrap;
   }
 
-  span {
+  > div > span {
     overflow: hidden;
     color: var(--admin-muted);
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
@@ -759,7 +1004,7 @@ onMounted(loadFolders);
 
 .library-page__path-pill {
   display: inline-grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   gap: 7px;
   align-items: center;
   max-width: min(100%, 460px);
@@ -840,6 +1085,22 @@ onMounted(loadFolders);
 
 .library-page__cover--music {
   background: linear-gradient(135deg, #b45309, #be123c);
+}
+
+.library-page__cover--musicvideos {
+  background: linear-gradient(135deg, #be123c, #0e7490);
+}
+
+.library-page__cover--homevideos {
+  background: linear-gradient(135deg, #166534, #0369a1);
+}
+
+.library-page__cover--books {
+  background: linear-gradient(135deg, #92400e, #475569);
+}
+
+.library-page__cover--photos {
+  background: linear-gradient(135deg, #0369a1, #15803d);
 }
 
 .library-page__cover--mixed {
@@ -1035,6 +1296,34 @@ onMounted(loadFolders);
   width: 100%;
 }
 
+.library-page__settings-form {
+  display: grid;
+  gap: 4px;
+}
+
+.library-page__settings-section {
+  display: grid;
+  gap: 12px;
+  padding: 16px 0;
+  border-top: 1px solid var(--admin-border);
+
+  h3 {
+    margin: 0;
+    color: #0f172a;
+    font-size: 15px;
+  }
+}
+
+.library-page__settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+
+  .el-select {
+    width: 100%;
+  }
+}
+
 .library-page__path-input {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -1096,6 +1385,10 @@ onMounted(loadFolders);
     .el-button {
       min-height: 40px;
     }
+  }
+
+  .library-page__settings-grid {
+    grid-template-columns: 1fr;
   }
 }
 

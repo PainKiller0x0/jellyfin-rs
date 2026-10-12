@@ -18,6 +18,7 @@ pub mod media_game_genres;
 pub mod media_genres;
 pub mod media_items;
 pub mod media_people;
+pub mod media_scan_states;
 pub mod media_streams;
 pub mod media_studios;
 pub mod media_tags;

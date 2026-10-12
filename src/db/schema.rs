@@ -47,6 +47,30 @@ pub fn migrations() -> Vec<Migration> {
             "failed to migrate media_items",
         ),
         (
+            r#"CREATE TABLE IF NOT EXISTS media_scan_state (path TEXT PRIMARY KEY, item_id TEXT NOT NULL UNIQUE, library_id TEXT NOT NULL, fingerprint BIGINT NOT NULL, updated_at BIGINT NOT NULL, FOREIGN KEY(item_id) REFERENCES media_items(id) ON DELETE CASCADE, FOREIGN KEY(library_id) REFERENCES libraries(id) ON DELETE CASCADE)"#,
+            "failed to migrate media scan state",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_media_scan_state_library ON media_scan_state(library_id, path)",
+            "failed to create media scan state library index",
+        ),
+        (
+            r#"CREATE TABLE IF NOT EXISTS library_refresh_jobs (id BIGSERIAL PRIMARY KEY, scan_id TEXT NOT NULL, library_id TEXT NOT NULL, path TEXT NOT NULL UNIQUE, payload JSONB NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts BIGINT NOT NULL DEFAULT 0, available_at BIGINT NOT NULL, lease_until BIGINT, last_error TEXT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, FOREIGN KEY(library_id) REFERENCES libraries(id) ON DELETE CASCADE)"#,
+            "failed to create library refresh jobs",
+        ),
+        (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_library_refresh_jobs_path ON library_refresh_jobs(path)",
+            "failed to create library refresh job path index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_library_refresh_jobs_claim ON library_refresh_jobs(status, available_at, id) WHERE status IN ('pending', 'running')",
+            "failed to create library refresh job claim index",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_library_refresh_jobs_scan_status ON library_refresh_jobs(scan_id, status)",
+            "failed to create library refresh job scan index",
+        ),
+        (
             "CREATE INDEX IF NOT EXISTS idx_media_items_parent_id ON media_items(parent_id)",
             "failed to create media parent index",
         ),

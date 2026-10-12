@@ -2478,9 +2478,40 @@ fn resolve_episode_season_number(
     metadata_season: Option<i64>,
     filename_season: Option<i64>,
 ) -> Option<i64> {
-    metadata_season
-        .or_else(|| episode_season_number_from_path(path, root, collection_type))
-        .or(filename_season)
+    let archive_season = episode_season_number_from_path(path, root, collection_type);
+    if is_jojo_steel_ball_run_archive(path, root) {
+        metadata_season.or(archive_season).or(filename_season)
+    } else {
+        metadata_season.or(filename_season).or(archive_season)
+    }
+}
+
+fn is_jojo_steel_ball_run_archive(path: &std::path::Path, root: &std::path::Path) -> bool {
+    const SERIES_FOLDER: &str = "JOJO的奇妙冒险 (2012)";
+
+    if !path.starts_with(root) {
+        return false;
+    }
+    let mut current = path.parent();
+    while let Some(season_folder) = current {
+        let is_target_season = season_folder
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("Season 6"));
+        let is_target_series = season_folder
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == SERIES_FOLDER);
+        if is_target_season && is_target_series {
+            return true;
+        }
+        if same_normalized_path(season_folder, root) {
+            break;
+        }
+        current = season_folder.parent();
+    }
+    false
 }
 
 fn same_normalized_path(left: &std::path::Path, right: &std::path::Path) -> bool {
@@ -3870,9 +3901,9 @@ mod tests {
     }
 
     #[test]
-    fn episode_season_number_prefers_archive_folder_over_filename() {
+    fn archive_folder_overrides_filename_only_for_jojo_steel_ball_run() {
         let root = PathBuf::from("/media/迅雷-番");
-        let path = root.join("JOJO/Season 6/套马的汉子 - S01E04.strm");
+        let path = root.join("JOJO的奇妙冒险 (2012)/Season 6/套马的汉子 - S01E04.(mp4).strm");
 
         assert_eq!(
             resolve_episode_season_number(&path, &root, "tvshows", None, Some(1)),
@@ -3885,6 +3916,16 @@ mod tests {
         assert_eq!(
             resolve_episode_season_number(
                 &root.join("JOJO/套马的汉子 - S01E04.strm"),
+                &root,
+                "tvshows",
+                None,
+                Some(1),
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_episode_season_number(
+                &root.join("Other Show/Season 6/episode - S01E04.strm"),
                 &root,
                 "tvshows",
                 None,

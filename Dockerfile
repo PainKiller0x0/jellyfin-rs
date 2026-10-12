@@ -14,9 +14,11 @@ ENV CARGO_HTTP_MULTIPLEXING=false
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 RUN mkdir src && echo 'fn main() {}' > src/main.rs
-RUN cargo fetch
+RUN cargo build --release
+RUN rm -rf src
 COPY src src
 COPY data data
+RUN touch src/main.rs
 RUN cargo build --release
 
 FROM docker.m.daocloud.io/library/debian:bookworm-slim

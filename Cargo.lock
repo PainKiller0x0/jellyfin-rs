@@ -1314,6 +1314,7 @@ dependencies = [
  "hmac",
  "image",
  "kamadak-exif",
+ "libc",
  "notify",
  "regex",
  "reqwest",

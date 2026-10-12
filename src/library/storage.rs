@@ -8,6 +8,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Set, sea_query::OnConflict,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     entities::{
@@ -31,7 +32,7 @@ use crate::{
     util::{now_unix, stable_text_id},
 };
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct ScannedMediaItem {
     pub id: String,
     pub title: String,
@@ -90,6 +91,7 @@ pub struct ScannedMediaItem {
 }
 
 pub struct CachedMediaProbe {
+    pub probe_failed: bool,
     pub runtime_ticks: Option<i64>,
     pub size_bytes: Option<i64>,
     pub title: String,
@@ -292,6 +294,7 @@ pub async fn cached_media_probe_if_current(
         .is_some();
     if has_failed_probe {
         return Ok(Some(CachedMediaProbe {
+            probe_failed: true,
             runtime_ticks: item.runtime_ticks,
             size_bytes: item.size_bytes,
             title: item.title,
@@ -336,6 +339,7 @@ pub async fn cached_media_probe_if_current(
     }
 
     Ok(Some(CachedMediaProbe {
+        probe_failed: false,
         runtime_ticks: item.runtime_ticks,
         size_bytes: item.size_bytes,
         title: item.title,
@@ -1936,15 +1940,6 @@ pub async fn remove_missing_media_items(
     remove_missing_media_items_internal(db, library_ids, &[], seen_paths).await
 }
 
-pub async fn remove_missing_media_items_in_scopes(
-    db: &DatabaseConnection,
-    library_ids: &[String],
-    scopes: &[String],
-    seen_paths: &[String],
-) -> anyhow::Result<()> {
-    remove_missing_media_items_internal(db, library_ids, scopes, seen_paths).await
-}
-
 async fn remove_missing_media_items_internal(
     db: &DatabaseConnection,
     library_ids: &[String],
@@ -2013,6 +2008,72 @@ fn path_is_in_scope(path: &str, scope: &str) -> bool {
         || path
             .strip_prefix(scope)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+pub async fn remove_missing_media_items_in_scopes(
+    db: &DatabaseConnection,
+    scopes: &[(String, String)],
+    seen_paths: &[String],
+) -> anyhow::Result<()> {
+    if scopes.is_empty() {
+        return Ok(());
+    }
+    let seen_paths = seen_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut last_id = None::<String>;
+    loop {
+        let mut scope_filter = Condition::any();
+        for (library_id, path) in scopes {
+            let normalized = crate::library::path_utils::normalize_path(path);
+            let mut prefix = normalized.clone();
+            if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
+                prefix.push(std::path::MAIN_SEPARATOR);
+            }
+            scope_filter = scope_filter.add(
+                Condition::all()
+                    .add(media_items::Column::LibraryId.eq(library_id))
+                    .add(
+                        Condition::any()
+                            .add(media_items::Column::Path.eq(&normalized))
+                            .add(media_items::Column::Path.starts_with(prefix)),
+                    ),
+            );
+        }
+
+        let mut query = MediaItems::find()
+            .filter(scope_filter)
+            .order_by_asc(media_items::Column::Id)
+            .limit(MISSING_CLEANUP_BATCH_SIZE);
+        if let Some(last_id) = last_id.as_deref() {
+            query = query.filter(media_items::Column::Id.gt(last_id));
+        }
+        let items = query
+            .all(db)
+            .await
+            .context("failed to list targeted media items for cleanup")?;
+        if items.is_empty() {
+            break;
+        }
+
+        last_id = items.last().map(|item| item.id.clone());
+        for item in items {
+            let id = item.id.clone();
+            let path = item.path.clone();
+            if seen_paths.contains(path.as_str()) || cleanup_path_exists(&path).await {
+                continue;
+            }
+            MediaItems::delete_by_id(id)
+                .exec(db)
+                .await
+                .with_context(|| format!("failed to delete missing media item: {path}"))?;
+        }
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(MISSING_CLEANUP_PAUSE).await;
+    }
+    Ok(())
 }
 
 async fn cleanup_path_exists(path: &str) -> bool {

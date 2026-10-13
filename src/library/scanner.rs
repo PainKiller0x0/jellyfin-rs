@@ -1,25 +1,32 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use anyhow::Context;
 use chrono::Datelike;
+use sea_orm::sea_query::OnConflict;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
-use tokio::sync::{Mutex, RwLock, mpsc};
-use walkdir::WalkDir;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{RwLock, mpsc};
+use tokio_util::sync::CancellationToken;
+use walkdir::{DirEntry, WalkDir};
 
 use crate::{
     app::state::AppState,
     entities::{
-        image_assets::{self, Entity as ImageAssets},
         libraries::Entity as Libraries,
         library_paths::{self, Entity as LibraryPaths},
         media_genres::{self, Entity as MediaGenres},
         media_items::{self, Entity as MediaItems},
         media_people::{self, Entity as MediaPeople},
+        media_scan_states::{self, Entity as MediaScanStates},
         media_studios::{self, Entity as MediaStudios},
         provider_ids::{self, Entity as ProviderIds},
     },
@@ -55,69 +62,149 @@ use crate::{
 
 const MEDIA_PROBE_CACHE_VERSION_KEY: &str = "media_probe_cache_version";
 const MEDIA_PROBE_CACHE_VERSION: &str = "6";
-const MIN_INGEST_QUEUE_CAPACITY: usize = 512;
-const MAX_INGEST_QUEUE_CAPACITY: usize = 4096;
-const MIN_MEDIA_PROBE_QUEUE_CAPACITY: usize = 32;
-const MAX_MEDIA_PROBE_QUEUE_CAPACITY: usize = 256;
-const METADATA_FETCH_MAX_ATTEMPTS: usize = 30;
-const METADATA_FETCH_RETRY_DELAY_SECS: u64 = 2;
+const MIN_ITEM_REFRESH_QUEUE_CAPACITY: usize = 512;
+const MAX_ITEM_REFRESH_QUEUE_CAPACITY: usize = 4096;
+const METADATA_DEPENDENCY_MAX_ATTEMPTS: usize = 30;
+const METADATA_DEPENDENCY_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SCAN_FINGERPRINT_VERSION: u64 = 2;
 
-struct ScanRootResult {
-    scanned: usize,
-    seen_paths: Vec<String>,
-    ingest_queued: usize,
+#[derive(Debug)]
+pub struct ScanCancelled;
+
+impl std::fmt::Display for ScanCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("media library scan was cancelled")
+    }
 }
 
-struct ScanRootRequest {
-    root: PathBuf,
-    library_id: String,
-    collection_type: String,
-    enable_photos: bool,
-    scope_paths: Option<Vec<PathBuf>>,
+impl std::error::Error for ScanCancelled {}
+
+pub fn is_scan_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ScanCancelled>().is_some()
+}
+
+struct ScanTaskGuard<'a>(&'a crate::app::state::ScanTaskControl);
+
+impl Drop for ScanTaskGuard<'_> {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
 }
 
 #[derive(Clone)]
-struct ExistingMediaState {
-    id: String,
-    parent_id: String,
-    item_type: String,
-    modified_at: i64,
-    size_bytes: Option<i64>,
+struct ScanProgressTracker {
+    reporter: crate::app::state::ScanProgressReporter,
+    discovered_entries: Arc<AtomicU64>,
+    refreshed_items: Arc<AtomicU64>,
 }
 
-struct IngestPipeline {
-    tx: mpsc::Sender<IngestJob>,
-    handle: tokio::task::JoinHandle<IngestWorkerStats>,
+impl ScanProgressTracker {
+    fn new(reporter: crate::app::state::ScanProgressReporter) -> Self {
+        Self {
+            reporter,
+            discovered_entries: Arc::new(AtomicU64::new(0)),
+            refreshed_items: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn set(&self, percentage: f64) {
+        self.reporter.set(percentage);
+    }
+
+    fn discovered_entry(&self) {
+        let discovered = self.discovered_entries.fetch_add(1, Ordering::Relaxed) + 1;
+        if discovered.is_multiple_of(64) {
+            let fraction = discovered as f64 / (discovered as f64 + 2_048.0);
+            self.set(2.0 + 28.0 * fraction);
+        }
+    }
+
+    fn root_completed(&self, completed: usize, total: usize) {
+        if total > 0 {
+            self.set(2.0 + 38.0 * completed as f64 / total as f64);
+        }
+    }
+
+    fn refresh_completed(&self, total: usize) {
+        let completed = self.refreshed_items.fetch_add(1, Ordering::Relaxed) + 1;
+        let fraction = completed.min(total.max(1) as u64) as f64 / total.max(1) as f64;
+        self.set(45.0 + 45.0 * fraction);
+    }
 }
 
-struct MediaProbePipeline {
-    tx: mpsc::Sender<MediaProbeJob>,
-    handle: tokio::task::JoinHandle<MediaProbeWorkerStats>,
+fn ensure_scan_active(cancellation: &CancellationToken) -> anyhow::Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(ScanCancelled.into());
+    }
+    Ok(())
 }
 
-struct MetadataFetchPipeline {
-    tx: mpsc::UnboundedSender<MetadataFetchJob>,
-    handle: tokio::task::JoinHandle<()>,
+#[derive(Default)]
+struct SidecarFingerprintCache {
+    by_directory: HashMap<PathBuf, u64>,
 }
 
-struct IngestJob {
+impl SidecarFingerprintCache {
+    fn for_media_path(&mut self, path: &std::path::Path) -> u64 {
+        let directory = if path.is_dir() {
+            Some(path)
+        } else {
+            path.parent()
+        };
+        let Some(directory) = directory else {
+            return 0;
+        };
+
+        *self
+            .by_directory
+            .entry(directory.to_path_buf())
+            .or_insert_with(|| sidecar_directory_fingerprint(directory))
+    }
+}
+
+struct ScanRootResult {
+    scanned: usize,
+    unchanged: usize,
+    seen_paths: Vec<String>,
+    refresh_queued: usize,
+}
+
+struct RefreshJobStager {
+    tx: mpsc::Sender<ItemRefreshJob>,
+    handle: tokio::task::JoinHandle<anyhow::Result<usize>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ItemRefreshJob {
     item: ScannedMediaItem,
     source_path: PathBuf,
     parsed_metadata: ParsedMetadata,
     clear_folder_metadata: bool,
     media_probe: Option<PendingMediaProbe>,
+    scan_fingerprint: i64,
 }
 
+#[derive(Serialize, Deserialize)]
 struct PendingMediaProbe {
     media_path: PathBuf,
     probe_path: PathBuf,
     allow_size_mismatch: bool,
 }
 
-struct IngestJobResult {
-    metadata_queued: bool,
-    probe_queued: bool,
+struct LocalRefreshResult {
+    stored_item_id: String,
     probe_skipped: bool,
+    scan_state_cacheable: bool,
+}
+
+#[derive(Default)]
+struct ItemRefreshResult {
+    metadata_completed: bool,
+    metadata_deferred: bool,
+    metadata_failed: bool,
+    probe_completed: bool,
+    probe_skipped: bool,
+    probe_failed: bool,
 }
 
 struct MediaProbeJob {
@@ -132,27 +219,20 @@ struct MediaProbeJobResult {
 
 struct MetadataFetchJob {
     item_id: String,
-    library_id: String,
     item_type: String,
     path: PathBuf,
     preserve_existing_metadata: bool,
-    attempts: usize,
-    retry_tx: mpsc::UnboundedSender<MetadataFetchJob>,
 }
 
 #[derive(Default)]
-struct IngestWorkerStats {
+struct ItemRefreshWorkerStats {
     completed: usize,
-    metadata_queued: usize,
-    probe_queued: usize,
+    metadata_completed: usize,
+    metadata_deferred: usize,
+    metadata_failed: usize,
+    probe_completed: usize,
     probe_skipped: usize,
-    failed: usize,
-}
-
-#[derive(Default)]
-struct MediaProbeWorkerStats {
-    completed: usize,
-    stream_probe_succeeded: usize,
+    probe_failed: usize,
     failed: usize,
 }
 
@@ -305,71 +385,47 @@ async fn force_refresh_media_probe(
 }
 
 pub async fn scan_media_library_if_idle(state: &AppState) -> anyhow::Result<Option<usize>> {
-    let roots = media_roots(state).await?;
-    let roots = roots
-        .into_iter()
-        .map(
-            |(root, library_id, collection_type, enable_photos)| ScanRootRequest {
-                root,
-                library_id,
-                collection_type,
-                enable_photos,
-                scope_paths: None,
-            },
-        )
-        .collect();
-    scan_media_roots_if_idle(state, roots, true).await
+    scan_media_libraries_if_idle(state, &[]).await
 }
 
-pub async fn scan_media_library_paths_if_idle(
+pub async fn scan_media_libraries_if_idle(
     state: &AppState,
-    requested_paths: &[String],
+    library_ids: &[String],
 ) -> anyhow::Result<Option<usize>> {
-    let roots = select_media_roots(media_roots(state).await?, requested_paths);
-    scan_media_roots_if_idle(state, roots, false).await
+    scan_media_libraries_internal(state, library_ids, None).await
 }
 
-fn select_media_roots(
-    roots: Vec<(PathBuf, String, String, bool)>,
-    requested_paths: &[String],
-) -> Vec<ScanRootRequest> {
-    let requested_paths = requested_paths
-        .iter()
-        .map(|path| PathBuf::from(path_utils::normalize_path(path)))
-        .collect::<std::collections::HashSet<_>>();
-    roots
-        .into_iter()
-        .filter_map(|(root, library_id, collection_type, enable_photos)| {
-            let normalized_root =
-                PathBuf::from(path_utils::normalize_path(&root.to_string_lossy()));
-            let matching_paths = requested_paths
-                .iter()
-                .filter(|path| *path == &normalized_root || path.starts_with(&normalized_root))
-                .cloned()
-                .collect::<Vec<_>>();
-            if matching_paths.is_empty() {
-                return None;
-            }
-            let scope_paths = matching_paths
-                .into_iter()
-                .filter(|path| path != &normalized_root)
-                .collect::<Vec<_>>();
-            Some(ScanRootRequest {
-                root,
-                library_id,
-                collection_type,
-                enable_photos,
-                scope_paths: (!scope_paths.is_empty()).then_some(scope_paths),
+pub async fn scan_media_paths_if_idle(
+    state: &AppState,
+    changed_paths: &[PathBuf],
+) -> anyhow::Result<Option<usize>> {
+    scan_media_libraries_internal(state, &[], Some(changed_paths)).await
+}
+
+async fn scan_media_libraries_internal(
+    state: &AppState,
+    library_ids: &[String],
+    changed_paths: Option<&[PathBuf]>,
+) -> anyhow::Result<Option<usize>> {
+    let selected_library_ids =
+        (!library_ids.is_empty()).then(|| library_ids.iter().cloned().collect::<HashSet<_>>());
+    let roots = media_roots(state, selected_library_ids.as_ref()).await?;
+    let targeted = changed_paths.is_some();
+    let roots = match changed_paths {
+        Some(changed_paths) => targeted_scan_roots(roots, changed_paths),
+        None => roots
+            .into_iter()
+            .map(|(root, library_id, collection_type, enable_photos)| {
+                (
+                    root.clone(),
+                    root,
+                    library_id,
+                    collection_type,
+                    enable_photos,
+                )
             })
-        })
-        .collect()
-}
-
-async fn scan_media_roots_if_idle(
-    state: &AppState,
-    roots: Vec<ScanRootRequest>,
-    remove_missing: bool,
-) -> anyhow::Result<Option<usize>> {
+            .collect(),
+    };
     if roots.is_empty() {
         tracing::info!("media scan skipped because no media library paths are configured");
         return Ok(Some(0));
@@ -382,23 +438,18 @@ async fn scan_media_roots_if_idle(
             return Ok(None);
         }
     };
+    let cancellation = state.scan_task.start();
+    let _scan_task_guard = ScanTaskGuard(&state.scan_task);
+    let progress = ScanProgressTracker::new(state.scan_task.progress());
+    progress.set(1.0);
 
     let scan_database_url = crate::db::database_url_from_env();
     let scan_db = crate::db::background_connection(&scan_database_url).await?;
-    let existing_media = load_existing_media_state(&scan_db, &roots).await?;
-
-    let force_probe = !media_probe_cache_is_current(&scan_db).await?;
-    if force_probe {
-        tracing::info!("media probe cache version changed; forcing one-time media stream reprobe");
-    }
-
-    let probe_pipeline = start_media_probe_pipeline(
-        scan_db.clone(),
-        force_probe.then(|| scan_db.clone()),
-        state.sa_config.ffmpeg_path.clone(),
-    );
-    let mut tasks = tokio::task::JoinSet::new();
-    let root_concurrency = scan_root_concurrency();
+    let scanned_library_ids = roots
+        .iter()
+        .map(|(_, _, library_id, _, _)| library_id.clone())
+        .collect::<HashSet<_>>();
+    let scan_states = Arc::new(load_scan_states(&scan_db, &scanned_library_ids).await?);
     let tmdb_enabled = crate::library::tmdb_metadata::tmdb_provider_enabled(&scan_db).await;
     let api_key = if tmdb_enabled {
         state.tmdb_api_key.read().await.clone().unwrap_or_default()
@@ -406,6 +457,16 @@ async fn scan_media_roots_if_idle(
         tracing::info!("TMDb metadata disabled by provider setting for this scan");
         String::new()
     };
+    let scan_contexts =
+        scan_context_fingerprints(&scan_db, &scanned_library_ids, !api_key.is_empty()).await?;
+
+    let force_probe = !media_probe_cache_is_current(&scan_db).await?;
+    if force_probe {
+        tracing::info!("media probe cache version changed; forcing one-time media stream reprobe");
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
+    let root_concurrency = scan_root_concurrency();
     let douban_enabled = crate::library::douban_metadata::douban_provider_enabled(&scan_db).await;
     let douban_cookie = if douban_enabled {
         state.douban_cookie.read().await.clone()
@@ -415,58 +476,47 @@ async fn scan_media_roots_if_idle(
     };
     let tmdb_library_options =
         crate::library::tmdb_metadata::load_tmdb_library_provider_options(&scan_db).await?;
-    let metadata_pipeline = start_metadata_fetch_pipeline(
-        scan_db.clone(),
-        api_key.clone(),
-        state.tmdb_proxy_url.clone(),
-        state.tmdb_http_client.clone(),
-        douban_cookie,
-        tmdb_library_options,
-    );
-    let ingest_pipeline = start_ingest_pipeline(
-        scan_db.clone(),
-        force_probe,
-        probe_pipeline.tx.clone(),
-        metadata_pipeline.tx.clone(),
-    );
-    let mut scanned_library_ids = Vec::new();
+    let scan_id = uuid::Uuid::new_v4().to_string();
+    let refresh_stager = start_refresh_job_stager(scan_db.clone(), scan_id.clone());
+    let mut completed_library_ids = Vec::new();
+    let mut completed_scan_scopes = Vec::new();
     let mut total = 0usize;
+    let mut unchanged = 0usize;
     let mut all_seen = Vec::new();
-    let mut ingest_queued = 0usize;
-    let scoped_cleanup_paths = roots
-        .iter()
-        .flat_map(|request| request.scope_paths.iter().flatten())
-        .map(|path| path_utils::normalize_path(&path.to_string_lossy()))
-        .collect::<Vec<_>>();
+    let mut refresh_queued = 0usize;
+    let root_count = roots.len();
+    let mut completed_roots = 0usize;
     let mut pending_roots = roots.into_iter();
     loop {
-        while tasks.len() < root_concurrency {
-            let Some(request) = pending_roots.next() else {
+        while !cancellation.is_cancelled() && tasks.len() < root_concurrency {
+            let Some((root, scan_path, library_id, collection_type, enable_photos)) =
+                pending_roots.next()
+            else {
                 break;
             };
-            let ScanRootRequest {
-                root,
-                library_id,
-                collection_type,
-                enable_photos,
-                scope_paths,
-            } = request;
             if !root.exists() {
                 tracing::warn!("media directory does not exist: {}", root.display());
                 continue;
             }
-            scanned_library_ids.push(library_id.clone());
-            let ingest_tx = ingest_pipeline.tx.clone();
-            let existing_media = existing_media.clone();
+            completed_library_ids.push(library_id.clone());
+            completed_scan_scopes.push((library_id.clone(), scan_path.to_string_lossy().into()));
+            let refresh_tx = refresh_stager.tx.clone();
+            let scan_states = scan_states.clone();
+            let cancellation = cancellation.clone();
+            let progress = progress.clone();
+            let scan_context = scan_contexts.get(&library_id).copied().unwrap_or_default();
             tasks.spawn(async move {
                 scan_root(
                     root,
+                    scan_path,
                     library_id,
                     collection_type,
                     enable_photos,
-                    scope_paths,
-                    existing_media,
-                    ingest_tx,
+                    scan_context,
+                    scan_states,
+                    refresh_tx,
+                    cancellation,
+                    progress,
                 )
                 .await
             });
@@ -475,599 +525,671 @@ async fn scan_media_roots_if_idle(
         let Some(result) = tasks.join_next().await else {
             break;
         };
+        completed_roots += 1;
+        progress.root_completed(completed_roots, root_count);
         match result {
             Ok(Ok(result)) => {
                 total += result.scanned;
+                unchanged += result.unchanged;
                 all_seen.extend(result.seen_paths);
-                ingest_queued += result.ingest_queued;
+                refresh_queued += result.refresh_queued;
             }
             Ok(Err(e)) => tracing::warn!("library scan failed: {e:#}"),
             Err(e) => tracing::warn!("scan task panicked: {e}"),
         }
     }
 
-    drop(ingest_pipeline.tx);
-    let ingest_stats = match ingest_pipeline.handle.await {
-        Ok(stats) => stats,
-        Err(error) => {
-            tracing::warn!("ingest pipeline task panicked: {error}");
-            IngestWorkerStats::default()
-        }
-    };
-
-    scanned_library_ids.sort();
-    scanned_library_ids.dedup();
-    if remove_missing {
-        remove_missing_media_items(&scan_db, &scanned_library_ids, &all_seen).await?;
-    } else if !scoped_cleanup_paths.is_empty() {
-        remove_missing_media_items_in_scopes(
-            &scan_db,
-            &scanned_library_ids,
-            &scoped_cleanup_paths,
-            &all_seen,
-        )
-        .await?;
+    drop(refresh_stager.tx);
+    let staged_jobs = refresh_stager
+        .handle
+        .await
+        .context("refresh job stager task panicked")??;
+    tracing::info!("staged {staged_jobs} item refresh job(s) in PostgreSQL");
+    if cancellation.is_cancelled() {
+        crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
+        return Err(ScanCancelled.into());
     }
+    progress.set(40.0);
+
+    completed_library_ids.sort();
+    completed_library_ids.dedup();
+    if targeted {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
+                return Err(ScanCancelled.into());
+            }
+            result = remove_missing_media_items_in_scopes(
+                &scan_db,
+                &completed_scan_scopes,
+                &all_seen,
+            ) => result?,
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
+                return Err(ScanCancelled.into());
+            }
+            result = remove_missing_media_items(&scan_db, &completed_library_ids, &all_seen) => result?,
+        }
+    }
+    progress.set(45.0);
+    if staged_jobs == 0 {
+        progress.set(90.0);
+    }
+
+    let refresh_stats = run_item_refresh_workers(
+        scan_db.clone(),
+        &scan_id,
+        force_probe,
+        state.sa_config.ffmpeg_path.clone(),
+        api_key.clone(),
+        state.tmdb_proxy_url.clone(),
+        state.tmdb_http_client.clone(),
+        tmdb_library_options,
+        cancellation.clone(),
+        progress.clone(),
+        staged_jobs,
+    )
+    .await;
+    if cancellation.is_cancelled() {
+        crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
+        return Err(ScanCancelled.into());
+    }
+    progress.set(90.0);
+    if force_probe && refresh_stats.probe_failed == 0 {
+        if let Err(error) = set_media_probe_cache_current(&scan_db).await {
+            tracing::warn!("failed to mark media probe cache current: {error:#}");
+        }
+    }
+    if !targeted {
+        let post_scan_metadata = run_post_scan_metadata_tasks(
+            &scan_db,
+            &api_key,
+            state.tmdb_proxy_url.clone(),
+            state.tmdb_http_client.clone(),
+            douban_cookie.as_deref(),
+        );
+        progress.set(95.0);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                crate::library::refresh_queue::delete_scan(&scan_db, &scan_id).await?;
+                return Err(ScanCancelled.into());
+            }
+            _ = post_scan_metadata => {}
+        }
+    }
+    progress.set(99.0);
+
+    let queue_stats = crate::library::refresh_queue::stats(&scan_db, &scan_id).await?;
     tracing::info!(
-        "media scan discovered {total} file item(s) across all libraries; queued {ingest_queued} ingest job(s)"
+        "PostgreSQL refresh queue scan_id={scan_id} pending={} running={} completed={} failed={}",
+        queue_stats.pending,
+        queue_stats.running,
+        queue_stats.completed,
+        queue_stats.failed
     );
+    crate::library::refresh_queue::delete_completed(&scan_db, &scan_id).await?;
     tracing::info!(
-        "media ingest completed {} job(s); metadata_queued={} probe_queued={} probe_skipped={} failed={}",
-        ingest_stats.completed,
-        ingest_stats.metadata_queued,
-        ingest_stats.probe_queued,
-        ingest_stats.probe_skipped,
-        ingest_stats.failed
+        "media scan discovered {total} file item(s) across all libraries; queued {refresh_queued} item refresh job(s)"
     );
-    if ingest_stats.probe_skipped > 0 {
+    tracing::info!("media scan skipped {unchanged} unchanged item(s) through fingerprint cache");
+    tracing::info!(
+        "item refresh completed {} job(s); metadata_completed={} metadata_deferred={} metadata_failed={} probe_completed={} probe_skipped={} probe_failed={} failed={}",
+        refresh_stats.completed,
+        refresh_stats.metadata_completed,
+        refresh_stats.metadata_deferred,
+        refresh_stats.metadata_failed,
+        refresh_stats.probe_completed,
+        refresh_stats.probe_skipped,
+        refresh_stats.probe_failed,
+        refresh_stats.failed
+    );
+    if refresh_stats.probe_skipped > 0 {
         tracing::info!(
-            "media ingest reused cached probe data for {}/{} file item(s)",
-            ingest_stats.probe_skipped,
+            "item refresh reused cached probe data for {}/{} file item(s)",
+            refresh_stats.probe_skipped,
             total
         );
     }
 
-    // Catalog discovery and ingestion are complete. Metadata and probing can involve slow remote
-    // calls, so they must not block a follow-up scan from discovering newly arrived files.
-    drop(_scan_guard);
-    drop(probe_pipeline.tx);
-    drop(metadata_pipeline.tx);
-    tokio::spawn(async move {
-        let (probe_result, metadata_result) =
-            tokio::join!(probe_pipeline.handle, metadata_pipeline.handle);
-        match probe_result {
-            Ok(stats) => tracing::info!(
-                "media probe completed {} item(s); stream_probe_succeeded={} failed={}",
-                stats.completed,
-                stats.stream_probe_succeeded,
-                stats.failed
-            ),
-            Err(error) => tracing::warn!("media probe pipeline task panicked: {error}"),
-        }
-        if let Err(error) = metadata_result {
-            tracing::warn!("metadata fetch pipeline task panicked: {error}");
-        }
-    });
+    progress.set(100.0);
 
     Ok(Some(total))
 }
 
 async fn scan_root(
     root: PathBuf,
+    scan_path: PathBuf,
     library_id: String,
     collection_type: String,
     enable_photos: bool,
-    scope_paths: Option<Vec<PathBuf>>,
-    existing_media: HashMap<String, ExistingMediaState>,
-    ingest_tx: mpsc::Sender<IngestJob>,
+    scan_context: i64,
+    scan_states: Arc<HashMap<String, i64>>,
+    refresh_tx: mpsc::Sender<ItemRefreshJob>,
+    cancellation: CancellationToken,
+    progress: ScanProgressTracker,
 ) -> anyhow::Result<ScanRootResult> {
     let mut scanned = 0usize;
+    let mut unchanged = 0usize;
+    let mut visited_entries = 0usize;
     let mut seen_paths = Vec::new();
-    let mut ingest_queued = 0usize;
-    // Building version ownership requires a second full directory walk and name parse.  A
-    // global scan commonly has no changed files, so defer that work until the first file that
-    // actually needs ingestion.  Scoped scans still build it on demand, preserving the version
-    // grouping behavior for watcher-triggered updates.
-    let stack_owners_cache = OnceLock::new();
-    let episode_owners_cache = OnceLock::new();
+    let mut refresh_queued = 0usize;
+    let mut sidecar_fingerprints = SidecarFingerprintCache::default();
+    let inventory = scan_path_inventory(&scan_path, &cancellation, &progress).await?;
+    let stack_part_owners = scan_path
+        .is_dir()
+        .then(|| {
+            movie_stack_part_owners(
+                inventory.iter().filter_map(inventory_file_path),
+                &scan_path,
+                &collection_type,
+                &cancellation,
+            )
+        })
+        .unwrap_or_default();
+    let episode_version_owners = scan_path
+        .is_dir()
+        .then(|| {
+            episode_version_owners(
+                inventory.iter().filter_map(inventory_file_path),
+                &root,
+                &library_id,
+                &collection_type,
+                &cancellation,
+            )
+        })
+        .unwrap_or_default();
 
-    let walk_roots = scope_paths.clone().unwrap_or_else(|| vec![root.clone()]);
-    if scope_paths.is_none() {
-        let preflight = scan_root_preflight(&root, &collection_type, &existing_media)?;
-        if !preflight.has_changes {
-            tracing::info!(
-                "global scan skipped unchanged root {} after lightweight preflight",
-                root.display()
-            );
-            return Ok(ScanRootResult {
-                scanned: 0,
-                seen_paths: preflight.seen_paths,
-                ingest_queued: 0,
-            });
+    for entry in inventory {
+        ensure_scan_active(&cancellation)?;
+        visited_entries += 1;
+        if visited_entries.is_multiple_of(64) {
+            crate::library::resource_governor::cooperative_scan_yield().await;
         }
-    }
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+        if should_skip_disc_structure_entry(path, &root) {
+            continue;
+        }
 
-    for walk_root in walk_roots {
-        for entry in WalkDir::new(walk_root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| !is_ignored_scan_path(entry.path()))
-        {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    tracing::warn!("failed to read media path: {error}");
-                    continue;
-                }
-            };
-            let path = entry.path();
-            if path == root {
+        let resolved = match path_utils::resolve_path_info(path) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::warn!("failed to resolve media path {}: {error:#}", path.display());
                 continue;
             }
-            if is_ignored_scan_path(path) || !path_is_in_scan_scope(path, scope_paths.as_deref()) {
+        };
+
+        let path_string = resolved.path.clone();
+        let mut parent_id = parent_id_for_path(path, &root, &library_id);
+
+        if resolved.is_directory {
+            // Jellyfin's BookResolver collapses a directory containing exactly one supported
+            // book into that file-backed Book item. The file is handled below by WalkDir.
+            if collection_type == "books"
+                && (book_file_for_directory(path).is_some()
+                    || audiobook_file_for_directory(path).is_some())
+            {
                 continue;
             }
-            if should_skip_disc_structure_entry(path, &root) {
+            if collection_type == "music"
+                && is_music_multi_part_folder(path)
+                && path.parent().is_some_and(|parent| {
+                    tv_folder_type(parent, &root, &collection_type) == "MusicAlbum"
+                })
+            {
                 continue;
             }
-
-            let resolved = match path_utils::resolve_path_info(path) {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    tracing::warn!("failed to resolve media path {}: {error:#}", path.display());
-                    continue;
-                }
-            };
-
-            let path_string = resolved.path.clone();
-            let mut parent_id = parent_id_for_path(path, &root, &library_id);
-
-            if resolved.is_directory {
-                // Jellyfin's BookResolver collapses a directory containing exactly one supported
-                // book into that file-backed Book item. The file is handled below by WalkDir.
-                if collection_type == "books"
-                    && (book_file_for_directory(path).is_some()
-                        || audiobook_file_for_directory(path).is_some())
-                {
-                    continue;
-                }
-                if collection_type == "music"
-                    && is_music_multi_part_folder(path)
-                    && path.parent().is_some_and(|parent| {
-                        tv_folder_type(parent, &root, &collection_type) == "MusicAlbum"
-                    })
-                {
-                    continue;
-                }
-                seen_paths.push(path_string.clone());
-                let mut folder_type = tv_folder_type(path, &root, &collection_type);
-                if collection_type == "homevideos" && !enable_photos && folder_type == "PhotoAlbum"
-                {
-                    folder_type = "Folder";
-                }
-                let (folder_title, year) =
-                    crate::library::tmdb_metadata::clean_title_with_year(&resolved.name);
-                let mut item = ScannedMediaItem::folder_with_type(
-                    resolved.id,
-                    library_id.clone(),
-                    parent_id,
-                    path_string,
-                    folder_title,
-                    folder_type,
-                    resolved.modified_at,
-                    resolved.created_at,
-                    year,
-                );
-                if folder_type == "Season" {
-                    item.season_number =
-                        crate::library::tmdb_metadata::parse_season_number(&resolved.name);
-                }
-                item.video_type = folder_video_type(path).map(ToString::to_string);
-                // Jellyfin resolves DVD and Blu-ray directory structures as Video
-                // items whose Path happens to be a directory, not as folders.
-                item.is_folder = item
-                    .video_type
-                    .as_deref()
-                    .is_none_or(|video_type| !matches!(video_type, "Dvd" | "BluRay"));
-                item.iso_type = item
-                    .video_type
-                    .as_deref()
-                    .filter(|video_type| *video_type == "Iso")
-                    .and_then(|_| iso_type_for_path(path).map(ToString::to_string));
-                item.video_3d_format = crate::library::naming::parse_video_3d_format(&item.path);
-                let parsed_metadata = parse_sidecar_metadata_for_item(path, folder_type).await;
-                if parsed_metadata.has_nfo {
-                    if let Some(title) = parsed_metadata.title.clone() {
-                        item.title = title;
-                    }
-                    item.overview = parsed_metadata.overview.clone();
-                    item.official_rating = parsed_metadata.official_rating.clone();
-                    item.custom_rating = parsed_metadata.custom_rating.clone();
-                    item.video_3d_format = parsed_metadata
-                        .video_3d_format
-                        .clone()
-                        .or(item.video_3d_format);
-                    item.original_title = parsed_metadata.original_title.clone();
-                    item.sort_name = parsed_metadata.sort_name.clone();
-                    item.forced_sort_name = parsed_metadata.forced_sort_name.clone();
-                    item.lock_data = parsed_metadata.lock_data;
-                    item.locked_fields = parsed_metadata.locked_fields.clone();
-                    item.tagline = parsed_metadata.tagline.clone();
-                    item.collection_name = parsed_metadata.collection_name.clone();
-                    item.original_language = parsed_metadata.original_language.clone();
-                    item.preferred_metadata_language =
-                        parsed_metadata.preferred_metadata_language.clone();
-                    item.preferred_metadata_country_code =
-                        parsed_metadata.preferred_metadata_country_code.clone();
-                    item.series_status = parsed_metadata.series_status.clone();
-                    item.air_days = parsed_metadata.air_days.clone();
-                    item.air_time = parsed_metadata.air_time.clone();
-                    item.home_page_url = parsed_metadata.home_page_url.clone();
-                    item.remote_trailers = parsed_metadata.remote_trailers.clone();
-                    item.production_locations = parsed_metadata.production_locations.clone();
-                    item.production_year = parsed_metadata.production_year.or(item.production_year);
-                    item.premiere_date = parsed_metadata.premiere_date.clone();
-                    item.end_date = parsed_metadata.end_date.clone();
-                    item.runtime_ticks = parsed_metadata.runtime_ticks;
-                    item.aspect_ratio = parsed_metadata.aspect_ratio.clone();
-                    item.width = parsed_metadata.width;
-                    item.height = parsed_metadata.height;
-                    item.has_subtitles = parsed_metadata.has_subtitles.unwrap_or(false);
-                    item.display_order = parsed_metadata.display_order.clone();
-                    item.community_rating = parsed_metadata.community_rating;
-                    item.critic_rating = parsed_metadata.critic_rating;
-                    item.created_at = parsed_metadata.created_at.unwrap_or(item.created_at);
-                    if folder_type == "Season" {
-                        item.season_number = parsed_metadata.season_number.or(item.season_number);
-                    }
-                }
-                let media_probe = item
-                    .video_type
-                    .as_deref()
-                    .filter(|video_type| matches!(*video_type, "Dvd" | "BluRay"))
-                    .map(|_| PendingMediaProbe {
-                        media_path: path.to_path_buf(),
-                        probe_path: path.to_path_buf(),
-                        allow_size_mismatch: true,
-                    });
-                let job = IngestJob {
-                    item,
-                    source_path: path.to_path_buf(),
-                    parsed_metadata,
-                    clear_folder_metadata: folder_type == "Folder",
-                    media_probe,
-                };
-                if scope_paths.is_some() || item_requires_ingest(&job.item, &existing_media) {
-                    if queue_ingest(&ingest_tx, job).await {
-                        ingest_queued += 1;
-                    }
-                }
+            seen_paths.push(path_string.clone());
+            let scan_fingerprint = media_scan_fingerprint(
+                path,
+                &parent_id,
+                resolved.modified_at,
+                resolved.size_bytes,
+                scan_context,
+                &mut sidecar_fingerprints,
+            );
+            if scan_states.get(&path_string) == Some(&scan_fingerprint) {
+                unchanged += 1;
                 continue;
             }
-
-            // Handle STRM files: classify based on the resolved target's extension
-            let is_strm_file = strm::is_strm_path(path);
-            let (classify_path, probe_path) = if is_strm_file {
-                match strm::resolve_strm_path(path) {
-                    Ok(resolved_target) => {
-                        let ext_path = strm::classification_path_for_target(&resolved_target, path);
-                        (ext_path, Some(resolved_target))
-                    }
-                    Err(e) => {
-                        tracing::warn!("failed to resolve STRM {}: {e}", path.display());
-                        continue;
-                    }
-                }
-            } else {
-                (path.to_path_buf(), None)
-            };
-
-            let Some(item_type) = classify_media_path(&classify_path, &collection_type) else {
-                continue;
-            };
-            if collection_type == "homevideos" && !enable_photos && item_type == "Photo" {
-                continue;
+            let mut folder_type = tv_folder_type(path, &root, &collection_type);
+            if collection_type == "homevideos" && !enable_photos && folder_type == "PhotoAlbum" {
+                folder_type = "Folder";
             }
-            let extra_type =
-                video_extra_type(path, matches!(item_type.as_str(), "Audio" | "AudioBook"))
-                    .map(|extra_type| extra_type.as_jellyfin_str().to_string());
-            let video_type = file_video_type(path).map(ToString::to_string);
-            let iso_type = video_type
+            let (folder_title, year) =
+                crate::library::tmdb_metadata::clean_title_with_year(&resolved.name);
+            let mut item = ScannedMediaItem::folder_with_type(
+                resolved.id,
+                library_id.clone(),
+                parent_id,
+                path_string,
+                folder_title,
+                folder_type,
+                resolved.modified_at,
+                resolved.created_at,
+                year,
+            );
+            if folder_type == "Season" {
+                item.season_number =
+                    crate::library::tmdb_metadata::parse_season_number(&resolved.name);
+            }
+            item.video_type = folder_video_type(path).map(ToString::to_string);
+            // Jellyfin resolves DVD and Blu-ray directory structures as Video
+            // items whose Path happens to be a directory, not as folders.
+            item.is_folder = item
+                .video_type
+                .as_deref()
+                .is_none_or(|video_type| !matches!(video_type, "Dvd" | "BluRay"));
+            item.iso_type = item
+                .video_type
                 .as_deref()
                 .filter(|video_type| *video_type == "Iso")
                 .and_then(|_| iso_type_for_path(path).map(ToString::to_string));
-            let mut item_type = normalize_scanned_file_type(
-                &item_type,
-                &collection_type,
-                &parent_id,
-                &library_id,
-                path,
-                &root,
-                extra_type.is_some(),
-            );
-            parent_id = parent_id_for_scanned_file(
-                path,
-                &root,
-                &library_id,
-                &collection_type,
-                &item_type,
-                extra_type.is_some(),
-            );
-            if matches!(collection_type.as_str(), "tvshows" | "tv")
-                && item_type == "Episode"
-                && extra_type.is_none()
-                && let Some(season_id) = existing_episode_season_id(path, &existing_media)
-            {
-                parent_id = season_id;
-            }
-            let primary_path = if item_type == "Movie" {
-                stack_owners_cache
-                    .get_or_init(|| {
-                        movie_stack_part_owners(&root, &collection_type, scope_paths.as_deref())
-                    })
-                    .get(path)
-            } else if item_type == "Episode" {
-                episode_owners_cache
-                    .get_or_init(|| {
-                        episode_version_owners(
-                            &root,
-                            &library_id,
-                            &collection_type,
-                            scope_paths.as_deref(),
-                        )
-                    })
-                    .get(path)
-            } else {
-                None
-            };
-            if item_type == "Movie"
-                && let Some(primary_path) = primary_path
-            {
-                item_type = "Video".to_string();
-                parent_id = crate::util::stable_item_id(primary_path);
-            } else if item_type == "Episode"
-                && let Some(primary_path) = primary_path
-            {
-                item_type = "Video".to_string();
-                parent_id = crate::util::stable_item_id(primary_path);
-            }
-            let container = if is_strm_file {
-                probe_path
-                    .as_ref()
-                    .and_then(|target| strm::target_extension(&target.to_string_lossy()))
-            } else {
-                classify_path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .map(|extension| extension.to_ascii_lowercase())
-            };
-
-            seen_paths.push(path_string.clone());
-            let parsed_metadata = parse_sidecar_metadata_for_item(path, &item_type).await;
-            let parsed_name = parse_media_name(path, &collection_type);
-            let collapsed_book_directory = (item_type == "Book")
-                .then(|| path.parent())
-                .flatten()
-                .filter(|parent| {
-                    book_file_for_directory(parent)
-                        .as_deref()
-                        .is_some_and(|book| same_normalized_path(book, path))
-                });
-            let collapsed_audiobook_directory = (item_type == "AudioBook")
-                .then(|| path.parent())
-                .flatten()
-                .filter(|parent| {
-                    audiobook_file_for_directory(parent)
-                        .as_deref()
-                        .is_some_and(|audiobook| same_normalized_path(audiobook, path))
-                });
-            let parsed_book = (item_type == "Book").then(|| {
-                let source = collapsed_book_directory
-                    .and_then(|parent| parent.file_name())
-                    .or_else(|| path.file_stem())
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default();
-                crate::library::naming::parse_book_name(source)
-            });
-            if let Some(parent) = collapsed_book_directory.or(collapsed_audiobook_directory) {
-                parent_id = parent_id_for_path(parent, &root, &library_id);
-            }
-            let (audiobook_title, audiobook_year) = collapsed_audiobook_directory
-                .and_then(|parent| parent.file_name())
-                .and_then(|name| name.to_str())
-                .map(crate::library::tmdb_metadata::clean_title_with_year)
-                .unzip();
-            let mut season_number = parsed_metadata
-                .season_number
-                .or(parsed_name.season_number)
-                .or_else(|| episode_season_number_from_path(path, &root, &collection_type));
-            let episode_number = parsed_metadata
-                .episode_number
-                .or(parsed_name.episode_number);
-            if item_type == "Episode"
-                && season_number.is_none()
-                && (episode_number.is_some()
-                    || parsed_metadata.premiere_date.is_some()
-                    || parsed_name.premiere_date.is_some())
-            {
-                season_number = Some(1);
-            }
-            let episode_number_end = parsed_metadata
-                .ending_episode_number
-                .or(parsed_name.ending_episode_number);
-            let title = if parsed_metadata.has_nfo {
-                parsed_metadata
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| resolved.name.clone())
-            } else if let Some(book) = parsed_book.as_ref() {
-                book.title.clone()
-            } else if let Some(title) = audiobook_title {
-                title
-            } else if parsed_name.title.is_empty() {
-                resolved.name.clone()
-            } else {
-                parsed_name.title.clone()
-            };
-            let probe_target_path = probe_path.as_deref().unwrap_or(path);
-            let standalone_book_series_name = (item_type == "Book"
-                && collapsed_book_directory.is_none())
-            .then(|| {
-                path.parent()
-                    .and_then(|parent| parent.file_name())
-                    .and_then(|name| name.to_str())
-                    .map(ToString::to_string)
-            })
-            .flatten();
-            let item = ScannedMediaItem {
-                id: resolved.id,
-                title,
-                path: path_string,
-                library_id: library_id.clone(),
-                parent_id,
-                item_type,
-                extra_type,
-                video_type,
-                iso_type,
-                video_3d_format: parsed_metadata
+            item.video_3d_format = crate::library::naming::parse_video_3d_format(&item.path);
+            let parsed_metadata = parse_sidecar_metadata_for_item(path, folder_type).await;
+            if parsed_metadata.has_nfo {
+                if let Some(title) = parsed_metadata.title.clone() {
+                    item.title = title;
+                }
+                item.overview = parsed_metadata.overview.clone();
+                item.official_rating = parsed_metadata.official_rating.clone();
+                item.custom_rating = parsed_metadata.custom_rating.clone();
+                item.video_3d_format = parsed_metadata
                     .video_3d_format
                     .clone()
-                    .or(parsed_name.video_3d_format),
-                is_folder: false,
-                container,
-                overview: parsed_metadata.overview.clone(),
-                official_rating: parsed_metadata.official_rating.clone(),
-                custom_rating: parsed_metadata.custom_rating.clone(),
-                extended_video_type: (!parsed_name.extended_video_types.is_empty())
-                    .then(|| parsed_name.extended_video_types.join(",")),
-                original_title: parsed_metadata.original_title.clone(),
-                sort_name: parsed_metadata.sort_name.clone(),
-                forced_sort_name: parsed_metadata.forced_sort_name.clone(),
-                lock_data: parsed_metadata.lock_data,
-                locked_fields: parsed_metadata.locked_fields.clone(),
-                tagline: parsed_metadata.tagline.clone(),
-                collection_name: parsed_metadata.collection_name.clone(),
-                original_language: parsed_metadata.original_language.clone(),
-                preferred_metadata_language: parsed_metadata.preferred_metadata_language.clone(),
-                preferred_metadata_country_code: parsed_metadata
-                    .preferred_metadata_country_code
-                    .clone(),
-                series_status: parsed_metadata.series_status.clone(),
-                air_days: parsed_metadata.air_days.clone(),
-                air_time: parsed_metadata.air_time.clone(),
-                home_page_url: parsed_metadata.home_page_url.clone(),
-                remote_trailers: parsed_metadata.remote_trailers.clone(),
-                production_locations: parsed_metadata.production_locations.clone(),
-                production_year: parsed_metadata
-                    .production_year
-                    .or_else(|| {
-                        parsed_name
-                            .premiere_date
-                            .as_deref()
-                            .and_then(crate::util::year_from_yyyy_mm_dd)
-                    })
-                    .or_else(|| parsed_book.as_ref().and_then(|book| book.production_year))
-                    .or(audiobook_year.flatten()),
-                premiere_date: parsed_metadata
-                    .premiere_date
-                    .clone()
-                    .or_else(|| parsed_name.premiere_date.clone()),
-                end_date: parsed_metadata.end_date.clone(),
-                runtime_ticks: parsed_metadata.runtime_ticks,
-                aspect_ratio: parsed_metadata.aspect_ratio.clone(),
-                width: parsed_metadata.width,
-                height: parsed_metadata.height,
-                has_subtitles: parsed_metadata.has_subtitles.unwrap_or(false),
-                photo_metadata: None,
-                display_order: parsed_metadata.display_order.clone(),
-                size_bytes: resolved.size_bytes,
-                season_number: parsed_book
-                    .as_ref()
-                    .and_then(|book| book.parent_index_number)
-                    .or(season_number),
-                episode_number: parsed_book
-                    .as_ref()
-                    .and_then(|book| book.index_number)
-                    .or(episode_number),
-                episode_number_end,
-                airs_before_episode_number: parsed_metadata.airs_before_episode_number,
-                airs_after_season_number: parsed_metadata.airs_after_season_number,
-                airs_before_season_number: parsed_metadata.airs_before_season_number,
-                series_name: parsed_metadata
-                    .series_name
-                    .clone()
-                    .or_else(|| {
-                        parsed_book
-                            .as_ref()
-                            .and_then(|book| book.series_name.clone())
-                    })
-                    .or(standalone_book_series_name),
-                community_rating: parsed_metadata.community_rating,
-                critic_rating: parsed_metadata.critic_rating,
-                modified_at: resolved.modified_at,
-                created_at: parsed_metadata.created_at.unwrap_or(resolved.created_at),
-            };
-
-            let media_probe = (!is_video_stub(path)
-                && matches!(
-                    item.item_type.as_str(),
-                    "Audio"
-                        | "AudioBook"
-                        | "Movie"
-                        | "Episode"
-                        | "Video"
-                        | "Trailer"
-                        | "MusicVideo"
-                ))
-            .then(|| PendingMediaProbe {
-                media_path: path.to_path_buf(),
-                probe_path: probe_target_path.to_path_buf(),
-                allow_size_mismatch: is_strm_file,
-            });
-            let job = IngestJob {
+                    .or(item.video_3d_format);
+                item.original_title = parsed_metadata.original_title.clone();
+                item.sort_name = parsed_metadata.sort_name.clone();
+                item.forced_sort_name = parsed_metadata.forced_sort_name.clone();
+                item.lock_data = parsed_metadata.lock_data;
+                item.locked_fields = parsed_metadata.locked_fields.clone();
+                item.tagline = parsed_metadata.tagline.clone();
+                item.collection_name = parsed_metadata.collection_name.clone();
+                item.original_language = parsed_metadata.original_language.clone();
+                item.preferred_metadata_language =
+                    parsed_metadata.preferred_metadata_language.clone();
+                item.preferred_metadata_country_code =
+                    parsed_metadata.preferred_metadata_country_code.clone();
+                item.series_status = parsed_metadata.series_status.clone();
+                item.air_days = parsed_metadata.air_days.clone();
+                item.air_time = parsed_metadata.air_time.clone();
+                item.home_page_url = parsed_metadata.home_page_url.clone();
+                item.remote_trailers = parsed_metadata.remote_trailers.clone();
+                item.production_locations = parsed_metadata.production_locations.clone();
+                item.production_year = parsed_metadata.production_year.or(item.production_year);
+                item.premiere_date = parsed_metadata.premiere_date.clone();
+                item.end_date = parsed_metadata.end_date.clone();
+                item.runtime_ticks = parsed_metadata.runtime_ticks;
+                item.aspect_ratio = parsed_metadata.aspect_ratio.clone();
+                item.width = parsed_metadata.width;
+                item.height = parsed_metadata.height;
+                item.has_subtitles = parsed_metadata.has_subtitles.unwrap_or(false);
+                item.display_order = parsed_metadata.display_order.clone();
+                item.community_rating = parsed_metadata.community_rating;
+                item.critic_rating = parsed_metadata.critic_rating;
+                item.created_at = parsed_metadata.created_at.unwrap_or(item.created_at);
+                if folder_type == "Season" {
+                    item.season_number = parsed_metadata.season_number.or(item.season_number);
+                }
+            }
+            let media_probe = item
+                .video_type
+                .as_deref()
+                .filter(|video_type| matches!(*video_type, "Dvd" | "BluRay"))
+                .map(|_| PendingMediaProbe {
+                    media_path: path.to_path_buf(),
+                    probe_path: path.to_path_buf(),
+                    allow_size_mismatch: true,
+                });
+            let job = ItemRefreshJob {
                 item,
                 source_path: path.to_path_buf(),
                 parsed_metadata,
-                clear_folder_metadata: false,
+                clear_folder_metadata: folder_type == "Folder",
                 media_probe,
+                scan_fingerprint,
             };
-            if scope_paths.is_some() || item_requires_ingest(&job.item, &existing_media) {
-                if queue_ingest(&ingest_tx, job).await {
-                    ingest_queued += 1;
-                    scanned += 1;
+            if queue_item_refresh(&refresh_tx, job, &cancellation).await {
+                refresh_queued += 1;
+            }
+            continue;
+        }
+
+        // Handle STRM files: classify based on the resolved target's extension
+        let is_strm_file = strm::is_strm_path(path);
+        let (classify_path, probe_path) = if is_strm_file {
+            match strm::resolve_strm_path(path) {
+                Ok(resolved_target) => {
+                    let ext_path = strm::classification_path_for_target(&resolved_target, path);
+                    (ext_path, Some(resolved_target))
+                }
+                Err(e) => {
+                    tracing::warn!("failed to resolve STRM {}: {e}", path.display());
+                    continue;
                 }
             }
+        } else {
+            (path.to_path_buf(), None)
+        };
+
+        let Some(item_type) = classify_media_path(&classify_path, &collection_type) else {
+            continue;
+        };
+        if collection_type == "homevideos" && !enable_photos && item_type == "Photo" {
+            continue;
+        }
+        let extra_type =
+            video_extra_type(path, matches!(item_type.as_str(), "Audio" | "AudioBook"))
+                .map(|extra_type| extra_type.as_jellyfin_str().to_string());
+        let video_type = file_video_type(path).map(ToString::to_string);
+        let iso_type = video_type
+            .as_deref()
+            .filter(|video_type| *video_type == "Iso")
+            .and_then(|_| iso_type_for_path(path).map(ToString::to_string));
+        let mut item_type = normalize_scanned_file_type(
+            &item_type,
+            &collection_type,
+            &parent_id,
+            &library_id,
+            path,
+            &root,
+            extra_type.is_some(),
+        );
+        parent_id = parent_id_for_scanned_file(
+            path,
+            &root,
+            &library_id,
+            &collection_type,
+            &item_type,
+            extra_type.is_some(),
+        );
+        if item_type == "Movie"
+            && let Some(primary_path) = stack_part_owners.get(path)
+        {
+            item_type = "Video".to_string();
+            parent_id = crate::util::stable_item_id(primary_path);
+        } else if item_type == "Episode"
+            && let Some(primary_path) = episode_version_owners.get(path)
+        {
+            item_type = "Video".to_string();
+            parent_id = crate::util::stable_item_id(primary_path);
+        }
+        let container = if is_strm_file {
+            probe_path
+                .as_ref()
+                .and_then(|target| strm::target_extension(&target.to_string_lossy()))
+        } else {
+            classify_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.to_ascii_lowercase())
+        };
+
+        seen_paths.push(path_string.clone());
+        scanned += 1;
+        let scan_fingerprint = media_scan_fingerprint(
+            path,
+            &parent_id,
+            resolved.modified_at,
+            resolved.size_bytes,
+            scan_context,
+            &mut sidecar_fingerprints,
+        );
+        if scan_states.get(&path_string) == Some(&scan_fingerprint) {
+            unchanged += 1;
+            continue;
+        }
+        let parsed_metadata = parse_sidecar_metadata_for_item(path, &item_type).await;
+        let parsed_name = parse_media_name(path, &collection_type);
+        let collapsed_book_directory = (item_type == "Book")
+            .then(|| path.parent())
+            .flatten()
+            .filter(|parent| {
+                book_file_for_directory(parent)
+                    .as_deref()
+                    .is_some_and(|book| same_normalized_path(book, path))
+            });
+        let collapsed_audiobook_directory = (item_type == "AudioBook")
+            .then(|| path.parent())
+            .flatten()
+            .filter(|parent| {
+                audiobook_file_for_directory(parent)
+                    .as_deref()
+                    .is_some_and(|audiobook| same_normalized_path(audiobook, path))
+            });
+        let parsed_book = (item_type == "Book").then(|| {
+            let source = collapsed_book_directory
+                .and_then(|parent| parent.file_name())
+                .or_else(|| path.file_stem())
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            crate::library::naming::parse_book_name(source)
+        });
+        if let Some(parent) = collapsed_book_directory.or(collapsed_audiobook_directory) {
+            parent_id = parent_id_for_path(parent, &root, &library_id);
+        }
+        let (audiobook_title, audiobook_year) = collapsed_audiobook_directory
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .map(crate::library::tmdb_metadata::clean_title_with_year)
+            .unzip();
+        let mut season_number = resolve_episode_season_number(
+            path,
+            &root,
+            &collection_type,
+            parsed_metadata.season_number,
+            parsed_name.season_number,
+        );
+        let episode_number = parsed_metadata
+            .episode_number
+            .or(parsed_name.episode_number);
+        if item_type == "Episode"
+            && season_number.is_none()
+            && (episode_number.is_some()
+                || parsed_metadata.premiere_date.is_some()
+                || parsed_name.premiere_date.is_some())
+        {
+            season_number = Some(1);
+        }
+        let episode_number_end = parsed_metadata
+            .ending_episode_number
+            .or(parsed_name.ending_episode_number);
+        let title = if parsed_metadata.has_nfo {
+            parsed_metadata
+                .title
+                .clone()
+                .unwrap_or_else(|| resolved.name.clone())
+        } else if let Some(book) = parsed_book.as_ref() {
+            book.title.clone()
+        } else if let Some(title) = audiobook_title {
+            title
+        } else if parsed_name.title.is_empty() {
+            resolved.name.clone()
+        } else {
+            parsed_name.title.clone()
+        };
+        let probe_target_path = probe_path.as_deref().unwrap_or(path);
+        let standalone_book_series_name = (item_type == "Book"
+            && collapsed_book_directory.is_none())
+        .then(|| {
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .map(ToString::to_string)
+        })
+        .flatten();
+        let item = ScannedMediaItem {
+            id: resolved.id,
+            title,
+            path: path_string,
+            library_id: library_id.clone(),
+            parent_id,
+            item_type,
+            extra_type,
+            video_type,
+            iso_type,
+            video_3d_format: parsed_metadata
+                .video_3d_format
+                .clone()
+                .or(parsed_name.video_3d_format),
+            is_folder: false,
+            container,
+            overview: parsed_metadata.overview.clone(),
+            official_rating: parsed_metadata.official_rating.clone(),
+            custom_rating: parsed_metadata.custom_rating.clone(),
+            extended_video_type: (!parsed_name.extended_video_types.is_empty())
+                .then(|| parsed_name.extended_video_types.join(",")),
+            original_title: parsed_metadata.original_title.clone(),
+            sort_name: parsed_metadata.sort_name.clone(),
+            forced_sort_name: parsed_metadata.forced_sort_name.clone(),
+            lock_data: parsed_metadata.lock_data,
+            locked_fields: parsed_metadata.locked_fields.clone(),
+            tagline: parsed_metadata.tagline.clone(),
+            collection_name: parsed_metadata.collection_name.clone(),
+            original_language: parsed_metadata.original_language.clone(),
+            preferred_metadata_language: parsed_metadata.preferred_metadata_language.clone(),
+            preferred_metadata_country_code: parsed_metadata
+                .preferred_metadata_country_code
+                .clone(),
+            series_status: parsed_metadata.series_status.clone(),
+            air_days: parsed_metadata.air_days.clone(),
+            air_time: parsed_metadata.air_time.clone(),
+            home_page_url: parsed_metadata.home_page_url.clone(),
+            remote_trailers: parsed_metadata.remote_trailers.clone(),
+            production_locations: parsed_metadata.production_locations.clone(),
+            production_year: parsed_metadata
+                .production_year
+                .or_else(|| {
+                    parsed_name
+                        .premiere_date
+                        .as_deref()
+                        .and_then(crate::util::year_from_yyyy_mm_dd)
+                })
+                .or_else(|| parsed_book.as_ref().and_then(|book| book.production_year))
+                .or(audiobook_year.flatten()),
+            premiere_date: parsed_metadata
+                .premiere_date
+                .clone()
+                .or_else(|| parsed_name.premiere_date.clone()),
+            end_date: parsed_metadata.end_date.clone(),
+            runtime_ticks: parsed_metadata.runtime_ticks,
+            aspect_ratio: parsed_metadata.aspect_ratio.clone(),
+            width: parsed_metadata.width,
+            height: parsed_metadata.height,
+            has_subtitles: parsed_metadata.has_subtitles.unwrap_or(false),
+            photo_metadata: None,
+            display_order: parsed_metadata.display_order.clone(),
+            size_bytes: resolved.size_bytes,
+            season_number: parsed_book
+                .as_ref()
+                .and_then(|book| book.parent_index_number)
+                .or(season_number),
+            episode_number: parsed_book
+                .as_ref()
+                .and_then(|book| book.index_number)
+                .or(episode_number),
+            episode_number_end,
+            airs_before_episode_number: parsed_metadata.airs_before_episode_number,
+            airs_after_season_number: parsed_metadata.airs_after_season_number,
+            airs_before_season_number: parsed_metadata.airs_before_season_number,
+            series_name: parsed_metadata
+                .series_name
+                .clone()
+                .or_else(|| {
+                    parsed_book
+                        .as_ref()
+                        .and_then(|book| book.series_name.clone())
+                })
+                .or(standalone_book_series_name),
+            community_rating: parsed_metadata.community_rating,
+            critic_rating: parsed_metadata.critic_rating,
+            modified_at: resolved.modified_at,
+            created_at: parsed_metadata.created_at.unwrap_or(resolved.created_at),
+        };
+
+        let media_probe = (!is_video_stub(path)
+            && matches!(
+                item.item_type.as_str(),
+                "Audio" | "AudioBook" | "Movie" | "Episode" | "Video" | "Trailer" | "MusicVideo"
+            ))
+        .then(|| PendingMediaProbe {
+            media_path: path.to_path_buf(),
+            probe_path: probe_target_path.to_path_buf(),
+            allow_size_mismatch: is_strm_file,
+        });
+        let job = ItemRefreshJob {
+            item,
+            source_path: path.to_path_buf(),
+            parsed_metadata,
+            clear_folder_metadata: false,
+            media_probe,
+            scan_fingerprint,
+        };
+        if queue_item_refresh(&refresh_tx, job, &cancellation).await {
+            refresh_queued += 1;
         }
     }
 
     Ok(ScanRootResult {
         scanned,
+        unchanged,
         seen_paths,
-        ingest_queued,
+        refresh_queued,
     })
 }
 
-fn movie_stack_part_owners(
+async fn scan_path_inventory(
+    scan_path: &std::path::Path,
+    cancellation: &CancellationToken,
+    progress: &ScanProgressTracker,
+) -> anyhow::Result<Vec<DirEntry>> {
+    let mut inventory = Vec::new();
+    for entry in WalkDir::new(scan_path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_ignored_scan_path(entry.path()))
+    {
+        ensure_scan_active(cancellation)?;
+        progress.discovered_entry();
+        match entry {
+            Ok(entry) => inventory.push(entry),
+            Err(error) => tracing::warn!("failed to read media path: {error}"),
+        }
+        if inventory.len().is_multiple_of(64) {
+            crate::library::resource_governor::cooperative_scan_yield().await;
+        }
+    }
+    Ok(inventory)
+}
+
+fn inventory_file_path(entry: &DirEntry) -> Option<&std::path::Path> {
+    entry.file_type().is_file().then(|| entry.path())
+}
+
+fn movie_stack_part_owners<'a>(
+    paths: impl IntoIterator<Item = &'a std::path::Path>,
     root: &std::path::Path,
     collection_type: &str,
-    scope_paths: Option<&[PathBuf]>,
+    cancellation: &CancellationToken,
 ) -> HashMap<PathBuf, PathBuf> {
     if collection_type != "movies" {
         return HashMap::new();
     }
 
     let mut groups = HashMap::<(PathBuf, String), Vec<(i64, PathBuf)>>::new();
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| !is_ignored_scan_path(entry.path()))
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-    {
-        let path = entry.path();
-        if is_ignored_scan_path(path)
-            || !path_is_in_scan_scope(path, scope_paths)
-            || should_skip_disc_structure_entry(path, root)
+    for path in paths {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if should_skip_disc_structure_entry(path, root)
             || classify_media_path(path, collection_type).as_deref() != Some("Video")
             || video_extra_type(path, false).is_some()
         {
@@ -1103,11 +1225,12 @@ fn movie_stack_part_owners(
     owners
 }
 
-fn episode_version_owners(
-    root: &std::path::Path,
+fn episode_version_owners<'a>(
+    paths: impl IntoIterator<Item = &'a std::path::Path>,
+    library_root: &std::path::Path,
     library_id: &str,
     collection_type: &str,
-    scope_paths: Option<&[PathBuf]>,
+    cancellation: &CancellationToken,
 ) -> HashMap<PathBuf, PathBuf> {
     if !matches!(collection_type, "tvshows" | "tv") {
         return HashMap::new();
@@ -1116,28 +1239,26 @@ fn episode_version_owners(
     let mut groups =
         HashMap::<(String, Option<i64>, String), Vec<(PathBuf, Option<String>, Option<i64>)>>::new(
         );
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| !is_ignored_scan_path(entry.path()))
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-    {
-        let path = entry.path();
-        if is_ignored_scan_path(path)
-            || !path_is_in_scan_scope(path, scope_paths)
-            || classify_media_path(path, collection_type).as_deref() != Some("Episode")
+    for path in paths {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if classify_media_path(path, collection_type).as_deref() != Some("Episode")
             || video_extra_type(path, false).is_some()
         {
             continue;
         }
         let parsed = parse_media_name(path, collection_type);
-        let season = parsed
-            .season_number
-            .or_else(|| episode_season_number_from_path(path, root, collection_type))
-            .or_else(|| {
-                (parsed.episode_number.is_some() || parsed.premiere_date.is_some()).then_some(1)
-            });
+        let season = resolve_episode_season_number(
+            path,
+            library_root,
+            collection_type,
+            None,
+            parsed.season_number,
+        )
+        .or_else(|| {
+            (parsed.episode_number.is_some() || parsed.premiere_date.is_some()).then_some(1)
+        });
         let episode_key = if let Some(episode) = parsed.episode_number {
             format!(
                 "E{episode}:{}",
@@ -1148,8 +1269,14 @@ fn episode_version_owners(
         } else {
             continue;
         };
-        let parent_id =
-            parent_id_for_scanned_file(path, root, library_id, collection_type, "Episode", false);
+        let parent_id = parent_id_for_scanned_file(
+            path,
+            library_root,
+            library_id,
+            collection_type,
+            "Episode",
+            false,
+        );
         groups
             .entry((parent_id, season, episode_key))
             .or_default()
@@ -1213,145 +1340,21 @@ fn video_version_rank(version: Option<&str>) -> i64 {
     0
 }
 
-pub(crate) fn is_ignored_scan_path(path: &std::path::Path) -> bool {
-    path.components()
-        .any(|component| component.as_os_str() == std::ffi::OsStr::new(".oani-download-tmp"))
-}
-
-fn item_requires_ingest(
-    item: &ScannedMediaItem,
-    existing_media: &HashMap<String, ExistingMediaState>,
+async fn queue_item_refresh(
+    refresh_tx: &mpsc::Sender<ItemRefreshJob>,
+    job: ItemRefreshJob,
+    cancellation: &CancellationToken,
 ) -> bool {
-    existing_media.get(&item.path).is_none_or(|existing| {
-        // STRM ingestion replaces the source-file size with the resolved media size after
-        // probing. Comparing that value with the tiny STRM text file would make every
-        // unchanged STRM look modified on the next full scan. Its mtime is the stable source
-        // fingerprint; a changed STRM gets a new mtime and is still re-ingested.
-        let source_size_changed = !item.path.to_ascii_lowercase().ends_with(".strm")
-            && existing.size_bytes != item.size_bytes;
-        existing.item_type != item.item_type
-            || existing.parent_id != item.parent_id
-            || existing.modified_at != item.modified_at
-            || source_size_changed
-    })
-}
-
-fn existing_episode_season_id(
-    path: &std::path::Path,
-    existing_media: &HashMap<String, ExistingMediaState>,
-) -> Option<String> {
-    let parent_path = path.parent()?;
-    let normalized_parent = path_utils::normalize_path(&parent_path.to_string_lossy());
-    existing_media
-        .get(&normalized_parent)
-        .filter(|parent| parent.item_type == "Season")
-        .map(|parent| parent.id.clone())
-}
-
-fn source_fingerprint_is_unchanged(
-    path: &str,
-    resolved: &path_utils::ResolvedPathInfo,
-    existing: &ExistingMediaState,
-) -> bool {
-    existing.modified_at == resolved.modified_at
-        && (path.to_ascii_lowercase().ends_with(".strm")
-            || existing.size_bytes == resolved.size_bytes)
-}
-
-struct ScanPreflight {
-    has_changes: bool,
-    seen_paths: Vec<String>,
-}
-
-fn scan_root_preflight(
-    root: &std::path::Path,
-    collection_type: &str,
-    existing_media: &HashMap<String, ExistingMediaState>,
-) -> anyhow::Result<ScanPreflight> {
-    let normalized_root = path_utils::normalize_path(&root.to_string_lossy());
-    let mut has_changes = false;
-    let mut seen_paths = Vec::new();
-    let mut seen_set = std::collections::HashSet::new();
-    seen_set.insert(normalized_root);
-
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| !is_ignored_scan_path(entry.path()))
-    {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracing::warn!("failed to read media path during preflight: {error}");
-                has_changes = true;
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path == root || should_skip_disc_structure_entry(path, root) {
-            continue;
-        }
-
-        // Match the main scanner's notion of a media item. Sidecars, artwork and
-        // unrelated files must not force an expensive full scan every time.
-        if !entry.file_type().is_dir()
-            && !strm::is_strm_path(path)
-            && classify_media_path(path, collection_type).is_none()
-        {
-            continue;
-        }
-
-        let resolved = match path_utils::resolve_path_info(path) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                tracing::warn!(
-                    "failed to resolve media path during preflight {}: {error:#}",
-                    path.display()
-                );
-                has_changes = true;
-                continue;
-            }
-        };
-        let path_string = resolved.path.clone();
-        seen_set.insert(path_string.clone());
-        seen_paths.push(path_string.clone());
-        let parent_changed = matches!(collection_type, "tvshows" | "tv")
-            && existing_media.get(&path_string).is_some_and(|existing| {
-                existing.item_type == "Episode"
-                    && existing_episode_season_id(path, existing_media)
-                        .is_some_and(|season_id| existing.parent_id != season_id)
-            });
-        match existing_media.get(&path_string) {
-            Some(existing)
-                if source_fingerprint_is_unchanged(&path_string, &resolved, existing)
-                    && !parent_changed => {}
-            _ => has_changes = true,
-        }
-    }
-
-    if existing_media
-        .keys()
-        .any(|path| PathBuf::from(path).starts_with(root) && !seen_set.contains(path))
-    {
-        has_changes = true;
-    }
-
-    Ok(ScanPreflight {
-        has_changes,
-        seen_paths,
-    })
-}
-
-fn path_is_in_scan_scope(path: &std::path::Path, scope_paths: Option<&[PathBuf]>) -> bool {
-    scope_paths.is_none_or(|scopes| scopes.iter().any(|scope| path.starts_with(scope)))
-}
-
-async fn queue_ingest(ingest_tx: &mpsc::Sender<IngestJob>, job: IngestJob) -> bool {
-    match ingest_tx.send(job).await {
+    let sent = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return false,
+        result = refresh_tx.send(job) => result,
+    };
+    match sent {
         Ok(()) => true,
         Err(error) => {
             tracing::warn!(
-                "ingest queue closed before job could be scheduled for {}",
+                "item refresh queue closed before job could be scheduled for {}",
                 error.0.item.path
             );
             false
@@ -1359,101 +1362,369 @@ async fn queue_ingest(ingest_tx: &mpsc::Sender<IngestJob>, job: IngestJob) -> bo
     }
 }
 
-fn start_ingest_pipeline(
-    db: sea_orm::DatabaseConnection,
-    force_probe: bool,
-    probe_tx: mpsc::Sender<MediaProbeJob>,
-    metadata_tx: mpsc::UnboundedSender<MetadataFetchJob>,
-) -> IngestPipeline {
-    let concurrency = ingest_concurrency();
-    let queue_capacity = ingest_queue_capacity();
-    let (tx, rx) = mpsc::channel::<IngestJob>(queue_capacity);
+fn start_refresh_job_stager(db: sea_orm::DatabaseConnection, scan_id: String) -> RefreshJobStager {
+    const STAGE_BATCH_SIZE: usize = 256;
+    let (tx, mut rx) = mpsc::channel::<ItemRefreshJob>(item_refresh_queue_capacity());
     let handle = tokio::spawn(async move {
-        let receiver = Arc::new(Mutex::new(rx));
-        let mut workers = tokio::task::JoinSet::new();
-        tracing::info!(
-            "ingest pipeline started concurrency={concurrency} queue_capacity={queue_capacity}"
-        );
+        let mut staged = 0usize;
+        let mut batch = Vec::with_capacity(STAGE_BATCH_SIZE);
+        while let Some(job) = rx.recv().await {
+            batch.push(job);
+            if batch.len() >= STAGE_BATCH_SIZE {
+                staged += stage_refresh_job_batch(&db, &scan_id, &mut batch).await?;
+            }
+        }
+        staged += stage_refresh_job_batch(&db, &scan_id, &mut batch).await?;
+        Ok(staged)
+    });
+    RefreshJobStager { tx, handle }
+}
 
-        for _ in 0..concurrency {
-            let db = db.clone();
-            let receiver = receiver.clone();
-            let probe_tx = probe_tx.clone();
-            let metadata_tx = metadata_tx.clone();
-            workers.spawn(async move {
-                let mut stats = IngestWorkerStats::default();
-                loop {
-                    let job = {
-                        let mut receiver = receiver.lock().await;
-                        receiver.recv().await
-                    };
-                    let Some(job) = job else {
+async fn stage_refresh_job_batch(
+    db: &sea_orm::DatabaseConnection,
+    scan_id: &str,
+    batch: &mut Vec<ItemRefreshJob>,
+) -> anyhow::Result<usize> {
+    if batch.is_empty() {
+        return Ok(0);
+    }
+    let jobs = batch
+        .drain(..)
+        .map(|job| {
+            Ok(crate::library::refresh_queue::RefreshJobPayload {
+                library_id: job.item.library_id.clone(),
+                path: job.item.path.clone(),
+                payload: serde_json::to_value(job).context("failed to encode item refresh job")?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    crate::library::refresh_queue::enqueue_batch(db, scan_id, &jobs).await
+}
+
+async fn run_item_refresh_workers(
+    db: sea_orm::DatabaseConnection,
+    preferred_scan_id: &str,
+    force_probe: bool,
+    ffmpeg_path: String,
+    api_key: String,
+    tmdb_proxy_url: Arc<RwLock<Option<String>>>,
+    tmdb_http_client: Arc<RwLock<reqwest::Client>>,
+    library_options: HashMap<String, crate::library::tmdb_metadata::TmdbLibraryProviderOptions>,
+    cancellation: CancellationToken,
+    progress: ScanProgressTracker,
+    refresh_total: usize,
+) -> ItemRefreshWorkerStats {
+    let concurrency = item_refresh_concurrency();
+    let chapter_image_settings = Arc::new(crate::chapters::chapter_image_scan_settings(&db).await);
+    let dummy_chapter_duration_seconds = configured_dummy_chapter_duration_seconds(&db).await;
+    let library_options = Arc::new(library_options);
+    let preferred_scan_id = Arc::<str>::from(preferred_scan_id);
+    let mut workers = tokio::task::JoinSet::new();
+    tracing::info!(
+        "Jellyfin-style item refresh workers started concurrency={concurrency} source=PostgreSQL"
+    );
+
+    for worker_index in 0..concurrency {
+        let db = db.clone();
+        let ffmpeg_path = ffmpeg_path.clone();
+        let api_key = api_key.clone();
+        let tmdb_proxy_url = tmdb_proxy_url.clone();
+        let tmdb_http_client = tmdb_http_client.clone();
+        let library_options = library_options.clone();
+        let chapter_image_settings = chapter_image_settings.clone();
+        let preferred_scan_id = preferred_scan_id.clone();
+        let cancellation = cancellation.clone();
+        let progress = progress.clone();
+        workers.spawn(async move {
+            let mut stats = ItemRefreshWorkerStats::default();
+            let mut idle_rounds = 0usize;
+            loop {
+                if cancellation.is_cancelled() {
+                    break;
+                }
+                let claim = crate::library::refresh_queue::claim_next(&db, &preferred_scan_id);
+                let claimed = match tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    claimed = claim => claimed,
+                } {
+                    Ok(claimed) => claimed,
+                    Err(error) => {
+                        stats.failed += 1;
+                        tracing::warn!("failed to claim PostgreSQL refresh job: {error:#}");
                         break;
-                    };
-                    stats.completed += 1;
-                    match run_ingest_job(db.clone(), job, force_probe, &probe_tx, &metadata_tx)
-                        .await
-                    {
-                        Ok(result) => {
-                            if result.metadata_queued {
-                                stats.metadata_queued += 1;
-                            }
-                            if result.probe_queued {
-                                stats.probe_queued += 1;
-                            }
-                            if result.probe_skipped {
-                                stats.probe_skipped += 1;
-                            }
+                    }
+                };
+                let Some(claimed) = claimed else {
+                    idle_rounds += 1;
+                    if idle_rounds >= 3 {
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
+                    continue;
+                };
+                idle_rounds = 0;
+                let job = match serde_json::from_str::<ItemRefreshJob>(&claimed.payload) {
+                    Ok(job) => job,
+                    Err(error) => {
+                        stats.failed += 1;
+                        let _ = crate::library::refresh_queue::fail(
+                            &db,
+                            claimed.id,
+                            &format!("invalid refresh payload: {error}"),
+                        )
+                        .await;
+                        progress.refresh_completed(refresh_total);
+                        continue;
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    _ = crate::library::resource_governor::wait_for_background_worker(worker_index, 1) => {}
+                }
+                let refresh = run_item_refresh_job(
+                    db.clone(),
+                    job,
+                    force_probe,
+                    &ffmpeg_path,
+                    dummy_chapter_duration_seconds,
+                    &chapter_image_settings,
+                    &api_key,
+                    tmdb_proxy_url.clone(),
+                    tmdb_http_client.clone(),
+                    &library_options,
+                );
+                let refresh_result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    result = refresh => result,
+                };
+                match refresh_result {
+                    Ok(result) => {
+                        stats.completed += 1;
+                        if result.metadata_completed {
+                            stats.metadata_completed += 1;
                         }
-                        Err(error) => {
+                        if result.metadata_deferred {
+                            stats.metadata_deferred += 1;
+                        }
+                        if result.metadata_failed {
+                            stats.metadata_failed += 1;
+                        }
+                        if result.probe_completed {
+                            stats.probe_completed += 1;
+                        }
+                        if result.probe_skipped {
+                            stats.probe_skipped += 1;
+                        }
+                        if result.probe_failed {
+                            stats.probe_failed += 1;
+                        }
+                        if let Err(error) =
+                            crate::library::refresh_queue::complete(&db, claimed.id).await
+                        {
                             stats.failed += 1;
-                            tracing::warn!("ingest job failed: {error:#}");
+                            tracing::warn!("failed to complete PostgreSQL refresh job: {error:#}");
                         }
                     }
+                    Err(error) => {
+                        if let Err(queue_error) = crate::library::refresh_queue::fail(
+                            &db,
+                            claimed.id,
+                            &format!("{error:#}"),
+                        )
+                        .await
+                        {
+                            stats.failed += 1;
+                            tracing::warn!(
+                                "failed to record PostgreSQL refresh error: {queue_error:#}"
+                            );
+                        }
+                        tracing::warn!("item refresh failed: {error:#}");
+                    }
                 }
-                stats
-            });
-        }
+                progress.refresh_completed(refresh_total);
+            }
+            stats
+        });
+    }
 
-        let mut stats = IngestWorkerStats::default();
-        while let Some(result) = workers.join_next().await {
-            match result {
-                Ok(worker_stats) => {
-                    stats.completed += worker_stats.completed;
-                    stats.metadata_queued += worker_stats.metadata_queued;
-                    stats.probe_queued += worker_stats.probe_queued;
-                    stats.probe_skipped += worker_stats.probe_skipped;
-                    stats.failed += worker_stats.failed;
+    let mut stats = ItemRefreshWorkerStats::default();
+    while let Some(result) = workers.join_next().await {
+        match result {
+            Ok(worker_stats) => {
+                stats.completed += worker_stats.completed;
+                stats.metadata_completed += worker_stats.metadata_completed;
+                stats.metadata_deferred += worker_stats.metadata_deferred;
+                stats.metadata_failed += worker_stats.metadata_failed;
+                stats.probe_completed += worker_stats.probe_completed;
+                stats.probe_skipped += worker_stats.probe_skipped;
+                stats.probe_failed += worker_stats.probe_failed;
+                stats.failed += worker_stats.failed;
+            }
+            Err(error) => {
+                stats.failed += 1;
+                tracing::warn!("item refresh worker task panicked: {error}");
+            }
+        }
+    }
+
+    tracing::info!(
+        "Jellyfin-style item refresh completed {} job(s); metadata_completed={} metadata_deferred={} metadata_failed={} probe_completed={} probe_skipped={} probe_failed={} failed={}",
+        stats.completed,
+        stats.metadata_completed,
+        stats.metadata_deferred,
+        stats.metadata_failed,
+        stats.probe_completed,
+        stats.probe_skipped,
+        stats.probe_failed,
+        stats.failed
+    );
+    stats
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_item_refresh_job(
+    db: sea_orm::DatabaseConnection,
+    mut job: ItemRefreshJob,
+    force_probe: bool,
+    ffmpeg_path: &str,
+    dummy_chapter_duration_seconds: i64,
+    chapter_image_settings: &crate::chapters::ChapterImageScanSettings,
+    api_key: &str,
+    tmdb_proxy_url: Arc<RwLock<Option<String>>>,
+    tmdb_http_client: Arc<RwLock<reqwest::Client>>,
+    library_options: &HashMap<String, crate::library::tmdb_metadata::TmdbLibraryProviderOptions>,
+) -> anyhow::Result<ItemRefreshResult> {
+    let mut result = ItemRefreshResult::default();
+    let local = run_local_refresh_job(&db, &mut job, force_probe).await?;
+    job.item.id = local.stored_item_id;
+
+    if let Some(metadata_job) =
+        metadata_fetch_job(&job.item, &job.source_path, job.parsed_metadata.has_nfo)
+    {
+        let provider_options = library_options
+            .get(&job.item.library_id)
+            .cloned()
+            .unwrap_or_default();
+        let tmdb_base_url = tmdb_proxy_url.read().await.clone();
+        let tmdb_client = tmdb_http_client.read().await.clone();
+        for attempt in 0..=METADATA_DEPENDENCY_MAX_ATTEMPTS {
+            match run_metadata_fetch_job(
+                db.clone(),
+                &metadata_job,
+                api_key,
+                &tmdb_client,
+                tmdb_base_url.as_deref(),
+                &provider_options,
+            )
+            .await
+            {
+                Ok(true) => {
+                    result.metadata_completed = true;
+                    break;
+                }
+                Ok(false) if attempt < METADATA_DEPENDENCY_MAX_ATTEMPTS => {
+                    tokio::time::sleep(METADATA_DEPENDENCY_RETRY_DELAY).await;
+                }
+                Ok(false) => {
+                    result.metadata_deferred = true;
+                    break;
                 }
                 Err(error) => {
-                    stats.failed += 1;
-                    tracing::warn!("ingest worker task panicked: {error}");
+                    result.metadata_failed = true;
+                    tracing::warn!(
+                        "metadata provider failed during item refresh: {}",
+                        crate::library::tmdb_metadata::redact_tmdb_error(&error)
+                    );
+                    break;
                 }
             }
         }
 
-        tracing::info!(
-            "ingest pipeline completed {} job(s); metadata_queued={} probe_queued={} probe_skipped={} failed={}",
-            stats.completed,
-            stats.metadata_queued,
-            stats.probe_queued,
-            stats.probe_skipped,
-            stats.failed
-        );
-        stats
-    });
-    IngestPipeline { tx, handle }
+        if let Some(stored) = MediaItems::find_by_id(job.item.id.clone()).one(&db).await? {
+            job.item = ScannedMediaItem::from_stored(&stored);
+        }
+    }
+
+    let scan_state = (
+        job.item.path.clone(),
+        job.item.id.clone(),
+        job.item.library_id.clone(),
+        job.scan_fingerprint,
+    );
+    let Some(pending_probe) = job.media_probe.take() else {
+        persist_completed_scan_state(&db, &scan_state, local.scan_state_cacheable).await;
+        return Ok(result);
+    };
+
+    if local.probe_skipped {
+        result.probe_skipped = true;
+        persist_completed_scan_state(&db, &scan_state, local.scan_state_cacheable).await;
+        return Ok(result);
+    }
+
+    match run_media_probe_job(
+        db.clone(),
+        MediaProbeJob {
+            item: job.item,
+            media_path: pending_probe.media_path,
+            probe_path: pending_probe.probe_path,
+        },
+        dummy_chapter_duration_seconds,
+        ffmpeg_path,
+        chapter_image_settings,
+    )
+    .await
+    {
+        Ok(probe) if probe.stream_probe_succeeded => {
+            result.probe_completed = true;
+            persist_completed_scan_state(&db, &scan_state, true).await;
+        }
+        Ok(_) => result.probe_failed = true,
+        Err(error) => {
+            result.probe_failed = true;
+            tracing::warn!("ProbeProvider failed during item refresh: {error:#}");
+        }
+    }
+
+    Ok(result)
 }
 
-async fn run_ingest_job(
-    db: sea_orm::DatabaseConnection,
-    mut job: IngestJob,
+async fn persist_completed_scan_state(
+    db: &sea_orm::DatabaseConnection,
+    scan_state: &(String, String, String, i64),
+    cacheable: bool,
+) {
+    if cacheable
+        && let Err(error) = upsert_scan_state(
+            db,
+            &scan_state.0,
+            &scan_state.1,
+            &scan_state.2,
+            scan_state.3,
+        )
+        .await
+    {
+        tracing::warn!(
+            "failed to persist scan fingerprint for {}: {error:#}",
+            scan_state.0
+        );
+    }
+}
+
+async fn run_local_refresh_job(
+    db: &sea_orm::DatabaseConnection,
+    job: &mut ItemRefreshJob,
     force_probe: bool,
-    probe_tx: &mpsc::Sender<MediaProbeJob>,
-    metadata_tx: &mpsc::UnboundedSender<MetadataFetchJob>,
-) -> anyhow::Result<IngestJobResult> {
+) -> anyhow::Result<LocalRefreshResult> {
     let cached_probe = match job.media_probe.as_ref() {
-        Some(pending) => cached_media_probe_for_job(&db, &job.item, pending, force_probe).await,
+        Some(pending) => cached_media_probe_for_job(db, &job.item, pending, force_probe).await,
         None => None,
     };
     if let Some(cached_probe) = cached_probe.as_ref() {
@@ -1487,20 +1758,20 @@ async fn run_ingest_job(
         }
     }
 
-    let stored_item_id = upsert_media_item(&db, &job.item).await?;
-    job.item.id = stored_item_id;
-    upsert_media_metadata(&db, &job.item.id, &job.parsed_metadata).await?;
+    let stored_item_id = upsert_media_item(db, &job.item).await?;
+    job.item.id = stored_item_id.clone();
+    upsert_media_metadata(db, &job.item.id, &job.parsed_metadata).await?;
     if job.clear_folder_metadata {
-        clear_scraped_folder_metadata(&db, &job.item.id).await;
+        clear_scraped_folder_metadata(db, &job.item.id).await;
     }
-    upsert_sidecar_images(&db, &job.source_path, &job.item.id).await?;
+    upsert_sidecar_images(db, &job.source_path, &job.item.id).await?;
     if job.item.item_type == "Photo" {
         let size_bytes = tokio::fs::metadata(&job.source_path)
             .await
             .ok()
             .and_then(|metadata| i64::try_from(metadata.len()).ok());
         upsert_image_asset(
-            &db,
+            db,
             &job.item.id,
             "Primary",
             0,
@@ -1509,27 +1780,24 @@ async fn run_ingest_job(
         )
         .await?;
     }
-    upsert_nfo_images(&db, &job.item.id, &job.parsed_metadata.images).await?;
+    upsert_nfo_images(db, &job.item.id, &job.parsed_metadata.images).await?;
 
-    let mut result = IngestJobResult {
-        metadata_queued: queue_metadata_fetch(
-            metadata_tx,
-            &job.item,
-            &job.source_path,
-            job.parsed_metadata.has_nfo,
-        ),
-        probe_queued: false,
+    let mut result = LocalRefreshResult {
+        stored_item_id,
         probe_skipped: false,
+        scan_state_cacheable: cached_probe
+            .as_ref()
+            .is_none_or(|probe| !probe.probe_failed),
     };
 
-    let Some(pending_probe) = job.media_probe else {
+    let Some(_pending_probe) = job.media_probe.as_ref() else {
         return Ok(result);
     };
 
     if cached_probe.is_some() {
         result.probe_skipped = true;
         refresh_sidecar_streams(
-            &db,
+            db,
             &job.source_path,
             &job.item.id,
             !matches!(job.item.item_type.as_str(), "Audio" | "AudioBook"),
@@ -1538,20 +1806,8 @@ async fn run_ingest_job(
         return Ok(result);
     }
 
-    upsert_default_media_stream(&db, &job.item).await?;
-    upsert_sidecar_subtitles(&db, &job.source_path, &job.item.id).await?;
-    let probe_job = MediaProbeJob {
-        item: job.item,
-        media_path: pending_probe.media_path,
-        probe_path: pending_probe.probe_path,
-    };
-    probe_tx.send(probe_job).await.map_err(|error| {
-        anyhow::anyhow!(
-            "media probe queue closed before job could be scheduled for {}",
-            error.0.item.path
-        )
-    })?;
-    result.probe_queued = true;
+    upsert_default_media_stream(db, &job.item).await?;
+    upsert_sidecar_subtitles(db, &job.source_path, &job.item.id).await?;
 
     Ok(result)
 }
@@ -1622,224 +1878,31 @@ fn apply_cached_probe(item: &mut ScannedMediaItem, cached_probe: &CachedMediaPro
     }
 }
 
-fn start_media_probe_pipeline(
-    db: sea_orm::DatabaseConnection,
-    cache_version_db: Option<sea_orm::DatabaseConnection>,
-    ffmpeg_path: String,
-) -> MediaProbePipeline {
-    let concurrency = media_probe_concurrency();
-    let queue_capacity = media_probe_queue_capacity();
-    let (tx, rx) = mpsc::channel::<MediaProbeJob>(queue_capacity);
-    let handle = tokio::spawn(async move {
-        let dummy_chapter_duration_seconds = configured_dummy_chapter_duration_seconds(&db).await;
-        let chapter_image_settings = crate::chapters::chapter_image_scan_settings(&db).await;
-        let receiver = Arc::new(Mutex::new(rx));
-        let mut workers = tokio::task::JoinSet::new();
-        tracing::info!(
-            "media probe pipeline started concurrency={concurrency} queue_capacity={queue_capacity}"
-        );
-
-        for _ in 0..concurrency {
-            let db = db.clone();
-            let receiver = receiver.clone();
-            let ffmpeg_path = ffmpeg_path.clone();
-            let chapter_image_settings = chapter_image_settings.clone();
-            workers.spawn(async move {
-                let mut stats = MediaProbeWorkerStats::default();
-                loop {
-                    let job = {
-                        let mut receiver = receiver.lock().await;
-                        receiver.recv().await
-                    };
-                    let Some(job) = job else {
-                        break;
-                    };
-                    stats.completed += 1;
-                    match run_media_probe_job(
-                        db.clone(),
-                        job,
-                        dummy_chapter_duration_seconds,
-                        &ffmpeg_path,
-                        &chapter_image_settings,
-                    )
-                    .await
-                    {
-                        Ok(result) => {
-                            if result.stream_probe_succeeded {
-                                stats.stream_probe_succeeded += 1;
-                            }
-                        }
-                        Err(error) => {
-                            stats.failed += 1;
-                            tracing::warn!("media probe job failed: {error:#}");
-                        }
-                    }
-                }
-                stats
-            });
-        }
-
-        let mut stats = MediaProbeWorkerStats::default();
-        while let Some(result) = workers.join_next().await {
-            match result {
-                Ok(worker_stats) => {
-                    stats.completed += worker_stats.completed;
-                    stats.stream_probe_succeeded += worker_stats.stream_probe_succeeded;
-                    stats.failed += worker_stats.failed;
-                }
-                Err(error) => {
-                    stats.failed += 1;
-                    tracing::warn!("media probe worker task panicked: {error}");
-                }
-            }
-        }
-
-        tracing::info!(
-            "media probe pipeline completed {} item(s); stream_probe_succeeded={} failed={}",
-            stats.completed,
-            stats.stream_probe_succeeded,
-            stats.failed
-        );
-        if let Some(db) = cache_version_db {
-            if let Err(error) = set_media_probe_cache_current(&db).await {
-                tracing::warn!("failed to mark media probe cache current: {error:#}");
-            }
-        }
-        stats
-    });
-    MediaProbePipeline { tx, handle }
-}
-
-fn start_metadata_fetch_pipeline(
-    db: sea_orm::DatabaseConnection,
-    api_key: String,
-    tmdb_proxy_url: Arc<RwLock<Option<String>>>,
-    tmdb_http_client: Arc<RwLock<reqwest::Client>>,
-    douban_cookie: Option<String>,
-    library_options: HashMap<String, crate::library::tmdb_metadata::TmdbLibraryProviderOptions>,
-) -> MetadataFetchPipeline {
-    let (tx, mut rx) = mpsc::unbounded_channel::<MetadataFetchJob>();
-    let handle = tokio::spawn(async move {
-        let concurrency = metadata_fetch_concurrency();
-        let mut pending = tokio::task::JoinSet::new();
-        let mut queued = 0usize;
-        let mut completed = 0usize;
-        let mut failed = 0usize;
-        tracing::info!("metadata fetch pipeline started concurrency={concurrency}");
-
-        while let Some(job) = rx.recv().await {
-            queued += 1;
-            while pending.len() >= concurrency {
-                if metadata_job_finished(pending.join_next().await) {
-                    completed += 1;
-                } else {
-                    failed += 1;
-                }
-            }
-            let db = db.clone();
-            let api_key = api_key.clone();
-            let tmdb_proxy_url = tmdb_proxy_url.clone();
-            let tmdb_http_client = tmdb_http_client.clone();
-            let provider_options = library_options
-                .get(&job.library_id)
-                .cloned()
-                .unwrap_or_default();
-            pending.spawn(async move {
-                let tmdb_base_url = tmdb_proxy_url.read().await.clone();
-                let tmdb_client = tmdb_http_client.read().await.clone();
-                run_metadata_fetch_job(
-                    db,
-                    job,
-                    &api_key,
-                    &tmdb_client,
-                    tmdb_base_url.as_deref(),
-                    &provider_options,
-                )
-                .await
-            });
-        }
-
-        while let Some(result) = pending.join_next().await {
-            if metadata_job_finished(Some(result)) {
-                completed += 1;
-            } else {
-                failed += 1;
-            }
-        }
-
-        if queued > 0 {
-            run_post_scan_metadata_tasks(
-                &db,
-                &api_key,
-                tmdb_proxy_url,
-                tmdb_http_client,
-                douban_cookie.as_deref(),
-            )
-            .await;
-        } else {
-            tracing::info!(
-                "metadata fetch pipeline skipped metadata backfill because no metadata jobs were queued"
-            );
-            // Provider reconciliation is a database consistency pass, not a
-            // metadata fetch.  It must still run when every scanned item is
-            // unchanged; otherwise the same TMDb title from Quark and
-            // Xunlei can remain exposed as two top-level Series forever.
-            run_provider_reconciliation(&db).await;
-        }
-        tracing::info!(
-            "metadata fetch pipeline completed {completed}/{queued} item(s); failed={failed}"
-        );
-    });
-    MetadataFetchPipeline { tx, handle }
-}
-
-fn metadata_job_finished(
-    result: Option<Result<anyhow::Result<()>, tokio::task::JoinError>>,
-) -> bool {
-    match result {
-        Some(Ok(Ok(()))) => true,
-        Some(Ok(Err(error))) => {
-            tracing::warn!(
-                "metadata fetch job failed: {}",
-                crate::library::tmdb_metadata::redact_tmdb_error(&error)
-            );
-            false
-        }
-        Some(Err(error)) => {
-            tracing::warn!("metadata fetch worker task panicked: {error}");
-            false
-        }
-        None => false,
-    }
-}
-
 async fn run_metadata_fetch_job(
     db: sea_orm::DatabaseConnection,
-    job: MetadataFetchJob,
+    job: &MetadataFetchJob,
     api_key: &str,
     tmdb_client: &reqwest::Client,
     tmdb_base_url: Option<&str>,
     provider_options: &crate::library::tmdb_metadata::TmdbLibraryProviderOptions,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if api_key.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     if metadata_item_is_locked(&db, &job.item_id).await {
-        return Ok(());
+        return Ok(true);
     }
     let Some(policy) =
         provider_options.automatic_policy(&job.item_type, job.preserve_existing_metadata)
     else {
-        return Ok(());
+        return Ok(true);
     };
-    if matches!(job.item_type.as_str(), "Movie" | "Series" | "Episode")
-        && tmdb_metadata_is_current(&db, &job.item_id, policy).await
-    {
-        return Ok(());
-    }
 
     let metadata_ready = match job.item_type.as_str() {
         "Movie" | "Series" => {
+            if tmdb_metadata_is_current(&db, &job.item_id, policy).await {
+                return Ok(true);
+            }
             crate::library::tmdb_metadata::fetch_and_apply_tmdb_metadata(
                 &db,
                 &job.item_id,
@@ -1879,44 +1942,13 @@ async fn run_metadata_fetch_job(
     };
 
     if !metadata_ready && provider_options.metadata_enabled("Series") {
-        schedule_metadata_fetch_retry(job);
-    }
-    Ok(())
-}
-
-fn schedule_metadata_fetch_retry(mut job: MetadataFetchJob) {
-    if job.attempts >= METADATA_FETCH_MAX_ATTEMPTS {
         tracing::debug!(
-            "TMDb metadata dependency was not ready after {} attempt(s) for {} {} ({}); post-scan TMDb batch will retry it",
-            METADATA_FETCH_MAX_ATTEMPTS,
+            "metadata dependency is not ready for {} {}; deferring to the post-scan hierarchy refresh",
             job.item_type,
-            job.item_id,
-            job.path.display()
+            job.item_id
         );
-        return;
     }
-
-    job.attempts += 1;
-    let retry_number = job.attempts;
-    let item_type = job.item_type.clone();
-    let retry_tx = job.retry_tx.clone();
-
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(METADATA_FETCH_RETRY_DELAY_SECS)).await;
-        match retry_tx.send(job) {
-            Ok(()) => {
-                tracing::debug!(
-                    "metadata fetch retry queued for {item_type} after dependency wait attempt {retry_number}"
-                );
-            }
-            Err(error) => {
-                tracing::debug!(
-                    "metadata fetch queue closed before retry could be scheduled for {}",
-                    error.0.path.display()
-                );
-            }
-        }
-    });
+    Ok(metadata_ready)
 }
 
 async fn run_post_scan_metadata_tasks(
@@ -1926,24 +1958,10 @@ async fn run_post_scan_metadata_tasks(
     tmdb_http_client: Arc<RwLock<reqwest::Client>>,
     douban_cookie: Option<&str>,
 ) {
-    let run_global_backfill = std::env::var("JELLYFIN_RS_POST_SCAN_METADATA_BACKFILL")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes"
-            )
-        });
     if !api_key.is_empty() {
         let tmdb_base_url = tmdb_proxy_url.read().await.clone();
         let tmdb_client = tmdb_http_client.read().await.clone();
-        // Incremental scans (for example, a new folder appearing in a watched
-        // cloud root) do not go through the one-time startup backfill in
-        // `main.rs`.  Resolve newly-created Movie/Series rows before provider
-        // reconciliation; otherwise a matching item with a missing TMDb ID is
-        // invisible to the duplicate grouping pass and remains as a second
-        // top-level entry.
-        match crate::library::tmdb_metadata::fill_missing_tmdb(
+        match crate::library::tmdb_metadata::batch_fetch_episode_tmdb(
             db,
             api_key,
             &tmdb_client,
@@ -1952,61 +1970,34 @@ async fn run_post_scan_metadata_tasks(
         .await
         {
             Ok(0) => {}
-            Ok(n) => tracing::info!(
-                "post-scan TMDb backfill matched {n} newly discovered Movie/Series item(s)"
-            ),
+            Ok(n) => tracing::info!("post-scan episode TMDb batch fetched {n} title(s)"),
             Err(error) => tracing::warn!(
-                "post-scan TMDb backfill failed: {}",
+                "post-scan episode TMDb batch failed: {}",
                 crate::library::tmdb_metadata::redact_tmdb_error(&error)
             ),
         }
-
-        if run_global_backfill {
-            match crate::library::tmdb_metadata::batch_fetch_episode_tmdb(
-                db,
-                api_key,
-                &tmdb_client,
-                tmdb_base_url.as_deref(),
-            )
-            .await
-            {
-                Ok(0) => {}
-                Ok(n) => tracing::info!("post-scan episode TMDb batch fetched {n} title(s)"),
-                Err(error) => tracing::warn!(
-                    "post-scan episode TMDb batch failed: {}",
-                    crate::library::tmdb_metadata::redact_tmdb_error(&error)
-                ),
-            }
-        } else {
-            tracing::info!(
-                "post-scan episode TMDb backfill skipped; set JELLYFIN_RS_POST_SCAN_METADATA_BACKFILL=true for a full backfill"
-            );
-        }
     }
 
-    if run_global_backfill {
-        if let Err(error) =
-            crate::library::douban_metadata::fill_missing_douban(db, douban_cookie).await
-        {
-            tracing::warn!("Douban metadata fetch failed: {error:#}");
-        }
-    } else {
-        tracing::info!(
-            "post-scan Douban backfill skipped; set JELLYFIN_RS_POST_SCAN_METADATA_BACKFILL=true for a full backfill"
-        );
+    if let Err(error) =
+        crate::library::douban_metadata::fill_missing_douban(db, douban_cookie).await
+    {
+        tracing::warn!("Douban metadata fetch failed: {error:#}");
     }
 
     run_provider_reconciliation(db).await;
 }
 
+pub(crate) fn is_ignored_scan_path(path: &std::path::Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == std::ffi::OsStr::new(".oani-download-tmp"))
+}
+
 async fn run_provider_reconciliation(db: &sea_orm::DatabaseConnection) {
     match crate::library::reconcile::reconcile_provider_duplicates(db).await {
         Ok(stats) if stats.changed() => tracing::info!(
-            "provider reconciliation repaired {} episode parent(s), merged {} series, {} movie version(s), and {} episode version(s); normalized {} series date range(s), {} dimension year(s), and {} episode metadata row(s)",
-            stats.repaired_episode_parents,
+            "provider reconciliation merged {} series and {} movie version(s); normalized {} series date range(s), {} dimension year(s), and {} episode metadata row(s)",
             stats.merged_series,
             stats.merged_versions,
-            stats.merged_episode_versions,
             stats.normalized_series_dates,
             stats.normalized_dimension_years,
             stats.normalized_episode_metadata,
@@ -2482,39 +2473,69 @@ fn episode_season_number_from_path(
     None
 }
 
+fn resolve_episode_season_number(
+    path: &std::path::Path,
+    root: &std::path::Path,
+    collection_type: &str,
+    metadata_season: Option<i64>,
+    filename_season: Option<i64>,
+) -> Option<i64> {
+    let archive_season = episode_season_number_from_path(path, root, collection_type);
+    if is_jojo_steel_ball_run_archive(path, root) {
+        metadata_season.or(archive_season).or(filename_season)
+    } else {
+        metadata_season.or(filename_season).or(archive_season)
+    }
+}
+
+fn is_jojo_steel_ball_run_archive(path: &std::path::Path, root: &std::path::Path) -> bool {
+    const SERIES_FOLDER: &str = "JOJO的奇妙冒险 (2012)";
+
+    if !path.starts_with(root) {
+        return false;
+    }
+    let mut current = path.parent();
+    while let Some(season_folder) = current {
+        let is_target_season = season_folder
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("Season 6"));
+        let is_target_series = season_folder
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == SERIES_FOLDER);
+        if is_target_season && is_target_series {
+            return true;
+        }
+        if same_normalized_path(season_folder, root) {
+            break;
+        }
+        current = season_folder.parent();
+    }
+    false
+}
+
 fn same_normalized_path(left: &std::path::Path, right: &std::path::Path) -> bool {
     path_utils::normalize_path(&left.to_string_lossy())
         == path_utils::normalize_path(&right.to_string_lossy())
 }
 
-fn queue_metadata_fetch(
-    metadata_tx: &mpsc::UnboundedSender<MetadataFetchJob>,
+fn metadata_fetch_job(
     item: &ScannedMediaItem,
     path: &std::path::Path,
     preserve_existing_metadata: bool,
-) -> bool {
+) -> Option<MetadataFetchJob> {
     match item.item_type.as_str() {
         "Movie" | "Series" | "Season" | "Episode" => {}
-        _ => return false,
+        _ => return None,
     }
-    match metadata_tx.send(MetadataFetchJob {
+    Some(MetadataFetchJob {
         item_id: item.id.clone(),
-        library_id: item.library_id.clone(),
         item_type: item.item_type.clone(),
         path: path.to_path_buf(),
         preserve_existing_metadata,
-        attempts: 0,
-        retry_tx: metadata_tx.clone(),
-    }) {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(
-                "metadata fetch queue closed before job could be scheduled for {}",
-                error.0.path.display()
-            );
-            false
-        }
-    }
+    })
 }
 
 async fn metadata_item_is_locked(db: &sea_orm::DatabaseConnection, item_id: &str) -> bool {
@@ -2555,13 +2576,6 @@ async fn clear_scraped_folder_metadata(db: &sea_orm::DatabaseConnection, item_id
     {
         tracing::debug!("failed to clear media_people for folder {item_id}: {error:#}");
     }
-    if let Err(error) = ImageAssets::delete_many()
-        .filter(image_assets::Column::ItemId.eq(item_id))
-        .exec(db)
-        .await
-    {
-        tracing::debug!("failed to clear image_assets for folder {item_id}: {error:#}");
-    }
 
     match MediaItems::find_by_id(item_id.to_string()).one(db).await {
         Ok(Some(item)) if item.item_type == "Folder" => {
@@ -2586,7 +2600,6 @@ async fn clear_scraped_folder_metadata(db: &sea_orm::DatabaseConnection, item_id
             active.remote_trailers = Set(None);
             active.production_locations = Set(None);
             active.production_year = Set(None);
-            active.tmdb_metadata_version = Set(0);
             active.premiere_date = Set(None);
             active.end_date = Set(None);
             active.community_rating = Set(None);
@@ -2656,7 +2669,10 @@ async fn tmdb_metadata_is_current(
         .is_some()
 }
 
-async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String, String, bool)>> {
+async fn media_roots(
+    state: &AppState,
+    selected_library_ids: Option<&HashSet<String>>,
+) -> anyhow::Result<Vec<(PathBuf, String, String, bool)>> {
     let paths = LibraryPaths::find()
         .order_by_asc(library_paths::Column::Path)
         .all(&state.db)
@@ -2673,127 +2689,294 @@ async fn media_roots(state: &AppState) -> anyhow::Result<Vec<(PathBuf, String, S
         .into_iter()
         .map(|library| (library.id.clone(), library))
         .collect::<std::collections::HashMap<_, _>>();
-    let library_options = crate::db::settings::find_by_prefix(&state.db, "LibraryOptions.")
-        .await?
-        .into_iter()
-        .filter_map(|setting| {
-            let library_id = setting.key.strip_prefix("LibraryOptions.")?.to_string();
-            let enable_photos = serde_json::from_str::<serde_json::Value>(&setting.value)
-                .ok()
-                .and_then(|options| {
-                    options
-                        .get("EnablePhotos")
-                        .or_else(|| options.get("enablePhotos"))
-                        .and_then(serde_json::Value::as_bool)
-                })
-                .unwrap_or(true);
-            Some((library_id, enable_photos))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
+    let library_options = crate::library::options::load_runtime_options(&state.db).await?;
 
     Ok(paths
         .into_iter()
         .filter_map(|path| {
+            if selected_library_ids.is_some_and(|selected| !selected.contains(&path.library_id)) {
+                return None;
+            }
             libraries.get(&path.library_id).map(|library| {
+                let options = library_options
+                    .get(&library.id)
+                    .cloned()
+                    .unwrap_or_default();
                 (
                     PathBuf::from(path_utils::normalize_path(&path.path)),
                     path.library_id,
                     library.collection_type.clone(),
-                    library_options.get(&library.id).copied().unwrap_or(true),
+                    options,
                 )
             })
         })
-        .collect())
-}
-
-async fn load_existing_media_state(
-    db: &sea_orm::DatabaseConnection,
-    roots: &[ScanRootRequest],
-) -> anyhow::Result<HashMap<String, ExistingMediaState>> {
-    let mut library_ids = roots
-        .iter()
-        .map(|root| root.library_id.clone())
-        .collect::<Vec<_>>();
-    library_ids.sort();
-    library_ids.dedup();
-    if library_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let items = MediaItems::find()
-        .filter(media_items::Column::LibraryId.is_in(library_ids))
-        .all(db)
-        .await
-        .context("failed to load existing media index")?;
-    Ok(items
-        .into_iter()
-        .map(|item| {
-            (
-                item.path,
-                ExistingMediaState {
-                    id: item.id,
-                    parent_id: item.parent_id,
-                    item_type: item.item_type,
-                    modified_at: item.modified_at,
-                    size_bytes: item.size_bytes,
-                },
-            )
+        .filter(|(_, _, _, options)| options.enabled)
+        .map(|(path, library_id, collection_type, options)| {
+            (path, library_id, collection_type, options.enable_photos)
         })
         .collect())
 }
 
-fn media_probe_concurrency() -> usize {
-    configured_concurrency(
-        "JELLYFIN_RS_MEDIA_PROBE_CONCURRENCY",
-        (crate::db::cpu_parallelism() / 4).clamp(1, 3),
-        1,
-        4,
+type MediaRoot = (PathBuf, String, String, bool);
+type MediaScanRoot = (PathBuf, PathBuf, String, String, bool);
+
+fn targeted_scan_roots(roots: Vec<MediaRoot>, changed_paths: &[PathBuf]) -> Vec<MediaScanRoot> {
+    let mut targets = Vec::<MediaScanRoot>::new();
+    for changed_path in changed_paths {
+        let changed_path =
+            PathBuf::from(path_utils::normalize_path(&changed_path.to_string_lossy()));
+        let Some((root, library_id, collection_type, enable_photos)) = roots
+            .iter()
+            .filter(|(root, _, _, _)| changed_path.starts_with(root))
+            .max_by_key(|(root, _, _, _)| root.components().count())
+        else {
+            continue;
+        };
+        let Some(scan_path) = targeted_scan_path(&changed_path, root, collection_type) else {
+            continue;
+        };
+
+        if targets
+            .iter()
+            .any(|(existing_root, existing_path, existing_library, _, _)| {
+                existing_root == root
+                    && existing_library == library_id
+                    && scan_path.starts_with(existing_path)
+            })
+        {
+            continue;
+        }
+        targets.retain(|(existing_root, existing_path, existing_library, _, _)| {
+            existing_root != root
+                || existing_library != library_id
+                || !existing_path.starts_with(&scan_path)
+        });
+        targets.push((
+            root.clone(),
+            scan_path,
+            library_id.clone(),
+            collection_type.clone(),
+            *enable_photos,
+        ));
+    }
+    targets.sort_by(|left, right| left.1.cmp(&right.1));
+    targets
+}
+
+fn targeted_scan_path(
+    changed_path: &std::path::Path,
+    library_root: &std::path::Path,
+    collection_type: &str,
+) -> Option<PathBuf> {
+    if changed_path.is_dir()
+        || classify_media_path(changed_path, collection_type).is_some()
+        || strm::is_strm_path(changed_path)
+    {
+        return Some(changed_path.to_path_buf());
+    }
+    if is_metadata_sidecar_path(changed_path) {
+        return changed_path
+            .parent()
+            .filter(|parent| parent.starts_with(library_root))
+            .map(std::path::Path::to_path_buf);
+    }
+    if !changed_path.exists() {
+        return Some(changed_path.to_path_buf());
+    }
+    None
+}
+
+fn is_metadata_sidecar_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "nfo"
+                    | "xml"
+                    | "jpg"
+                    | "jpeg"
+                    | "png"
+                    | "webp"
+                    | "srt"
+                    | "ass"
+                    | "ssa"
+                    | "sub"
+                    | "vtt"
+                    | "lrc"
+                    | "cue"
+            )
+        })
+        .unwrap_or(false)
+}
+
+async fn load_scan_states(
+    db: &sea_orm::DatabaseConnection,
+    library_ids: &HashSet<String>,
+) -> anyhow::Result<HashMap<String, i64>> {
+    if library_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(MediaScanStates::find()
+        .filter(media_scan_states::Column::LibraryId.is_in(library_ids.iter().cloned()))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|state| (state.path, state.fingerprint))
+        .collect())
+}
+
+async fn scan_context_fingerprints(
+    db: &sea_orm::DatabaseConnection,
+    library_ids: &HashSet<String>,
+    tmdb_configured: bool,
+) -> anyhow::Result<HashMap<String, i64>> {
+    let options = crate::library::options::raw_options(db).await?;
+    let preferred_language = crate::db::settings::get(db, "PreferredMetadataLanguage").await?;
+    let metadata_country = crate::db::settings::get(db, "MetadataCountryCode").await?;
+    Ok(library_ids
+        .iter()
+        .map(|library_id| {
+            let mut hasher = DefaultHasher::new();
+            SCAN_FINGERPRINT_VERSION.hash(&mut hasher);
+            MEDIA_PROBE_CACHE_VERSION.hash(&mut hasher);
+            tmdb_configured.hash(&mut hasher);
+            preferred_language.hash(&mut hasher);
+            metadata_country.hash(&mut hasher);
+            options
+                .get(library_id)
+                .map(ToString::to_string)
+                .hash(&mut hasher);
+            (library_id.clone(), hasher.finish() as i64)
+        })
+        .collect())
+}
+
+fn media_scan_fingerprint(
+    path: &std::path::Path,
+    parent_id: &str,
+    modified_at: i64,
+    size_bytes: Option<i64>,
+    scan_context: i64,
+    sidecar_fingerprints: &mut SidecarFingerprintCache,
+) -> i64 {
+    let mut hasher = DefaultHasher::new();
+    SCAN_FINGERPRINT_VERSION.hash(&mut hasher);
+    parent_id.hash(&mut hasher);
+    scan_context.hash(&mut hasher);
+    modified_at.hash(&mut hasher);
+    size_bytes.hash(&mut hasher);
+    sidecar_fingerprints.for_media_path(path).hash(&mut hasher);
+    hasher.finish() as i64
+}
+
+fn sidecar_directory_fingerprint(directory: &std::path::Path) -> u64 {
+    let mut sidecars = std::fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() || !is_scan_sidecar(&path) {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            Some((entry.file_name(), metadata.len(), modified))
+        })
+        .collect::<Vec<_>>();
+    sidecars.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = DefaultHasher::new();
+    sidecars.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn is_scan_sidecar(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "nfo"
+                    | "jpg"
+                    | "jpeg"
+                    | "png"
+                    | "webp"
+                    | "srt"
+                    | "ass"
+                    | "ssa"
+                    | "vtt"
+                    | "sub"
+                    | "smi"
+                    | "sami"
+                    | "mpl"
+                    | "lrc"
+                    | "mka"
+            )
+        })
+}
+
+async fn upsert_scan_state(
+    db: &sea_orm::DatabaseConnection,
+    path: &str,
+    item_id: &str,
+    library_id: &str,
+    fingerprint: i64,
+) -> anyhow::Result<()> {
+    MediaScanStates::insert(media_scan_states::ActiveModel {
+        path: Set(path.to_string()),
+        item_id: Set(item_id.to_string()),
+        library_id: Set(library_id.to_string()),
+        fingerprint: Set(fingerprint),
+        updated_at: Set(crate::util::now_unix()),
+    })
+    .on_conflict(
+        OnConflict::column(media_scan_states::Column::Path)
+            .update_columns([
+                media_scan_states::Column::ItemId,
+                media_scan_states::Column::LibraryId,
+                media_scan_states::Column::Fingerprint,
+                media_scan_states::Column::UpdatedAt,
+            ])
+            .to_owned(),
     )
+    .exec(db)
+    .await?;
+    Ok(())
 }
 
 fn scan_root_concurrency() -> usize {
     configured_concurrency(
         "JELLYFIN_RS_SCAN_ROOT_CONCURRENCY",
-        (crate::db::cpu_parallelism() / 4).clamp(1, 2),
-        1,
-        4,
+        crate::db::cpu_parallelism().clamp(1, 2),
     )
 }
 
-fn ingest_concurrency() -> usize {
+fn item_refresh_concurrency() -> usize {
     configured_concurrency(
         "JELLYFIN_RS_INGEST_CONCURRENCY",
         crate::db::cpu_parallelism().clamp(1, 2),
-        1,
-        4,
     )
 }
 
-fn metadata_fetch_concurrency() -> usize {
-    configured_concurrency(
-        "JELLYFIN_RS_METADATA_CONCURRENCY",
-        crate::db::cpu_parallelism().clamp(1, 2),
-        1,
-        4,
-    )
-}
-
-fn configured_concurrency(key: &str, default: usize, min: usize, max: usize) -> usize {
+fn configured_concurrency(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .map_or(default, |value| value.clamp(min, max))
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(1, 4))
+        .unwrap_or(default)
 }
 
-fn ingest_queue_capacity() -> usize {
-    crate::db::cpu_parallelism()
-        .saturating_mul(512)
-        .clamp(MIN_INGEST_QUEUE_CAPACITY, MAX_INGEST_QUEUE_CAPACITY)
-}
-
-fn media_probe_queue_capacity() -> usize {
-    crate::db::cpu_parallelism().saturating_mul(32).clamp(
-        MIN_MEDIA_PROBE_QUEUE_CAPACITY,
-        MAX_MEDIA_PROBE_QUEUE_CAPACITY,
+fn item_refresh_queue_capacity() -> usize {
+    crate::db::cpu_parallelism().saturating_mul(512).clamp(
+        MIN_ITEM_REFRESH_QUEUE_CAPACITY,
+        MAX_ITEM_REFRESH_QUEUE_CAPACITY,
     )
 }
 
@@ -2845,7 +3028,12 @@ mod tests {
         fs::write(&cd1, []).unwrap();
         fs::write(&cd2, []).unwrap();
 
-        let owners = movie_stack_part_owners(&root, "movies", None);
+        let owners = movie_stack_part_owners(
+            [cd1.as_path(), cd2.as_path()],
+            &root,
+            "movies",
+            &CancellationToken::new(),
+        );
         assert_eq!(owners.get(&cd2), Some(&cd1));
         assert!(!owners.contains_key(&cd1));
 
@@ -3031,8 +3219,210 @@ mod tests {
     }
 
     #[test]
-    fn media_probe_concurrency_defaults_to_positive_value() {
-        assert!(media_probe_concurrency() > 0);
+    fn scan_fingerprint_changes_when_sidecar_changes() {
+        let root = test_dir("scan_fingerprint_changes_when_sidecar_changes");
+        let media = root.join("Movie.mkv");
+        let nfo = root.join("Movie.nfo");
+        fs::write(&media, b"video").unwrap();
+        fs::write(&nfo, b"<movie />").unwrap();
+
+        let before = media_scan_fingerprint(
+            &media,
+            "parent-a",
+            10,
+            Some(5),
+            20,
+            &mut SidecarFingerprintCache::default(),
+        );
+        fs::write(&nfo, b"<movie><title>Changed</title></movie>").unwrap();
+        let after = media_scan_fingerprint(
+            &media,
+            "parent-a",
+            10,
+            Some(5),
+            20,
+            &mut SidecarFingerprintCache::default(),
+        );
+
+        assert_ne!(before, after);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scan_fingerprint_changes_when_parent_changes() {
+        let root = test_dir("scan_fingerprint_changes_when_parent_changes");
+        let media = root.join("Episode.mkv");
+        fs::write(&media, b"video").unwrap();
+
+        let first = media_scan_fingerprint(
+            &media,
+            "season-one",
+            10,
+            Some(5),
+            20,
+            &mut SidecarFingerprintCache::default(),
+        );
+        let second = media_scan_fingerprint(
+            &media,
+            "season-two",
+            10,
+            Some(5),
+            20,
+            &mut SidecarFingerprintCache::default(),
+        );
+
+        assert_ne!(first, second);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scan_fingerprint_reuses_sidecar_signature_within_a_directory() {
+        let root = test_dir("scan_fingerprint_reuses_sidecar_signature_within_a_directory");
+        let first = root.join("First.mkv");
+        let second = root.join("Second.mkv");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        fs::write(root.join("First.nfo"), b"<movie />").unwrap();
+        let mut cache = SidecarFingerprintCache::default();
+
+        media_scan_fingerprint(&first, "parent", 10, Some(5), 20, &mut cache);
+        media_scan_fingerprint(&second, "parent", 11, Some(6), 20, &mut cache);
+
+        assert_eq!(cache.by_directory.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn scan_root_skips_matching_fingerprint_before_refresh() {
+        let root = test_dir("scan_root_skips_matching_fingerprint_before_refresh");
+        let media = root.join("Movie.mkv");
+        fs::write(&media, b"video").unwrap();
+        let resolved = path_utils::resolve_path_info(&media).unwrap();
+        let fingerprint = media_scan_fingerprint(
+            &media,
+            &crate::library::classify::parent_id_for_path(&media, &root, "movies"),
+            resolved.modified_at,
+            resolved.size_bytes,
+            42,
+            &mut SidecarFingerprintCache::default(),
+        );
+        let states = Arc::new(HashMap::from([(resolved.path, fingerprint)]));
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let result = scan_root(
+            root.clone(),
+            root.clone(),
+            "movies".to_string(),
+            "movies".to_string(),
+            true,
+            42,
+            states,
+            tx,
+            CancellationToken::new(),
+            test_progress(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.scanned, 1);
+        assert_eq!(result.unchanged, 1);
+        assert!(rx.recv().await.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn scan_root_stops_before_traversal_when_cancelled() {
+        let root = test_dir("scan_root_stops_before_traversal_when_cancelled");
+        fs::write(root.join("Movie.mkv"), b"video").unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = scan_root(
+            root.clone(),
+            root.clone(),
+            "movies".to_string(),
+            "movies".to_string(),
+            true,
+            0,
+            Arc::new(HashMap::new()),
+            tx,
+            cancellation,
+            test_progress(),
+        )
+        .await
+        .err()
+        .expect("cancelled scan should return an error");
+
+        assert!(is_scan_cancelled(&error));
+        assert!(rx.recv().await.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn targeted_file_scan_does_not_queue_sibling_media() {
+        let root = test_dir("targeted_file_scan_does_not_queue_sibling_media");
+        let changed = root.join("Changed.mkv");
+        let sibling = root.join("Sibling.mkv");
+        fs::write(&changed, b"changed").unwrap();
+        fs::write(&sibling, b"sibling").unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        scan_root(
+            root.clone(),
+            changed.clone(),
+            "movies".to_string(),
+            "movies".to_string(),
+            true,
+            0,
+            Arc::new(HashMap::new()),
+            tx,
+            CancellationToken::new(),
+            test_progress(),
+        )
+        .await
+        .unwrap();
+
+        let mut paths = Vec::new();
+        while let Some(job) = rx.recv().await {
+            paths.push(job.item.path);
+        }
+        assert_eq!(
+            paths,
+            vec![path_utils::normalize_path(&changed.to_string_lossy())]
+        );
+        assert!(!paths.contains(&path_utils::normalize_path(&sibling.to_string_lossy())));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn targeted_roots_keep_media_files_narrow_and_expand_sidecars() {
+        let root = test_dir("targeted_roots_keep_media_files_narrow_and_expand_sidecars");
+        let media = root.join("Movie.mkv");
+        let sidecar = root.join("Movie.nfo");
+        let unrelated = root.join("notes.txt");
+        fs::write(&media, b"video").unwrap();
+        fs::write(&sidecar, b"<movie />").unwrap();
+        fs::write(&unrelated, b"notes").unwrap();
+        let roots = vec![(
+            root.clone(),
+            "movies".to_string(),
+            "movies".to_string(),
+            true,
+        )];
+
+        let media_target = targeted_scan_roots(roots.clone(), std::slice::from_ref(&media));
+        assert_eq!(media_target[0].1, media);
+        let sidecar_target = targeted_scan_roots(roots.clone(), std::slice::from_ref(&sidecar));
+        assert_eq!(sidecar_target[0].1, root);
+        assert!(targeted_scan_roots(roots, &[unrelated]).is_empty());
+
+        let _ = fs::remove_dir_all(sidecar_target[0].0.clone());
+    }
+
+    #[test]
+    fn item_refresh_concurrency_defaults_to_positive_value() {
+        assert!(item_refresh_concurrency() > 0);
     }
 
     #[test]
@@ -3041,240 +3431,18 @@ mod tests {
     }
 
     #[test]
-    fn targeted_scan_selects_only_requested_library_roots() {
-        let roots = vec![
-            (
-                PathBuf::from("/media/tv-domestic"),
-                "tv".to_string(),
-                "tvshows".to_string(),
-                true,
-            ),
-            (
-                PathBuf::from("/media/tv-xunlei"),
-                "tv".to_string(),
-                "tvshows".to_string(),
-                true,
-            ),
-        ];
-
-        let selected = select_media_roots(roots, &["/media/tv-xunlei".to_string()]);
-
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].root, PathBuf::from("/media/tv-xunlei"));
-        assert!(selected[0].scope_paths.is_none());
-
-        let roots = vec![(
-            PathBuf::from("/media/tv-xunlei"),
-            "tv".to_string(),
-            "tvshows".to_string(),
-            true,
-        )];
-        let selected = select_media_roots(roots, &["/media/tv-xunlei/Show".to_string()]);
-        assert_eq!(
-            selected[0].scope_paths,
-            Some(vec![PathBuf::from("/media/tv-xunlei/Show")])
-        );
-    }
-
-    #[test]
     fn temporary_download_tree_is_ignored() {
         assert!(is_ignored_scan_path(
-            PathBuf::from("/media/tv/.oani-download-tmp/job/movie.mkv",).as_path()
+            PathBuf::from("/media/tv/.oani-download-tmp/job/movie.mkv").as_path()
         ));
         assert!(!is_ignored_scan_path(
-            PathBuf::from("/media/tv/Show/Season 1/movie.strm",).as_path()
+            PathBuf::from("/media/tv/Show/Season 1/movie.strm").as_path()
         ));
     }
 
     #[test]
-    fn unchanged_strm_ignores_resolved_media_size() {
-        let item = ScannedMediaItem {
-            path: "/media/tv/Show/Season 1/E01.strm".to_string(),
-            item_type: "Episode".to_string(),
-            modified_at: 42,
-            size_bytes: Some(128),
-            ..Default::default()
-        };
-        let existing = HashMap::from([(
-            item.path.clone(),
-            ExistingMediaState {
-                id: "episode".to_string(),
-                parent_id: String::new(),
-                item_type: "Episode".to_string(),
-                modified_at: 42,
-                size_bytes: Some(700_000_000),
-            },
-        )]);
-
-        assert!(!item_requires_ingest(&item, &existing));
-
-        let mut changed = item;
-        changed.modified_at = 43;
-        assert!(item_requires_ingest(&changed, &existing));
-    }
-
-    #[test]
-    fn unchanged_source_fingerprint_skips_expensive_file_parsing() {
-        let existing = ExistingMediaState {
-            id: "episode".to_string(),
-            parent_id: String::new(),
-            item_type: "Episode".to_string(),
-            modified_at: 42,
-            size_bytes: Some(700_000_000),
-        };
-        let strm = path_utils::ResolvedPathInfo {
-            id: "strm".to_string(),
-            name: "E01.strm".to_string(),
-            path: "/media/tv/Show/Season 1/E01.strm".to_string(),
-            is_directory: false,
-            size_bytes: Some(128),
-            created_at: 1,
-            modified_at: 42,
-        };
-        assert!(source_fingerprint_is_unchanged(
-            &strm.path, &strm, &existing
-        ));
-
-        let video = path_utils::ResolvedPathInfo {
-            path: "/media/movies/Movie.mkv".to_string(),
-            size_bytes: Some(700_000_000),
-            ..strm.clone()
-        };
-        assert!(source_fingerprint_is_unchanged(
-            &video.path,
-            &video,
-            &existing
-        ));
-
-        let mut changed = video;
-        changed.size_bytes = Some(700_000_001);
-        assert!(!source_fingerprint_is_unchanged(
-            &changed.path,
-            &changed,
-            &existing
-        ));
-    }
-
-    #[test]
-    fn unchanged_global_preflight_ignores_sidecars_and_detects_new_media() {
-        let root = test_dir("unchanged_global_preflight_ignores_sidecars");
-        let movie_dir = root.join("Movie");
-        fs::create_dir_all(&movie_dir).unwrap();
-        let movie = movie_dir.join("Movie.mkv");
-        fs::write(&movie, []).unwrap();
-        fs::write(movie_dir.join("poster.jpg"), []).unwrap();
-
-        let folder_info = path_utils::resolve_path_info(&movie_dir).unwrap();
-        let movie_info = path_utils::resolve_path_info(&movie).unwrap();
-        let existing = HashMap::from([
-            (
-                folder_info.path.clone(),
-                ExistingMediaState {
-                    id: folder_info.id.clone(),
-                    parent_id: String::new(),
-                    item_type: "Folder".to_string(),
-                    modified_at: folder_info.modified_at,
-                    size_bytes: folder_info.size_bytes,
-                },
-            ),
-            (
-                movie_info.path.clone(),
-                ExistingMediaState {
-                    id: movie_info.id.clone(),
-                    parent_id: folder_info.id.clone(),
-                    item_type: "Movie".to_string(),
-                    modified_at: movie_info.modified_at,
-                    size_bytes: movie_info.size_bytes,
-                },
-            ),
-        ]);
-
-        let unchanged = scan_root_preflight(&root, "movies", &existing).unwrap();
-        assert!(!unchanged.has_changes);
-        assert!(unchanged.seen_paths.contains(&folder_info.path));
-        assert!(unchanged.seen_paths.contains(&movie_info.path));
-        assert!(
-            !unchanged
-                .seen_paths
-                .iter()
-                .any(|path| path.ends_with("poster.jpg"))
-        );
-
-        fs::write(movie_dir.join("Movie 2.mkv"), []).unwrap();
-        let changed = scan_root_preflight(&root, "movies", &existing).unwrap();
-        assert!(changed.has_changes);
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn unchanged_episode_with_stale_season_id_triggers_global_scan() {
-        let root = test_dir("stale_episode_season_id");
-        let series_dir = root.join("JOJO");
-        let season_dir = series_dir.join("Season 6");
-        fs::create_dir_all(&season_dir).unwrap();
-        let episode = season_dir.join("E01.mkv");
-        fs::write(&episode, []).unwrap();
-
-        let series_info = path_utils::resolve_path_info(&series_dir).unwrap();
-        let season_info = path_utils::resolve_path_info(&season_dir).unwrap();
-        let episode_info = path_utils::resolve_path_info(&episode).unwrap();
-        let existing = HashMap::from([
-            (
-                series_info.path.clone(),
-                ExistingMediaState {
-                    id: "series-id".to_string(),
-                    parent_id: String::new(),
-                    item_type: "Series".to_string(),
-                    modified_at: series_info.modified_at,
-                    size_bytes: series_info.size_bytes,
-                },
-            ),
-            (
-                season_info.path.clone(),
-                ExistingMediaState {
-                    id: "persisted-season-id".to_string(),
-                    parent_id: "series-id".to_string(),
-                    item_type: "Season".to_string(),
-                    modified_at: season_info.modified_at,
-                    size_bytes: season_info.size_bytes,
-                },
-            ),
-            (
-                episode_info.path.clone(),
-                ExistingMediaState {
-                    id: "episode-id".to_string(),
-                    parent_id: "path-derived-season-id".to_string(),
-                    item_type: "Episode".to_string(),
-                    modified_at: episode_info.modified_at,
-                    size_bytes: episode_info.size_bytes,
-                },
-            ),
-        ]);
-
-        let scan = scan_root_preflight(&root, "tvshows", &existing).unwrap();
-        assert!(scan.has_changes);
-        assert_eq!(
-            existing_episode_season_id(&episode, &existing).as_deref(),
-            Some("persisted-season-id")
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn media_probe_queue_capacity_defaults_to_positive_value() {
-        assert!(media_probe_queue_capacity() > 0);
-    }
-
-    #[test]
-    fn ingest_concurrency_defaults_to_positive_value() {
-        assert!(ingest_concurrency() > 0);
-    }
-
-    #[test]
-    fn ingest_queue_capacity_defaults_to_positive_value() {
-        assert!(ingest_queue_capacity() > 0);
+    fn item_refresh_queue_capacity_defaults_to_positive_value() {
+        assert!(item_refresh_queue_capacity() > 0);
     }
 
     #[test]
@@ -3353,12 +3521,15 @@ mod tests {
 
         let result = scan_root(
             root.clone(),
+            root.clone(),
             "tv".to_string(),
             "tvshows".to_string(),
             true,
-            None,
-            HashMap::new(),
+            0,
+            Arc::new(HashMap::new()),
             tx,
+            CancellationToken::new(),
+            test_progress(),
         )
         .await
         .unwrap();
@@ -3371,7 +3542,7 @@ mod tests {
                 break;
             }
         }
-        let episode_item = episode_item.expect("episode ingest job should be queued");
+        let episode_item = episode_item.expect("episode refresh job should be queued");
         assert_eq!(episode_item.season_number, Some(1));
         assert_eq!(episode_item.episode_number, Some(1));
         assert_eq!(episode_item.episode_number_end, Some(3));
@@ -3389,12 +3560,15 @@ mod tests {
 
         scan_root(
             root.clone(),
+            root.clone(),
             "tv".to_string(),
             "tvshows".to_string(),
             true,
-            None,
-            HashMap::new(),
+            0,
+            Arc::new(HashMap::new()),
             tx,
+            CancellationToken::new(),
+            test_progress(),
         )
         .await
         .unwrap();
@@ -3414,8 +3588,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_root_applies_local_nfo_scalars_to_ingest_item() {
-        let root = test_dir("scan_root_applies_local_nfo_scalars_to_ingest_item");
+    async fn scan_root_applies_local_nfo_scalars_to_refresh_item() {
+        let root = test_dir("scan_root_applies_local_nfo_scalars_to_refresh_item");
         let path = root.join("Movie One.mkv");
         fs::write(&path, []).unwrap();
         fs::write(
@@ -3447,12 +3621,15 @@ mod tests {
 
         let result = scan_root(
             root.clone(),
+            root.clone(),
             "movies".to_string(),
             "movies".to_string(),
             true,
-            None,
-            HashMap::new(),
+            0,
+            Arc::new(HashMap::new()),
             tx,
+            CancellationToken::new(),
+            test_progress(),
         )
         .await
         .unwrap();
@@ -3465,7 +3642,7 @@ mod tests {
                 break;
             }
         }
-        let movie_item = movie_item.expect("movie ingest job should be queued");
+        let movie_item = movie_item.expect("movie refresh job should be queued");
         assert_eq!(movie_item.title, "NFO Movie One");
         assert_eq!(
             movie_item.original_title.as_deref(),
@@ -3514,12 +3691,15 @@ mod tests {
 
         scan_root(
             root.clone(),
+            root.clone(),
             "movies".to_string(),
             "movies".to_string(),
             true,
-            None,
-            HashMap::new(),
+            0,
+            Arc::new(HashMap::new()),
             tx,
+            CancellationToken::new(),
+            test_progress(),
         )
         .await
         .unwrap();
@@ -3531,7 +3711,7 @@ mod tests {
                 break;
             }
         }
-        let disc_job = disc_job.expect("DVD ingest job should be queued");
+        let disc_job = disc_job.expect("DVD refresh job should be queued");
         assert_eq!(disc_job.item.item_type, "Movie");
         assert_eq!(disc_job.item.video_type.as_deref(), Some("Dvd"));
         assert!(!disc_job.item.is_folder);
@@ -3559,7 +3739,7 @@ mod tests {
             .find(|job| job.item.item_type == "Photo")
             .expect("photo should be scanned");
         let photo_id = photo_job.item.id.clone();
-        ingest_without_running_probe(&db, photo_job).await;
+        refresh_without_running_probe(&db, photo_job).await;
         let photo = MediaItems::find_by_id(&photo_id)
             .one(&db)
             .await
@@ -3635,7 +3815,7 @@ mod tests {
         assert_eq!(book_job.item.production_year, Some(1890));
         assert_eq!(book_job.item.parent_id, "books");
         let book_id = book_job.item.id.clone();
-        ingest_without_running_probe(&db, book_job).await;
+        refresh_without_running_probe(&db, book_job).await;
         assert_eq!(
             media_stream_types(&db, &book_id).await,
             Vec::<String>::new()
@@ -3659,7 +3839,7 @@ mod tests {
         assert_eq!(audiobook_job.item.title, "The Spoken Book");
         assert_eq!(audiobook_job.item.production_year, Some(2024));
         let audiobook_id = audiobook_job.item.id.clone();
-        ingest_without_running_probe(&db, audiobook_job).await;
+        refresh_without_running_probe(&db, audiobook_job).await;
         assert_eq!(media_stream_types(&db, &audiobook_id).await, ["Audio"]);
 
         let music_video_root = test_dir("specialized_library_music_video");
@@ -3671,7 +3851,7 @@ mod tests {
             .find(|job| job.item.item_type == "MusicVideo")
             .expect("music video should be scanned");
         let music_video_id = music_video_job.item.id.clone();
-        ingest_without_running_probe(&db, music_video_job).await;
+        refresh_without_running_probe(&db, music_video_job).await;
         assert_eq!(media_stream_types(&db, &music_video_id).await, ["Video"]);
 
         for root in [photo_root, book_root, audiobook_root, music_video_root] {
@@ -3754,6 +3934,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn archive_folder_overrides_filename_only_for_jojo_steel_ball_run() {
+        let root = PathBuf::from("/media/迅雷-番");
+        let path = root.join("JOJO的奇妙冒险 (2012)/Season 6/套马的汉子 - S01E04.(mp4).strm");
+
+        assert_eq!(
+            resolve_episode_season_number(&path, &root, "tvshows", None, Some(1)),
+            Some(6)
+        );
+        assert_eq!(
+            resolve_episode_season_number(&path, &root, "tvshows", Some(7), Some(1)),
+            Some(7)
+        );
+        assert_eq!(
+            resolve_episode_season_number(
+                &root.join("JOJO/套马的汉子 - S01E04.strm"),
+                &root,
+                "tvshows",
+                None,
+                Some(1),
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_episode_season_number(
+                &root.join("Other Show/Season 6/episode - S01E04.strm"),
+                &root,
+                "tvshows",
+                None,
+                Some(1),
+            ),
+            Some(1)
+        );
+    }
+
+    fn test_progress() -> ScanProgressTracker {
+        ScanProgressTracker::new(crate::app::state::ScanTaskControl::default().progress())
+    }
+
     fn test_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3768,7 +3987,7 @@ mod tests {
         root: &std::path::Path,
         library_id: &str,
         collection: &str,
-    ) -> Vec<IngestJob> {
+    ) -> Vec<ItemRefreshJob> {
         scan_jobs_with_photos(root, library_id, collection, true).await
     }
 
@@ -3777,16 +3996,19 @@ mod tests {
         library_id: &str,
         collection: &str,
         enable_photos: bool,
-    ) -> Vec<IngestJob> {
+    ) -> Vec<ItemRefreshJob> {
         let (tx, mut rx) = mpsc::channel(64);
         scan_root(
+            root.to_path_buf(),
             root.to_path_buf(),
             library_id.to_string(),
             collection.to_string(),
             enable_photos,
-            None,
-            HashMap::new(),
+            0,
+            Arc::new(HashMap::new()),
             tx,
+            CancellationToken::new(),
+            test_progress(),
         )
         .await
         .unwrap();
@@ -3797,19 +4019,11 @@ mod tests {
         jobs
     }
 
-    async fn ingest_without_running_probe(
+    async fn refresh_without_running_probe(
         db: &sea_orm::DatabaseConnection,
-        job: IngestJob,
-    ) -> IngestJobResult {
-        let (probe_tx, mut probe_rx) = mpsc::channel(8);
-        let (metadata_tx, _metadata_rx) = mpsc::unbounded_channel();
-        let result = run_ingest_job(db.clone(), job, false, &probe_tx, &metadata_tx)
-            .await
-            .unwrap();
-        if result.probe_queued {
-            probe_rx.recv().await.expect("probe job should be queued");
-        }
-        result
+        mut job: ItemRefreshJob,
+    ) -> LocalRefreshResult {
+        run_local_refresh_job(db, &mut job, false).await.unwrap()
     }
 
     async fn media_stream_types(db: &sea_orm::DatabaseConnection, item_id: &str) -> Vec<String> {

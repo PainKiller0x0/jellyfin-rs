@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,6 +9,13 @@ use tracing::{info, warn};
 use walkdir::WalkDir;
 
 use crate::app::state::AppState;
+
+pub fn schedule_paths_scan(state: Arc<AppState>, paths: Vec<String>, reason: &'static str) {
+    let changed_paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    tokio::spawn(async move {
+        run_scheduled_scan_when_idle(&state, &changed_paths, reason).await;
+    });
+}
 
 pub fn start_watching(state: Arc<AppState>) {
     let notify_state = state.clone();
@@ -23,81 +30,128 @@ pub fn start_watching(state: Arc<AppState>) {
 }
 
 async fn watch_loop(state: Arc<AppState>) -> anyhow::Result<()> {
-    let paths = library_paths(&state).await;
-    if paths.is_empty() {
-        info!("no library paths to watch, file watcher disabled");
-        return Ok(());
-    }
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Event, notify::Error>>(256);
-    let mut watcher = notify::recommended_watcher(move |event| {
-        let _ = tx.blocking_send(event);
-    })?;
-
-    for path in &paths {
-        if let Err(e) = watcher.watch(Path::new(path), RecursiveMode::Recursive) {
-            warn!("failed to watch {path}: {e}");
-        } else {
-            info!("watching library path: {path}");
-        }
-    }
-
-    let debounce = debounce_duration();
-    let scan_triggered = Arc::new(Mutex::new(false));
-
+    let pending_scan = Arc::new(Mutex::new(PendingWatchScan::default()));
+    let mut last_targets = Vec::<LibraryWatchTarget>::new();
     loop {
-        let mut changed = false;
-        let mut changed_paths = Vec::new();
-        // Drain pending events
-        while let Ok(Ok(event)) = rx.try_recv() {
-            if is_relevant(&event) {
-                changed = true;
-                changed_paths.extend(event.paths);
-            }
+        let targets = library_watch_targets(&state).await;
+        let paths = targets
+            .iter()
+            .map(|target| target.path.clone())
+            .collect::<Vec<_>>();
+        if targets != last_targets {
+            info!(
+                "reconfiguring media file watcher old_paths={} new_paths={}",
+                last_targets.len(),
+                paths.len()
+            );
+            last_targets.clone_from(&targets);
         }
-        // If no immediate events, wait for the next one
-        if !changed {
-            match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
-                Ok(Some(Ok(event))) if is_relevant(&event) => {
-                    changed = true;
-                    changed_paths.extend(event.paths);
-                }
-                Ok(Some(Ok(_))) => {} // non-relevant event, continue
-                Ok(Some(Err(e))) => warn!("file watch error: {e}"),
-                Ok(None) => break,
-                Err(_) => {} // timeout, continue
+        if targets.is_empty() {
+            tokio::time::sleep(watcher_reload_interval()).await;
+            continue;
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Event, notify::Error>>(256);
+        let mut watcher = notify::recommended_watcher(move |event| {
+            let _ = tx.blocking_send(event);
+        })?;
+        for target in &targets {
+            if let Err(error) = watcher.watch(Path::new(&target.path), RecursiveMode::Recursive) {
+                warn!("failed to watch {}: {error}", target.path);
+            } else {
+                info!(
+                    "watching library path: {} library_id={}",
+                    target.path, target.library_id
+                );
             }
         }
 
-        if changed {
-            let mut triggered = scan_triggered.lock().await;
-            if !*triggered {
-                *triggered = true;
-                drop(triggered);
-                info!("file change detected, scheduling scan after debounce...");
-                let state = state.clone();
-                let flag = scan_triggered.clone();
-                let changed_scopes = scan_scopes_for_changed_paths(&paths, &changed_paths);
-                if changed_scopes.is_empty() {
-                    *flag.lock().await = false;
-                    continue;
+        loop {
+            match tokio::time::timeout(watcher_reload_interval(), rx.recv()).await {
+                Ok(Some(Ok(event))) if is_relevant(&event) => {
+                    let paths = changed_paths(&event, &targets);
+                    if !paths.is_empty() {
+                        schedule_watch_scan(state.clone(), pending_scan.clone(), paths).await;
+                    }
                 }
-                tokio::spawn(async move {
-                    tokio::time::sleep(debounce).await;
-                    run_scheduled_scan_when_idle(
-                        &state,
-                        "file watcher trigger",
-                        Some(&changed_scopes),
-                    )
-                    .await;
-                    let mut triggered = flag.lock().await;
-                    *triggered = false;
-                });
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(error))) => warn!("file watch error: {error}"),
+                Ok(None) => break,
+                Err(_) => {
+                    if library_watch_targets(&state).await != targets {
+                        break;
+                    }
+                }
             }
         }
     }
+}
 
-    Ok(())
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LibraryWatchTarget {
+    path: String,
+    library_id: String,
+}
+
+#[derive(Default)]
+struct PendingWatchScan {
+    scheduled: bool,
+    paths: HashSet<PathBuf>,
+}
+
+async fn schedule_watch_scan(
+    state: Arc<AppState>,
+    pending_scan: Arc<Mutex<PendingWatchScan>>,
+    paths: HashSet<PathBuf>,
+) {
+    let mut pending = pending_scan.lock().await;
+    pending.paths.extend(paths);
+    if pending.scheduled {
+        return;
+    }
+    pending.scheduled = true;
+    drop(pending);
+
+    tokio::spawn(async move {
+        tokio::time::sleep(debounce_duration()).await;
+        loop {
+            let paths = {
+                let mut pending = pending_scan.lock().await;
+                std::mem::take(&mut pending.paths)
+            };
+            if !paths.is_empty() {
+                let mut paths = paths.into_iter().collect::<Vec<_>>();
+                paths.sort();
+                info!(
+                    "file change detected, refreshing {} changed path(s)",
+                    paths.len()
+                );
+                run_scheduled_scan_when_idle(&state, &paths, "targeted file watcher trigger").await;
+            }
+
+            let mut pending = pending_scan.lock().await;
+            if pending.paths.is_empty() {
+                pending.scheduled = false;
+                break;
+            }
+            drop(pending);
+            tokio::time::sleep(debounce_duration()).await;
+        }
+    });
+}
+
+fn changed_paths(event: &Event, targets: &[LibraryWatchTarget]) -> HashSet<PathBuf> {
+    event
+        .paths
+        .iter()
+        .filter(|changed| {
+            !crate::library::scanner::is_ignored_scan_path(changed)
+                && targets
+                    .iter()
+                    .any(|target| changed.starts_with(Path::new(&target.path)))
+        })
+        .cloned()
+        .collect()
 }
 
 async fn poll_loop(state: Arc<AppState>) {
@@ -113,7 +167,11 @@ async fn poll_loop(state: Arc<AppState>) {
     );
 
     loop {
-        let paths = library_paths(&state).await;
+        let paths = library_watch_targets(&state)
+            .await
+            .into_iter()
+            .map(|target| target.path)
+            .collect::<Vec<_>>();
         if paths.is_empty() {
             if previous_snapshot.take().is_some() {
                 info!(
@@ -138,20 +196,17 @@ async fn poll_loop(state: Arc<AppState>) {
             if *previous != current_snapshot {
                 info!("media directory change detected by polling; waiting for changes to settle");
                 tokio::time::sleep(debounce).await;
-                match media_tree_snapshot(paths.clone()).await {
+                match media_tree_snapshot(paths).await {
                     Ok(settled_snapshot) => {
                         if settled_snapshot == current_snapshot {
-                            let changed_paths = changed_snapshot_paths(previous, &settled_snapshot);
-                            let changed_scopes =
-                                scan_scopes_for_changed_paths(&paths, &changed_paths);
-                            let scan_succeeded = !changed_scopes.is_empty()
-                                && run_scheduled_scan_when_idle(
-                                    &state,
-                                    "file watcher polling fallback",
-                                    Some(&changed_scopes),
-                                )
-                                .await;
-                            if changed_scopes.is_empty() || scan_succeeded {
+                            let changed_paths = media_tree_changes(previous, &settled_snapshot);
+                            if run_scheduled_scan_when_idle(
+                                &state,
+                                &changed_paths,
+                                "file watcher polling fallback",
+                            )
+                            .await
+                            {
                                 previous_snapshot = Some(settled_snapshot);
                             }
                         } else {
@@ -173,25 +228,13 @@ async fn poll_loop(state: Arc<AppState>) {
     }
 }
 
-pub fn schedule_paths_scan(state: Arc<AppState>, paths: Vec<String>, reason: &'static str) {
-    tokio::spawn(async move {
-        run_scheduled_scan_when_idle(&state, reason, Some(&paths)).await;
-    });
-}
-
 async fn run_scheduled_scan_when_idle(
     state: &AppState,
+    changed_paths: &[PathBuf],
     reason: &str,
-    paths: Option<&[String]>,
 ) -> bool {
     loop {
-        let result = match paths {
-            Some(paths) if !paths.is_empty() => {
-                crate::library::scanner::scan_media_library_paths_if_idle(state, paths).await
-            }
-            _ => crate::library::scanner::scan_media_library_if_idle(state).await,
-        };
-        match result {
+        match crate::library::scanner::scan_media_paths_if_idle(state, changed_paths).await {
             Ok(Some(_)) => {
                 info!("scheduled scan completed ({reason})");
                 return true;
@@ -208,64 +251,6 @@ async fn run_scheduled_scan_when_idle(
     }
 }
 
-fn scan_scopes_for_changed_paths(
-    library_paths: &[String],
-    changed_paths: &[PathBuf],
-) -> Vec<String> {
-    let mut roots = HashSet::new();
-    for changed_path in changed_paths {
-        if crate::library::scanner::is_ignored_scan_path(changed_path) {
-            continue;
-        }
-        for library_path in library_paths {
-            let library_root = Path::new(library_path);
-            if !changed_path.starts_with(library_root) {
-                continue;
-            }
-            let scope = top_level_scan_scope(library_root, changed_path);
-            roots.insert(scope.to_string_lossy().to_string());
-        }
-    }
-    let mut roots = roots.into_iter().collect::<Vec<_>>();
-    roots.sort();
-    roots
-}
-
-fn top_level_scan_scope(library_root: &Path, changed_path: &Path) -> PathBuf {
-    let Ok(relative) = changed_path.strip_prefix(library_root) else {
-        return library_root.to_path_buf();
-    };
-    let Some(first) = relative.components().next() else {
-        return library_root.to_path_buf();
-    };
-    library_root.join(first.as_os_str())
-}
-
-fn changed_snapshot_paths(
-    previous: &MediaTreeSnapshot,
-    current: &MediaTreeSnapshot,
-) -> Vec<PathBuf> {
-    let previous = previous
-        .files
-        .iter()
-        .map(|file| (file.path.clone(), (file.len, file.modified_at_nanos)))
-        .collect::<std::collections::HashMap<_, _>>();
-    let current = current
-        .files
-        .iter()
-        .map(|file| (file.path.clone(), (file.len, file.modified_at_nanos)))
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut changed = previous
-        .keys()
-        .chain(current.keys())
-        .filter(|path| previous.get(*path) != current.get(*path))
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    changed.sort();
-    changed.dedup();
-    changed
-}
-
 fn is_relevant(event: &Event) -> bool {
     matches!(
         event.kind,
@@ -273,23 +258,41 @@ fn is_relevant(event: &Event) -> bool {
     )
 }
 
-async fn library_paths(state: &AppState) -> Vec<String> {
+async fn library_watch_targets(state: &AppState) -> Vec<LibraryWatchTarget> {
     use sea_orm::{EntityTrait, QueryOrder};
 
-    crate::entities::library_paths::Entity::find()
+    let paths = crate::entities::library_paths::Entity::find()
         .order_by_asc(crate::entities::library_paths::Column::Path)
         .all(&state.db)
         .await
-        .map(|models| models.into_iter().map(|m| m.path).collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let options = crate::library::options::load_runtime_options(&state.db)
+        .await
+        .unwrap_or_default();
+
+    paths
+        .into_iter()
+        .filter(|model| {
+            let options = options.get(&model.library_id).cloned().unwrap_or_default();
+            options.enabled && options.enable_realtime_monitor
+        })
+        .map(|model| LibraryWatchTarget {
+            path: model.path,
+            library_id: model.library_id,
+        })
+        .collect()
 }
 
 fn debounce_duration() -> Duration {
     Duration::from_secs(env_duration_secs("JELLYFIN_RS_WATCH_DEBOUNCE_SECONDS", 10))
 }
 
+fn watcher_reload_interval() -> Duration {
+    Duration::from_secs(10)
+}
+
 fn poll_interval() -> Option<Duration> {
-    let seconds = env_duration_secs("JELLYFIN_RS_WATCH_POLL_SECONDS", 60);
+    let seconds = env_duration_secs("JELLYFIN_RS_WATCH_POLL_SECONDS", 0);
     (seconds > 0).then(|| Duration::from_secs(seconds))
 }
 
@@ -312,6 +315,33 @@ struct FileSnapshot {
     modified_at_nanos: u128,
 }
 
+fn media_tree_changes(previous: &MediaTreeSnapshot, current: &MediaTreeSnapshot) -> Vec<PathBuf> {
+    let previous = previous
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), (file.len, file.modified_at_nanos)))
+        .collect::<HashMap<_, _>>();
+    let current = current
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), (file.len, file.modified_at_nanos)))
+        .collect::<HashMap<_, _>>();
+    let mut changed = previous
+        .iter()
+        .filter(|(path, fingerprint)| current.get(*path) != Some(*fingerprint))
+        .map(|(path, _)| PathBuf::from(path))
+        .chain(
+            current
+                .iter()
+                .filter(|(path, fingerprint)| previous.get(*path) != Some(*fingerprint))
+                .map(|(path, _)| PathBuf::from(path)),
+        )
+        .collect::<Vec<_>>();
+    changed.sort();
+    changed.dedup();
+    changed
+}
+
 async fn media_tree_snapshot(paths: Vec<String>) -> anyhow::Result<MediaTreeSnapshot> {
     tokio::task::spawn_blocking(move || media_tree_snapshot_blocking(&paths)).await?
 }
@@ -323,7 +353,11 @@ fn media_tree_snapshot_blocking(paths: &[String]) -> anyhow::Result<MediaTreeSna
         if !root_path.exists() {
             continue;
         }
-        for entry in WalkDir::new(root_path).follow_links(false).into_iter() {
+        for entry in WalkDir::new(root_path)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !crate::library::scanner::is_ignored_scan_path(entry.path()))
+        {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -331,10 +365,7 @@ fn media_tree_snapshot_blocking(paths: &[String]) -> anyhow::Result<MediaTreeSna
                     continue;
                 }
             };
-            if !entry.file_type().is_file()
-                || crate::library::scanner::is_ignored_scan_path(entry.path())
-                || !is_snapshot_relevant(entry.path())
-            {
+            if !entry.file_type().is_file() || !is_snapshot_relevant(entry.path()) {
                 continue;
             }
             let metadata = match entry.metadata() {
@@ -413,6 +444,7 @@ fn is_snapshot_relevant(path: &Path) -> bool {
 mod tests {
     use std::fs;
 
+    use notify::event::{CreateKind, EventAttributes};
     use uuid::Uuid;
 
     use super::*;
@@ -454,28 +486,68 @@ mod tests {
     }
 
     #[test]
-    fn changed_file_is_mapped_to_its_scan_scope() {
-        let library_paths = vec![
-            "/media/tv-domestic".to_string(),
-            "/media/tv-xunlei".to_string(),
+    fn file_event_preserves_only_paths_inside_watched_roots() {
+        let event = Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![Path::new("/media/tv/Show/episode.mkv").to_path_buf()],
+            attrs: EventAttributes::new(),
+        };
+        let targets = vec![
+            LibraryWatchTarget {
+                path: "/media/movies".to_string(),
+                library_id: "movies".to_string(),
+            },
+            LibraryWatchTarget {
+                path: "/media/tv".to_string(),
+                library_id: "tv".to_string(),
+            },
         ];
-        let changed_paths = vec![PathBuf::from(
-            "/media/tv-xunlei/Home Temptation/episode-01.strm",
-        )];
 
+        let selected = changed_paths(&event, &targets);
         assert_eq!(
-            scan_scopes_for_changed_paths(&library_paths, &changed_paths),
-            vec!["/media/tv-xunlei/Home Temptation".to_string()]
+            selected,
+            HashSet::from([PathBuf::from("/media/tv/Show/episode.mkv")])
         );
     }
 
     #[test]
-    fn nested_episode_change_scans_the_series_directory() {
-        let root = Path::new("/media/tv-xunlei");
-        let changed = Path::new("/media/tv-xunlei/Home Temptation/Season 1/E01.strm");
+    fn snapshot_diff_returns_added_modified_and_removed_paths() {
+        let previous = MediaTreeSnapshot {
+            files: vec![
+                FileSnapshot {
+                    path: "/media/removed.mkv".to_string(),
+                    len: 1,
+                    modified_at_nanos: 1,
+                },
+                FileSnapshot {
+                    path: "/media/modified.mkv".to_string(),
+                    len: 1,
+                    modified_at_nanos: 1,
+                },
+            ],
+        };
+        let current = MediaTreeSnapshot {
+            files: vec![
+                FileSnapshot {
+                    path: "/media/added.mkv".to_string(),
+                    len: 1,
+                    modified_at_nanos: 1,
+                },
+                FileSnapshot {
+                    path: "/media/modified.mkv".to_string(),
+                    len: 2,
+                    modified_at_nanos: 2,
+                },
+            ],
+        };
+
         assert_eq!(
-            top_level_scan_scope(root, changed),
-            PathBuf::from("/media/tv-xunlei/Home Temptation")
+            media_tree_changes(&previous, &current),
+            vec![
+                PathBuf::from("/media/added.mkv"),
+                PathBuf::from("/media/modified.mkv"),
+                PathBuf::from("/media/removed.mkv"),
+            ]
         );
     }
 }

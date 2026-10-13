@@ -1871,6 +1871,10 @@ pub(crate) async fn readable_media_path(db: &sea_orm::DatabaseConnection, path: 
 }
 
 async fn library_roots(db: &sea_orm::DatabaseConnection) -> anyhow::Result<Vec<String>> {
+    if cfg!(test) {
+        return query_library_roots(db).await;
+    }
+
     {
         let cache = library_roots_cache().read().await;
         if let Some(cached) = cache.as_ref()
@@ -1889,16 +1893,22 @@ async fn library_roots(db: &sea_orm::DatabaseConnection) -> anyhow::Result<Vec<S
         return Ok(cached.roots.clone());
     }
 
-    let paths = LibraryPaths::find()
-        .order_by_asc(library_paths::Column::Path)
-        .all(db)
-        .await?;
-    let roots: Vec<String> = paths.into_iter().map(|path| path.path).collect();
+    let roots = query_library_roots(db).await?;
     *cache = Some(CachedLibraryRoots {
         loaded_at: Instant::now(),
         roots: roots.clone(),
     });
     Ok(roots)
+}
+
+async fn query_library_roots(db: &sea_orm::DatabaseConnection) -> anyhow::Result<Vec<String>> {
+    Ok(LibraryPaths::find()
+        .order_by_asc(library_paths::Column::Path)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|path| path.path)
+        .collect())
 }
 
 const LIBRARY_ROOTS_CACHE_TTL: Duration = Duration::from_secs(3);

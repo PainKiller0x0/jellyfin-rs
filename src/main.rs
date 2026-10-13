@@ -96,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
         tmdb_http_client: Arc::new(RwLock::new(tmdb_http_client)),
         douban_cookie: RwLock::new(douban_cookie),
         scan_lock: tokio::sync::Mutex::new(()),
+        scan_task: Default::default(),
         chapter_image_task_cancel: tokio::sync::Mutex::new(None),
         playback_sessions: RwLock::new(HashMap::new()),
         session_capabilities: RwLock::new(HashMap::new()),
@@ -632,6 +633,9 @@ async fn log_http_request(
     let jellyfin_device = jellyfin_auth_field(request.headers(), "Device");
     let jellyfin_device_id = jellyfin_auth_field(request.headers(), "DeviceId");
     let started = Instant::now();
+    if should_prioritize_foreground(&path) {
+        library::resource_governor::mark_foreground_activity();
+    }
 
     tracing::info!(
         request_id = %request_id,
@@ -651,6 +655,9 @@ async fn log_http_request(
     let response = next.run(request).await;
     let status = response.status();
     let elapsed_ms = started.elapsed().as_millis();
+    if should_prioritize_foreground(&path) {
+        library::resource_governor::report_request_latency(started.elapsed());
+    }
 
     tracing::info!(
         request_id = %request_id,
@@ -696,6 +703,13 @@ async fn log_http_request(
 
 fn should_record_admin_http_log(path: &str) -> bool {
     !path.starts_with("/admin") && !path.ends_with("/Admin/Logs")
+}
+
+fn should_prioritize_foreground(path: &str) -> bool {
+    !path.starts_with("/Library/Refresh")
+        && !path.starts_with("/ScheduledTasks")
+        && !path.starts_with("/admin")
+        && !path.ends_with("/Admin/Logs")
 }
 
 fn sanitize_query(query: &str) -> String {

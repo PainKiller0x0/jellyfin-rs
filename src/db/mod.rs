@@ -84,7 +84,7 @@ pub(crate) fn online_cpu_count() -> usize {
 }
 
 fn foreground_max_connections() -> u32 {
-    cpu_parallelism().saturating_mul(4).clamp(8, 32) as u32
+    4
 }
 
 fn background_max_connections() -> u32 {

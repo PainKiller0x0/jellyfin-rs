@@ -901,7 +901,7 @@ mod tests {
                 "fallback",
                 Some("mp4"),
             ),
-            "极速车魂 - S01E01.mp4"
+            "【夸克】极速车魂 - S01E01.mp4"
         );
     }
 

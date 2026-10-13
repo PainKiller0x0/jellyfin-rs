@@ -2002,9 +2002,11 @@ async fn run_post_scan_metadata_tasks(
 async fn run_provider_reconciliation(db: &sea_orm::DatabaseConnection) {
     match crate::library::reconcile::reconcile_provider_duplicates(db).await {
         Ok(stats) if stats.changed() => tracing::info!(
-            "provider reconciliation merged {} series and {} movie version(s); normalized {} series date range(s), {} dimension year(s), and {} episode metadata row(s)",
+            "provider reconciliation repaired {} episode parent(s), merged {} series, {} movie version(s), and {} episode version(s); normalized {} series date range(s), {} dimension year(s), and {} episode metadata row(s)",
+            stats.repaired_episode_parents,
             stats.merged_series,
             stats.merged_versions,
+            stats.merged_episode_versions,
             stats.normalized_series_dates,
             stats.normalized_dimension_years,
             stats.normalized_episode_metadata,

@@ -114,6 +114,30 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn source_label_keeps_existing_download_token_valid() {
+        let old = signed_download_path_with_filename("movie", "movie.mp4", Some("secret"), 100);
+        for label in ["【迅雷】", "【夸克】"] {
+            let path = signed_download_path_with_filename(
+                "movie",
+                &format!("{label}movie.mp4"),
+                Some("secret"),
+                100,
+            );
+            assert!(path.starts_with("/Items/movie/Download/%E3%80%90"));
+            assert_eq!(
+                path.split_once('?').unwrap().1,
+                old.split_once('?').unwrap().1
+            );
+            assert!(valid_download_token_with_secret(
+                "movie",
+                path.split_once("download_token=").unwrap().1,
+                "secret",
+                100
+            ));
+        }
+    }
+
+    #[test]
     fn signed_path_is_bound_to_item_and_expiry() {
         let path = signed_download_path_with_filename("movie", "movie.mp4", Some("secret"), 100);
         let token = path.split("download_token=").nth(1).unwrap();

@@ -1,6 +1,7 @@
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
+    path::Path,
 };
 
 use anyhow::Context;
@@ -23,6 +24,8 @@ pub struct ProviderReconcileStats {
     pub merged_series: usize,
     pub merged_movies: usize,
     pub merged_versions: usize,
+    pub merged_episode_versions: usize,
+    pub repaired_episode_parents: usize,
     pub normalized_series_dates: usize,
     pub normalized_episode_metadata: usize,
     pub normalized_dimension_years: usize,
@@ -32,6 +35,8 @@ impl ProviderReconcileStats {
     pub fn changed(self) -> bool {
         self.merged_series > 0
             || self.merged_movies > 0
+            || self.merged_episode_versions > 0
+            || self.repaired_episode_parents > 0
             || self.normalized_series_dates > 0
             || self.normalized_episode_metadata > 0
             || self.normalized_dimension_years > 0
@@ -227,6 +232,11 @@ pub async fn reconcile_provider_duplicates(
         }
     }
 
+    let (repaired_episode_parents, merged_episode_versions) =
+        reconcile_duplicate_episodes(&txn).await?;
+    stats.repaired_episode_parents = repaired_episode_parents;
+    stats.merged_episode_versions = merged_episode_versions;
+
     stats.normalized_series_dates =
         normalize_series_date_ranges(&txn, &all_items, &children_by_parent).await?;
     stats.normalized_dimension_years = normalize_dimension_years(&txn).await?;
@@ -235,6 +245,152 @@ pub async fn reconcile_provider_duplicates(
         .await
         .context("failed to commit provider reconciliation transaction")?;
     Ok(stats)
+}
+
+async fn repair_episode_season_parents<C: ConnectionTrait>(
+    db: &C,
+    items: &mut [media_items::Model],
+) -> anyhow::Result<usize> {
+    let seasons_by_library_path = items
+        .iter()
+        .filter(|item| item.item_type == "Season")
+        .map(|season| {
+            (
+                (
+                    season.library_id.as_str(),
+                    crate::library::path_utils::normalize_path(&season.path),
+                ),
+                season.id.as_str(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let corrections = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, episode)| {
+            if episode.item_type != "Episode" {
+                return None;
+            }
+            let season_id = season_id_for_episode_path(
+                &episode.library_id,
+                &episode.path,
+                &seasons_by_library_path,
+            )?;
+            (episode.parent_id != season_id).then_some((index, season_id))
+        })
+        .collect::<Vec<_>>();
+    if corrections.is_empty() {
+        return Ok(0);
+    }
+
+    for (index, season_id) in &corrections {
+        let episode = &items[*index];
+        let mut active: media_items::ActiveModel = episode.clone().into();
+        active.parent_id = Set(season_id.clone());
+        active.updated_at = Set(now_unix());
+        active
+            .update(db)
+            .await
+            .with_context(|| format!("failed to repair episode season parent: {}", episode.id))?;
+    }
+    for (index, season_id) in &corrections {
+        items[*index].parent_id = season_id.clone();
+    }
+    Ok(corrections.len())
+}
+
+fn season_id_for_episode_path(
+    library_id: &str,
+    episode_path: &str,
+    seasons_by_library_path: &HashMap<(&str, String), &str>,
+) -> Option<String> {
+    let parent_path = Path::new(episode_path).parent()?;
+    let key = (
+        library_id,
+        crate::library::path_utils::normalize_path(&parent_path.to_string_lossy()),
+    );
+    seasons_by_library_path
+        .get(&key)
+        .map(|id| (*id).to_string())
+}
+
+async fn reconcile_duplicate_episodes<C: ConnectionTrait>(
+    db: &C,
+) -> anyhow::Result<(usize, usize)> {
+    let mut items = MediaItems::find()
+        .all(db)
+        .await
+        .context("failed to load episodes for version reconciliation")?;
+    let repaired = repair_episode_season_parents(db, &mut items).await?;
+    let by_id: HashMap<&str, &media_items::Model> =
+        items.iter().map(|item| (item.id.as_str(), item)).collect();
+    let tmdb_ids = ProviderIds::find()
+        .filter(provider_ids::Column::Provider.eq("Tmdb"))
+        .all(db)
+        .await
+        .context("failed to load TMDb episode IDs for version reconciliation")?;
+    let tmdb_ids_by_item: HashMap<String, String> = tmdb_ids
+        .into_iter()
+        .map(|provider_id| (provider_id.item_id, provider_id.provider_item_id))
+        .collect();
+
+    let mut groups: HashMap<(String, Option<i64>, i64, String), Vec<&media_items::Model>> =
+        HashMap::new();
+    for episode in items.iter().filter(|item| item.item_type == "Episode") {
+        let Some(series) = ancestor_series(episode, &by_id) else {
+            continue;
+        };
+        let Some(episode_number) = episode.episode_number else {
+            continue;
+        };
+        let Some(tmdb_id) = tmdb_ids_by_item.get(&episode.id) else {
+            continue;
+        };
+        groups
+            .entry((
+                series.id.clone(),
+                episode.season_number,
+                episode_number,
+                tmdb_id.clone(),
+            ))
+            .or_default()
+            .push(episode);
+    }
+
+    let mut merged = 0;
+    for candidates in groups.values().filter(|items| items.len() > 1) {
+        let representative = candidates
+            .iter()
+            .min_by_key(|item| {
+                (
+                    source_fallback_key(&item.path),
+                    is_generic_episode_title(&item.title),
+                    Reverse(item.title.chars().count()),
+                    item.created_at,
+                    item.path.len(),
+                    item.id.clone(),
+                )
+            })
+            .expect("candidate list is non-empty");
+
+        for duplicate in candidates {
+            if duplicate.id == representative.id {
+                continue;
+            }
+            move_item(
+                db,
+                &duplicate.id,
+                &representative.id,
+                Some("Video"),
+                Some(0),
+            )
+            .await?;
+            merged += 1;
+        }
+    }
+
+    Ok((repaired, merged))
 }
 
 /// Clears production years that were parsed from a video dimension, such as
@@ -898,7 +1054,12 @@ fn parse_year(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_series_identity, source_fallback_key, source_priority_score};
+    use super::{
+        normalize_series_identity, reconcile_provider_duplicates, season_id_for_episode_path,
+        source_fallback_key, source_priority_score,
+    };
+    use crate::entities::{media_items, provider_ids};
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 
     #[test]
     fn xunlei_is_primary_and_quark_is_fallback() {
@@ -922,5 +1083,185 @@ mod tests {
             normalize_series_identity("再见菈菈"),
             normalize_series_identity("再见，拉拉")
         );
+    }
+
+    #[test]
+    fn season_parent_lookup_requires_same_library_and_exact_directory() {
+        let seasons = std::collections::HashMap::from([(
+            ("library-1", "/media/show/Season 6".to_string()),
+            "season-6",
+        )]);
+
+        assert_eq!(
+            season_id_for_episode_path("library-1", "/media/show/Season 6/E01.strm", &seasons,),
+            Some("season-6".to_string())
+        );
+        assert_eq!(
+            season_id_for_episode_path("library-2", "/media/show/Season 6/E01.strm", &seasons,),
+            None
+        );
+        assert_eq!(
+            season_id_for_episode_path("library-1", "/media/show/Season 7/E01.strm", &seasons,),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_episode_parent_is_repaired_from_its_season_path() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        let library_id = "test-season-parent-library";
+        let series_id = "test-season-parent-series";
+        let season_id = "test-season-parent-season-6";
+        let episode_id = "test-season-parent-episode-6-1";
+        let unrelated_episode_id = "test-season-parent-episode-7-1";
+
+        for (id, title, path, parent_id, item_type, season_number, episode_number) in [
+            (
+                series_id,
+                "JOJO",
+                "/media/迅雷-番/JOJO (2012)",
+                library_id,
+                "Series",
+                None,
+                None,
+            ),
+            (
+                season_id,
+                "Season 6",
+                "/media/迅雷-番/JOJO (2012)/Season 6",
+                series_id,
+                "Season",
+                Some(6),
+                None,
+            ),
+            (
+                episode_id,
+                "Episode 1",
+                "/media/迅雷-番/JOJO (2012)/Season 6/E01.strm",
+                "deleted-season-id",
+                "Episode",
+                Some(6),
+                Some(1),
+            ),
+            (
+                unrelated_episode_id,
+                "Episode 1",
+                "/media/迅雷-番/JOJO (2012)/Season 7/E01.strm",
+                "deleted-season-7-id",
+                "Episode",
+                Some(7),
+                Some(1),
+            ),
+        ] {
+            media_items::ActiveModel {
+                id: Set(id.to_string()),
+                title: Set(title.to_string()),
+                path: Set(path.to_string()),
+                library_id: Set(library_id.to_string()),
+                parent_id: Set(parent_id.to_string()),
+                item_type: Set(item_type.to_string()),
+                season_number: Set(season_number),
+                episode_number: Set(episode_number),
+                created_at: Set(1),
+                modified_at: Set(1),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+
+        let stats = reconcile_provider_duplicates(&db).await.unwrap();
+        assert_eq!(stats.repaired_episode_parents, 1);
+        let repaired = media_items::Entity::find_by_id(episode_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.parent_id, season_id);
+        let untouched = media_items::Entity::find_by_id(unrelated_episode_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.parent_id, "deleted-season-7-id");
+
+        let second_run = reconcile_provider_duplicates(&db).await.unwrap();
+        assert_eq!(second_run.repaired_episode_parents, 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_tmdb_episodes_become_xunlei_primary_versions() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        let series_id = "test-gaim-series";
+        let primary_id = "test-gaim-xunlei-episode";
+        let alternate_id = "test-gaim-quark-episode";
+        let now = 1;
+
+        media_items::ActiveModel {
+            id: Set(series_id.to_string()),
+            title: Set("假面骑士铠武".to_string()),
+            path: Set("/media/迅雷-特摄/假面骑士铠武Gaim(2013)".to_string()),
+            library_id: Set("test-library".to_string()),
+            parent_id: Set("test-library".to_string()),
+            item_type: Set("Series".to_string()),
+            created_at: Set(now),
+            modified_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        for (id, source) in [(primary_id, "迅雷-特摄"), (alternate_id, "特摄")] {
+            media_items::ActiveModel {
+                id: Set(id.to_string()),
+                title: Set("变身！从天而降的柳橙！？".to_string()),
+                path: Set(format!("/media/{source}/假面骑士铠武Gaim(2013)/01.strm")),
+                library_id: Set("test-library".to_string()),
+                parent_id: Set(series_id.to_string()),
+                item_type: Set("Episode".to_string()),
+                season_number: Set(Some(1)),
+                episode_number: Set(Some(1)),
+                created_at: Set(now),
+                modified_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            provider_ids::ActiveModel {
+                item_id: Set(id.to_string()),
+                provider: Set("Tmdb".to_string()),
+                provider_item_id: Set("5541405".to_string()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+
+        let stats = reconcile_provider_duplicates(&db).await.unwrap();
+        assert_eq!(stats.merged_episode_versions, 1);
+
+        let primary = media_items::Entity::find_by_id(primary_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let alternate = media_items::Entity::find_by_id(alternate_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(primary.item_type, "Episode");
+        assert_eq!(alternate.item_type, "Video");
+        assert_eq!(alternate.parent_id, primary_id);
+
+        let second_run = reconcile_provider_duplicates(&db).await.unwrap();
+        assert_eq!(second_run.merged_episode_versions, 0);
     }
 }

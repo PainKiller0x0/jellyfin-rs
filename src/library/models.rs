@@ -744,7 +744,13 @@ pub fn media_source_json_with_streams(
 
     let mut map = Map::new();
     map.insert("Id".into(), JsonValue::String(item.id.clone()));
-    map.insert("Name".into(), JsonValue::String(item.title.clone()));
+    map.insert(
+        "Name".into(),
+        JsonValue::String(crate::library::naming::media_source_display_name(
+            &item.path,
+            &item.title,
+        )),
+    );
     map.insert("Type".into(), JsonValue::String("Default".to_string()));
     map.insert("Protocol".into(), JsonValue::String(protocol));
     map.insert(
@@ -1730,7 +1736,12 @@ pub fn child_video_source_json_for_item(
     let video_3d_format = crate::library::naming::parse_video_3d_format(&source_path);
     let mut map = Map::new();
     map.insert("Id".into(), JsonValue::String(media_source_id.to_string()));
-    map.insert("Name".into(), JsonValue::String(title.to_string()));
+    map.insert(
+        "Name".into(),
+        JsonValue::String(crate::library::naming::media_source_display_name(
+            path, title,
+        )),
+    );
     map.insert("Type".into(), JsonValue::String("Default".to_string()));
     map.insert("Protocol".into(), JsonValue::String(protocol));
     map.insert(
@@ -1812,6 +1823,43 @@ mod tests {
         media_source_json_with_streams, rewrite_public_strm_target_with_base,
     };
     use serde_json::json;
+
+    #[test]
+    fn source_labels_preserve_ids_and_stream_routes() {
+        for (root, label) in [("迅雷-番", "【迅雷】"), ("番", "【夸克】")] {
+            let path = format!("/media/{root}/Show/Show - S01E01.(mp4).strm");
+            let mut item = video_item();
+            item.path = path.clone();
+            let source = media_source_json_with_streams(&item, Vec::new());
+            assert_eq!(source["Name"], format!("{label}{}", item.title));
+            assert_eq!(source["Id"], item.id);
+            assert_eq!(
+                source["DirectStreamUrl"],
+                format!("/Videos/{}/stream", item.id)
+            );
+
+            let child =
+                child_video_source_json("version", "Show", &path, "mp4", None, None, Vec::new());
+            assert_eq!(child["Name"], format!("{label}Show"));
+            assert_eq!(child["Id"], "version");
+            assert_eq!(child["DirectStreamUrl"], "/Videos/version/version/stream");
+
+            let url = super::public_item_download_path_with_base(
+                "version",
+                &path,
+                "Show",
+                Some("mp4"),
+                Some("https://example.test"),
+            );
+            let expected =
+                crate::jellyfin::download_tokens::public_download_path_with_filename_with_base(
+                    "version",
+                    &format!("{label}Show - S01E01.mp4"),
+                    Some("https://example.test"),
+                );
+            assert_eq!(url, expected);
+        }
+    }
 
     #[test]
     fn public_strm_base_rewrites_only_local_smartstrm_targets() {

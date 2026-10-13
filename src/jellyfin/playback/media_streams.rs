@@ -773,12 +773,12 @@ fn compare_size_desc_nulls_last(a: Option<i64>, b: Option<i64>) -> Ordering {
 }
 
 fn media_source_file_name(path: &str, fallback_title: &str) -> String {
-    Path::new(path)
+    let name = Path::new(path)
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.trim().is_empty())
-        .unwrap_or(fallback_title)
-        .to_string()
+        .unwrap_or(fallback_title);
+    crate::library::naming::media_source_display_name(path, name)
 }
 
 pub async fn subtitle_stream_path(

@@ -100,6 +100,23 @@ pub fn parse_media_name(path: &Path, collection_type: &str) -> ParsedName {
     }
 }
 
+/// Label known SmartStrm source roots without changing the stored filename.
+pub fn media_source_display_name(path: &str, name: &str) -> String {
+    let root = path
+        .strip_prefix("/media/")
+        .and_then(|path| path.split('/').next());
+    let label = match root {
+        Some("迅雷-番" | "迅雷-特摄" | "迅雷-电视剧") => "【迅雷】",
+        Some("番" | "特摄" | "电影" | "电视剧") => "【夸克】",
+        _ => return name.to_string(),
+    };
+    if name.starts_with(label) {
+        name.to_string()
+    } else {
+        format!("{label}{name}")
+    }
+}
+
 /// Build the download filename exposed for a media item.
 ///
 /// STRM files may preserve the source container in a wrapped suffix such as
@@ -132,7 +149,7 @@ pub fn download_filename_from_path(path: &str, title: &str, container: Option<&s
         .trim();
     let stem = if stem.is_empty() { title.trim() } else { stem };
     let stem = if stem.is_empty() { "download" } else { stem };
-    format!("{stem}.{extension}")
+    media_source_display_name(path, &format!("{stem}.{extension}"))
 }
 
 fn strip_download_suffix<'a>(value: &'a str, suffix: &str) -> &'a str {
@@ -154,6 +171,15 @@ fn parse_episode_name(path: &str, stem: &str, folder: &str) -> ParsedName {
     if let Some((premiere_date, title)) = parse_episode_date(stem) {
         parsed.premiere_date = Some(premiere_date);
         parsed.title = title;
+        parsed.version = parse_version(stem);
+        parsed.extended_video_types = parse_extended_video_types(stem);
+        return parsed;
+    }
+
+    if stem.contains("先行预告") {
+        parsed.season_number = season_number_from_path(path);
+        parsed.episode_number = Some(0);
+        parsed.title = "先行预告".to_string();
         parsed.version = parse_version(stem);
         parsed.extended_video_types = parse_extended_video_types(stem);
         return parsed;
@@ -221,6 +247,18 @@ fn parse_episode_name(path: &str, stem: &str, folder: &str) -> ParsedName {
     parsed.version = parse_version(stem);
     parsed.extended_video_types = parse_extended_video_types(stem);
     parsed
+}
+
+fn season_number_from_path(path: &str) -> Option<i64> {
+    static SEASON_FOLDER: OnceLock<Regex> = OnceLock::new();
+    let regex = SEASON_FOLDER.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|/)season[._ ](?P<season>[0-9]{1,4})(?:/|$)")
+            .expect("season folder regex must compile")
+    });
+    let season = regex
+        .captures(path)
+        .and_then(|captures| capture_i64(&captures, &["season"], &[]))?;
+    (!is_invalid_episode_season_number(season)).then_some(season)
 }
 
 fn parse_episode_date(value: &str) -> Option<(String, String)> {
@@ -429,6 +467,16 @@ fn episode_patterns() -> &'static [(Regex, EpisodeStyle)] {
             // Episode 16 / Episode 16 - Title.
             r#"(?i).*(?:/)episode[ ._-]*(?P<episode>[0-9]{1,4})(?:[ ._-]*(?P<ending>[0-9]{1,4}))?(?:[ ._-]+(?P<name>[^/]+))?$"#,
             EpisodeStyle::TrailingTitle,
+        ),
+        (
+            // Anime releases may wrap the marker under an explicit Season folder.
+            r#"(?i).*/season[._ ](?P<season>[0-9]{1,4})/(?:\[[^\]]+\]\s*)*\[episode[ ._-]*(?P<episode>[0-9]{1,4})\][^/]*$"#,
+            EpisodeStyle::Named,
+        ),
+        (
+            // Anime releases may wrap the marker, e.g. `[Episode.01][Title]`.
+            r#"(?i).*(?:/)(?:\[[^\]]+\]\s*)*\[episode[ ._-]*(?P<episode>[0-9]{1,4})\][^/]*$"#,
+            EpisodeStyle::Named,
         ),
         (
             // Season 1/01 episode title.avi.
@@ -855,7 +903,7 @@ mod tests {
                 "fallback",
                 Some("mp4"),
             ),
-            "极速车魂 - S01E01.mp4"
+            "【夸克】极速车魂 - S01E01.mp4"
         );
         assert_eq!(
             download_filename_from_path("/media/movie/movie.mkv.strm", "fallback", None),
@@ -864,6 +912,36 @@ mod tests {
         assert_eq!(
             download_filename_from_path("", "", Some("strm")),
             "download.mp4"
+        );
+    }
+
+    #[test]
+    fn source_labels_distinguish_identical_filenames_without_guessing_unknown_roots() {
+        for root in ["迅雷-番", "迅雷-特摄", "迅雷-电视剧"] {
+            let path = format!("/media/{root}/Show/Show - S01E01.(mp4).strm");
+            assert_eq!(media_source_display_name(&path, "Show"), "【迅雷】Show");
+            assert_eq!(
+                download_filename_from_path(&path, "Show", Some("mp4")),
+                "【迅雷】Show - S01E01.mp4"
+            );
+        }
+        for root in ["番", "特摄", "电影", "电视剧"] {
+            assert_eq!(
+                media_source_display_name(&format!("/media/{root}/迅雷 Show/episode.strm"), "Show"),
+                "【夸克】Show"
+            );
+        }
+        assert_eq!(
+            media_source_display_name("/media/local/迅雷 Show.strm", "Show"),
+            "Show"
+        );
+        assert_eq!(
+            media_source_display_name("/media/番外/Show.strm", "Show"),
+            "Show"
+        );
+        assert_eq!(
+            media_source_display_name("/media/番/Show.strm", "【夸克】Show"),
+            "【夸克】Show"
         );
     }
 
@@ -992,6 +1070,25 @@ mod tests {
         assert_eq!(parsed.season_number, None);
         assert_eq!(parsed.episode_number, Some(62));
         assert_ne!(parsed.title, "mp4");
+
+        let parsed = parse_media_name(
+            Path::new(
+                "假面骑士Amazons (2016)/Season 2/[魔星字幕团][假面骑士Amazons II][Episode.01][新生之种][中日双语字幕][BDRip][1080P][MKV].(mkv).strm",
+            ),
+            "tvshows",
+        );
+        assert_eq!(parsed.season_number, Some(2));
+        assert_eq!(parsed.episode_number, Some(1));
+
+        let parsed = parse_media_name(
+            Path::new(
+                "假面骑士Amazons (2016)/Season 2/[魔星字幕团][假面骑士Amazons II][先行预告][中日双语字幕][1080P][HDRip][MKV].(mkv).strm",
+            ),
+            "tvshows",
+        );
+        assert_eq!(parsed.season_number, Some(2));
+        assert_eq!(parsed.episode_number, Some(0));
+        assert_eq!(parsed.title, "先行预告");
     }
 
     #[test]

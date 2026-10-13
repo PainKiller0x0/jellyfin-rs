@@ -33,6 +33,11 @@ pub async fn item_by_id(
             Err(error) => internal_error(error),
         },
         Ok(None) => {
+            match super::tv_shows::flat_season_json_by_id(&state.db, &user_id, &item_id).await {
+                Ok(Some(item)) => return Json(strip_nulls(item)).into_response(),
+                Ok(None) => {}
+                Err(error) => return internal_error(error),
+            }
             // Check if it's a library
             if let Ok(Some(lib_item)) = find_library_as_item(&state.db, &item_id).await {
                 return Json(lib_item).into_response();
@@ -74,6 +79,11 @@ pub async fn item_by_id_public(
             }
         }
         Ok(None) => {
+            match super::tv_shows::flat_season_json_by_id(&state.db, &user_id, &item_id).await {
+                Ok(Some(item)) => return Json(strip_nulls(item)).into_response(),
+                Ok(None) => {}
+                Err(error) => return internal_error(error),
+            }
             // Check if it's a library
             if let Ok(Some(lib_item)) = find_library_as_item(&state.db, &item_id).await {
                 return Json(lib_item).into_response();
@@ -726,6 +736,7 @@ struct EpisodeParentInfo {
     series_name: String,
     season_id: Option<String>,
     season_name: Option<String>,
+    has_real_seasons: bool,
 }
 
 /// Get series and season info for an episode parent. The parent may be a real
@@ -774,7 +785,9 @@ async fn batch_episode_parent_info(
                JOIN ancestors ON ancestor_parent.id = ancestors.parent_id
                WHERE ancestors.depth < 8 AND {ancestor_visible}
            )
-           SELECT root_id, id, title, item_type, depth
+           SELECT root_id, id, title, item_type, depth,
+                  EXISTS (SELECT 1 FROM media_items season WHERE season.parent_id = ancestors.id
+                          AND season.item_type = 'Season' AND season.is_public = 1) AS has_real_seasons
            FROM ancestors
            ORDER BY root_id ASC, depth ASC"#
     );
@@ -795,6 +808,7 @@ async fn batch_episode_parent_info(
         title: String,
         item_type: String,
         depth: i64,
+        has_real_seasons: bool,
     }
 
     let mut grouped: HashMap<String, Vec<Ancestor>> = HashMap::new();
@@ -813,6 +827,7 @@ async fn batch_episode_parent_info(
             title,
             item_type,
             depth,
+            has_real_seasons: row.try_get::<bool>("", "has_real_seasons").unwrap_or(false),
         });
     }
 
@@ -836,6 +851,7 @@ async fn batch_episode_parent_info(
                 series_name: series.title.clone(),
                 season_id: season.map(|ancestor| ancestor.id.clone()),
                 season_name: season.map(|ancestor| ancestor.title.clone()),
+                has_real_seasons: series.has_real_seasons,
             },
         );
     }
@@ -852,13 +868,25 @@ fn apply_episode_parent_info(
     value["SeriesName"] = json!(info.series_name.clone());
     value["SeriesId"] = json!(info.series_id.clone());
 
+    let virtual_season_id =
+        (info.season_id.is_none() && item_parent_id == info.series_id && !info.has_real_seasons)
+            .then(|| super::tv_shows::flat_season_id(&info.series_id, season_number.unwrap_or(0)));
+    if let Some(id) = &virtual_season_id {
+        value["ParentId"] = json!(id);
+    }
     let season_name = info
         .season_name
         .clone()
-        .or_else(|| season_number.map(display_season_name));
+        .or_else(|| season_number.map(display_season_name))
+        .or_else(|| virtual_season_id.as_ref().map(|_| display_season_name(0)));
     if let Some(season_name) = season_name {
         value["SeasonName"] = json!(season_name);
-        value["SeasonId"] = json!(info.season_id.as_deref().unwrap_or(item_parent_id));
+        value["SeasonId"] = json!(
+            info.season_id
+                .as_deref()
+                .or(virtual_season_id.as_deref())
+                .unwrap_or(item_parent_id)
+        );
     }
 
     let season_image_id = info.season_id.as_deref().unwrap_or(&info.series_id);
@@ -1227,6 +1255,34 @@ pub async fn enrich_item_list(
             for row in &rows {
                 if let (Ok(series_id), Ok(cnt)) = (row.get_str("series_id"), row.get_i64("cnt")) {
                     series_played_episode_count_map.insert(series_id, cnt);
+                }
+            }
+        }
+    }
+
+    if !series_ids.is_empty() {
+        let placeholders = series_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let episode_visible = item_queries::visible_media_item_sql("episode");
+        let season_visible = item_queries::visible_media_item_sql("season");
+        let sql = format!(
+            "SELECT episode.parent_id AS series_id, COUNT(DISTINCT COALESCE(episode.season_number, 0)) AS season_count, COUNT(DISTINCT (COALESCE(episode.season_number, 0), COALESCE(episode.episode_number, 0))) AS episode_count, COUNT(DISTINCT (COALESCE(episode.season_number, 0), COALESCE(episode.episode_number, 0))) FILTER (WHERE COALESCE(ud.played, 0) = 1) AS played_episode_count FROM media_items episode LEFT JOIN user_data ud ON ud.item_id = episode.id AND ud.user_id = ? WHERE episode.parent_id IN ({placeholders}) AND episode.item_type = 'Episode' AND {episode_visible} AND NOT EXISTS (SELECT 1 FROM media_items season WHERE season.parent_id = episode.parent_id AND season.item_type = 'Season' AND {season_visible}) GROUP BY episode.parent_id"
+        );
+        let mut values: Vec<sea_orm::Value> = vec![user_id.into()];
+        values.extend(series_ids.iter().map(|id| id.as_str().into()));
+        if let Ok(rows) = db
+            .query_all_raw(crate::db::helpers::pg_statement(&sql, values))
+            .await
+        {
+            for row in &rows {
+                if let (Ok(series_id), Ok(season_count), Ok(episode_count), Ok(played_count)) = (
+                    row.get_str("series_id"),
+                    row.get_i64("season_count"),
+                    row.get_i64("episode_count"),
+                    row.get_i64("played_episode_count"),
+                ) {
+                    series_season_count_map.insert(series_id.clone(), season_count);
+                    series_episode_count_map.insert(series_id.clone(), episode_count);
+                    series_played_episode_count_map.insert(series_id, played_count);
                 }
             }
         }
@@ -1697,7 +1753,9 @@ mod tests {
             .unwrap();
         assert_eq!(direct_json["SeriesId"], "direct-series");
         assert_eq!(direct_json["SeriesName"], "Direct Series");
-        assert_eq!(direct_json["SeasonId"], "direct-series");
+        let season_id = super::super::tv_shows::flat_season_id("direct-series", 1);
+        assert_eq!(direct_json["SeasonId"], season_id);
+        assert_eq!(direct_json["ParentId"], season_id);
         assert_eq!(direct_json["SeasonName"], "Season 1");
         assert_eq!(direct_json["SeriesPrimaryImageTag"], "series-primary-tag");
         assert_eq!(direct_json["ParentPrimaryImageItemId"], "direct-series");
@@ -1706,7 +1764,8 @@ mod tests {
         let direct_enriched = enrich_episode_list(&db, "u1", vec![direct_episode]).await;
         assert_eq!(direct_enriched[0]["SeriesId"], "direct-series");
         assert_eq!(direct_enriched[0]["SeriesName"], "Direct Series");
-        assert_eq!(direct_enriched[0]["SeasonId"], "direct-series");
+        assert_eq!(direct_enriched[0]["SeasonId"], season_id);
+        assert_eq!(direct_enriched[0]["ParentId"], season_id);
         assert_eq!(direct_enriched[0]["SeasonName"], "Season 1");
         assert_eq!(
             direct_enriched[0]["SeriesPrimaryImageTag"],

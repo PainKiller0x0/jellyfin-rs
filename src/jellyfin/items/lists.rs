@@ -51,6 +51,28 @@ async fn list_items_response(
     user_id: String,
     query: HashMap<String, String>,
 ) -> Response {
+    if let Some(parent_id) = query_value(&query, &["ParentId", "parentId"]) {
+        match super::tv_shows::flat_season_episodes_for_id(&state.db, &user_id, parent_id).await {
+            Ok(Some(items)) => {
+                let total = items.len();
+                let page = items
+                    .into_iter()
+                    .skip(query_start_index(&query))
+                    .take(query_limit(&query, usize::MAX))
+                    .collect::<Vec<_>>();
+                let json_items = super::enrich_episode_list(&state.db, &user_id, page).await;
+                return Json(base_item_query_result_with_total(
+                    json_items,
+                    total,
+                    query_start_index(&query),
+                ))
+                .into_response();
+            }
+            Ok(None) => {}
+            Err(error) => return internal_error(error),
+        }
+    }
+
     match list_media_items(&state.db, &user_id, &query).await {
         Ok((items, total)) => {
             let json_items = super::enrich_episode_list(&state.db, &user_id, items).await;

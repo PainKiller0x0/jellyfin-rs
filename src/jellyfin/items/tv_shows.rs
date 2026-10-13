@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use anyhow::Context;
 use axum::{
@@ -11,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::{
     app::state::AppState,
+    db::row_ext::QueryResultExt,
     jellyfin::item_queries::{self, attach_item_image_tags, batch_item_provider_ids},
     jellyfin::{auth::query_user_id_or_request, common::internal_error},
     library::{models::MediaItem, reconcile::source_priority_score},
@@ -94,14 +98,37 @@ pub async fn show_seasons(
     let start_index = query_usize(&query, &["StartIndex", "startIndex"], 0);
     let limit = query_limit(&query);
     match child_items_by_type(&state.db, &user_id, &show_id, "Season").await {
-        Ok(items) => {
+        Ok(mut items) => {
+            let mut virtual_counts = HashMap::new();
+            if items.is_empty() {
+                match flat_season_items(&state.db, &user_id, &show_id).await {
+                    Ok(flat_seasons) => {
+                        for flat_season in flat_seasons {
+                            virtual_counts.insert(
+                                flat_season.item.id.clone(),
+                                (flat_season.episode_count, flat_season.played_count),
+                            );
+                            items.push(flat_season.item);
+                        }
+                    }
+                    Err(error) => return internal_error(error),
+                }
+            }
             let total = items.len();
             let page = items
                 .into_iter()
                 .skip(start_index)
                 .take(limit)
                 .collect::<Vec<_>>();
-            let json_items = super::enrich_item_list(&state.db, &user_id, page).await;
+            let mut json_items = super::enrich_item_list(&state.db, &user_id, page).await;
+            for item in &mut json_items {
+                if let Some(id) = item.get("Id").and_then(Value::as_str)
+                    && let Some((episode_count, played_count)) = virtual_counts.get(id)
+                {
+                    item["SeriesId"] = json!(show_id);
+                    apply_virtual_season_counts(item, *episode_count, *played_count);
+                }
+            }
             Json(json!({ "Items": json_items, "TotalRecordCount": total, "StartIndex": start_index }))
                 .into_response()
         }
@@ -119,7 +146,16 @@ pub async fn show_episodes(
     let start_index = query_usize(&query, &["StartIndex", "startIndex"], 0);
     let limit = query_limit(&query);
     let result = if let Some(season_id) = query_value(&query, &["SeasonId", "seasonId"]) {
-        child_items_by_type(&state.db, &user_id, season_id, "Episode").await
+        match resolve_flat_season_id(&state.db, &user_id, season_id).await {
+            Ok(Some((series_id, _))) if series_id == show_id => {
+                flat_season_episodes_for_id(&state.db, &user_id, season_id)
+                    .await
+                    .map(|items| items.unwrap_or_default())
+            }
+            Ok(Some(_)) => Ok(Vec::new()),
+            Ok(None) => child_items_by_type(&state.db, &user_id, season_id, "Episode").await,
+            Err(error) => Err(error),
+        }
     } else {
         descendant_episodes(&state.db, &user_id, &show_id).await
     };
@@ -137,6 +173,186 @@ pub async fn show_episodes(
         }
         Err(error) => internal_error(error),
     }
+}
+
+const FLAT_SEASON_ID_PREFIX: &str = "jellyfin-rs-flat-season-";
+
+pub(crate) fn flat_season_id(series_id: &str, season_number: i64) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("{FLAT_SEASON_ID_PREFIX}{series_id}-{season_number}").as_bytes(),
+    )
+    .to_string()
+}
+
+pub(crate) async fn resolve_flat_season_id(
+    db: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    id: &str,
+) -> anyhow::Result<Option<(String, i64)>> {
+    if uuid::Uuid::parse_str(id).is_err() && !id.starts_with(FLAT_SEASON_ID_PREFIX) {
+        return Ok(None);
+    }
+    if item_queries::find_media_item(db, user_id, id)
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    // Keep virtual identities stable without inserting synthetic rows into the library.
+    let series_visible = item_queries::visible_media_item_sql("series");
+    let sql = format!(
+        "SELECT DISTINCT series.id, COALESCE(episode.season_number, 0) AS season_number
+         FROM media_items series JOIN media_items episode ON episode.parent_id = series.id
+         WHERE series.item_type = 'Series' AND {series_visible}
+         AND episode.item_type = 'Episode' AND episode.is_public = 1
+         AND NOT EXISTS (SELECT 1 FROM media_items season WHERE season.parent_id = series.id
+                         AND season.item_type = 'Season' AND season.is_public = 1)"
+    );
+    let rows = db
+        .query_all_raw(crate::db::helpers::pg_statement(&sql, vec![]))
+        .await?;
+    for row in rows {
+        let series_id = row.get_str("id")?;
+        let number = row.get_i64("season_number")?;
+        if id == flat_season_id(&series_id, number)
+            || id == format!("{FLAT_SEASON_ID_PREFIX}{series_id}-{number}")
+        {
+            if item_queries::find_media_item(db, user_id, &series_id)
+                .await?
+                .is_some()
+            {
+                return Ok(Some((series_id, number)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+struct FlatSeason {
+    item: MediaItem,
+    episode_count: i64,
+    played_count: i64,
+}
+
+async fn flat_season_items(
+    db: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    series_id: &str,
+) -> anyhow::Result<Vec<FlatSeason>> {
+    let seasons = child_items_by_type(db, user_id, series_id, "Season").await?;
+    if !seasons.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(mut series) = item_queries::find_media_item(db, user_id, series_id).await? else {
+        return Ok(Vec::new());
+    };
+    if series.item_type != "Series" {
+        return Ok(Vec::new());
+    }
+
+    let mut episodes = child_items_by_type(db, user_id, series_id, "Episode").await?;
+    if episodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let _ = attach_item_image_tags(db, std::slice::from_mut(&mut series)).await;
+
+    let mut grouped = BTreeMap::<i64, Vec<MediaItem>>::new();
+    for episode in episodes.drain(..) {
+        grouped
+            .entry(episode.season_number.unwrap_or(0))
+            .or_default()
+            .push(episode);
+    }
+
+    Ok(grouped
+        .into_iter()
+        .map(|(season_number, episodes)| {
+            let episode_count = episodes.len() as i64;
+            let played_count = episodes.iter().filter(|episode| episode.played).count() as i64;
+            let mut item = series.clone();
+            item.id = flat_season_id(series_id, season_number);
+            item.title = if season_number == 0 {
+                "Specials".to_string()
+            } else {
+                format!("Season {season_number}")
+            };
+            item.parent_id = series_id.to_string();
+            item.item_type = "Season".to_string();
+            item.is_folder = true;
+            item.season_number = Some(season_number);
+            item.episode_number = None;
+            item.episode_number_end = None;
+            item.series_name = Some(series.title.clone());
+            item.is_favorite = false;
+            item.played = false;
+            item.playback_position_ticks = 0;
+            item.played_percentage = None;
+            item.play_count = 0;
+            item.last_played_at = None;
+            FlatSeason {
+                item,
+                episode_count,
+                played_count,
+            }
+        })
+        .collect())
+}
+
+pub(crate) async fn flat_season_episodes_for_id(
+    db: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    season_id: &str,
+) -> anyhow::Result<Option<Vec<MediaItem>>> {
+    let Some((series_id, season_number)) = resolve_flat_season_id(db, user_id, season_id).await?
+    else {
+        return Ok(None);
+    };
+    let flat_seasons = flat_season_items(db, user_id, &series_id).await?;
+    if !flat_seasons
+        .iter()
+        .any(|season| season.item.season_number == Some(season_number))
+    {
+        return Ok(None);
+    }
+    let episodes = child_items_by_type(db, user_id, &series_id, "Episode").await?;
+    Ok(Some(
+        episodes
+            .into_iter()
+            .filter(|episode| episode.season_number.unwrap_or(0) == season_number)
+            .collect(),
+    ))
+}
+
+pub(crate) async fn flat_season_json_by_id(
+    db: &sea_orm::DatabaseConnection,
+    user_id: &str,
+    season_id: &str,
+) -> anyhow::Result<Option<Value>> {
+    let Some((series_id, season_number)) = resolve_flat_season_id(db, user_id, season_id).await?
+    else {
+        return Ok(None);
+    };
+    let Some(season) = flat_season_items(db, user_id, &series_id)
+        .await?
+        .into_iter()
+        .find(|season| season.item.season_number == Some(season_number))
+    else {
+        return Ok(None);
+    };
+    let mut value = season.item.to_jellyfin_json();
+    value["SeriesId"] = json!(series_id);
+    value["SeriesName"] = json!(season.item.series_name);
+    apply_virtual_season_counts(&mut value, season.episode_count, season.played_count);
+    Ok(Some(value))
+}
+
+fn apply_virtual_season_counts(value: &mut Value, episode_count: i64, played_count: i64) {
+    let unplayed_count = (episode_count - played_count).max(0);
+    value["ChildCount"] = json!(episode_count);
+    value["RecursiveItemCount"] = json!(episode_count);
+    value["EpisodeCount"] = json!(episode_count);
+    value["UserData"]["UnplayedItemCount"] = json!(unplayed_count);
 }
 
 fn query_value<'a>(query: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
@@ -248,7 +464,7 @@ async fn descendant_episodes(
 mod tests {
     use super::{
         MediaItem, child_items_by_type, descendant_episodes, episode_representative_score,
-        show_episodes, show_seasons,
+        flat_season_id, show_episodes, show_seasons,
     };
     use crate::entities::{
         image_assets::{self, Entity as ImageAssets},
@@ -494,6 +710,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn flat_season_ids_are_stable_client_guids() {
+        let id = flat_season_id("series-id-with-hyphens", 12);
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        assert_eq!(id, flat_season_id("series-id-with-hyphens", 12));
+        assert_ne!(id, flat_season_id("series-id-with-hyphens", 1));
+    }
+
     #[tokio::test]
     async fn enrich_season_list_counts_duplicate_episode_versions_once() {
         let Some(db) = crate::db::test_db().await else {
@@ -561,6 +785,174 @@ mod tests {
 
         assert_eq!(value["TotalRecordCount"], 1);
         assert_eq!(value["StartIndex"], 0);
+    }
+
+    #[tokio::test]
+    async fn flat_series_exposes_virtual_season_and_episode_children() {
+        let Some(db) = crate::db::test_db().await else {
+            return;
+        };
+        insert_library(&db).await;
+        insert_item(
+            &db,
+            "flat-series",
+            "Flat Series",
+            "tv",
+            "Series",
+            1,
+            1,
+            None,
+            None,
+        )
+        .await;
+        insert_item(
+            &db,
+            "flat-episode-1",
+            "Episode 1",
+            "flat-series",
+            "Episode",
+            0,
+            1,
+            Some(1),
+            Some(1),
+        )
+        .await;
+        insert_item(
+            &db,
+            "flat-episode-2",
+            "Episode 2",
+            "flat-series",
+            "Episode",
+            0,
+            1,
+            Some(1),
+            Some(2),
+        )
+        .await;
+        insert_item(
+            &db,
+            "flat-season-2-episode-1",
+            "Season 2 Episode 1",
+            "flat-series",
+            "Episode",
+            0,
+            1,
+            Some(2),
+            Some(1),
+        )
+        .await;
+
+        let state = Arc::new(test_state(db));
+        let mut query = HashMap::new();
+        query.insert("UserId".to_string(), "u1".to_string());
+        let response = show_seasons(
+            State(state.clone()),
+            Path("flat-series".to_string()),
+            Extension("u1".to_string()),
+            Query(query),
+        )
+        .await
+        .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["TotalRecordCount"], 2);
+        let season = &value["Items"][0];
+        assert_eq!(season["Type"], "Season");
+        assert_eq!(season["Name"], "Season 1");
+        assert_eq!(season["SeriesId"], "flat-series");
+        assert_eq!(season["IndexNumber"], 1);
+        assert_eq!(season["ChildCount"], 2);
+        let second_season = &value["Items"][1];
+        assert_eq!(second_season["Type"], "Season");
+        assert_eq!(second_season["Name"], "Season 2");
+        assert_eq!(second_season["IndexNumber"], 2);
+        assert_eq!(second_season["ChildCount"], 1);
+        let season_id = season["Id"].as_str().unwrap().to_string();
+        assert!(uuid::Uuid::parse_str(&season_id).is_ok());
+        assert_eq!(
+            super::resolve_flat_season_id(&state.db, "u1", &season_id)
+                .await
+                .unwrap(),
+            Some(("flat-series".to_string(), 1))
+        );
+        assert_eq!(
+            super::resolve_flat_season_id(&state.db, "u1", "jellyfin-rs-flat-season-flat-series-1")
+                .await
+                .unwrap(),
+            Some(("flat-series".to_string(), 1))
+        );
+        let season_detail = super::flat_season_json_by_id(&state.db, "u1", &season_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(season_detail["Id"], season_id);
+        assert_eq!(season_detail["ParentId"], "flat-series");
+        let query = HashMap::from([("ParentId".to_string(), season_id.clone())]);
+        let response = crate::jellyfin::items::user_items(
+            State(state.clone()),
+            Path("u1".to_string()),
+            Query(query),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let children: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(children["TotalRecordCount"], 2);
+        assert_eq!(children["Items"][0]["SeasonId"], season_id);
+        let query = HashMap::from([("SeasonId".to_string(), season_id.clone())]);
+        let response = show_episodes(
+            State(state.clone()),
+            Path("wrong-series".to_string()),
+            Extension("u1".to_string()),
+            Query(query),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let wrong_series: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(wrong_series["TotalRecordCount"], 0);
+
+        let mut query = HashMap::new();
+        query.insert("UserId".to_string(), "u1".to_string());
+        query.insert("SeasonId".to_string(), season_id.clone());
+        let response = show_episodes(
+            State(state.clone()),
+            Path("flat-series".to_string()),
+            Extension("u1".to_string()),
+            Query(query),
+        )
+        .await
+        .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["TotalRecordCount"], 2);
+        for episode in value["Items"].as_array().unwrap() {
+            assert_eq!(episode["SeasonId"], season_id);
+            assert_eq!(episode["ParentId"], season_id);
+            assert_eq!(episode["SeriesId"], "flat-series");
+        }
+        assert_eq!(
+            value["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["Id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["flat-episode-1", "flat-episode-2"]
+        );
+        sea_orm::ConnectionTrait::execute_raw(
+            &state.db,
+            crate::db::helpers::pg_statement(
+                "UPDATE media_items SET is_public = 0 WHERE id = ?",
+                vec!["flat-series".into()],
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            super::resolve_flat_season_id(&state.db, "u1", &season_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     async fn insert_library(db: &sea_orm::DatabaseConnection) {

@@ -78,6 +78,8 @@ struct ScanRootRequest {
 
 #[derive(Clone)]
 struct ExistingMediaState {
+    id: String,
+    parent_id: String,
     item_type: String,
     modified_at: i64,
     size_bytes: Option<i64>,
@@ -791,6 +793,13 @@ async fn scan_root(
                 &item_type,
                 extra_type.is_some(),
             );
+            if matches!(collection_type.as_str(), "tvshows" | "tv")
+                && item_type == "Episode"
+                && extra_type.is_none()
+                && let Some(season_id) = existing_episode_season_id(path, &existing_media)
+            {
+                parent_id = season_id;
+            }
             let primary_path = if item_type == "Movie" {
                 stack_owners_cache
                     .get_or_init(|| {
@@ -1221,9 +1230,22 @@ fn item_requires_ingest(
         let source_size_changed = !item.path.to_ascii_lowercase().ends_with(".strm")
             && existing.size_bytes != item.size_bytes;
         existing.item_type != item.item_type
+            || existing.parent_id != item.parent_id
             || existing.modified_at != item.modified_at
             || source_size_changed
     })
+}
+
+fn existing_episode_season_id(
+    path: &std::path::Path,
+    existing_media: &HashMap<String, ExistingMediaState>,
+) -> Option<String> {
+    let parent_path = path.parent()?;
+    let normalized_parent = path_utils::normalize_path(&parent_path.to_string_lossy());
+    existing_media
+        .get(&normalized_parent)
+        .filter(|parent| parent.item_type == "Season")
+        .map(|parent| parent.id.clone())
 }
 
 fn source_fingerprint_is_unchanged(
@@ -1293,9 +1315,16 @@ fn scan_root_preflight(
         let path_string = resolved.path.clone();
         seen_set.insert(path_string.clone());
         seen_paths.push(path_string.clone());
+        let parent_changed = matches!(collection_type, "tvshows" | "tv")
+            && existing_media.get(&path_string).is_some_and(|existing| {
+                existing.item_type == "Episode"
+                    && existing_episode_season_id(path, existing_media)
+                        .is_some_and(|season_id| existing.parent_id != season_id)
+            });
         match existing_media.get(&path_string) {
             Some(existing)
-                if source_fingerprint_is_unchanged(&path_string, &resolved, existing) => {}
+                if source_fingerprint_is_unchanged(&path_string, &resolved, existing)
+                    && !parent_changed => {}
             _ => has_changes = true,
         }
     }
@@ -2699,6 +2728,8 @@ async fn load_existing_media_state(
             (
                 item.path,
                 ExistingMediaState {
+                    id: item.id,
+                    parent_id: item.parent_id,
                     item_type: item.item_type,
                     modified_at: item.modified_at,
                     size_bytes: item.size_bytes,
@@ -3065,6 +3096,8 @@ mod tests {
         let existing = HashMap::from([(
             item.path.clone(),
             ExistingMediaState {
+                id: "episode".to_string(),
+                parent_id: String::new(),
                 item_type: "Episode".to_string(),
                 modified_at: 42,
                 size_bytes: Some(700_000_000),
@@ -3081,6 +3114,8 @@ mod tests {
     #[test]
     fn unchanged_source_fingerprint_skips_expensive_file_parsing() {
         let existing = ExistingMediaState {
+            id: "episode".to_string(),
+            parent_id: String::new(),
             item_type: "Episode".to_string(),
             modified_at: 42,
             size_bytes: Some(700_000_000),
@@ -3133,6 +3168,8 @@ mod tests {
             (
                 folder_info.path.clone(),
                 ExistingMediaState {
+                    id: folder_info.id.clone(),
+                    parent_id: String::new(),
                     item_type: "Folder".to_string(),
                     modified_at: folder_info.modified_at,
                     size_bytes: folder_info.size_bytes,
@@ -3141,6 +3178,8 @@ mod tests {
             (
                 movie_info.path.clone(),
                 ExistingMediaState {
+                    id: movie_info.id.clone(),
+                    parent_id: folder_info.id.clone(),
                     item_type: "Movie".to_string(),
                     modified_at: movie_info.modified_at,
                     size_bytes: movie_info.size_bytes,
@@ -3162,6 +3201,61 @@ mod tests {
         fs::write(movie_dir.join("Movie 2.mkv"), []).unwrap();
         let changed = scan_root_preflight(&root, "movies", &existing).unwrap();
         assert!(changed.has_changes);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unchanged_episode_with_stale_season_id_triggers_global_scan() {
+        let root = test_dir("stale_episode_season_id");
+        let series_dir = root.join("JOJO");
+        let season_dir = series_dir.join("Season 6");
+        fs::create_dir_all(&season_dir).unwrap();
+        let episode = season_dir.join("E01.mkv");
+        fs::write(&episode, []).unwrap();
+
+        let series_info = path_utils::resolve_path_info(&series_dir).unwrap();
+        let season_info = path_utils::resolve_path_info(&season_dir).unwrap();
+        let episode_info = path_utils::resolve_path_info(&episode).unwrap();
+        let existing = HashMap::from([
+            (
+                series_info.path.clone(),
+                ExistingMediaState {
+                    id: "series-id".to_string(),
+                    parent_id: String::new(),
+                    item_type: "Series".to_string(),
+                    modified_at: series_info.modified_at,
+                    size_bytes: series_info.size_bytes,
+                },
+            ),
+            (
+                season_info.path.clone(),
+                ExistingMediaState {
+                    id: "persisted-season-id".to_string(),
+                    parent_id: "series-id".to_string(),
+                    item_type: "Season".to_string(),
+                    modified_at: season_info.modified_at,
+                    size_bytes: season_info.size_bytes,
+                },
+            ),
+            (
+                episode_info.path.clone(),
+                ExistingMediaState {
+                    id: "episode-id".to_string(),
+                    parent_id: "path-derived-season-id".to_string(),
+                    item_type: "Episode".to_string(),
+                    modified_at: episode_info.modified_at,
+                    size_bytes: episode_info.size_bytes,
+                },
+            ),
+        ]);
+
+        let scan = scan_root_preflight(&root, "tvshows", &existing).unwrap();
+        assert!(scan.has_changes);
+        assert_eq!(
+            existing_episode_season_id(&episode, &existing).as_deref(),
+            Some("persisted-season-id")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

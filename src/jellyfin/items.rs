@@ -36,4 +36,5 @@ pub use recommendations::{
     home_section_items, home_sections, movie_recommendations, user_suggestions,
 };
 pub use remote_metadata::{apply_remote_search, remote_search};
+pub(crate) use tv_shows::resolve_flat_season_id;
 pub use tv_shows::{show_episodes, show_seasons};

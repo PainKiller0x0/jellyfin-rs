@@ -76,6 +76,10 @@ pub async fn item_images(
     Path(item_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    let item_id = match image_item_id(&state, &headers, &query, &item_id).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     if let Err(response) = ensure_visible_item_or_library(&state, &headers, &query, &item_id).await
     {
         return response;
@@ -92,6 +96,10 @@ pub async fn get_item_image(
     Query(query): Query<HashMap<String, String>>,
     Path((item_id, image_type)): Path<(String, String)>,
 ) -> Response {
+    let item_id = match image_item_id(&state, &headers, &query, &item_id).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     if let Err(response) = ensure_visible_item_or_library(&state, &headers, &query, &item_id).await
     {
         return response;
@@ -106,6 +114,10 @@ pub async fn get_item_image_with_index(
     Query(query): Query<HashMap<String, String>>,
     Path((item_id, first, second)): Path<(String, String, String)>,
 ) -> Response {
+    let item_id = match image_item_id(&state, &headers, &query, &item_id).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     if let Err(response) = ensure_visible_item_or_library(&state, &headers, &query, &item_id).await
     {
         return response;
@@ -143,6 +155,10 @@ pub async fn get_item_image_legacy_path(
         _unplayed_count,
     )): Path<LegacyItemImagePath>,
 ) -> Response {
+    let item_id = match image_item_id(&state, &headers, &query, &item_id).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     if let Err(response) = ensure_visible_item_or_library(&state, &headers, &query, &item_id).await
     {
         return response;
@@ -566,6 +582,28 @@ async fn serve_item_image(
         response_headers.insert(header::ETAG, value);
     }
     (response_headers, Body::from(bytes)).into_response()
+}
+
+async fn image_item_id(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+    item_id: &str,
+) -> Result<String, Response> {
+    if crate::jellyfin::item_queries::find_media_item(&state.db, "", item_id)
+        .await
+        .map_err(internal_error)?
+        .is_some()
+    {
+        return Ok(item_id.to_string());
+    }
+    let (user_id, _) =
+        crate::jellyfin::auth::request_user_id_and_admin_or_default(state, headers, query).await;
+    match crate::jellyfin::items::resolve_flat_season_id(&state.db, &user_id, item_id).await {
+        Ok(Some((series_id, _))) => Ok(series_id),
+        Ok(None) => Ok(item_id.to_string()),
+        Err(error) => Err(internal_error(error)),
+    }
 }
 
 async fn ensure_visible_item_or_library(

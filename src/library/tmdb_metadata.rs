@@ -1264,6 +1264,7 @@ pub async fn fetch_and_apply_episode_tmdb_metadata(
         .filter(|end| *end > episode_number);
 
     let current_title = row.get_str("episode_title").unwrap_or_default();
+    let episode_path = row.get_str("episode_path").unwrap_or_default();
     let series_title = row.get_str("series_title").unwrap_or_default();
     let series_year = row.get_opt_i64("series_year").ok().flatten();
     let series_display_order = row.get_opt_str("series_display_order").ok().flatten();
@@ -1277,7 +1278,7 @@ pub async fn fetch_and_apply_episode_tmdb_metadata(
     };
     let episode_metadata_is_current = row.get_opt_str("episode_tmdb_id").ok().flatten().is_some()
         && row.get_i64("tmdb_metadata_version").unwrap_or_default() == TMDB_METADATA_VERSION
-        && !is_replaceable_episode_title(&current_title, &series_title, series_year);
+        && !is_replaceable_episode_title(&current_title, &series_title, series_year, &episode_path);
     let has_primary = row.get_i64("has_primary").unwrap_or_default() != 0;
     if (!policy.refresh_metadata || episode_metadata_is_current)
         && (!policy.refresh_images || has_primary)
@@ -1616,6 +1617,7 @@ async fn apply_episode_tmdb_response(
                     &target.current_title,
                     &target.series_title,
                     target.series_year,
+                    &target.path,
                 ))
             && let Some(title) = episode_title_candidate(
                 episode.name.as_deref(),
@@ -2245,7 +2247,7 @@ fn episode_title_candidate(
         }
     }
 
-    if is_replaceable_episode_title(current_title, series_title, series_year) {
+    if is_replaceable_episode_title(current_title, series_title, series_year, path) {
         return local_episode_title_from_path(path)
             .filter(|title| !is_generic_series_episode_title(title, series_title, series_year))
             .or_else(|| Some(format!("Episode {episode_number}")));
@@ -2272,8 +2274,17 @@ fn is_generic_series_episode_title(
         .unwrap_or(false)
 }
 
-fn is_replaceable_episode_title(title: &str, series_title: &str, series_year: Option<i64>) -> bool {
-    is_generic_series_episode_title(title, series_title, series_year) || title.trim().contains("][")
+fn is_replaceable_episode_title(
+    title: &str,
+    series_title: &str,
+    series_year: Option<i64>,
+    path: &str,
+) -> bool {
+    is_generic_series_episode_title(title, series_title, series_year)
+        || title.trim().contains("][")
+        || local_episode_filename_prefix(path).is_some_and(|prefix| {
+            compact_title_for_compare(title) == compact_title_for_compare(&prefix)
+        })
 }
 
 fn compact_title_for_compare(value: &str) -> String {
@@ -2286,7 +2297,7 @@ fn compact_title_for_compare(value: &str) -> String {
 
 fn local_episode_title_from_path(path: &str) -> Option<String> {
     let stem = Path::new(path).file_stem()?.to_str()?;
-    let marker = find_episode_marker_end(stem)?;
+    let (_, marker) = find_episode_marker(stem)?;
     let tail = stem[marker..].trim_matches(|c: char| c.is_whitespace() || ".-_[]()".contains(c));
     let mut parts = Vec::new();
     for part in tail.split(['.', '_', '-']) {
@@ -2303,7 +2314,17 @@ fn local_episode_title_from_path(path: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-fn find_episode_marker_end(stem: &str) -> Option<usize> {
+fn local_episode_filename_prefix(path: &str) -> Option<String> {
+    let stem = Path::new(path).file_stem()?.to_str()?;
+    let (marker, _) = find_episode_marker(stem)?;
+    let prefix = stem[..marker]
+        .trim_matches(|c: char| c.is_whitespace() || ".-_[]()".contains(c))
+        .trim()
+        .to_string();
+    (!prefix.is_empty()).then_some(prefix)
+}
+
+fn find_episode_marker(stem: &str) -> Option<(usize, usize)> {
     let bytes = stem.as_bytes();
     let mut index = 0usize;
     while index < bytes.len() {
@@ -2326,7 +2347,7 @@ fn find_episode_marker_end(stem: &str) -> Option<usize> {
                 cursor += 1;
             }
             if cursor > episode_start {
-                return Some(cursor);
+                return Some((index, cursor));
             }
         }
         index += 1;
@@ -5490,12 +5511,37 @@ mod tests {
             "chs jpn][F17589F6",
             "攻壳机动队 STAND ALONE COMPLEX",
             Some(2002),
+            "/media/攻壳机动队/Season 1/E01.mkv",
         ));
         assert!(!is_replaceable_episode_title(
             "硝烟弹雨",
             "攻壳机动队 STAND ALONE COMPLEX",
             Some(2002),
+            "/media/攻壳机动队/Season 1/E01.mkv",
         ));
+    }
+
+    #[test]
+    fn jojo_filename_prefix_is_replaceable_by_tmdb_episode_title() {
+        let path = "/media/JOJO/Season 6/套马的汉子 - S06E04.(mp4).strm";
+        assert!(is_replaceable_episode_title(
+            "套马的汉子",
+            "JOJO的奇妙冒险",
+            Some(2012),
+            path,
+        ));
+        assert_eq!(
+            episode_title_candidate(
+                Some("恶魔之掌"),
+                "套马的汉子",
+                "JOJO的奇妙冒险",
+                Some(2012),
+                4,
+                path,
+            )
+            .as_deref(),
+            Some("恶魔之掌")
+        );
     }
 
     #[test]

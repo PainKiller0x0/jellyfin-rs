@@ -370,8 +370,13 @@ pub async fn upsert_media_item(
         }
         let preserve_scraped_episode_title = existing.item_type == "Episode"
             && item.item_type == "Episode"
-            && existing.tmdb_metadata_version > 0
-            && existing.overview.is_some();
+            && should_preserve_scraped_episode_title(
+                existing.tmdb_metadata_version,
+                existing.overview.is_some(),
+                &existing.title,
+                &item.title,
+                item.lock_data,
+            );
         let preserve_folder_title = existing.item_type == item.item_type
             && existing.is_folder != 0
             && (existing.overview.is_some() || existing.premiere_date.is_some());
@@ -542,6 +547,18 @@ pub async fn upsert_media_item(
     Ok(item.id.clone())
 }
 
+fn should_preserve_scraped_episode_title(
+    tmdb_metadata_version: i64,
+    has_overview: bool,
+    existing_title: &str,
+    scanned_title: &str,
+    scanned_lock_data: Option<bool>,
+) -> bool {
+    tmdb_metadata_version > 0
+        && has_overview
+        && !(scanned_lock_data == Some(true) && existing_title != scanned_title)
+}
+
 fn media_item_scan_matches(
     existing: &media_items::Model,
     item: &ScannedMediaItem,
@@ -549,8 +566,13 @@ fn media_item_scan_matches(
     let existing_is_folder = existing.is_folder != 0;
     let preserve_scraped_episode_title = existing.item_type == "Episode"
         && item.item_type == "Episode"
-        && existing.tmdb_metadata_version > 0
-        && existing.overview.is_some();
+        && should_preserve_scraped_episode_title(
+            existing.tmdb_metadata_version,
+            existing.overview.is_some(),
+            &existing.title,
+            &item.title,
+            item.lock_data,
+        );
     let preserve_folder_title = existing.item_type == item.item_type
         && existing_is_folder
         && (existing.overview.is_some() || existing.premiere_date.is_some());
@@ -2097,8 +2119,9 @@ async fn cleanup_path_exists(path: &str) -> bool {
 mod tests {
     use super::{
         ScannedMediaItem, apply_local_metadata_refresh, cached_media_probe_if_current,
-        upsert_default_media_stream, upsert_failed_media_probe, upsert_media_item,
-        upsert_media_metadata, upsert_probed_media_streams,
+        should_preserve_scraped_episode_title, upsert_default_media_stream,
+        upsert_failed_media_probe, upsert_media_item, upsert_media_metadata,
+        upsert_probed_media_streams,
     };
     use crate::entities::{
         genres::{self, Entity as Genres},
@@ -2186,6 +2209,31 @@ mod tests {
         let row = media_item_row(&db, &item.path).await;
         assert_eq!(row.title, "第一集");
         assert_eq!(row.overview.as_deref(), Some("已从 TMDB 获取的单集简介"));
+    }
+
+    #[test]
+    fn locked_nfo_episode_title_overrides_scraped_title() {
+        assert!(should_preserve_scraped_episode_title(
+            1,
+            true,
+            "TMDb title",
+            "filename title",
+            None,
+        ));
+        assert!(!should_preserve_scraped_episode_title(
+            1,
+            true,
+            "TMDb title",
+            "NFO title",
+            Some(true),
+        ));
+        assert!(!should_preserve_scraped_episode_title(
+            0,
+            true,
+            "filename title",
+            "NFO title",
+            Some(true),
+        ));
     }
 
     #[tokio::test]

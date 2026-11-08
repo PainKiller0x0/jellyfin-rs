@@ -2555,10 +2555,36 @@ pub(crate) fn parse_lookup_title_year(path: &Path) -> Option<(String, Option<i64
     } else {
         parsed_title
     };
+    let title = strip_trailing_media_format_hint(&title);
     if title.is_empty() {
         return None;
     }
     Some((title, year))
+}
+
+fn strip_trailing_media_format_hint(title: &str) -> String {
+    let title = title.trim_end();
+    for format in ["mp4", "mkv"] {
+        for (open, close) in [('(', ')'), ('（', '）')] {
+            let Some(start) = title.rfind(open) else {
+                continue;
+            };
+            if !title.ends_with(close) {
+                continue;
+            }
+            let value_start = start + open.len_utf8();
+            let value_end = title.len() - close.len_utf8();
+            if title
+                .get(value_start..value_end)
+                .is_some_and(|value| value.eq_ignore_ascii_case(format))
+            {
+                return title[..start]
+                    .trim_end_matches(|ch| ch == ' ' || ch == '.')
+                    .to_string();
+            }
+        }
+    }
+    title.to_string()
 }
 
 fn lookup_year_regex() -> &'static regex::Regex {
@@ -5261,6 +5287,14 @@ mod tests {
         assert_eq!(
             parse_lookup_title_year(Path::new("阿凡达1（2009）")),
             Some(("阿凡达1".to_string(), Some(2009)))
+        );
+        assert_eq!(
+            parse_lookup_title_year(Path::new("罗小黑战记 (2019).(mp4).strm")),
+            Some(("罗小黑战记".to_string(), Some(2019)))
+        );
+        assert_eq!(
+            parse_lookup_title_year(Path::new("罗小黑战记 2 (2025).（mkv）.strm")),
+            Some(("罗小黑战记 2".to_string(), Some(2025)))
         );
         assert_eq!(
             clean_title_with_year("美人心计【2010】"),

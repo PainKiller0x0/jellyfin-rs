@@ -1,4 +1,4 @@
-const DEFAULT_API_BASE_URL: &str = "https://api.themoviedb.org/3";
+const DEFAULT_API_BASE_URL: &str = "https://api.tmdb.org/3";
 const DEFAULT_IMAGE_BASE_URL: &str = "https://image.tmdb.org/t/p";
 
 pub fn normalize_base_url(base_url: &str) -> anyhow::Result<Option<String>> {
@@ -143,6 +143,15 @@ mod tests {
         assert_eq!(
             image_url(Some("https://tmdb.qb.edu.kg"), "w500", "/poster.jpg"),
             "https://tmdb.qb.edu.kg/t/p/w500/poster.jpg"
+        );
+    }
+
+    #[test]
+    fn default_tmdb_api_uses_alternate_host_and_keeps_official_image_cdn() {
+        assert_eq!(api_url(None, "movie/1"), "https://api.tmdb.org/3/movie/1");
+        assert_eq!(
+            image_url(None, "w500", "/poster.jpg"),
+            "https://image.tmdb.org/t/p/w500/poster.jpg"
         );
     }
 

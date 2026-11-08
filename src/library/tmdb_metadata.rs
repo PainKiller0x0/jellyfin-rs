@@ -902,6 +902,7 @@ struct TmdbEpisodeGroups {
 #[derive(serde::Deserialize)]
 struct TmdbEpisodeGroupSummary {
     id: String,
+    name: Option<String>,
     #[serde(rename = "type")]
     group_type: Option<i64>,
 }
@@ -1374,7 +1375,8 @@ async fn fetch_tmdb_episode_with_jellyfin_order(
     display_order: Option<&str>,
     language: &str,
 ) -> anyhow::Result<Option<EpisodeTmdbResponse>> {
-    let (mapped_season, mapped_episode) = match resolve_tmdb_group_episode(
+    let mut candidates = Vec::new();
+    if let Some(mapped) = resolve_tmdb_group_episode(
         client,
         api_key,
         tmdb_base_url,
@@ -1385,28 +1387,67 @@ async fn fetch_tmdb_episode_with_jellyfin_order(
     )
     .await?
     {
-        Some((mapped_season, mapped_episode)) => {
+        if !candidates.contains(&mapped) {
+            candidates.push(mapped);
+        }
+    }
+    candidates.push((season_number, episode_number));
+
+    for (mapped_season, mapped_episode) in candidates {
+        if let Some(episode) = fetch_tmdb_episode_endpoint(
+            client,
+            api_key,
+            tmdb_base_url,
+            series_tmdb_id,
+            mapped_season,
+            mapped_episode,
+            language,
+        )
+        .await?
+        {
             if mapped_season != season_number || mapped_episode != episode_number {
                 tracing::debug!(
                     "TMDb episode group mapped tmdb-{series_tmdb_id} S{season_number}E{episode_number} ({}) to S{mapped_season}E{mapped_episode}",
                     display_order.unwrap_or_default()
                 );
             }
-            (mapped_season, mapped_episode)
+            return Ok(Some(episode));
         }
-        None => (season_number, episode_number),
-    };
+    }
 
-    fetch_tmdb_episode_endpoint(
-        client,
-        api_key,
-        tmdb_base_url,
-        series_tmdb_id,
-        mapped_season,
-        mapped_episode,
-        language,
-    )
-    .await
+    if tmdb_episode_group_type(display_order) != Some(6)
+        && let Some((mapped_season, mapped_episode)) = resolve_tmdb_group_episode_type(
+            client,
+            api_key,
+            tmdb_base_url,
+            series_tmdb_id,
+            season_number,
+            episode_number,
+            6,
+            Some("Seasons"),
+        )
+        .await?
+        && (mapped_season != season_number || mapped_episode != episode_number)
+    {
+        if let Some(episode) = fetch_tmdb_episode_endpoint(
+            client,
+            api_key,
+            tmdb_base_url,
+            series_tmdb_id,
+            mapped_season,
+            mapped_episode,
+            language,
+        )
+        .await?
+        {
+            tracing::debug!(
+                "TMDb Seasons group mapped tmdb-{series_tmdb_id} S{season_number}E{episode_number} to S{mapped_season}E{mapped_episode}"
+            );
+            return Ok(Some(episode));
+        }
+    }
+
+    Ok(None)
 }
 
 async fn fetch_tmdb_episode_endpoint(
@@ -1449,9 +1490,38 @@ async fn resolve_tmdb_group_episode(
     let Some(group_type) = tmdb_episode_group_type(display_order) else {
         return Ok(None);
     };
-    let Some(group) =
-        fetch_tmdb_episode_group_cached(client, api_key, tmdb_base_url, series_tmdb_id, group_type)
-            .await?
+    resolve_tmdb_group_episode_type(
+        client,
+        api_key,
+        tmdb_base_url,
+        series_tmdb_id,
+        season_number,
+        episode_number,
+        group_type,
+        None,
+    )
+    .await
+}
+
+async fn resolve_tmdb_group_episode_type(
+    client: &reqwest::Client,
+    api_key: &str,
+    tmdb_base_url: Option<&str>,
+    series_tmdb_id: &str,
+    season_number: i64,
+    episode_number: i64,
+    group_type: i64,
+    group_name: Option<&str>,
+) -> anyhow::Result<Option<(i64, i64)>> {
+    let Some(group) = fetch_tmdb_episode_group_cached(
+        client,
+        api_key,
+        tmdb_base_url,
+        series_tmdb_id,
+        group_type,
+        group_name,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -1468,10 +1538,12 @@ async fn fetch_tmdb_episode_group_cached(
     tmdb_base_url: Option<&str>,
     series_tmdb_id: &str,
     group_type: i64,
+    group_name: Option<&str>,
 ) -> anyhow::Result<Option<Arc<TmdbEpisodeGroupCollection>>> {
     let cache_key = format!(
-        "{}:{group_type}",
-        tmdb::api_url(tmdb_base_url, &format!("tv/{series_tmdb_id}"))
+        "{}:{group_type}:{}",
+        tmdb::api_url(tmdb_base_url, &format!("tv/{series_tmdb_id}")),
+        group_name.unwrap_or_default(),
     );
     let cell = {
         let cache = EPISODE_GROUP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1487,9 +1559,16 @@ async fn fetch_tmdb_episode_group_cached(
 
     let group = cell
         .get_or_try_init(|| async {
-            fetch_tmdb_episode_group(client, api_key, tmdb_base_url, series_tmdb_id, group_type)
-                .await
-                .map(|group| group.map(Arc::new))
+            fetch_tmdb_episode_group(
+                client,
+                api_key,
+                tmdb_base_url,
+                series_tmdb_id,
+                group_type,
+                group_name,
+            )
+            .await
+            .map(|group| group.map(Arc::new))
         })
         .await?;
     Ok(group.clone())
@@ -1501,10 +1580,17 @@ async fn fetch_tmdb_episode_group(
     tmdb_base_url: Option<&str>,
     series_tmdb_id: &str,
     group_type: i64,
+    group_name: Option<&str>,
 ) -> anyhow::Result<Option<TmdbEpisodeGroupCollection>> {
-    let Some(group_id) =
-        fetch_tmdb_episode_group_id(client, api_key, tmdb_base_url, series_tmdb_id, group_type)
-            .await?
+    let Some(group_id) = fetch_tmdb_episode_group_id(
+        client,
+        api_key,
+        tmdb_base_url,
+        series_tmdb_id,
+        group_type,
+        group_name,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -1533,6 +1619,12 @@ fn tmdb_episode_group_type(display_order: Option<&str>) -> Option<i64> {
     }
 }
 
+fn tmdb_episode_group_name_matches(name: Option<&str>, expected: &str) -> bool {
+    name.is_some_and(|name| {
+        name.trim().eq_ignore_ascii_case(expected) || (expected == "Seasons" && name.contains('季'))
+    })
+}
+
 fn resolve_tmdb_episode_group_mapping(
     group: &TmdbEpisodeGroupCollection,
     season_number: i64,
@@ -1557,6 +1649,7 @@ async fn fetch_tmdb_episode_group_id(
     tmdb_base_url: Option<&str>,
     series_tmdb_id: &str,
     group_type: i64,
+    group_name: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
     let url = tmdb::api_url(tmdb_base_url, &format!("tv/{series_tmdb_id}"));
     let response = client
@@ -1576,7 +1669,12 @@ async fn fetch_tmdb_episode_group_id(
         episode_groups
             .results
             .into_iter()
-            .find(|group| group.group_type == Some(group_type))
+            .find(|group| {
+                group.group_type == Some(group_type)
+                    && group_name.is_none_or(|expected| {
+                        tmdb_episode_group_name_matches(group.name.as_deref(), expected)
+                    })
+            })
             .map(|group| group.id)
     }))
 }
@@ -1914,6 +2012,7 @@ pub async fn batch_fetch_episode_tmdb(
 
     // Process in concurrent batches (10 seasons at a time)
     let mut count = 0usize;
+    let mut request_failures = 0usize;
     let mut processed_seasons = 0usize;
     for chunk in tasks.chunks(10) {
         let futures: Vec<_> = chunk
@@ -1929,8 +2028,9 @@ pub async fn batch_fetch_episode_tmdb(
                         .values()
                         .flat_map(|targets| targets.iter().flat_map(episode_numbers_for_target))
                         .collect::<std::collections::BTreeSet<_>>();
+                    let mut fetch_failures = 0usize;
                     for episode_number in needed_episode_numbers {
-                        if let Ok(Some(episode)) = fetch_tmdb_episode_with_jellyfin_order(
+                        let result = fetch_tmdb_episode_with_jellyfin_order(
                             &client,
                             &api_key,
                             tmdb_base_url,
@@ -1940,20 +2040,32 @@ pub async fn batch_fetch_episode_tmdb(
                             task.display_order.as_deref(),
                             &task.language,
                         )
-                        .await
-                        {
-                            episodes_by_number.insert(episode_number, episode);
+                        .await;
+                        if let Err(error) = record_tmdb_episode_fetch(
+                            result,
+                            episode_number,
+                            &mut episodes_by_number,
+                        ) {
+                            fetch_failures += 1;
+                            tracing::warn!(
+                                "TMDb episode lookup failed for series tmdb-{} S{}E{}: {}",
+                                task.tmdb_id,
+                                task.season_number,
+                                episode_number,
+                                redact_tmdb_error(&error)
+                            );
                         }
                     }
 
-                    Some((episodes_by_number, task))
+                    Some((episodes_by_number, task, fetch_failures))
                 }
             })
             .collect();
 
         let results: Vec<_> = futures_util::future::join_all(futures).await;
         for result in results.into_iter().flatten() {
-            let (episodes_by_number, task) = result;
+            let (episodes_by_number, task, fetch_failures) = result;
+            request_failures += fetch_failures;
             processed_seasons += 1;
             for targets in task.targets_by_episode.values() {
                 for target in targets {
@@ -1990,6 +2102,11 @@ pub async fn batch_fetch_episode_tmdb(
     }
 
     tracing::info!("TMDb episode metadata fetched for {count} episodes");
+    if request_failures > 0 {
+        anyhow::bail!(
+            "TMDb episode batch had {request_failures} lookup failure(s); startup backfill must remain pending"
+        );
+    }
     Ok(count)
 }
 
@@ -2171,6 +2288,17 @@ fn episode_numbers_for_target(target: &EpisodeTmdbTarget) -> impl Iterator<Item 
         .filter(|end| *end > target.episode_number)
         .unwrap_or(target.episode_number);
     target.episode_number..=end
+}
+
+fn record_tmdb_episode_fetch(
+    result: anyhow::Result<Option<EpisodeTmdbResponse>>,
+    episode_number: i64,
+    episodes_by_number: &mut HashMap<i64, EpisodeTmdbResponse>,
+) -> anyhow::Result<()> {
+    if let Some(episode) = result? {
+        episodes_by_number.insert(episode_number, episode);
+    }
+    Ok(())
 }
 
 fn tmdb_episode_response_for_target(
@@ -4843,11 +4971,12 @@ mod tests {
         episode_remote_trailers, episode_title_candidate, extract_tmdb_id,
         is_replaceable_episode_title, is_tmdb_image_asset, local_episode_title_from_path,
         merge_metadata_string_list, merge_remote_trailers, metadata_field_locked_storage,
-        normalize_tmdb_overview, parse_lookup_title_year, parse_season_number, redact_tmdb_api_key,
-        resolve_tmdb_episode_group_mapping, should_skip_name_based_tmdb_lookup,
-        tmdb_candidate_score, tmdb_credit_people, tmdb_episode_group_type,
-        tmdb_episode_response_for_target, tmdb_find_result_id, tmdb_search_query_variants,
-        tmdb_title_match_score, upsert_tmdb_people,
+        normalize_tmdb_overview, parse_lookup_title_year, parse_season_number,
+        record_tmdb_episode_fetch, redact_tmdb_api_key, resolve_tmdb_episode_group_mapping,
+        should_skip_name_based_tmdb_lookup, tmdb_candidate_score, tmdb_credit_people,
+        tmdb_episode_group_name_matches, tmdb_episode_group_type, tmdb_episode_response_for_target,
+        tmdb_find_result_id, tmdb_search_query_variants, tmdb_title_match_score,
+        upsert_tmdb_people,
     };
     use crate::{
         entities::{
@@ -5428,6 +5557,21 @@ mod tests {
     }
 
     #[test]
+    fn episode_tmdb_lookup_errors_are_not_treated_as_missing_results() {
+        let mut episodes = HashMap::new();
+
+        let result = record_tmdb_episode_fetch(
+            Err(anyhow::anyhow!("temporary TMDb failure")),
+            1,
+            &mut episodes,
+        );
+
+        assert!(result.is_err());
+        assert!(episodes.is_empty());
+        assert!(record_tmdb_episode_fetch(Ok(None), 1, &mut episodes).is_ok());
+    }
+
+    #[test]
     fn tmdb_episode_group_type_matches_jellyfin_display_orders() {
         assert_eq!(tmdb_episode_group_type(Some("originalAirDate")), Some(1));
         assert_eq!(tmdb_episode_group_type(Some("absolute")), Some(2));
@@ -5438,6 +5582,16 @@ mod tests {
         assert_eq!(tmdb_episode_group_type(Some("tv")), Some(7));
         assert_eq!(tmdb_episode_group_type(Some("airdate")), None);
         assert_eq!(tmdb_episode_group_type(None), None);
+    }
+
+    #[test]
+    fn tmdb_seasons_fallback_requires_a_season_group_name() {
+        assert!(tmdb_episode_group_name_matches(Some("Seasons"), "Seasons"));
+        assert!(tmdb_episode_group_name_matches(Some("季度"), "Seasons"));
+        assert!(!tmdb_episode_group_name_matches(
+            Some("Production"),
+            "Seasons"
+        ));
     }
 
     #[test]
@@ -5458,6 +5612,25 @@ mod tests {
             Some((2, 23))
         );
         assert_eq!(resolve_tmdb_episode_group_mapping(&group, 1, 74), None);
+    }
+
+    #[test]
+    fn tmdb_seasons_group_maps_local_second_season_to_tmdb_episode_offset() {
+        let group = TmdbEpisodeGroupCollection {
+            groups: vec![TmdbEpisodeGroup {
+                order: 2,
+                episodes: vec![TmdbEpisodeGroupEpisode {
+                    order: 0,
+                    episode_number: 13,
+                    season_number: 1,
+                }],
+            }],
+        };
+
+        assert_eq!(
+            resolve_tmdb_episode_group_mapping(&group, 2, 1),
+            Some((1, 13))
+        );
     }
 
     fn episode_response(

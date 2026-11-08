@@ -155,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
                             return;
                         }
                     };
+                let mut startup_backfill_succeeded = true;
                 // First: fill in missing TMDb IDs for movies/series without tags
                 let tmdb_base_url = ep_state.tmdb_proxy_url.read().await.clone();
                 let tmdb_client = ep_state.tmdb_http_client().await;
@@ -173,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
                         tracing::info!("Filled TMDb metadata for {n} items via name search");
                     }
                     Err(e) => {
+                        startup_backfill_succeeded = false;
                         tracing::warn!("fill_missing_tmdb failed: {e:#}");
                     }
                 }
@@ -195,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Ok(_) => {}
                     Err(e) => {
+                        startup_backfill_succeeded = false;
                         tracing::warn!("startup provider reconciliation failed: {e:#}");
                     }
                 }
@@ -221,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
                             );
                         }
                         Err(e) => {
+                            startup_backfill_succeeded = false;
                             tracing::warn!("audit_existing_tmdb failed: {e:#}");
                         }
                     }
@@ -243,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
                         tracing::info!("Refreshed {n} existing TMDb item title(s)");
                     }
                     Err(e) => {
+                        startup_backfill_succeeded = false;
                         tracing::warn!("refresh_existing_tmdb_titles failed: {e:#}");
                     }
                 }
@@ -265,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
                         tracing::info!("Fetched TMDb data for {n} people");
                     }
                     Err(e) => {
+                        startup_backfill_succeeded = false;
                         tracing::warn!("batch_fetch_person_tmdb failed: {e:#}");
                     }
                 }
@@ -285,18 +291,31 @@ async fn main() -> anyhow::Result<()> {
                         tracing::info!("episode TMDb batch fetched {n} titles");
                     }
                     Err(e) => {
+                        startup_backfill_succeeded = false;
                         tracing::warn!("episode TMDb batch failed: {e:#}");
                     }
                 }
 
-                if let Err(error) =
-                    crate::db::settings::set(&metadata_db, STARTUP_METADATA_BACKFILL_KEY, "true")
-                        .await
+                let backfill_value = if startup_backfill_succeeded {
+                    "true"
+                } else {
+                    "false"
+                };
+                if let Err(error) = crate::db::settings::set(
+                    &metadata_db,
+                    STARTUP_METADATA_BACKFILL_KEY,
+                    backfill_value,
+                )
+                .await
                 {
                     tracing::warn!("failed to mark startup metadata backfill complete: {error:#}");
-                } else {
+                } else if startup_backfill_succeeded {
                     tracing::info!(
                         "startup metadata backfill completed; future restarts will skip the full pass"
+                    );
+                } else {
+                    tracing::warn!(
+                        "startup metadata backfill remains pending after errors; it will retry on the next restart"
                     );
                 }
             });

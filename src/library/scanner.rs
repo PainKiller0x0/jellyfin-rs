@@ -605,6 +605,19 @@ async fn scan_media_libraries_internal(
             tracing::warn!("failed to mark media probe cache current: {error:#}");
         }
     }
+    if targeted {
+        match crate::library::reconcile::repair_episode_season_parents_for_paths(
+            &scan_db, &all_seen,
+        )
+        .await
+        {
+            Ok(repaired) if repaired > 0 => {
+                tracing::info!("targeted scan repaired {repaired} episode season parent link(s)");
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!("targeted scan episode parent repair failed: {error:#}"),
+        }
+    }
     if !targeted {
         let post_scan_metadata = run_post_scan_metadata_tasks(
             &scan_db,

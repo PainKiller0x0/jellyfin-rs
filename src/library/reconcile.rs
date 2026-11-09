@@ -247,6 +247,43 @@ pub async fn reconcile_provider_duplicates(
     Ok(stats)
 }
 
+pub async fn repair_episode_season_parents_for_paths(
+    db: &DatabaseConnection,
+    scanned_paths: &[String],
+) -> anyhow::Result<usize> {
+    if scanned_paths.is_empty() {
+        return Ok(0);
+    }
+    let episodes = MediaItems::find()
+        .filter(media_items::Column::ItemType.eq("Episode"))
+        .filter(media_items::Column::Path.is_in(scanned_paths.iter().cloned()))
+        .all(db)
+        .await
+        .context("failed to load media items for episode season parent repair")?;
+    if episodes.is_empty() {
+        return Ok(0);
+    }
+
+    let library_ids = episodes
+        .iter()
+        .map(|episode| episode.library_id.clone())
+        .collect::<HashSet<_>>();
+    let season_paths = episodes
+        .iter()
+        .filter_map(|episode| Path::new(&episode.path).parent())
+        .map(|path| crate::library::path_utils::normalize_path(&path.to_string_lossy()))
+        .collect::<HashSet<_>>();
+    let mut items = MediaItems::find()
+        .filter(media_items::Column::ItemType.eq("Season"))
+        .filter(media_items::Column::LibraryId.is_in(library_ids))
+        .filter(media_items::Column::Path.is_in(season_paths))
+        .all(db)
+        .await
+        .context("failed to load season nodes for episode parent repair")?;
+    items.extend(episodes);
+    repair_episode_season_parents(db, &mut items).await
+}
+
 async fn repair_episode_season_parents<C: ConnectionTrait>(
     db: &C,
     items: &mut [media_items::Model],
@@ -1055,8 +1092,9 @@ fn parse_year(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_series_identity, reconcile_provider_duplicates, season_id_for_episode_path,
-        source_fallback_key, source_priority_score,
+        normalize_series_identity, reconcile_provider_duplicates,
+        repair_episode_season_parents_for_paths, season_id_for_episode_path, source_fallback_key,
+        source_priority_score,
     };
     use crate::entities::{media_items, provider_ids};
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
@@ -1173,8 +1211,11 @@ mod tests {
             .unwrap();
         }
 
-        let stats = reconcile_provider_duplicates(&db).await.unwrap();
-        assert_eq!(stats.repaired_episode_parents, 1);
+        let scanned_paths = vec!["/media/迅雷-番/JOJO (2012)/Season 6/E01.strm".to_string()];
+        let repaired_count = repair_episode_season_parents_for_paths(&db, &scanned_paths)
+            .await
+            .unwrap();
+        assert_eq!(repaired_count, 1);
         let repaired = media_items::Entity::find_by_id(episode_id)
             .one(&db)
             .await
@@ -1188,8 +1229,10 @@ mod tests {
             .unwrap();
         assert_eq!(untouched.parent_id, "deleted-season-7-id");
 
-        let second_run = reconcile_provider_duplicates(&db).await.unwrap();
-        assert_eq!(second_run.repaired_episode_parents, 0);
+        let second_run = repair_episode_season_parents_for_paths(&db, &scanned_paths)
+            .await
+            .unwrap();
+        assert_eq!(second_run, 0);
     }
 
     #[tokio::test]
